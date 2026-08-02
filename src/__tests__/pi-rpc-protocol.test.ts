@@ -9,13 +9,17 @@ import { fileURLToPath } from "node:url";
 import {
   existsSync,
   chmodSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { CURRENT_SESSION_VERSION } from "@earendil-works/pi-coding-agent";
 import {
   _resetPiContextCache,
   FILE_DELIVERY_CONTEXT,
@@ -41,10 +45,13 @@ import {
   buildPiSpawnEnv,
   buildPiSubagentChildSpawnEnv,
   buildPiSteerCommand,
+  assertPiSessionIdentityMatchesBinding,
   extractPiTextDelta,
   handlePiExtensionUiRecord,
   isPiAlreadyProcessingRejection,
   parsePiEvent,
+  parsePiGetStateIdentity,
+  parsePiStartupIdentityRecord,
   parsePiStartupRecord,
   piExtensionRelpathForDir,
   readPiStream,
@@ -60,7 +67,15 @@ import {
   type PiExtensionResolveOptions,
   type PiRpcParseState,
   type PiSpawnExtensionOptions,
+  type PiSpawnSessionBinding,
 } from "../pi-rpc-protocol.js";
+import {
+  MAX_INTERACTIVE_SESSION_HEADER_BYTES,
+  inspectInteractiveSessionBinding,
+  listInteractiveSessionCandidates,
+  preseedInteractiveSessionBinding,
+  resolveInteractiveSessionLocation,
+} from "../interactive-session-binding.js";
 import {
   PI_ACKNOWLEDGED_STEER_COMMAND,
   buildPiAcknowledgedSteerResultNotice,
@@ -93,6 +108,12 @@ const testAgent: AgentConfig = {
 // extension loading has its own dedicated block below.
 const NO_EXTENSIONS: PiExtensionResolveOptions = {
   env: { PI_EXTENSIONS_DISABLED: "1" },
+};
+const TEST_SESSION_BINDING: PiSpawnSessionBinding = {
+  sessionId: "exact-session",
+  sessionDirectory: "/tmp/minime-test-pi-sessions",
+  sessionFile: "/tmp/minime-test-pi-sessions/exact-session.jsonl",
+  workspaceRealpath: "/tmp/test-workspace",
 };
 const RETIRED_GUARD_WRAPPER_PATTERN = new RegExp(["guardian", "protect", "files"].join("-"));
 const RETIRED_SCHEMA_PATH_ENV = ["MINIME", "SCHEMA", "PATH"].join("_");
@@ -179,6 +200,281 @@ describe("NewlineOnlyJsonlSplitter", () => {
   });
 });
 
+describe("exact interactive Pi session bindings", () => {
+  const fixtures: string[] = [];
+
+  after(() => {
+    for (const fixture of fixtures) {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  function makeFixture(): {
+    root: string;
+    workspace: string;
+    agent: AgentConfig;
+  } {
+    const root = mkdtempSync(join(tmpdir(), "interactive-binding-"));
+    fixtures.push(root);
+    const workspace = join(root, "workspace");
+    mkdirSync(workspace, { recursive: true });
+    return {
+      root,
+      workspace,
+      agent: { ...testAgent, id: `binding-${fixtures.length}`, workspaceCwd: workspace },
+    };
+  }
+
+  function privateDirectory(path: string): void {
+    mkdirSync(path, { recursive: true, mode: 0o700 });
+    chmodSync(path, 0o700);
+  }
+
+  function writeTranscript(
+    path: string,
+    header: Record<string, unknown>,
+    mode: number = 0o600,
+  ): void {
+    writeFileSync(path, `${JSON.stringify(header)}\n`, { encoding: "utf8", mode });
+    chmodSync(path, mode);
+  }
+
+  it("uses Pi 0.82.1 session-directory precedence and canonicalizes the workspace", () => {
+    const { root, workspace, agent } = makeFixture();
+    const explicit = join(root, "explicit");
+    const environment = join(root, "environment");
+    const settings = join(root, "settings");
+    const projectSettingsDirectory = join(workspace, ".pi");
+    mkdirSync(projectSettingsDirectory, { recursive: true });
+    writeFileSync(
+      join(projectSettingsDirectory, "settings.json"),
+      JSON.stringify({ sessionDir: settings }),
+      "utf8",
+    );
+
+    const explicitLocation = resolveInteractiveSessionLocation(agent, {
+      sessionDirectory: explicit,
+      env: { PI_CODING_AGENT_SESSION_DIR: environment },
+      homeDirectory: root,
+    });
+    assert.strictEqual(explicitLocation.sessionDirectory, realpathSync(explicit));
+    assert.strictEqual(explicitLocation.workspaceRealpath, realpathSync(workspace));
+
+    const environmentLocation = resolveInteractiveSessionLocation(agent, {
+      env: { PI_CODING_AGENT_SESSION_DIR: environment },
+      homeDirectory: root,
+    });
+    assert.strictEqual(environmentLocation.sessionDirectory, realpathSync(environment));
+
+    const settingsLocation = resolveInteractiveSessionLocation(agent, {
+      env: {},
+      homeDirectory: root,
+    });
+    assert.strictEqual(settingsLocation.sessionDirectory, realpathSync(settings));
+  });
+
+  it("uses Pi's cwd-encoded default beneath the configured agent directory", () => {
+    const { root, agent } = makeFixture();
+    const agentDirectory = join(root, "agent-home");
+    const location = resolveInteractiveSessionLocation(agent, {
+      env: { PI_CODING_AGENT_DIR: agentDirectory },
+      homeDirectory: root,
+    });
+
+    assert.strictEqual(dirname(location.sessionDirectory), realpathSync(join(agentDirectory, "sessions")));
+    assert.match(location.sessionDirectory, /--.*workspace--$/);
+    assert.strictEqual(lstatSync(location.sessionDirectory).mode & 0o777, 0o700);
+  });
+
+  it("rejects unsafe session directories without repairing them", () => {
+    const { root, agent } = makeFixture();
+    const publicDirectory = join(root, "public");
+    mkdirSync(publicDirectory, { mode: 0o755 });
+    chmodSync(publicDirectory, 0o755);
+    assert.throws(
+      () => resolveInteractiveSessionLocation(agent, {
+        sessionDirectory: publicDirectory,
+        env: {},
+        homeDirectory: root,
+      }),
+      /not private/,
+    );
+    assert.strictEqual(lstatSync(publicDirectory).mode & 0o777, 0o755);
+
+    const target = join(root, "target");
+    const linked = join(root, "linked");
+    privateDirectory(target);
+    symlinkSync(target, linked, "dir");
+    assert.throws(
+      () => resolveInteractiveSessionLocation(agent, {
+        sessionDirectory: linked,
+        env: {},
+        homeDirectory: root,
+      }),
+      /symlink/,
+    );
+    assert.throws(
+      () => resolveInteractiveSessionLocation(agent, {
+        sessionDirectory: target,
+        env: {},
+        homeDirectory: root,
+        expectedUid: (typeof process.getuid === "function" ? process.getuid() : 0) + 1,
+      }),
+      /owned by uid/,
+    );
+  });
+
+  it("pre-seeds one owner-only Pi-authored canonical transcript", () => {
+    const { root, agent } = makeFixture();
+    const location = resolveInteractiveSessionLocation(agent, {
+      sessionDirectory: join(root, "sessions"),
+      env: {},
+      homeDirectory: root,
+    });
+    const binding = preseedInteractiveSessionBinding(location);
+    const header = JSON.parse(readFileSync(binding.sessionFile, "utf8").split("\n")[0]);
+
+    assert.strictEqual(binding.workspaceRealpath, realpathSync(agent.workspaceCwd));
+    assert.strictEqual(binding.sessionDirectory, realpathSync(join(root, "sessions")));
+    assert.strictEqual(binding.sessionFile, realpathSync(binding.sessionFile));
+    assert.strictEqual(lstatSync(binding.sessionFile).mode & 0o777, 0o600);
+    assert.deepStrictEqual(
+      { type: header.type, version: header.version, id: header.id, cwd: header.cwd },
+      {
+        type: "session",
+        version: CURRENT_SESSION_VERSION,
+        id: binding.sessionId,
+        cwd: binding.workspaceRealpath,
+      },
+    );
+    assert.deepStrictEqual(listInteractiveSessionCandidates(location), [binding.sessionFile]);
+  });
+
+  it("retries exclusive filename collisions without changing the existing file", () => {
+    const { root, agent } = makeFixture();
+    const location = resolveInteractiveSessionLocation(agent, {
+      sessionDirectory: join(root, "sessions"),
+      env: {},
+      homeDirectory: root,
+    });
+    const collision = join(location.sessionDirectory, "collision.jsonl");
+    writeFileSync(collision, "sentinel\n", { encoding: "utf8", mode: 0o600 });
+    chmodSync(collision, 0o600);
+
+    const binding = preseedInteractiveSessionBinding(location, {
+      candidateName: (attempt) => attempt === 0 ? "collision.jsonl" : "replacement.jsonl",
+    });
+
+    assert.strictEqual(readFileSync(collision, "utf8"), "sentinel\n");
+    assert.strictEqual(binding.sessionFile, join(location.sessionDirectory, "replacement.jsonl"));
+    assert.deepStrictEqual(readdirSync(location.sessionDirectory).sort(), [
+      "collision.jsonl",
+      "replacement.jsonl",
+    ]);
+  });
+
+  it("rejects unsafe paths, ownership, modes, headers, IDs, versions, and CWDs", () => {
+    const { root, agent } = makeFixture();
+    const location = resolveInteractiveSessionLocation(agent, {
+      sessionDirectory: join(root, "sessions"),
+      env: {},
+      homeDirectory: root,
+    });
+    const baseHeader = {
+      type: "session",
+      version: CURRENT_SESSION_VERSION,
+      id: "expected-id",
+      cwd: location.workspaceRealpath,
+      timestamp: new Date(0).toISOString(),
+    };
+    const good = join(location.sessionDirectory, "good.jsonl");
+    writeTranscript(good, baseHeader);
+    assert.strictEqual(
+      inspectInteractiveSessionBinding(location, good, "expected-id").valid,
+      true,
+    );
+
+    chmodSync(good, 0o644);
+    assert.deepStrictEqual(
+      inspectInteractiveSessionBinding(location, good, "expected-id"),
+      { valid: false, reason: "unsafe" },
+    );
+    chmodSync(good, 0o600);
+    assert.deepStrictEqual(
+      inspectInteractiveSessionBinding(location, good, "expected-id", {
+        expectedUid: (typeof process.getuid === "function" ? process.getuid() : 0) + 1,
+      }),
+      { valid: false, reason: "unsafe" },
+    );
+
+    for (const [name, patch] of [
+      ["id", { id: "other-id" }],
+      ["version", { version: CURRENT_SESSION_VERSION - 1 }],
+      ["cwd", { cwd: join(root, "other-workspace") }],
+      ["type", { type: "message" }],
+    ] as const) {
+      const path = join(location.sessionDirectory, `${name}.jsonl`);
+      writeTranscript(path, { ...baseHeader, ...patch });
+      assert.deepStrictEqual(
+        inspectInteractiveSessionBinding(location, path, "expected-id"),
+        { valid: false, reason: "invalid" },
+        name,
+      );
+    }
+
+    const oversized = join(location.sessionDirectory, "oversized.jsonl");
+    writeFileSync(oversized, "x".repeat(MAX_INTERACTIVE_SESSION_HEADER_BYTES), {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    chmodSync(oversized, 0o600);
+    assert.deepStrictEqual(
+      inspectInteractiveSessionBinding(location, oversized, "expected-id"),
+      { valid: false, reason: "invalid" },
+    );
+
+    const outside = join(root, "outside.jsonl");
+    writeTranscript(outside, baseHeader);
+    assert.deepStrictEqual(
+      inspectInteractiveSessionBinding(location, outside, "expected-id"),
+      { valid: false, reason: "unsafe" },
+    );
+
+    const symlink = join(location.sessionDirectory, "symlink.jsonl");
+    symlinkSync(good, symlink);
+    assert.deepStrictEqual(
+      inspectInteractiveSessionBinding(location, symlink, "expected-id"),
+      { valid: false, reason: "unsafe" },
+    );
+  });
+
+  it("bounds candidate enumeration", () => {
+    const { root, agent } = makeFixture();
+    const location = resolveInteractiveSessionLocation(agent, {
+      sessionDirectory: join(root, "sessions"),
+      env: {},
+      homeDirectory: root,
+    });
+    writeTranscript(join(location.sessionDirectory, "one.jsonl"), {
+      type: "session",
+      version: CURRENT_SESSION_VERSION,
+      id: "one",
+      cwd: location.workspaceRealpath,
+    });
+    writeTranscript(join(location.sessionDirectory, "two.jsonl"), {
+      type: "session",
+      version: CURRENT_SESSION_VERSION,
+      id: "two",
+      cwd: location.workspaceRealpath,
+    });
+
+    assert.throws(
+      () => listInteractiveSessionCandidates(location, 1),
+      /exceeds the 1-entry inspection bound/,
+    );
+  });
+});
+
 describe("buildPiSpawnArgs", () => {
   it("builds the Pi RPC OpenAI Codex command arguments", () => {
     assert.deepStrictEqual(buildPiSpawnArgs(testAgent, undefined, NO_EXTENSIONS), [
@@ -251,22 +547,41 @@ describe("buildPiSpawnArgs", () => {
     assert.ok(!args.includes("--add-dir"));
   });
 
-  it("appends --session with the resume session id when one is provided", () => {
-    const args = buildPiSpawnArgs(testAgent, "pi-sess-resume", NO_EXTENSIONS);
-    const idx = args.indexOf("--session");
+  it("appends one exact session directory and absolute transcript path", () => {
+    const args = buildPiSpawnArgs(testAgent, TEST_SESSION_BINDING, NO_EXTENSIONS);
+    const directoryIndex = args.indexOf("--session-dir");
+    const sessionIndex = args.indexOf("--session");
 
-    assert.notStrictEqual(idx, -1, "should include --session on resume");
-    assert.strictEqual(args[idx + 1], "pi-sess-resume");
+    assert.strictEqual(args.filter((arg) => arg === "--session-dir").length, 1);
+    assert.strictEqual(args.filter((arg) => arg === "--session").length, 1);
+    assert.strictEqual(args[directoryIndex + 1], TEST_SESSION_BINDING.sessionDirectory);
+    assert.strictEqual(args[sessionIndex + 1], TEST_SESSION_BINDING.sessionFile);
+    assert.ok(!args.includes("--resume"));
+    assert.ok(!args.includes("--continue"));
   });
 
-  it("omits --session on a fresh start (no resume id, or a blank one)", () => {
-    assert.ok(
-      !buildPiSpawnArgs(testAgent, undefined, NO_EXTENSIONS).includes("--session"),
-      "no arg => fresh start",
+  it("rejects ID-shaped, blank, relative, and cross-directory interactive bindings", () => {
+    assert.throws(
+      () => buildPiSpawnArgs(testAgent, "pi-sess-resume", NO_EXTENSIONS),
+      /exact \{ sessionDirectory, sessionFile \} binding; IDs are not accepted/,
     );
-    assert.ok(
-      !buildPiSpawnArgs(testAgent, "", NO_EXTENSIONS).includes("--session"),
-      "blank id => fresh start",
+    assert.throws(
+      () => buildPiSpawnArgs(testAgent, "", NO_EXTENSIONS),
+      /IDs are not accepted/,
+    );
+    assert.throws(
+      () => buildPiSpawnArgs(testAgent, {
+        sessionDirectory: "relative",
+        sessionFile: "relative/session.jsonl",
+      }, NO_EXTENSIONS),
+      /sessionDirectory must be a normalized absolute path/,
+    );
+    assert.throws(
+      () => buildPiSpawnArgs(testAgent, {
+        sessionDirectory: "/tmp/a",
+        sessionFile: "/tmp/b/session.jsonl",
+      }, NO_EXTENSIONS),
+      /direct normalized absolute JSONL path/,
     );
   });
 });
@@ -384,7 +699,7 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
   it("composes with --extension args: context args precede extensions; --session stays last", () => {
     const FAKE_DIR = "/fake/ext";
     const ws = fullPiWorkspace();
-    const args = buildPiSpawnArgs(piAgent(ws), "pi-sess-resume", {
+    const args = buildPiSpawnArgs(piAgent(ws), TEST_SESSION_BINDING, {
       extensionsDir: FAKE_DIR,
       env: {},
       exists: () => true,
@@ -398,7 +713,7 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
     assert.notStrictEqual(firstExtension, -1);
     assert.ok(noContextIdx < firstExtension, "context args must precede --extension args");
     assert.ok(firstExtension < session, "--extension args must precede --session");
-    assert.strictEqual(args[session + 1], "pi-sess-resume");
+    assert.strictEqual(args[session + 1], TEST_SESSION_BINDING.sessionFile);
     assert.strictEqual(args.filter((a) => a === "--extension").length, 7);
   });
 
@@ -1040,7 +1355,7 @@ describe("Pi extension loading (--extension)", () => {
 
   it("places all --extension paths before --session on resume", () => {
     const extraExtension = resolve("/approved/resume-extra.ts");
-    const args = buildPiSpawnArgs(testAgent, "pi-sess-resume", {
+    const args = buildPiSpawnArgs(testAgent, TEST_SESSION_BINDING, {
       ...presentAll,
       extraExtensions: [extraExtension],
     });
@@ -1051,7 +1366,7 @@ describe("Pi extension loading (--extension)", () => {
     assert.notStrictEqual(session, -1);
     assert.ok(lastExtension < session, "--extension args must precede --session");
     assert.strictEqual(args[lastExtension + 1], extraExtension);
-    assert.strictEqual(args[session + 1], "pi-sess-resume");
+    assert.strictEqual(args[session + 1], TEST_SESSION_BINDING.sessionFile);
   });
 
   // End-to-end smoke (real disk, no mocks): the resolver's missing-wrapper contract
@@ -1515,9 +1830,18 @@ describe("spawnPiRpcSession workspace validation", () => {
       process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = workspaceRoot;
       process.env.PATH = `${fakeBin}:${oldPath ?? ""}`;
 
+      const agent = { ...testAgent, workspaceCwd: agentWorkspace };
+      const binding = preseedInteractiveSessionBinding(
+        resolveInteractiveSessionLocation(agent, {
+          sessionDirectory: join(workspaceRoot, "pi-sessions"),
+          env: {},
+          homeDirectory: workspaceRoot,
+        }),
+      );
+
       const child = spawnPiRpcSession(
-        { ...testAgent, workspaceCwd: agentWorkspace },
-        undefined,
+        agent,
+        binding,
         NO_EXTENSIONS,
         { askCallerAgentId: "main" },
       );
@@ -1565,7 +1889,8 @@ describe("spawnPiRpcSession workspace validation", () => {
     }
     mkdirSync(agentWorkspace, { recursive: true });
     mkdirSync(agentDir, { recursive: true });
-    mkdirSync(sessionDir, { recursive: true });
+    mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+    chmodSync(sessionDir, 0o700);
     writeFileSync(
       extensionPath,
       [
@@ -1588,9 +1913,18 @@ describe("spawnPiRpcSession workspace validation", () => {
       process.env.PI_OFFLINE = "1";
       process.env.PI_SKIP_VERSION_CHECK = "1";
 
+      const agent = { ...testAgent, id: "startup-ui", workspaceCwd: agentWorkspace };
+      const binding = preseedInteractiveSessionBinding(
+        resolveInteractiveSessionLocation(agent, {
+          sessionDirectory: sessionDir,
+          env: process.env,
+          homeDirectory: workspaceRoot,
+        }),
+      );
+
       child = spawnPiRpcSession(
-        { ...testAgent, id: "startup-ui", workspaceCwd: agentWorkspace },
-        undefined,
+        agent,
+        binding,
         { relpaths: [], extraExtensions: [extensionPath] },
       );
       close = once(child, "close");
@@ -2029,6 +2363,102 @@ describe("Pi RPC prompt and steer commands", () => {
     assert.throws(
       () => sendPiPrompt(createMockChild({ exitCode: 1 }), "hello"),
       /Pi RPC child process is not available/,
+    );
+  });
+});
+
+describe("correlated Pi get_state identity", () => {
+  const identityEvent = {
+    type: "response",
+    id: "binding-probe",
+    command: "get_state",
+    success: true,
+    data: {
+      sessionId: "pi-authored-id",
+      sessionFile: "/tmp/pi-sessions/exact.jsonl",
+    },
+  } as const;
+
+  it("requires the exact correlation id and both identity fields", () => {
+    const observed = parsePiGetStateIdentity(identityEvent, "binding-probe");
+    assert.deepStrictEqual(observed, {
+      sessionId: "pi-authored-id",
+      sessionFile: "/tmp/pi-sessions/exact.jsonl",
+    });
+    assert.ok(observed);
+    assert.doesNotThrow(() => assertPiSessionIdentityMatchesBinding({
+      sessionId: "pi-authored-id",
+      sessionFile: "/tmp/pi-sessions/exact.jsonl",
+    }, observed));
+    assert.strictEqual(parsePiGetStateIdentity(identityEvent, "different-probe"), null);
+    assert.strictEqual(
+      parsePiGetStateIdentity({
+        ...identityEvent,
+        data: { sessionId: "pi-authored-id" },
+      }, "binding-probe"),
+      null,
+    );
+    assert.strictEqual(
+      parsePiGetStateIdentity({
+        ...identityEvent,
+        data: { sessionFile: "/tmp/pi-sessions/exact.jsonl" },
+      }, "binding-probe"),
+      null,
+    );
+    assert.strictEqual(
+      parsePiGetStateIdentity({ ...identityEvent, success: false }, "binding-probe"),
+      null,
+    );
+  });
+
+  it("rejects mismatched IDs and paths without replacing the expected binding", () => {
+    const expected = {
+      sessionId: "expected-id",
+      sessionFile: "/tmp/pi-sessions/expected.jsonl",
+    };
+    assert.throws(
+      () => assertPiSessionIdentityMatchesBinding(expected, {
+        ...expected,
+        sessionId: "different-id",
+      }),
+      /sessionId mismatch/,
+    );
+    assert.throws(
+      () => assertPiSessionIdentityMatchesBinding(expected, {
+        ...expected,
+        sessionFile: "/tmp/pi-sessions/different.jsonl",
+      }),
+      /sessionFile mismatch/,
+    );
+    assert.deepStrictEqual(expected, {
+      sessionId: "expected-id",
+      sessionFile: "/tmp/pi-sessions/expected.jsonl",
+    });
+  });
+
+  it("does not invent a fallback identity while an exact response is absent or delayed", () => {
+    const child = new EventEmitter() as unknown as ChildProcess;
+    const records = [
+      "not-json",
+      JSON.stringify({ ...identityEvent, id: "stale-probe" }),
+      JSON.stringify({
+        ...identityEvent,
+        data: { sessionId: "partial-id" },
+      }),
+      JSON.stringify(identityEvent),
+    ];
+
+    assert.deepStrictEqual(
+      records.map((record) => parsePiStartupIdentityRecord(child, record, "binding-probe")),
+      [
+        null,
+        null,
+        null,
+        {
+          sessionId: "pi-authored-id",
+          sessionFile: "/tmp/pi-sessions/exact.jsonl",
+        },
+      ],
     );
   });
 });

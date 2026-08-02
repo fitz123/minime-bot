@@ -42,12 +42,12 @@ git diff --no-ext-diff main...HEAD | rg -n '/Users/|306600687|255582' || true
 ### Task 1: Establish the canonical exact-path session primitive
 **Goal:** Resolve one authoritative workspace/session directory and create or inspect only verified Pi-authored transcript bindings.
 **Serves:** Fresh topics must persist a real canonical ID/path before spawn; resumes must use exact paths; broad discovery, provisional IDs, and silent transcript mutation must be structurally impossible.
-- [ ] Add a cohesive interactive binding helper that resolves the canonical agent workspace and Pi session directory using Pi 0.82.1 precedence, validates owner/private/non-symlink directory state, and bounds header reads and candidate inspection.
-- [ ] Adapt the public #74 primitive to exclusively create a collision-safe `0600` JSONL, open it through Pi `SessionManager.open`, and return `{sessionId, sessionFile, workspaceRealpath}` only after canonical in-directory path, regular-file owner/mode, current header version, ID, and CWD all match.
-- [ ] Change the interactive spawn contract in `src/pi-rpc-protocol.ts` to accept the resolved session directory and absolute transcript path, emit exactly one `--session <absolute-jsonl-path>` (and an explicit matching session directory where required), and reject ID-shaped interactive bindings, `--resume`, and `--continue`.
-- [ ] Parse correlated `get_state` identity as `{sessionId, sessionFile}` for bounded equality assertions; never let reported state create or replace a durable identity.
-- [ ] Add focused protocol/helper tests for secure pre-seed, symlink/owner/mode/path/header/ID/CWD failures, collision safety, exact spawn arguments, and mismatched/absent/delayed `get_state` without fallback identity.
-- [ ] Run `npm run test:file -- src/__tests__/pi-rpc-protocol.test.ts src/__tests__/session-manager-pi-spawn.test.ts` and `npm run lint` before Task 2.
+- [x] Add a cohesive interactive binding helper that resolves the canonical agent workspace and Pi session directory using Pi 0.82.1 precedence, validates owner/private/non-symlink directory state, and bounds header reads and candidate inspection.
+- [x] Adapt the public #74 primitive to exclusively create a collision-safe `0600` JSONL, open it through Pi `SessionManager.open`, and return `{sessionId, sessionFile, workspaceRealpath}` only after canonical in-directory path, regular-file owner/mode, current header version, ID, and CWD all match.
+- [x] Change the interactive spawn contract in `src/pi-rpc-protocol.ts` to accept the resolved session directory and absolute transcript path, emit exactly one `--session <absolute-jsonl-path>` (and an explicit matching session directory where required), and reject ID-shaped interactive bindings, `--resume`, and `--continue`.
+- [x] Parse correlated `get_state` identity as `{sessionId, sessionFile}` for bounded equality assertions; never let reported state create or replace a durable identity.
+- [x] Add focused protocol/helper tests for secure pre-seed, symlink/owner/mode/path/header/ID/CWD failures, collision safety, exact spawn arguments, and mismatched/absent/delayed `get_state` without fallback identity.
+- [x] Run `npm run test:file -- src/__tests__/pi-rpc-protocol.test.ts src/__tests__/session-manager-pi-spawn.test.ts` and `npm run lint` before Task 2.
 
 ### Task 2: Perform one data-preserving legacy store cutover
 **Goal:** Convert the legacy ID-only map into strict canonical bindings or an explicit one-time unresolved migration state without losing the old ID or any source bytes.

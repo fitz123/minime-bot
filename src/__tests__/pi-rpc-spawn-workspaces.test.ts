@@ -16,6 +16,10 @@ import { Readable, Writable } from "node:stream";
 import { loadConfig } from "../config.js";
 import { MINIME_AGENT_WORKSPACE_ROOT_ENV, MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
 import type { ExecFileSyncLike } from "../secrets.js";
+import {
+  preseedInteractiveSessionBinding,
+  resolveInteractiveSessionLocation,
+} from "../interactive-session-binding.js";
 
 const RETIRED_CONTROL_WORKSPACE_ENV = ["MINIME", "WORKSPACE", "ROOT"].join("_");
 const RETIRED_AGENT_WORKSPACE_ENV = ["MINIME", "AGENT", "WORKSPACE", "CWD"].join("_");
@@ -42,7 +46,6 @@ const {
   PI_EXTENSIONS_DISABLED_ENV,
   spawnPiRpcSession,
 } = await import("../pi-rpc-protocol.js");
-
 after(() => {
   for (const fixture of fixtures) {
     rmSync(fixture, { recursive: true, force: true });
@@ -169,8 +172,23 @@ describe("Pi spawn workspace contract", () => {
       assert.equal(config.agents.reviewer.workspaceCwd, reviewerWorkspace);
       assert.deepEqual(secretReads, [controlSecretsFile]);
 
-      spawnPiRpcSession(config.agents.main, undefined, undefined, { askCallerAgentId: "main" });
-      spawnPiRpcSession(config.agents.reviewer);
+      const mainBinding = preseedInteractiveSessionBinding(
+        resolveInteractiveSessionLocation(config.agents.main, {
+          sessionDirectory: join(root, "main-sessions"),
+          env: {},
+          homeDirectory: root,
+        }),
+      );
+      const reviewerBinding = preseedInteractiveSessionBinding(
+        resolveInteractiveSessionLocation(config.agents.reviewer, {
+          sessionDirectory: join(root, "reviewer-sessions"),
+          env: {},
+          homeDirectory: root,
+        }),
+      );
+
+      spawnPiRpcSession(config.agents.main, mainBinding, undefined, { askCallerAgentId: "main" });
+      spawnPiRpcSession(config.agents.reviewer, reviewerBinding);
 
       assert.equal(spawnCaptures.length, 2);
       assert.equal(spawnCaptures[0].command, process.execPath);
@@ -181,6 +199,10 @@ describe("Pi spawn workspace contract", () => {
       assert.equal(spawnCaptures[0].options.cwd, mainWorkspace);
       assert.equal(spawnCaptures[1].command, process.execPath);
       assert.equal(spawnCaptures[1].options.cwd, reviewerWorkspace);
+      assert.equal(flagValue(spawnCaptures[0].args, "--session"), mainBinding.sessionFile);
+      assert.equal(flagValue(spawnCaptures[0].args, "--session-dir"), mainBinding.sessionDirectory);
+      assert.equal(flagValue(spawnCaptures[1].args, "--session"), reviewerBinding.sessionFile);
+      assert.equal(flagValue(spawnCaptures[1].args, "--session-dir"), reviewerBinding.sessionDirectory);
       for (const capture of spawnCaptures) {
         const env = capture.options.env as NodeJS.ProcessEnv;
         assert.equal(env[MINIME_CONTROL_WORKSPACE_ROOT_ENV], controlWorkspace);
