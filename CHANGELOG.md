@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 2026.8.3
+
+- Bind every interactive lane to one verified Pi-authored transcript ID and
+  absolute path, migrate legacy ID-only records without rewriting transcripts,
+  and rotate one unavailable binding with a durable direct notice while
+  automatically replaying the triggering message (#174).
+
 ## 2026.8.2
 
 - Move interactive file-delivery guidance from repeated user prompts into one
