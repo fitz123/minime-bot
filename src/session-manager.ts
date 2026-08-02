@@ -189,6 +189,12 @@ interface PreparedSessionBinding {
   rotationAllowed: boolean;
 }
 
+interface SessionStartup {
+  generation: number;
+  agentId: string;
+  promise: Promise<ActiveSession>;
+}
+
 export function formatSessionRecoveryNotice(notice: PendingSessionRecoveryNotice): string {
   return `I could not resume session ${notice.failedSessionId}. I started replacement session ${notice.replacementSessionId} and will continue your message there automatically.`;
 }
@@ -270,6 +276,8 @@ export class SessionManager {
    * older startup work cannot re-create state a clean just removed.
    */
   private sessionGenerations: Map<string, number> = new Map();
+  /** Coalesce one same-generation startup per transport lane. */
+  private sessionStartups: Map<string, SessionStartup> = new Map();
   private store: SessionStore;
   private loadConfig: () => BotConfig;
   private logDir: string;
@@ -677,6 +685,36 @@ export class SessionManager {
    */
   async getOrCreateSession(chatId: string, agentId: string): Promise<ActiveSession> {
     const generation = this.sessionGenerations.get(chatId) ?? 0;
+    const inFlight = this.sessionStartups.get(chatId);
+    if (inFlight?.generation === generation) {
+      if (inFlight.agentId === agentId) {
+        return inFlight.promise;
+      }
+      try {
+        await inFlight.promise;
+      } catch {
+        // A differently bound caller still gets its own serialized decision.
+      }
+      if ((this.sessionGenerations.get(chatId) ?? 0) !== generation) {
+        throw new SessionStartupSupersededError();
+      }
+      return this.getOrCreateSession(chatId, agentId);
+    }
+
+    const promise = this.startSession(chatId, agentId);
+    const startup: SessionStartup = { generation, agentId, promise };
+    this.sessionStartups.set(chatId, startup);
+    try {
+      return await promise;
+    } finally {
+      if (this.sessionStartups.get(chatId) === startup) {
+        this.sessionStartups.delete(chatId);
+      }
+    }
+  }
+
+  private async startSession(chatId: string, agentId: string): Promise<ActiveSession> {
+    const generation = this.sessionGenerations.get(chatId) ?? 0;
     const isStartupSuperseded = () => (this.sessionGenerations.get(chatId) ?? 0) !== generation;
     const abortSupersededStartup = async (childToTerminate?: ChildProcess): Promise<never> => {
       if (childToTerminate) {
@@ -837,11 +875,20 @@ export class SessionManager {
           await abortSupersededStartup(child);
         }
 
-        const localFailure = child === undefined
-          ? this.localSpawnBindingFailure(err)
-          : undefined;
         const exactOpenRejected = child !== undefined
           && this.hasPiExactOpenRejectedSignal(child, prepared.binding);
+        const localFailure = child === undefined
+          ? this.localSpawnBindingFailure(err)
+          : exactOpenRejected
+            ? undefined
+            : (() => {
+              const inspection = inspectInteractiveSessionBinding(
+                prepared.binding,
+                prepared.binding.sessionFile,
+                prepared.binding.sessionId,
+              );
+              return inspection.valid ? undefined : inspection.reason;
+            })();
         if (prepared.rotationAllowed && (localFailure || exactOpenRejected)) {
           const reason: SessionRecoveryReason = localFailure ?? "exact-open-rejected";
           prepared = this.publishPreseededBinding(
@@ -931,14 +978,18 @@ export class SessionManager {
     try {
       activationConfirmed = this.store.compareAndSetSession(chatId, prepared.state, confirmedState);
     } catch (err) {
-      this.active.delete(chatId);
-      sessionsActive.dec();
+      if (this.active.get(chatId) === session) {
+        this.active.delete(chatId);
+        sessionsActive.dec();
+      }
       await this.terminateStartupChild(child);
       throw err;
     }
     if (!activationConfirmed) {
-      this.active.delete(chatId);
-      sessionsActive.dec();
+      if (this.active.get(chatId) === session) {
+        this.active.delete(chatId);
+        sessionsActive.dec();
+      }
       await this.terminateStartupChild(child);
       if (isStartupSuperseded()) {
         await abortSupersededStartup();

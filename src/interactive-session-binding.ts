@@ -3,6 +3,7 @@ import {
   chmodSync,
   closeSync,
   fchmodSync,
+  fsyncSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -419,6 +420,15 @@ function defaultCandidateName(): string {
   return `${timestamp}_${randomUUID()}.jsonl`;
 }
 
+function fsyncPath(path: string): void {
+  const descriptor = openSync(path, "r");
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
 /**
  * Exclusively create a private empty file and let Pi author its canonical
  * header. The returned binding is accepted only after exact path, identity,
@@ -488,6 +498,11 @@ export function preseedInteractiveSessionBindingCore(
   if (canonicalReportedFile !== sessionFile) {
     throw new Error("Pi authored the interactive session at an unexpected transcript path");
   }
+  // Pi writes the header synchronously but does not fsync it. Make both the
+  // authored bytes and their directory entry durable before publishing a
+  // binding that the store may commit independently.
+  fsyncPath(canonicalReportedFile);
+  fsyncPath(sessionDirectory);
   const inspection = inspectInteractiveSessionBinding(
     { ...location, sessionDirectory },
     canonicalReportedFile,

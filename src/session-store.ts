@@ -349,6 +349,15 @@ function cloneState<T>(value: T): T {
   return structuredClone(value);
 }
 
+function fsyncDirectory(path: string): void {
+  const descriptor = openSync(path, "r");
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
 function serializeStore(data: SessionStoreData): string {
   const checked = parseCurrentStore({ version: SESSION_STORE_VERSION, sessions: data });
   return JSON.stringify({ version: SESSION_STORE_VERSION, sessions: checked }, null, 2);
@@ -440,6 +449,7 @@ export class SessionStore {
       descriptor = undefined;
       assertPrivateRegularFile(tmpPath);
       renameSync(tmpPath, this.path);
+      fsyncDirectory(dir);
     } catch (error) {
       if (descriptor !== undefined) closeSync(descriptor);
       try { unlinkSync(tmpPath); } catch (cleanupError) {
@@ -544,6 +554,7 @@ export class SessionStore {
       closeSync(descriptor);
       descriptor = undefined;
       assertPrivateRegularFile(backupPath);
+      fsyncDirectory(dirname(backupPath));
     } catch (error) {
       if (descriptor !== undefined) closeSync(descriptor);
       try { unlinkSync(backupPath); } catch (cleanupError) {

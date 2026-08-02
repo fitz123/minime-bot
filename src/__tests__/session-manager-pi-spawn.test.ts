@@ -882,6 +882,100 @@ describe("SessionManager exact Pi binding startup", () => {
     assert.strictEqual(piSpawnCaptures.length, 2, "identity mismatches never allocate a recovery binding");
   });
 
+  it("rotates when Pi replaces a transcript that vanished after spawn validation", async () => {
+    const store = new SessionStore(TEST_STORE_PATH);
+    const prior = storedPiBinding("pi-open-race", "pi-open-race-old-id");
+    store.setSession("pi-open-race", prior);
+    const piAuthoredDifferentId = "pi-authored-after-disappearance";
+    let getStateCount = 0;
+    onGetState = () => {
+      getStateCount += 1;
+      if (getStateCount === 1) {
+        rmSync(prior.sessionFile);
+        writeFileSync(prior.sessionFile, `${JSON.stringify({
+          type: "session",
+          version: CURRENT_SESSION_VERSION,
+          id: piAuthoredDifferentId,
+          timestamp: "2026-08-02T00:00:00.000Z",
+          cwd: prior.workspaceRealpath,
+        })}\n`, { mode: 0o600 });
+        forceIdentityOverride = true;
+        nextPiSessionId = piAuthoredDifferentId;
+      } else {
+        forceIdentityOverride = false;
+        nextPiSessionId = undefined;
+      }
+    };
+
+    const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+    const session = await manager.getOrCreateSession("pi-open-race", "pi");
+
+    assert.strictEqual(piSpawnCaptures.length, 2, "the unavailable binding rotates exactly once");
+    assert.notStrictEqual(session.sessionId, prior.sessionId);
+    assert.notStrictEqual(session.sessionFile, prior.sessionFile);
+    assert.strictEqual(
+      JSON.parse(readFileSync(prior.sessionFile, "utf8").trim()).id,
+      piAuthoredDifferentId,
+      "the failed path is preserved after Pi authors the mismatched identity",
+    );
+    assert.deepStrictEqual(
+      new SessionStore(TEST_STORE_PATH).getSession("pi-open-race")?.pendingRecoveryNotice,
+      {
+        failedSessionId: prior.sessionId,
+        replacementSessionId: session.sessionId,
+        reason: "invalid",
+      },
+    );
+    await manager.closeAll();
+  });
+
+  it("coalesces concurrent same-lane startups onto one child and binding", async () => {
+    suppressGetStateResponse = true;
+    const startupRequests: Array<{ child: ChildProcess; responseId?: string }> = [];
+    onGetState = (child, responseId) => {
+      startupRequests.push({ child, responseId });
+    };
+    const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+    const first = manager.getOrCreateSession("pi-concurrent-start", "pi");
+    const second = manager.getOrCreateSession("pi-concurrent-start", "pi");
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const spawnCountBeforeRelease = piSpawnCaptures.length;
+    for (const [index, request] of startupRequests.entries()) {
+      const binding = piSpawnCaptures[index].sessionBinding;
+      request.child.stdout!.push(`${JSON.stringify({
+        type: "response",
+        id: request.responseId,
+        command: "get_state",
+        success: true,
+        data: {
+          sessionId: binding.sessionId,
+          sessionFile: binding.sessionFile,
+        },
+      })}\n`);
+    }
+    const results = await Promise.allSettled([first, second]);
+
+    try {
+      assert.strictEqual(spawnCountBeforeRelease, 1, "one same-generation child is spawned");
+      assert.strictEqual(results[0].status, "fulfilled");
+      assert.strictEqual(results[1].status, "fulfilled");
+      if (results[0].status === "fulfilled" && results[1].status === "fulfilled") {
+        assert.strictEqual(results[0].value, results[1].value, "both callers receive the same active session");
+      }
+      assert.strictEqual(manager.getActiveCount(), 1);
+    } finally {
+      suppressGetStateResponse = false;
+      await manager.closeAll();
+      for (const result of results) {
+        if (result.status !== "fulfilled") continue;
+        if (result.value.idleTimer) clearTimeout(result.value.idleTimer);
+        if (!hasExited(result.value.child)) result.value.child.kill("SIGKILL");
+      }
+    }
+  });
+
   it("rotates locally missing, malformed, unsafe, and ID-mismatched transcripts before spawn", async () => {
     const store = new SessionStore(TEST_STORE_PATH);
     const cases = [
