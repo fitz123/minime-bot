@@ -170,10 +170,12 @@ on the worker host. Their defaults are `/opt/homebrew/bin/ffmpeg`,
 `/opt/homebrew/bin/whisper-cli`, and
 `~/.minime/models/ggml-medium.bin`; override them with `FFMPEG_BIN`,
 `WHISPER_BIN`, and `WHISPER_MODEL`. `WHISPER_LANGUAGE` optionally replaces
-automatic language detection. Ops accepts only Telegram voice messages of at
-most 20 MiB and 10 minutes, and bounds each download attempt to 30 seconds.
-Missing local resources or transcription failure returns fixed text guidance;
-text and slash commands remain available.
+automatic language detection. `WHISPER_GLOSSARY_PATH` optionally selects the
+shared bounded plain-text recognition glossary described in the README. Ops
+accepts only Telegram voice messages of at most 20 MiB and 10 minutes, and
+bounds each download attempt to 30 seconds. Missing local resources or
+transcription failure returns fixed text guidance; text and slash commands
+remain available.
 
 The conversation lane has one in-flight turn and no queue. Its update is
 acknowledged before local transcription or provider work begins, so polling,

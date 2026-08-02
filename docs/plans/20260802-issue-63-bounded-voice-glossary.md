@@ -75,10 +75,10 @@ gitleaks git --no-banner --redact --log-opts='main..HEAD' .
 
 **Serves:** Public issue #63 requires a short README contract, synthetic-only public evidence, local-only inference, and no private values/paths/audio/transcripts/identities in repository artifacts or logs.
 
-- [ ] Add a concise `README.md` paragraph describing `WHISPER_GLOSSARY_PATH`, one-term-per-line format, `#` comments, deduplication/budget behavior, hot reload, and absent-safe fallback; extend `docs/ops-worker.md` only enough to list the shared optional runtime control.
-- [ ] Verify Telegram, Discord, and dedicated Ops voice entry points all reach the common `voice.ts` invocation without platform-specific glossary handling or duplicated parsing.
-- [ ] Run the full package test suite, lint, build, dry-pack, schema-contract, CLI-help, and minimal-workspace validation commands; all must pass.
-- [ ] Run `git diff --check`, gitleaks, author-scope, and public privacy scans; confirm the diff contains only generic code, synthetic fixtures, and public documentation.
+- [x] Add a concise `README.md` paragraph describing `WHISPER_GLOSSARY_PATH`, one-term-per-line format, `#` comments, deduplication/budget behavior, hot reload, and absent-safe fallback; extend `docs/ops-worker.md` only enough to list the shared optional runtime control.
+- [x] Verify Telegram, Discord, and dedicated Ops voice entry points all reach the common `voice.ts` invocation without platform-specific glossary handling or duplicated parsing.
+- [x] Run the full package test suite, lint, build, dry-pack, schema-contract, CLI-help, and minimal-workspace validation commands; all must pass.
+- [x] Run `git diff --check`, gitleaks, author-scope, and public privacy scans; confirm the diff contains only generic code, synthetic fixtures, and public documentation.
 
 ## Technical Details
 
