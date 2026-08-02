@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 2026.8.4
+
+- Add an optional hot-reloaded plain-text recognition glossary to the existing
+  local Whisper path, with deterministic deduplication and a conservative
+  whole-term prompt bound while preserving exact unprompted behavior when the
+  glossary is absent or empty (#63).
+
 ## 2026.8.3
 
 - Bind every interactive lane to one verified Pi-authored transcript ID and
