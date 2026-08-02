@@ -28,6 +28,7 @@ import {
   type RuntimeGuard,
   type RuntimeResource,
 } from "../runtime-guard.js";
+import { shutdownServingRuntime } from "../runtime-shutdown.js";
 import {
   initializeInstanceIdentity,
   startMetricsServer,
@@ -41,6 +42,12 @@ function tempRoot(): string {
   const root = mkdtempSync(join(tmpdir(), "minime-runtime-guard-test-"));
   tempRoots.push(root);
   return root;
+}
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((resolvePromise) => { resolve = resolvePromise; });
+  return { promise, resolve };
 }
 
 const quiet = {
@@ -191,8 +198,32 @@ describe("runtime resource ownership", () => {
     writeFileSync(join(lockPath, `claim-${suffix}`), `${suffix}\n`, { mode: 0o600 });
     utimesSync(lockPath, new Date(0), new Date(0));
 
-    const replacement = acquire(root, [shared], { now: () => 10_000, incompleteGraceMs: 100 });
+    const replacement = acquire(root, [shared], {
+      now: () => 10_000,
+      incompleteGraceMs: 100,
+      processStartToken: (pid) => pid === 999 ? "feedfacefeedface" : "aaaaaaaaaaaaaaaa",
+    });
     assert.equal(readdirSync(replacement.lockPaths[0]).length, 2);
+  });
+
+  it("does not reclaim an old claim-only publication from the same live process", () => {
+    const root = tempRoot();
+    const lockPath = runtimeResourceLockPath(shared, root);
+    const suffix = `${process.pid}-aaaaaaaaaaaaaaaa-acde-5678`;
+    mkdirSync(lockPath, { mode: 0o700 });
+    writeFileSync(join(lockPath, `claim-${suffix}`), `${suffix}\n`, { mode: 0o600 });
+    utimesSync(lockPath, new Date(0), new Date(0));
+
+    assert.throws(
+      () => acquire(root, [shared], {
+        now: () => 10_000,
+        incompleteGraceMs: 100,
+        processStartToken: () => "aaaaaaaaaaaaaaaa",
+        isProcessAlive: () => true,
+      }),
+      StartupConflictError,
+    );
+    assert.deepEqual(readdirSync(lockPath), [`claim-${suffix}`]);
   });
 
   it("refuses foreign, malformed, replaced, and raced lock states", () => {
@@ -286,12 +317,27 @@ describe("media-root preflight", () => {
   it("allows missing and owned directory roots without mutation", () => {
     const base = tempRoot();
     const missing = join(base, "missing");
-    assert.equal(preflightMediaRoot(missing, quiet), missing);
+    assert.equal(preflightMediaRoot(missing, quiet), join(realpathSync(base), "missing"));
     assert.equal(existsSync(missing), false);
 
     const safe = join(base, "safe");
     mkdirSync(safe, { mode: 0o700 });
     assert.equal(preflightMediaRoot(safe, quiet), realpathSync(safe));
+  });
+
+  it("keeps a missing root's identity stable across a symlinked parent", () => {
+    const base = tempRoot();
+    const physicalParent = join(base, "physical-parent");
+    const linkedParent = join(base, "linked-parent");
+    mkdirSync(physicalParent, { mode: 0o700 });
+    symlinkSync(physicalParent, linkedParent);
+    const mediaRoot = join(linkedParent, "nested", "media");
+    const expected = join(realpathSync(physicalParent), "nested", "media");
+
+    assert.equal(preflightMediaRoot(mediaRoot, quiet), expected);
+    assert.equal(existsSync(mediaRoot), false);
+    mkdirSync(mediaRoot, { recursive: true, mode: 0o700 });
+    assert.equal(preflightMediaRoot(mediaRoot, quiet), expected);
   });
 
   it("classifies foreign and symlink roots with bounded reasons", () => {
@@ -395,18 +441,97 @@ describe("bounded lifecycle integration", () => {
     assert.deepEqual(readdirSync(root), [basename(servingOwner.lockPaths[0])]);
     assert.equal(oldMetrics.listening, true);
 
+    const pollingDrained = deferred();
+    const discordDrained = deferred();
+    const sessionsDrained = deferred();
+    const sessionsStarted = deferred();
     const teardown: string[] = [];
-    teardown.push("polling");
+    const shutdown = shutdownServingRuntime({
+      telegramBot: {
+        stop: async () => { teardown.push("telegram-stop"); },
+      },
+      telegramPolling: pollingDrained.promise.then(() => { teardown.push("polling-drained"); }),
+      shutdownDiscord: async () => {
+        teardown.push("discord-stop");
+        await discordDrained.promise;
+        teardown.push("discord-drained");
+      },
+      messageQueues: [{
+        cancelAllDebounceTimers: () => {
+          assert.ok(existsSync(servingOwner.lockPaths[0]));
+          teardown.push("queues-stopped");
+        },
+        clearAll: () => {
+          assert.ok(existsSync(servingOwner.lockPaths[0]));
+          teardown.push("media");
+        },
+      }],
+      sessionManager: {
+        gracefulShutdown: async () => {
+          teardown.push("sessions-started");
+          sessionsStarted.resolve();
+          await sessionsDrained.promise;
+          teardown.push("sessions-drained");
+        },
+        closeAll: async () => {
+          assert.ok(existsSync(servingOwner.lockPaths[0]));
+          teardown.push("sessions-closed");
+        },
+      },
+      shutdownTimeoutMs: 1_000,
+      stopMetrics: async () => {
+        assert.ok(existsSync(servingOwner.lockPaths[0]));
+        await stopMetricsServer();
+        teardown.push("metrics");
+      },
+      releaseRuntimeGuard: () => {
+        const released = servingOwner.release();
+        teardown.push("claims");
+        return released;
+      },
+      onTelegramStopError: () => assert.fail("Telegram stop should not fail"),
+      onDiscordStopError: () => assert.fail("Discord stop should not fail"),
+    });
+
+    await new Promise<void>((resolveImmediate) => setImmediate(resolveImmediate));
+    assert.deepEqual(teardown, ["telegram-stop", "discord-stop"]);
     assert.ok(existsSync(servingOwner.lockPaths[0]));
-    teardown.push("sessions");
+    assert.equal(oldMetrics.listening, true);
+
+    pollingDrained.resolve();
+    await new Promise<void>((resolveImmediate) => setImmediate(resolveImmediate));
+    assert.deepEqual(teardown, ["telegram-stop", "discord-stop", "polling-drained"]);
     assert.ok(existsSync(servingOwner.lockPaths[0]));
-    teardown.push("media");
-    await stopMetricsServer();
-    teardown.push("metrics");
+
+    discordDrained.resolve();
+    await sessionsStarted.promise;
+    assert.deepEqual(teardown, [
+      "telegram-stop",
+      "discord-stop",
+      "polling-drained",
+      "discord-drained",
+      "queues-stopped",
+      "sessions-started",
+    ]);
     assert.ok(existsSync(servingOwner.lockPaths[0]));
-    assert.equal(servingOwner.release(), true);
-    teardown.push("claims");
-    assert.deepEqual(teardown, ["polling", "sessions", "media", "metrics", "claims"]);
+    assert.equal(oldMetrics.listening, true);
+
+    sessionsDrained.resolve();
+    assert.equal(await shutdown, true);
+    assert.deepEqual(teardown, [
+      "telegram-stop",
+      "discord-stop",
+      "polling-drained",
+      "discord-drained",
+      "queues-stopped",
+      "sessions-started",
+      "sessions-drained",
+      "media",
+      "metrics",
+      "sessions-closed",
+      "claims",
+    ]);
+    assert.equal(existsSync(servingOwner.lockPaths[0]), false);
 
     const replacement = acquire(root, [ordered[1]], {
       processStartToken: () => "bbbbbbbbbbbbbbbb",

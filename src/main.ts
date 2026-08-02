@@ -43,6 +43,7 @@ import {
   type RuntimeGuard,
   StartupConflictError,
 } from "./runtime-guard.js";
+import { shutdownServingRuntime } from "./runtime-shutdown.js";
 
 let activeRuntimeGuard: RuntimeGuard | undefined;
 let removeRuntimeExitHook: (() => void) | undefined;
@@ -93,9 +94,11 @@ async function main(): Promise<void> {
 
   // Track resources for shutdown
   let telegramBot: TelegramBotResult["bot"] | undefined;
+  let telegramPolling: Promise<void> | undefined;
   const messageQueues: MessageQueue[] = [];
   let echoWatcher: EchoWatcher | undefined;
   let discordClient: Client | undefined;
+  let shutdownDiscord: (() => Promise<void>) | undefined;
   let watchdog: Watchdog | undefined;
   let telegramStartupTimeout: ReturnType<typeof setTimeout> | undefined;
   let telegramPollingRestart: TelegramPollingRestartScheduler | undefined;
@@ -115,30 +118,29 @@ async function main(): Promise<void> {
     telegramPollingRestart?.cancel();
     if (echoWatcher) echoWatcher.stop();
     if (watchdog) watchdog.stop();
-    if (telegramBot) {
-      stopTelegramBotInBackground(telegramBot, () => {
+    const released = await shutdownServingRuntime({
+      telegramBot,
+      telegramPolling,
+      shutdownDiscord,
+      messageQueues,
+      sessionManager,
+      shutdownTimeoutMs,
+      persistTransportState: telegramBot
+        ? () => {
+          saveThreadCache();
+          saveMessageIndex();
+        }
+        : undefined,
+      stopMetrics: stopMetricsServer,
+      releaseRuntimeGuard,
+      onTelegramStopError: () => {
         log.warn("main", "Telegram stopped without confirming the final update offset; continuing shutdown");
-      });
-    }
-    if (discordClient) discordClient.destroy();
-    // Cancel debounce timers BEFORE waiting — telegramBot.stop() prevents new
-    // updates, but already-scheduled debounce timers could still fire and start
-    // new flush() work during the graceful shutdown wait window.
-    for (const mq of messageQueues) mq.cancelAllDebounceTimers();
-    // Wait for busy sessions to finish their current turns BEFORE clearing
-    // queues — clearAll() runs cleanup callbacks (e.g. temp file deletion)
-    // that would break in-flight sessions still reading those files.
-    await sessionManager.gracefulShutdown(shutdownTimeoutMs);
-
-    for (const mq of messageQueues) mq.clearAll();
-
-    if (telegramBot) {
-      saveThreadCache();
-      saveMessageIndex();
-    }
-    await stopMetricsServer();
-    await sessionManager.closeAll();
-    if (!releaseRuntimeGuard()) {
+      },
+      onDiscordStopError: (error) => {
+        log.warn("main", "Discord shutdown failed; continuing shutdown", error);
+      },
+    });
+    if (!released) {
       log.warn("main", "Runtime ownership changed before release; leaving claims untouched");
     }
     log.info("main", "All sessions closed. Exiting.");
@@ -275,7 +277,7 @@ async function main(): Promise<void> {
       // bot.start() blocks until stopped — run it without awaiting.
       // startBotWithRetry handles 409 Conflict errors (old instance still polling)
       // before the outer supervisor applies its bounded restart backoff.
-      void startBotWithRetry(
+      telegramPolling = startBotWithRetry(
         () =>
           bot.start({
             timeout: TELEGRAM_LONG_POLL_TIMEOUT_SECONDS,
@@ -321,6 +323,7 @@ async function main(): Promise<void> {
     try {
       const result = await createDiscordBot(config, config.discord, sessionManager);
       discordClient = result.client;
+      shutdownDiscord = result.shutdown;
       messageQueues.push(result.messageQueue);
       log.info("main", "Discord bot started");
     } catch (err) {

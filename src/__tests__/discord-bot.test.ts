@@ -125,6 +125,84 @@ describe("Discord media failure handling", () => {
   });
 });
 
+describe("Discord shutdown", () => {
+  it("waits for an active message handler after disconnecting the client", async () => {
+    const originalLogin = Client.prototype.login;
+    const originalDestroy = Client.prototype.destroy;
+    const originalPut = REST.prototype.put;
+    let clientDestroyed = false;
+    Client.prototype.login = async function () {
+      this.user = { id: "bot-1", tag: "test-bot" } as never;
+      return "test-token";
+    };
+    Client.prototype.destroy = async function () {
+      clientDestroyed = true;
+    };
+    REST.prototype.put = async () => ({}) as never;
+
+    const config: BotConfig = {
+      agents: { main: { id: "main", workspaceCwd: "/tmp/test", model: "gpt-5.5" } },
+      bindings: [],
+      sessionDefaults: {
+        idleTimeoutMs: 60_000,
+        maxConcurrentSessions: 2,
+        maxMessageAgeMs: 300_000,
+        requireMention: false,
+        maxMediaBytes: 10,
+      },
+    };
+    const discordConfig: DiscordConfig = {
+      token: "test-token",
+      bindings: [{ channelId: "channel-1", guildId: "guild-1", agentId: "main", kind: "channel", requireMention: false }],
+    };
+    const sessionManager = {
+      sendSessionMessage: () => { throw new Error("unexpected"); },
+    } as unknown as SessionManager;
+    let resolveReply!: () => void;
+    let markReplyStarted!: () => void;
+    const replyPending = new Promise<void>((resolve) => { resolveReply = resolve; });
+    const replyStarted = new Promise<void>((resolve) => { markReplyStarted = resolve; });
+
+    try {
+      const { client, shutdown } = await createDiscordBot(config, discordConfig, sessionManager);
+      client.emit(Events.MessageCreate, {
+        author: { bot: false, username: "tester", globalName: "Tester" },
+        channel: { send: async () => ({}), isThread: () => false },
+        channelId: "channel-1",
+        guildId: "guild-1",
+        createdTimestamp: Date.now(),
+        mentions: { has: () => false },
+        attachments: new Map([["attachment", {
+          contentType: "image/png",
+          name: "large.png",
+          size: 11,
+          url: "https://example.invalid/media",
+        }]]),
+        content: "",
+        reply: async () => {
+          markReplyStarted();
+          await replyPending;
+        },
+      } as never);
+      await replyStarted;
+
+      let shutdownFinished = false;
+      const stopping = shutdown().then(() => { shutdownFinished = true; });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(clientDestroyed, true);
+      assert.equal(shutdownFinished, false);
+
+      resolveReply();
+      await stopping;
+      assert.equal(shutdownFinished, true);
+    } finally {
+      Client.prototype.login = originalLogin;
+      Client.prototype.destroy = originalDestroy;
+      REST.prototype.put = originalPut;
+    }
+  });
+});
+
 describe("Discord recovery notice delivery", () => {
   it("delivers the notice through the Discord adapter before the triggering prompt", async (t) => {
     t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 10_000 });

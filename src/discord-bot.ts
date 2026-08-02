@@ -138,6 +138,7 @@ export function buildDiscordSourcePrefix(
 export interface DiscordBotResult {
   client: Client;
   messageQueue: MessageQueue;
+  shutdown(): Promise<void>;
 }
 
 interface DiscordCommandInteractionLike {
@@ -260,6 +261,20 @@ export async function createDiscordBot(
     ],
     partials: [Partials.Channel],
   });
+  let acceptingHandlers = true;
+  const activeHandlers = new Set<Promise<void>>();
+  const trackHandler = (handler: () => Promise<void>): void => {
+    if (!acceptingHandlers) return;
+    const pending = handler();
+    activeHandlers.add(pending);
+    const remove = () => { activeHandlers.delete(pending); };
+    void pending.then(remove, remove);
+  };
+  const waitForActiveHandlers = async (): Promise<void> => {
+    while (activeHandlers.size > 0) {
+      await Promise.allSettled([...activeHandlers]);
+    }
+  };
 
   // Install error handlers before anything else so WebSocket errors
   // during login or event handling don't crash the process
@@ -282,19 +297,22 @@ export async function createDiscordBot(
   );
 
   // Thread support: join threads on creation so we receive their messages
-  client.on(Events.ThreadCreate, async (thread) => {
-    if (!thread.joined) {
-      try {
-        await thread.join();
-      } catch (err) {
-        log.warn("discord-bot", `Failed to join thread ${thread.id}:`, err);
+  client.on(Events.ThreadCreate, (thread) => {
+    trackHandler(async () => {
+      if (!thread.joined) {
+        try {
+          await thread.join();
+        } catch (err) {
+          log.warn("discord-bot", `Failed to join thread ${thread.id}:`, err);
+        }
       }
-    }
+    });
   });
 
   // Message handler
-  client.on(Events.MessageCreate, async (message) => {
-    try {
+  client.on(Events.MessageCreate, (message) => {
+    trackHandler(async () => {
+      try {
       // Ignore messages from bots (including ourselves)
       if (message.author.bot) return;
 
@@ -414,27 +432,30 @@ export async function createDiscordBot(
           messageQueue.enqueue(key, binding.agentId, prefix + cleanContent, adapter);
         }
       }
-    } catch (err) {
-      log.error("discord-bot", `Message handler error in ${message.channelId}:`, err);
-    }
+      } catch (err) {
+        log.error("discord-bot", `Message handler error in ${message.channelId}:`, err);
+      }
+    });
   });
 
   // Slash commands handler
-  client.on(Events.InteractionCreate, async (interaction) => {
-    try {
-      if (!interaction.isChatInputCommand()) return;
-      await handleDiscordChatInputCommand(interaction, {
-        config,
-        discordConfig,
-        sessionManager,
-        messageQueue,
-      });
-    } catch (err) {
-      log.error("discord-bot", `Interaction handler error:`, err);
-      if (interaction.isChatInputCommand() && !interaction.replied && !interaction.deferred) {
-        await interaction.reply({ content: "An internal error occurred.", ephemeral: true }).catch(() => {});
+  client.on(Events.InteractionCreate, (interaction) => {
+    trackHandler(async () => {
+      try {
+        if (!interaction.isChatInputCommand()) return;
+        await handleDiscordChatInputCommand(interaction, {
+          config,
+          discordConfig,
+          sessionManager,
+          messageQueue,
+        });
+      } catch (err) {
+        log.error("discord-bot", `Interaction handler error:`, err);
+        if (interaction.isChatInputCommand() && !interaction.replied && !interaction.deferred) {
+          await interaction.reply({ content: "An internal error occurred.", ephemeral: true }).catch(() => {});
+        }
       }
-    }
+    });
   });
 
   // Login and register slash commands
@@ -463,5 +484,16 @@ export async function createDiscordBot(
     }
   }
 
-  return { client, messageQueue };
+  return {
+    client,
+    messageQueue,
+    async shutdown(): Promise<void> {
+      acceptingHandlers = false;
+      try {
+        await client.destroy();
+      } finally {
+        await waitForActiveHandlers();
+      }
+    },
+  };
 }

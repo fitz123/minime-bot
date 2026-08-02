@@ -13,7 +13,7 @@ import {
 } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir, tmpdir, userInfo } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { log } from "./logger.js";
 import { recordStartupConflictMetric } from "./metrics.js";
@@ -100,6 +100,28 @@ export interface MediaRootPreflightOptions extends StartupConflictRecorderOption
   realpath?: typeof realpathSync;
 }
 
+function canonicalizeMissingPath(
+  absolutePath: string,
+  inspect: typeof lstatSync,
+  canonicalize: typeof realpathSync,
+): string {
+  const missingComponents: string[] = [];
+  let ancestor = absolutePath;
+
+  while (true) {
+    try {
+      inspect(ancestor);
+      return join(canonicalize(ancestor), ...missingComponents.reverse());
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const parent = dirname(ancestor);
+      if (parent === ancestor) throw error;
+      missingComponents.push(basename(ancestor));
+      ancestor = parent;
+    }
+  }
+}
+
 /**
  * Inspect the configured media root without mutating it. Missing roots are
  * allowed and will be created later by the media store after ownership has
@@ -115,7 +137,17 @@ export function preflightMediaRoot(
   try {
     stats = inspect(absoluteRoot);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return absoluteRoot;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      try {
+        return canonicalizeMissingPath(
+          absoluteRoot,
+          inspect,
+          options.realpath ?? realpathSync,
+        );
+      } catch {
+        return conflict("unsafe_media_root", options);
+      }
+    }
     return conflict("unsafe_media_root", options);
   }
 
@@ -348,10 +380,20 @@ function recoverStaleLock(
   if (parsed.some((entry) => entry === undefined)) return false;
   const entries = parsed as ParsedEntry[];
 
+  const belongsToLiveProcess = (entry: ParsedEntry): boolean => {
+    const currentStartToken = options.processStartToken(entry.pid);
+    const sameProcess = currentStartToken !== undefined
+      && entry.startToken !== "unknown"
+      && currentStartToken === entry.startToken;
+    const mustFallBackToLiveness = currentStartToken === undefined || entry.startToken === "unknown";
+    return sameProcess || (mustFallBackToLiveness && options.isProcessAlive(entry.pid));
+  };
+
   if (entries.length === 1 && entries[0].type === "claim") {
     const claim = entries[0];
     if (!entryHasExactContents(lockPath, snapshot.entries[0], claim.suffix)) return false;
     if (options.now() - snapshot.stats.mtimeMs <= options.incompleteGraceMs) return false;
+    if (belongsToLiveProcess(claim)) return false;
     options.beforeRecoveryVerification?.(lockPath);
     const current = readSnapshot(lockPath);
     if (!current || !entryHasExactContents(lockPath, snapshot.entries[0], claim.suffix)) return false;
@@ -369,12 +411,7 @@ function recoverStaleLock(
     return false;
   }
 
-  const currentStartToken = options.processStartToken(owner.pid);
-  const sameProcess = currentStartToken !== undefined
-    && owner.startToken !== "unknown"
-    && currentStartToken === owner.startToken;
-  const mustFallBackToLiveness = currentStartToken === undefined || owner.startToken === "unknown";
-  if (sameProcess || (mustFallBackToLiveness && options.isProcessAlive(owner.pid))) return false;
+  if (belongsToLiveProcess(owner)) return false;
 
   options.beforeRecoveryVerification?.(lockPath);
   if (
