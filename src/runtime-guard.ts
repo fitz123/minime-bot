@@ -1,8 +1,11 @@
 import {
   accessSync,
+  closeSync,
   constants,
+  fstatSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -264,6 +267,10 @@ interface LockSnapshot {
   entries: string[];
 }
 
+interface PinnedLockSnapshot extends LockSnapshot {
+  descriptor: number;
+}
+
 function sameDirectory(left: Stats, right: Stats): boolean {
   return left.isDirectory()
     && right.isDirectory()
@@ -279,6 +286,29 @@ function readSnapshot(lockPath: string): LockSnapshot | undefined {
     if (stats.isSymbolicLink() || !stats.isDirectory() || (stats.mode & 0o077) !== 0) return undefined;
     return { stats, entries: readdirSync(lockPath).sort() };
   } catch {
+    return undefined;
+  }
+}
+
+function readPinnedSnapshot(lockPath: string): PinnedLockSnapshot | undefined {
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(lockPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const pinnedStats = fstatSync(descriptor);
+    const snapshot = readSnapshot(lockPath);
+    if (!snapshot || !sameDirectory(pinnedStats, snapshot.stats)) {
+      closeSync(descriptor);
+      return undefined;
+    }
+    return { ...snapshot, descriptor };
+  } catch {
+    if (descriptor !== undefined) {
+      try {
+        closeSync(descriptor);
+      } catch {
+        // The descriptor is already closed or cannot be recovered here.
+      }
+    }
     return undefined;
   }
 }
@@ -361,13 +391,15 @@ function ensureOwnerOnlyRoot(root: string, expectedUid: number | undefined): voi
   }
 }
 
-function recoverStaleLock(
+type StaleRecoveryOptions = Required<
+  Pick<RuntimeGuardOptions, "incompleteGraceMs" | "now" | "processStartToken" | "isProcessAlive">
+> & Pick<RuntimeGuardOptions, "expectedUid" | "beforeRecoveryVerification">;
+
+function recoverStaleSnapshot(
   lockPath: string,
-  options: Required<Pick<RuntimeGuardOptions, "incompleteGraceMs" | "now" | "processStartToken" | "isProcessAlive">>
-    & Pick<RuntimeGuardOptions, "expectedUid" | "beforeRecoveryVerification">,
+  snapshot: LockSnapshot,
+  options: StaleRecoveryOptions,
 ): boolean {
-  const snapshot = readSnapshot(lockPath);
-  if (!snapshot) return false;
   if (options.expectedUid !== undefined && snapshot.stats.uid !== options.expectedUid) return false;
 
   if (snapshot.entries.length === 0) {
@@ -421,6 +453,19 @@ function recoverStaleLock(
     return false;
   }
   return removeExactSnapshot(lockPath, snapshot);
+}
+
+function recoverStaleLock(
+  lockPath: string,
+  options: StaleRecoveryOptions,
+): boolean {
+  const snapshot = readPinnedSnapshot(lockPath);
+  if (!snapshot) return false;
+  try {
+    return recoverStaleSnapshot(lockPath, snapshot, options);
+  } finally {
+    closeSync(snapshot.descriptor);
+  }
 }
 
 function acquireOneLock(
