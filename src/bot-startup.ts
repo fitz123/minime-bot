@@ -1,5 +1,6 @@
 import { GrammyError } from "grammy";
 import { log } from "./logger.js";
+import { recordStartupConflict } from "./runtime-guard.js";
 
 /**
  * Check if an error is a Telegram 409 Conflict error.
@@ -26,11 +27,27 @@ export function is409ConflictError(err: unknown): boolean {
 export interface RetryOptions {
   maxRetries?: number;
   baseDelayMs?: number;
+  signal?: AbortSignal;
   /** Injected sleep for testing — defaults to real setTimeout */
-  sleep?: (ms: number) => Promise<void>;
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 }
 
-const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+const defaultSleep = (ms: number, signal?: AbortSignal): Promise<void> => {
+  if (signal?.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(done, ms);
+    const abort = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      reject(signal?.reason);
+    };
+    function done(): void {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+};
 
 type TimeoutHandle = ReturnType<typeof setTimeout>;
 
@@ -116,6 +133,15 @@ export function shouldRestartForTelegramFailure(state: TelegramFailurePlatformSt
     !(state.discordStarted && state.discordBindingCount > 0);
 }
 
+/** Keep duplicate-polling diagnostics bounded while retaining other failures. */
+export function logTelegramPollingFailure(message: string, error?: unknown): void {
+  if (error === undefined || is409ConflictError(error)) {
+    log.error("main", message);
+    return;
+  }
+  log.error("main", message, error);
+}
+
 /**
  * Start non-critical Telegram setup without delaying grammY's first getUpdates.
  * Synchronous throws and rejected promises are routed to the same error callback.
@@ -176,19 +202,24 @@ export async function startBotWithRetry(
   const maxRetries = opts?.maxRetries ?? 5;
   const baseDelayMs = opts?.baseDelayMs ?? 5_000;
   const sleep = opts?.sleep ?? defaultSleep;
+  const signal = opts?.signal;
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    signal?.throwIfAborted();
     try {
       await startFn();
       return;
     } catch (err) {
-      if (is409ConflictError(err) && attempt < maxRetries) {
+      if (is409ConflictError(err)) {
+        recordStartupConflict("duplicate_telegram_polling");
+        if (attempt >= maxRetries) throw err;
+
         const delay = Math.min(baseDelayMs * 2 ** (attempt - 1), 60_000);
         log.warn(
           "main",
           `409 Conflict on startup attempt ${attempt}/${maxRetries} — retrying in ${delay / 1000}s`,
         );
-        await sleep(delay);
+        await sleep(delay, signal);
         continue;
       }
       throw err;

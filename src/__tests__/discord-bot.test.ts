@@ -13,8 +13,10 @@ import {
   installDiscordErrorHandlers,
 } from "../discord-bot.js";
 import { validateDiscordBinding } from "../config.js";
+import type { DiscordBotResult } from "../discord-bot.js";
 import type { BotConfig, DiscordBinding, DiscordConfig } from "../types.js";
 import type { SessionManager } from "../session-manager.js";
+import { mediaPipelineErrors } from "../metrics.js";
 
 // --- discordSessionKey ---
 
@@ -47,7 +49,7 @@ describe("discordSessionKey", () => {
 });
 
 describe("Discord media failure handling", () => {
-  it("makes image and audio size failures visible from the actual message handler", async () => {
+  it("counts each failed image and voice attachment independently", async () => {
     const originalLogin = Client.prototype.login;
     const originalPut = REST.prototype.put;
     Client.prototype.login = async function () {
@@ -77,7 +79,11 @@ describe("Discord media failure handling", () => {
 
     try {
       const { client } = await createDiscordBot(config, discordConfig, sessionManager);
-      for (const [contentType, name] of [["image/png", "large.png"], ["audio/ogg", "large.ogg"]] as const) {
+      for (const [mediaType, contentType, name] of [
+        ["image", "image/png", "large.png"],
+        ["voice", "audio/ogg", "large.ogg"],
+      ] as const) {
+        mediaPipelineErrors.reset();
         const replies: string[] = [];
         const channel = {
           send: async () => ({}),
@@ -90,21 +96,170 @@ describe("Discord media failure handling", () => {
           guildId: "guild-1",
           createdTimestamp: Date.now(),
           mentions: { has: () => false },
-          attachments: new Map([["attachment-1", {
+          attachments: new Map([1, 2].map((index) => [`attachment-${index}`, {
             contentType,
-            name,
+            name: `${index}-${name}`,
             size: 11,
-            url: "https://example.invalid/media",
-          }]]),
+            url: `https://example.invalid/media-${index}`,
+          }])),
           content: "",
           reply: async (text: string) => { replies.push(text); },
         } as never);
         await new Promise<void>((resolve) => setImmediate(resolve));
         await new Promise<void>((resolve) => setImmediate(resolve));
-        assert.deepStrictEqual(replies, ["Media is too large to process."]);
+        assert.deepStrictEqual(replies, [
+          "Media is too large to process.",
+          "Media is too large to process.",
+        ]);
+        assert.deepStrictEqual(
+          (await mediaPipelineErrors.get()).values.map(({ labels, value }) => ({ labels, value })),
+          [{
+            labels: { transport: "discord", media_type: mediaType, stage: "size-limit" },
+            value: 2,
+          }],
+        );
       }
     } finally {
       Client.prototype.login = originalLogin;
+      REST.prototype.put = originalPut;
+    }
+  });
+});
+
+describe("Discord shutdown", () => {
+  it("publishes a shutdown handle before login completes", async () => {
+    const originalLogin = Client.prototype.login;
+    const originalDestroy = Client.prototype.destroy;
+    const originalPut = REST.prototype.put;
+    let finishLogin!: () => void;
+    const loginPending = new Promise<void>((resolve) => { finishLogin = resolve; });
+    let clientDestroyed = false;
+    let commandRegistrations = 0;
+    Client.prototype.login = async function () {
+      this.user = { id: "bot-1", tag: "test-bot" } as never;
+      await loginPending;
+      return "test-token";
+    };
+    Client.prototype.destroy = async function () {
+      clientDestroyed = true;
+    };
+    REST.prototype.put = async () => {
+      commandRegistrations++;
+      return {} as never;
+    };
+
+    const config: BotConfig = {
+      agents: { main: { id: "main", workspaceCwd: "/tmp/test", model: "gpt-5.5" } },
+      bindings: [],
+      sessionDefaults: {
+        idleTimeoutMs: 60_000,
+        maxConcurrentSessions: 2,
+        maxMessageAgeMs: 300_000,
+        requireMention: false,
+        maxMediaBytes: 10,
+      },
+    };
+    const discordConfig: DiscordConfig = {
+      token: "test-token",
+      bindings: [{ channelId: "channel-1", guildId: "guild-1", agentId: "main", kind: "channel", requireMention: false }],
+    };
+    const sessionManager = {
+      sendSessionMessage: () => { throw new Error("unexpected"); },
+    } as unknown as SessionManager;
+    let created: DiscordBotResult | undefined;
+
+    try {
+      const starting = createDiscordBot(config, discordConfig, sessionManager, {
+        onCreated: (result) => { created = result; },
+      });
+      assert.ok(created);
+
+      await created.shutdown();
+      assert.equal(clientDestroyed, true);
+
+      finishLogin();
+      assert.equal(await starting, created);
+      assert.equal(commandRegistrations, 0);
+    } finally {
+      Client.prototype.login = originalLogin;
+      Client.prototype.destroy = originalDestroy;
+      REST.prototype.put = originalPut;
+      finishLogin();
+    }
+  });
+
+  it("waits for an active message handler after disconnecting the client", async () => {
+    const originalLogin = Client.prototype.login;
+    const originalDestroy = Client.prototype.destroy;
+    const originalPut = REST.prototype.put;
+    let clientDestroyed = false;
+    Client.prototype.login = async function () {
+      this.user = { id: "bot-1", tag: "test-bot" } as never;
+      return "test-token";
+    };
+    Client.prototype.destroy = async function () {
+      clientDestroyed = true;
+    };
+    REST.prototype.put = async () => ({}) as never;
+
+    const config: BotConfig = {
+      agents: { main: { id: "main", workspaceCwd: "/tmp/test", model: "gpt-5.5" } },
+      bindings: [],
+      sessionDefaults: {
+        idleTimeoutMs: 60_000,
+        maxConcurrentSessions: 2,
+        maxMessageAgeMs: 300_000,
+        requireMention: false,
+        maxMediaBytes: 10,
+      },
+    };
+    const discordConfig: DiscordConfig = {
+      token: "test-token",
+      bindings: [{ channelId: "channel-1", guildId: "guild-1", agentId: "main", kind: "channel", requireMention: false }],
+    };
+    const sessionManager = {
+      sendSessionMessage: () => { throw new Error("unexpected"); },
+    } as unknown as SessionManager;
+    let resolveReply!: () => void;
+    let markReplyStarted!: () => void;
+    const replyPending = new Promise<void>((resolve) => { resolveReply = resolve; });
+    const replyStarted = new Promise<void>((resolve) => { markReplyStarted = resolve; });
+
+    try {
+      const { client, shutdown } = await createDiscordBot(config, discordConfig, sessionManager);
+      client.emit(Events.MessageCreate, {
+        author: { bot: false, username: "tester", globalName: "Tester" },
+        channel: { send: async () => ({}), isThread: () => false },
+        channelId: "channel-1",
+        guildId: "guild-1",
+        createdTimestamp: Date.now(),
+        mentions: { has: () => false },
+        attachments: new Map([["attachment", {
+          contentType: "image/png",
+          name: "large.png",
+          size: 11,
+          url: "https://example.invalid/media",
+        }]]),
+        content: "",
+        reply: async () => {
+          markReplyStarted();
+          await replyPending;
+        },
+      } as never);
+      await replyStarted;
+
+      let shutdownFinished = false;
+      const stopping = shutdown().then(() => { shutdownFinished = true; });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(clientDestroyed, true);
+      assert.equal(shutdownFinished, false);
+
+      resolveReply();
+      await stopping;
+      assert.equal(shutdownFinished, true);
+    } finally {
+      Client.prototype.login = originalLogin;
+      Client.prototype.destroy = originalDestroy;
       REST.prototype.put = originalPut;
     }
   });

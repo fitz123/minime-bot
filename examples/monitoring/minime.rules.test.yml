@@ -166,3 +166,132 @@ tests:
       - eval_time: 10m
         alertname: MinimeCronTelemetryIncomplete
         exp_alerts: []
+
+  - name: multiple UP targets isolate the one missing runtime identity
+    input_series:
+      - series: 'up{job="minime-bot",instance="missing:9101"}'
+        values: "1x6"
+      - series: 'up{job="minime-bot",instance="healthy:9101"}'
+        values: "1x6"
+      - series: 'minime_bot_instance_info{job="minime-bot",instance="healthy:9101",user="USER_PLACEHOLDER",home="HOME_PLACEHOLDER",slot="SLOT_PLACEHOLDER",pid="1001"}'
+        values: "1x6"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: MinimeBotInstanceIdentityMissing
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: MinimeBotInstanceIdentityMissing
+        exp_alerts:
+          - exp_labels:
+              job: minime-bot
+              instance: missing:9101
+              severity: critical
+              component: runtime
+              failure_class: identity_missing
+            exp_annotations:
+              summary: Minime bot target is UP without runtime identity
+              description: 'Target "minime-bot/missing:9101" is healthy but does not expose minime_bot_instance_info.'
+
+  - name: down target suppresses missing identity and stale media series
+    input_series:
+      - series: 'up{job="minime-bot",instance="down:9101"}'
+        values: "0x11"
+      - series: 'minime_media_pipeline_errors_total{job="minime-bot",instance="down:9101",transport="telegram",media_type="voice",stage="download"}'
+        values: "0+1x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: MinimeBotInstanceIdentityMissing
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: MinimeBotMediaPipelineDegraded
+        exp_alerts: []
+
+  - name: isolated media failure stays below the threshold
+    input_series:
+      - series: 'up{job="minime-bot",instance="isolated:9101"}'
+        values: "1x11"
+      - series: 'minime_bot_instance_info{job="minime-bot",instance="isolated:9101",user="USER_PLACEHOLDER",home="HOME_PLACEHOLDER",slot="SLOT_PLACEHOLDER",pid="1002"}'
+        values: "1x11"
+      - series: 'minime_media_pipeline_errors_total{job="minime-bot",instance="isolated:9101",transport="telegram",media_type="document",stage="size-limit"}'
+        values: "0 1x9"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: MinimeBotMediaPipelineDegraded
+        exp_alerts: []
+
+  - name: sustained media failures fire while the same target remains UP
+    input_series:
+      - series: 'up{job="minime-bot",instance="degraded:9101"}'
+        values: "1x9"
+      - series: 'minime_bot_instance_info{job="minime-bot",instance="degraded:9101",user="USER_PLACEHOLDER",home="HOME_PLACEHOLDER",slot="SLOT_PLACEHOLDER",pid="1003"}'
+        values: "1x9"
+      - series: 'minime_media_pipeline_errors_total{job="minime-bot",instance="degraded:9101",transport="telegram",media_type="voice",stage="download"}'
+        values: "0+1x8"
+      - series: 'minime_media_pipeline_errors_total{job="minime-bot",instance="degraded:9101",transport="telegram",media_type="photo",stage="metadata"}'
+        values: "0+1x8"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: MinimeBotMediaPipelineDegraded
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: MinimeBotMediaPipelineDegraded
+        exp_alerts:
+          - exp_labels:
+              job: minime-bot
+              instance: degraded:9101
+              transport: telegram
+              severity: warning
+              component: media
+              failure_class: terminal_rate
+            exp_annotations:
+              summary: Minime bot media pipeline is repeatedly failing
+              description: 'Target "minime-bot/degraded:9101" recorded at least three terminal telegram media failures in ten minutes while remaining UP.'
+
+  - name: media counter reset preserves a sustained failure alert
+    input_series:
+      - series: 'up{job="minime-bot",instance="reset:9101"}'
+        values: "1x12"
+      - series: 'minime_bot_instance_info{job="minime-bot",instance="reset:9101",user="USER_PLACEHOLDER",home="HOME_PLACEHOLDER",slot="SLOT_PLACEHOLDER",pid="1004"}'
+        values: "1x12"
+      - series: 'minime_media_pipeline_errors_total{job="minime-bot",instance="reset:9101",transport="discord",media_type="image",stage="download"}'
+        values: "0 1 2 0 1 2 3 4 5 6 7x2"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: MinimeBotMediaPipelineDegraded
+        exp_alerts:
+          - exp_labels:
+              job: minime-bot
+              instance: reset:9101
+              transport: discord
+              severity: warning
+              component: media
+              failure_class: terminal_rate
+            exp_annotations:
+              summary: Minime bot media pipeline is repeatedly failing
+              description: 'Target "minime-bot/reset:9101" recorded at least three terminal discord media failures in ten minutes while remaining UP.'
+
+  - name: media alert recovers after the rolling window clears
+    input_series:
+      - series: 'up{job="minime-bot",instance="recovered:9101"}'
+        values: "1x16"
+      - series: 'minime_bot_instance_info{job="minime-bot",instance="recovered:9101",user="USER_PLACEHOLDER",home="HOME_PLACEHOLDER",slot="SLOT_PLACEHOLDER",pid="1005"}'
+        values: "1x16"
+      - series: 'minime_media_pipeline_errors_total{job="minime-bot",instance="recovered:9101",transport="telegram",media_type="sticker",stage="download"}'
+        values: "0 1 2 3 3x12"
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: MinimeBotMediaPipelineDegraded
+        exp_alerts:
+          - exp_labels:
+              job: minime-bot
+              instance: recovered:9101
+              transport: telegram
+              severity: warning
+              component: media
+              failure_class: terminal_rate
+            exp_annotations:
+              summary: Minime bot media pipeline is repeatedly failing
+              description: 'Target "minime-bot/recovered:9101" recorded at least three terminal telegram media failures in ten minutes while remaining UP.'
+      - eval_time: 15m
+        alertname: MinimeBotMediaPipelineDegraded
+        exp_alerts: []

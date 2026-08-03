@@ -1,16 +1,39 @@
-import { describe, it } from "node:test";
+import { beforeEach, describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { GrammyError } from "grammy";
+import client from "prom-client";
 import {
   createTelegramPollingRestartScheduler,
   hasActiveAgentPlatform,
   is409ConflictError,
+  logTelegramPollingFailure,
   runTelegramSetupInBackground,
   shouldRestartForTelegramFailure,
   startBotWithRetry,
   stopTelegramBot,
   stopTelegramBotInBackground,
 } from "../bot-startup.js";
+import { log } from "../logger.js";
+import { botStartupConflicts } from "../metrics.js";
+
+beforeEach(() => {
+  client.register.resetMetrics();
+});
+
+function captureConflictLogs(t: TestContext): string[] {
+  const messages: string[] = [];
+  t.mock.method(log, "error", (_tag: string, message: string) => {
+    messages.push(message);
+  });
+  return messages;
+}
+
+async function duplicatePollingConflictValues() {
+  const metric = await botStartupConflicts.get();
+  return metric.values.filter(
+    (value) => value.labels.reason === "duplicate_telegram_polling",
+  );
+}
 
 describe("createTelegramPollingRestartScheduler", () => {
   it("deduplicates restarts, bounds backoff, and resets after recovery", () => {
@@ -229,6 +252,38 @@ describe("is409ConflictError", () => {
   });
 });
 
+describe("logTelegramPollingFailure", () => {
+  it("omits raw details from duplicate-polling failures", (t) => {
+    const calls: unknown[][] = [];
+    t.mock.method(log, "error", (...args: unknown[]) => { calls.push(args); });
+    const error = new GrammyError(
+      "Conflict containing synthetic-token and /private/media-root",
+      {
+        ok: false,
+        error_code: 409,
+        description: "Conflict containing synthetic-token and /private/media-root",
+      } as any,
+      "getUpdates",
+      { offset: 123 },
+    );
+
+    logTelegramPollingFailure("Telegram polling unavailable (polling_failed)", error);
+
+    assert.deepEqual(calls, [["main", "Telegram polling unavailable (polling_failed)"]]);
+    assert.doesNotMatch(JSON.stringify(calls), /synthetic-token|private|media-root|offset/);
+  });
+
+  it("retains diagnostics for non-conflict polling failures", (t) => {
+    const calls: unknown[][] = [];
+    t.mock.method(log, "error", (...args: unknown[]) => { calls.push(args); });
+    const error = new Error("network failure");
+
+    logTelegramPollingFailure("Telegram polling unavailable (polling_failed)", error);
+
+    assert.deepEqual(calls, [["main", "Telegram polling unavailable (polling_failed)", error]]);
+  });
+});
+
 describe("startBotWithRetry", () => {
   const fakeSleep = async (_ms: number) => {};
 
@@ -241,15 +296,20 @@ describe("startBotWithRetry", () => {
     assert.strictEqual(callCount, 1);
   });
 
-  it("retries on 409 and succeeds on subsequent attempt", async () => {
+  it("records a first-attempt 409 and succeeds on the retry", async (t) => {
+    const conflictLogs = captureConflictLogs(t);
     let callCount = 0;
     await startBotWithRetry(
       async () => {
         callCount++;
-        if (callCount < 3) {
+        if (callCount === 1) {
           throw new GrammyError(
-            "Conflict",
-            { ok: false, error_code: 409, description: "Conflict" } as any,
+            "Conflict containing synthetic-token and /private/media-root",
+            {
+              ok: false,
+              error_code: 409,
+              description: "Conflict containing synthetic-token and /private/media-root",
+            } as any,
             "getUpdates",
             {},
           );
@@ -257,10 +317,48 @@ describe("startBotWithRetry", () => {
       },
       { maxRetries: 5, baseDelayMs: 10, sleep: fakeSleep },
     );
-    assert.strictEqual(callCount, 3);
+    assert.strictEqual(callCount, 2);
+
+    const conflicts = await duplicatePollingConflictValues();
+    assert.equal(conflicts.length, 1);
+    assert.equal(conflicts[0]?.value, 1);
+    assert.deepEqual(conflicts[0]?.labels, { reason: "duplicate_telegram_polling" });
+    assert.deepEqual(conflictLogs, [
+      "MINIME_STARTUP_GUARD_CONFLICT reason=duplicate_telegram_polling",
+    ]);
+    assert.doesNotMatch(conflictLogs.join("\n"), /synthetic-token|private|media-root/);
   });
 
-  it("throws after exhausting retries on persistent 409", async () => {
+  it("records a wrapped GrammyError 409 before recovering", async (t) => {
+    const conflictLogs = captureConflictLogs(t);
+    let callCount = 0;
+
+    await startBotWithRetry(
+      async () => {
+        callCount++;
+        if (callCount === 1) {
+          throw {
+            error: new GrammyError(
+              "Conflict",
+              { ok: false, error_code: 409, description: "Conflict" } as any,
+              "getUpdates",
+              {},
+            ),
+          };
+        }
+      },
+      { maxRetries: 2, baseDelayMs: 10, sleep: fakeSleep },
+    );
+
+    assert.equal(callCount, 2);
+    assert.equal((await duplicatePollingConflictValues())[0]?.value, 1);
+    assert.deepEqual(conflictLogs, [
+      "MINIME_STARTUP_GUARD_CONFLICT reason=duplicate_telegram_polling",
+    ]);
+  });
+
+  it("records every repeated 409 including the final propagated attempt", async (t) => {
+    const conflictLogs = captureConflictLogs(t);
     let callCount = 0;
     await assert.rejects(
       () =>
@@ -282,11 +380,43 @@ describe("startBotWithRetry", () => {
         return true;
       },
     );
-    // Should have tried 3 times: attempts 1 and 2 retry, attempt 3 is last so it throws
     assert.strictEqual(callCount, 3);
+    assert.equal((await duplicatePollingConflictValues())[0]?.value, 3);
+    assert.deepEqual(conflictLogs, Array(3).fill(
+      "MINIME_STARTUP_GUARD_CONFLICT reason=duplicate_telegram_polling",
+    ));
   });
 
-  it("does not retry non-409 errors", async () => {
+  it("aborts a pending 409 backoff without starting another polling attempt", async (t) => {
+    captureConflictLogs(t);
+    const controller = new AbortController();
+    const abortReason = new Error("shutdown");
+    let callCount = 0;
+    let firstAttempt!: () => void;
+    const firstAttemptFinished = new Promise<void>((resolve) => { firstAttempt = resolve; });
+    const polling = startBotWithRetry(
+      async () => {
+        callCount++;
+        firstAttempt();
+        throw new GrammyError(
+          "Conflict",
+          { ok: false, error_code: 409, description: "Conflict" } as any,
+          "getUpdates",
+          {},
+        );
+      },
+      { maxRetries: 3, baseDelayMs: 60_000, signal: controller.signal },
+    );
+
+    await firstAttemptFinished;
+    controller.abort(abortReason);
+
+    await assert.rejects(polling, (error: unknown) => error === abortReason);
+    assert.equal(callCount, 1);
+  });
+
+  it("does not record or retry non-409 errors", async (t) => {
+    const conflictLogs = captureConflictLogs(t);
     let callCount = 0;
     await assert.rejects(
       () =>
@@ -309,9 +439,12 @@ describe("startBotWithRetry", () => {
       },
     );
     assert.strictEqual(callCount, 1);
+    assert.deepEqual(await duplicatePollingConflictValues(), []);
+    assert.deepEqual(conflictLogs, []);
   });
 
-  it("uses exponential backoff delays", async () => {
+  it("uses exponential backoff delays", async (t) => {
+    captureConflictLogs(t);
     const delays: number[] = [];
     let callCount = 0;
     const trackingSleep = async (ms: number) => { delays.push(ms); };
@@ -335,7 +468,8 @@ describe("startBotWithRetry", () => {
     assert.deepStrictEqual(delays, [1000, 2000, 4000]);
   });
 
-  it("caps backoff delay at 60 seconds", async () => {
+  it("caps backoff delay at 60 seconds", async (t) => {
+    captureConflictLogs(t);
     const delays: number[] = [];
     const trackingSleep = async (ms: number) => { delays.push(ms); };
 

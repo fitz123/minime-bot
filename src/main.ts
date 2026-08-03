@@ -8,10 +8,16 @@ import {
 } from "./telegram-bot.js";
 import { createDiscordBot } from "./discord-bot.js";
 import { log, setLogLevel } from "./logger.js";
-import { startMetricsServer, stopMetricsServer } from "./metrics.js";
+import {
+  initializeInstanceIdentity,
+  MetricsServerBindError,
+  startMetricsServer,
+  stopMetricsServer,
+} from "./metrics.js";
 import {
   createTelegramPollingRestartScheduler,
   hasActiveAgentPlatform,
+  logTelegramPollingFailure,
   runTelegramSetupInBackground,
   shouldRestartForTelegramFailure,
   startBotWithRetry,
@@ -28,6 +34,28 @@ import type { Client } from "discord.js";
 import type { MessageQueue } from "./message-queue.js";
 import type { EchoWatcher } from "./echo-watcher.js";
 import { TELEGRAM_LONG_POLL_TIMEOUT_SECONDS } from "./poll-progress.js";
+import { MEDIA_BASE } from "./media-store.js";
+import {
+  acquireRuntimeGuard,
+  preflightMediaRoot,
+  recordStartupConflict,
+  resolveRuntimeIdentity,
+  runtimeGuardResources,
+  type RuntimeGuard,
+  StartupConflictError,
+} from "./runtime-guard.js";
+import { shutdownServingRuntime } from "./runtime-shutdown.js";
+
+let activeRuntimeGuard: RuntimeGuard | undefined;
+let removeRuntimeExitHook: (() => void) | undefined;
+
+function releaseRuntimeGuard(): boolean {
+  removeRuntimeExitHook?.();
+  removeRuntimeExitHook = undefined;
+  const released = activeRuntimeGuard?.release() ?? true;
+  activeRuntimeGuard = undefined;
+  return released;
+}
 
 async function main(): Promise<void> {
   log.info("main", `Bot version: ${getVersion()}`);
@@ -38,9 +66,24 @@ async function main(): Promise<void> {
   }
   log.info("main", `Config loaded: ${Object.keys(config.agents).length} agents, ${config.bindings.length} Telegram bindings${config.discord ? `, ${config.discord.bindings.length} Discord bindings` : ""}`);
 
+  const identity = resolveRuntimeIdentity();
+  initializeInstanceIdentity(identity);
+  const mediaRoot = preflightMediaRoot(MEDIA_BASE);
+  activeRuntimeGuard = acquireRuntimeGuard({
+    resources: runtimeGuardResources(mediaRoot, config.telegramToken),
+  });
+  removeRuntimeExitHook = activeRuntimeGuard.installProcessExitHook();
+
   // Start Prometheus metrics server if configured
   if (config.metricsPort !== undefined) {
-    startMetricsServer(config.metricsPort, config.metricsHost);
+    try {
+      await startMetricsServer(config.metricsPort, config.metricsHost);
+    } catch (error) {
+      if (error instanceof MetricsServerBindError) {
+        recordStartupConflict(error.reason);
+      }
+      throw error;
+    }
   }
 
   // Restore caches from disk (survives restarts)
@@ -52,12 +95,15 @@ async function main(): Promise<void> {
 
   // Track resources for shutdown
   let telegramBot: TelegramBotResult["bot"] | undefined;
+  let telegramPolling: Promise<void> | undefined;
   const messageQueues: MessageQueue[] = [];
   let echoWatcher: EchoWatcher | undefined;
   let discordClient: Client | undefined;
+  let shutdownDiscord: (() => Promise<void>) | undefined;
   let watchdog: Watchdog | undefined;
   let telegramStartupTimeout: ReturnType<typeof setTimeout> | undefined;
   let telegramPollingRestart: TelegramPollingRestartScheduler | undefined;
+  let telegramPollingAbortController: AbortController | undefined;
 
   // Graceful shutdown — registered early so signals during bot startup are handled.
   // Closure captures mutable variables, so shutdown always sees current state.
@@ -74,29 +120,32 @@ async function main(): Promise<void> {
     telegramPollingRestart?.cancel();
     if (echoWatcher) echoWatcher.stop();
     if (watchdog) watchdog.stop();
-    if (telegramBot) {
-      stopTelegramBotInBackground(telegramBot, () => {
+    const released = await shutdownServingRuntime({
+      abortTelegramPolling: () => telegramPollingAbortController?.abort(),
+      telegramBot,
+      telegramPolling,
+      shutdownDiscord,
+      messageQueues,
+      sessionManager,
+      shutdownTimeoutMs,
+      persistTransportState: telegramBot
+        ? () => {
+          saveThreadCache();
+          saveMessageIndex();
+        }
+        : undefined,
+      stopMetrics: stopMetricsServer,
+      releaseRuntimeGuard,
+      onTelegramStopError: () => {
         log.warn("main", "Telegram stopped without confirming the final update offset; continuing shutdown");
-      });
+      },
+      onDiscordStopError: (error) => {
+        log.warn("main", "Discord shutdown failed; continuing shutdown", error);
+      },
+    });
+    if (!released) {
+      log.warn("main", "Runtime ownership changed before release; leaving claims untouched");
     }
-    if (discordClient) discordClient.destroy();
-    // Cancel debounce timers BEFORE waiting — telegramBot.stop() prevents new
-    // updates, but already-scheduled debounce timers could still fire and start
-    // new flush() work during the graceful shutdown wait window.
-    for (const mq of messageQueues) mq.cancelAllDebounceTimers();
-    // Wait for busy sessions to finish their current turns BEFORE clearing
-    // queues — clearAll() runs cleanup callbacks (e.g. temp file deletion)
-    // that would break in-flight sessions still reading those files.
-    await sessionManager.gracefulShutdown(shutdownTimeoutMs);
-
-    for (const mq of messageQueues) mq.clearAll();
-
-    if (telegramBot) {
-      saveThreadCache();
-      saveMessageIndex();
-    }
-    await stopMetricsServer();
-    await sessionManager.closeAll();
     log.info("main", "All sessions closed. Exiting.");
     process.exit(requestedExitCode);
   };
@@ -170,13 +219,15 @@ async function main(): Promise<void> {
           discordBindingCount: config.discord?.bindings.length ?? 0,
         });
         if (restartRequired) {
-          log.error("main", `Telegram polling unavailable (${reason}) — exiting for restart`, error);
-          process.exit(1);
+          logTelegramPollingFailure(
+            `Telegram polling unavailable (${reason}) — exiting for restart`,
+            error,
+          );
+          requestShutdown("Telegram polling failure", 1);
           return;
         }
 
-        log.error(
-          "main",
+        logTelegramPollingFailure(
           `Telegram polling unavailable (${reason}); keeping the active conversational platform online`,
           error,
         );
@@ -201,6 +252,8 @@ async function main(): Promise<void> {
       const generation = ++telegramPollingGeneration;
       telegramFailureHandled = false;
       let startedSuccessfully = false;
+      const pollingAbortController = new AbortController();
+      telegramPollingAbortController = pollingAbortController;
 
       // A watchdog cannot be reused after it decides to restart, so each
       // supervised polling generation owns a fresh one.
@@ -231,7 +284,7 @@ async function main(): Promise<void> {
       // bot.start() blocks until stopped — run it without awaiting.
       // startBotWithRetry handles 409 Conflict errors (old instance still polling)
       // before the outer supervisor applies its bounded restart backoff.
-      void startBotWithRetry(
+      telegramPolling = startBotWithRetry(
         () =>
           bot.start({
             timeout: TELEGRAM_LONG_POLL_TIMEOUT_SECONDS,
@@ -266,6 +319,7 @@ async function main(): Promise<void> {
               );
             },
           }),
+        { signal: pollingAbortController.signal },
       ).catch((err) => handleTelegramPollingFailure(generation, "polling_failed", err));
     }
 
@@ -273,14 +327,22 @@ async function main(): Promise<void> {
   }
 
   // Start Discord bot if configured
-  if (config.discord) {
+  if (config.discord && !shuttingDown) {
     try {
-      const result = await createDiscordBot(config, config.discord, sessionManager);
+      const result = await createDiscordBot(config, config.discord, sessionManager, {
+        onCreated: (created) => {
+          shutdownDiscord = created.shutdown;
+          messageQueues.push(created.messageQueue);
+        },
+      });
+      if (shuttingDown) {
+        finishAgentPlatformStartup();
+        return;
+      }
       discordClient = result.client;
-      messageQueues.push(result.messageQueue);
       log.info("main", "Discord bot started");
     } catch (err) {
-      log.error("main", "Failed to start Discord bot:", err);
+      if (!shuttingDown) log.error("main", "Failed to start Discord bot:", err);
     }
   }
 
@@ -292,12 +354,17 @@ async function main(): Promise<void> {
     discordBindingCount: config.discord?.bindings.length ?? 0,
   })) {
     log.error("main", "No bots started — exiting");
-    process.exit(1);
+    await shutdown("startup failure", 1);
+    return;
   }
   finishAgentPlatformStartup();
 }
 
-main().catch((err) => {
-  log.error("main", "Fatal error:", err);
+main().catch(async (err) => {
+  await stopMetricsServer();
+  releaseRuntimeGuard();
+  if (!(err instanceof StartupConflictError) && !(err instanceof MetricsServerBindError)) {
+    log.error("main", "Fatal error:", err);
+  }
   process.exit(1);
 });

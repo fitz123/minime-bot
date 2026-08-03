@@ -82,6 +82,156 @@ function cronRules(): AlertRule[] {
     .filter((rule) => rule.alert.startsWith("MinimeCron"));
 }
 
+function botRuntimeRules(): AlertRule[] {
+  const names = new Set([
+    "MinimeBotInstanceIdentityMissing",
+    "MinimeBotMediaPipelineDegraded",
+  ]);
+  return readYaml<RuleFile>(rulesPath).groups
+    .flatMap((group) => group.rules)
+    .filter((rule) => names.has(rule.alert));
+}
+
+describe("bot runtime monitoring contract", () => {
+  it("defines stable per-target identity and healthy-target media alerts", () => {
+    const rules = botRuntimeRules();
+    assert.deepEqual(
+      rules.map((rule) => rule.alert),
+      ["MinimeBotInstanceIdentityMissing", "MinimeBotMediaPipelineDegraded"],
+    );
+
+    const identity = rules[0];
+    assert.equal(identity.for, "5m");
+    assert.deepEqual(identity.labels, {
+      severity: "critical",
+      component: "runtime",
+      failure_class: "identity_missing",
+    });
+    assert.deepEqual(identity.annotations, {
+      summary: "Minime bot target is UP without runtime identity",
+      description: 'Target "{{ $labels.job }}/{{ $labels.instance }}" is healthy but does not expose minime_bot_instance_info.',
+    });
+    assert.equal(
+      normalizePromql(identity.expr),
+      '(up{job="minime-bot"} == 1) unless on (job, instance) minime_bot_instance_info',
+    );
+
+    const media = rules[1];
+    assert.equal(media.for, "5m");
+    assert.deepEqual(media.labels, {
+      severity: "warning",
+      component: "media",
+      failure_class: "terminal_rate",
+    });
+    assert.deepEqual(media.annotations, {
+      summary: "Minime bot media pipeline is repeatedly failing",
+      description: 'Target "{{ $labels.job }}/{{ $labels.instance }}" recorded at least three terminal '
+        + "{{ $labels.transport }} media failures in ten minutes while remaining UP.",
+    });
+    assert.equal(
+      normalizePromql(media.expr),
+      '( sum by (job, instance, transport) ( increase(minime_media_pipeline_errors_total[10m]) ) '
+        + '>= 3 ) and on (job, instance) (up{job="minime-bot"} == 1)',
+    );
+
+    const publicRules = readFileSync(rulesPath, "utf8");
+    assert.doesNotMatch(publicRules, /\/(?:Users|home)\//);
+    for (const rule of rules) {
+      assert.deepEqual(Object.keys(rule.labels).sort(), ["component", "failure_class", "severity"]);
+      assert.ok(Object.values(rule.labels).every((value) => !value.includes("$")));
+      assert.deepEqual(Object.keys(rule.annotations).sort(), ["description", "summary"]);
+      assert.doesNotMatch(rule.expr, /\b(?:user|home|slot|pid)\s*=/);
+    }
+    assert.match(media.expr, /sum by \(job, instance, transport\)/);
+    assert.doesNotMatch(media.expr, /by \([^)]*(?:media_type|stage|pid)/);
+  });
+
+  it("covers isolation, suppression, reset, and rolling-window recovery fixtures", () => {
+    const fixture = readYaml<RuleTestFixture>(fixturePath);
+    const cases = new Map(fixture.tests.map((testCase) => [testCase.name, testCase]));
+    const requiredCases = [
+      "multiple UP targets isolate the one missing runtime identity",
+      "down target suppresses missing identity and stale media series",
+      "isolated media failure stays below the threshold",
+      "sustained media failures fire while the same target remains UP",
+      "media counter reset preserves a sustained failure alert",
+      "media alert recovers after the rolling window clears",
+    ];
+    for (const name of requiredCases) {
+      assert.ok(cases.has(name), `missing promtool scenario: ${name}`);
+    }
+
+    const identity = cases.get("multiple UP targets isolate the one missing runtime identity");
+    assert.ok(identity);
+    assert.equal(identity.input_series?.filter((series) => series.series.startsWith("up{")).length, 2);
+    assert.ok(identity.input_series?.some((series) =>
+      series.series.startsWith("minime_bot_instance_info{")
+      && series.series.includes('instance="healthy:9101"')
+    ));
+    const identityAlert = identity.alert_rule_test.at(-1)?.exp_alerts[0];
+    assert.equal(identityAlert?.exp_labels.instance, "missing:9101");
+    assert.deepEqual(Object.keys(identityAlert?.exp_labels ?? {}).sort(), [
+      "component",
+      "failure_class",
+      "instance",
+      "job",
+      "severity",
+    ]);
+
+    const down = cases.get("down target suppresses missing identity and stale media series");
+    assert.ok(down);
+    assert.ok(down.input_series?.some((series) =>
+      series.series.startsWith("minime_media_pipeline_errors_total{")
+      && series.values === "0+1x10"
+    ));
+    assert.ok(down.alert_rule_test.every((evaluation) => evaluation.exp_alerts.length === 0));
+
+    const isolated = cases.get("isolated media failure stays below the threshold");
+    assert.ok(isolated);
+    assert.ok(isolated.alert_rule_test.every((evaluation) => evaluation.exp_alerts.length === 0));
+
+    const sustained = cases.get("sustained media failures fire while the same target remains UP");
+    assert.ok(sustained);
+    assert.equal(
+      sustained.input_series?.filter((series) =>
+        series.series.startsWith("minime_media_pipeline_errors_total{")
+      ).length,
+      2,
+    );
+    const sustainedAlert = sustained.alert_rule_test.at(-1)?.exp_alerts[0];
+    assert.deepEqual(Object.keys(sustainedAlert?.exp_labels ?? {}).sort(), [
+      "component",
+      "failure_class",
+      "instance",
+      "job",
+      "severity",
+      "transport",
+    ]);
+
+    const reset = cases.get("media counter reset preserves a sustained failure alert");
+    assert.ok(reset);
+    assert.ok(reset.input_series?.some((series) => series.values === "0 1 2 0 1 2 3 4 5 6 7x2"));
+    assert.equal(reset.alert_rule_test[0]?.exp_alerts.length, 1);
+
+    const recovery = cases.get("media alert recovers after the rolling window clears");
+    assert.ok(recovery);
+    assert.equal(recovery.alert_rule_test[0]?.exp_alerts.length, 1);
+    assert.deepEqual(recovery.alert_rule_test.at(-1)?.exp_alerts, []);
+
+    const runtimeEvaluations = requiredCases.flatMap((name) => cases.get(name)?.alert_rule_test ?? []);
+    for (const evaluation of runtimeEvaluations) {
+      for (const alert of evaluation.exp_alerts) {
+        assert.ok(
+          !Object.keys(alert.exp_labels).some((label) =>
+            ["user", "home", "slot", "pid", "media_type", "stage"].includes(label)
+          ),
+          `${evaluation.alertname} has an unbounded or process-specific alert label`,
+        );
+      }
+    }
+  });
+});
+
 describe("cron terminal monitoring contract", () => {
   it("defines bounded failure and telemetry alerts without per-cron policy selectors", () => {
     const rules = cronRules();

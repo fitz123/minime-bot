@@ -3,7 +3,7 @@ import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { resolveBinding, isAuthorized, sessionKey, isImageMimeType, imageExtensionForMime, buildSourcePrefix, shouldRespondInGroup, shouldRespondToReaction, BOT_COMMANDS, TELEGRAM_ALLOWED_UPDATES, buildReplyContext, buildForwardContext, extensionForDocument, formatFileSize, formatDocumentMeta, buildReactionContext, AUTO_RETRY_OPTIONS, createTelegramAutoRetryTransformer, extractMediaInfo, extensionForMedia, formatMediaMeta, createTelegramBot, extractChatContext, formatChatContextForLog, describeTelegramUpdateForLog, createApiErrorLoggingTransformer, resolveBindingLabel, BINDING_LABEL_NONE, BINDING_LABEL_UNBOUND, makeSteerFn, parseTelegramEchoId, routeTelegramEchoToActiveTurn } from "../telegram-bot.js";
 import client from "prom-client";
-import { telegramApiCalls, telegramApiErrors } from "../metrics.js";
+import { mediaPipelineErrors, telegramApiCalls, telegramApiErrors } from "../metrics.js";
 import type { TelegramBinding, BotConfig } from "../types.js";
 import type { SessionManager } from "../session-manager.js";
 import { cleanupSessionMediaDir } from "../media-store.js";
@@ -2340,6 +2340,176 @@ describe("command handler wiring", () => {
       "[From: Test (@tester) | 10:00]\n[Voice message] voice correction 2",
     ]);
     messageQueue.clearAll();
+  });
+
+  it("counts one metadata failure for every Telegram media type", async () => {
+    mediaPipelineErrors.reset();
+    const mediaMessages = [
+      { mediaType: "voice", media: { voice: { file_id: "voice-1", duration: 1 } } },
+      {
+        mediaType: "photo",
+        media: { photo: [{ file_id: "photo-1", file_unique_id: "photo-u1", width: 1, height: 1 }] },
+      },
+      { mediaType: "document", media: { document: { file_id: "doc-1", file_unique_id: "doc-u1" } } },
+      {
+        mediaType: "animation",
+        media: {
+          animation: { file_id: "anim-1", file_unique_id: "anim-u1", width: 1, height: 1, duration: 1 },
+          document: { file_id: "anim-1", file_unique_id: "anim-u1" },
+        },
+      },
+      {
+        mediaType: "video",
+        media: { video: { file_id: "video-1", file_unique_id: "video-u1", width: 1, height: 1, duration: 1 } },
+      },
+      { mediaType: "video_note", media: { video_note: { file_id: "note-1", length: 1, duration: 1 } } },
+      {
+        mediaType: "audio",
+        media: { audio: { file_id: "audio-1", file_unique_id: "audio-u1", duration: 1 } },
+      },
+      {
+        mediaType: "sticker",
+        media: {
+          sticker: {
+            file_id: "sticker-1",
+            file_unique_id: "sticker-u1",
+            width: 1,
+            height: 1,
+            is_animated: false,
+            is_video: false,
+            type: "regular",
+          },
+        },
+      },
+    ] as const;
+
+    for (const [index, testCase] of mediaMessages.entries()) {
+      const { bot, messageQueue } = initBot(
+        createMockSessionManager(),
+        [],
+        undefined,
+        (method, payload) => method === "getFile" ? { file_id: payload.file_id } : true,
+      );
+      await bot.handleUpdate(makeMediaUpdate(testCase.media, 300 + index) as never);
+      messageQueue.clearAll();
+    }
+
+    const values = await mediaPipelineErrors.get();
+    assert.deepStrictEqual(
+      values.values.map(({ labels, value }) => ({ labels, value })),
+      mediaMessages.map(({ mediaType }) => ({
+        labels: { transport: "telegram", media_type: mediaType, stage: "metadata" },
+        value: 1,
+      })),
+    );
+  });
+
+  it("counts declared-size document and generic-media rejections before reply", async () => {
+    mediaPipelineErrors.reset();
+    const apiCalls: Array<{ method: string; payload: any }> = [];
+    const { bot, messageQueue } = initBot(createMockSessionManager(), apiCalls);
+
+    await bot.handleUpdate(makeMediaUpdate({
+      document: {
+        file_id: "oversized-doc",
+        file_unique_id: "oversized-doc-u1",
+        file_size: 20 * 1024 * 1024 + 1,
+      },
+    }, 320) as never);
+    await bot.handleUpdate(makeMediaUpdate({
+      video: {
+        file_id: "oversized-video",
+        file_unique_id: "oversized-video-u1",
+        width: 1,
+        height: 1,
+        duration: 1,
+        file_size: 20 * 1024 * 1024 + 1,
+      },
+    }, 321) as never);
+
+    assert.equal(apiCalls.filter(({ method }) => method === "sendMessage").length, 2);
+    assert.deepStrictEqual(
+      (await mediaPipelineErrors.get()).values.map(({ labels, value }) => ({ labels, value })),
+      [
+        {
+          labels: { transport: "telegram", media_type: "document", stage: "size-limit" },
+          value: 1,
+        },
+        {
+          labels: { transport: "telegram", media_type: "video", stage: "size-limit" },
+          value: 1,
+        },
+      ],
+    );
+    messageQueue.clearAll();
+  });
+
+  it("preserves a later-stage voice classification at the terminal boundary", async (t) => {
+    mediaPipelineErrors.reset();
+    const actualVoice = await import("../voice.js");
+    t.mock.module("../voice.js", {
+      namedExports: {
+        ...actualVoice,
+        ingestLocalAudio: async () => {
+          throw new actualVoice.MediaPipelineError("conversion");
+        },
+      },
+    });
+    const failingVoiceModulePath = "../telegram-bot.js?media-pipeline-conversion";
+    const { createTelegramBot: createFailingVoiceBot } = await import(
+      failingVoiceModulePath
+    ) as { createTelegramBot: typeof createTelegramBot };
+    const { bot, messageQueue } = initBot(
+      createMockSessionManager(),
+      [],
+      undefined,
+      (method, payload) => method === "getFile"
+        ? { file_id: payload.file_id, file_path: `files/${payload.file_id}` }
+        : true,
+      createFailingVoiceBot,
+    );
+
+    await bot.handleUpdate(makeMediaUpdate({
+      voice: { file_id: "voice-conversion", file_unique_id: "voice-conversion-u1", duration: 1 },
+    }, 330) as never);
+
+    assert.deepStrictEqual(
+      (await mediaPipelineErrors.get()).values.map(({ labels, value }) => ({ labels, value })),
+      [{
+        labels: { transport: "telegram", media_type: "voice", stage: "conversion" },
+        value: 1,
+      }],
+    );
+    messageQueue.clearAll();
+  });
+
+  it("does not count successful media handling or a recovered download retry", async (t) => {
+    mediaPipelineErrors.reset();
+    const statuses = [200, 503, 200];
+    let fetchCalls = 0;
+    t.mock.method(globalThis, "fetch", async () => {
+      const status = statuses[fetchCalls++] ?? 200;
+      return new Response(new Uint8Array([1, 2, 3, 4]), { status });
+    });
+    const { bot, messageQueue } = initBot(
+      createMockSessionManager(),
+      [],
+      undefined,
+      (method, payload) => method === "getFile"
+        ? { file_id: payload.file_id, file_path: `files/${payload.file_id}` }
+        : true,
+    );
+    const photo = (fileId: string) => ({
+      photo: [{ file_id: fileId, file_unique_id: `${fileId}-u1`, width: 1, height: 1 }],
+    });
+
+    await bot.handleUpdate(makeMediaUpdate(photo("success-photo"), 340) as never);
+    await bot.handleUpdate(makeMediaUpdate(photo("retried-photo"), 341) as never);
+
+    assert.equal(fetchCalls, 3);
+    assert.deepStrictEqual((await mediaPipelineErrors.get()).values, []);
+    messageQueue.clearAll();
+    cleanupSessionMediaDir(String(testChatId));
   });
 
   it("routes reactions through the same acknowledged active-turn path", async (t) => {

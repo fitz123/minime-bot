@@ -17,7 +17,7 @@ import {
 } from "./voice.js";
 import { allocateMediaPath, discardMediaPath, enforceMediaCap, releaseMediaPath } from "./media-store.js";
 import { log } from "./logger.js";
-import { messagesReceived } from "./metrics.js";
+import { messagesReceived, recordMediaPipelineError } from "./metrics.js";
 import { isImageMimeType } from "./mime.js";
 import { readQuotaStatus } from "./quota-status.js";
 import { buildStatusReport } from "./status-report.js";
@@ -138,6 +138,12 @@ export function buildDiscordSourcePrefix(
 export interface DiscordBotResult {
   client: Client;
   messageQueue: MessageQueue;
+  shutdown(): Promise<void>;
+}
+
+export interface DiscordBotCreationOptions {
+  /** Publish the shutdown handle before login or command registration can block. */
+  onCreated?(result: DiscordBotResult): void;
 }
 
 interface DiscordCommandInteractionLike {
@@ -250,6 +256,7 @@ export async function createDiscordBot(
   config: BotConfig,
   discordConfig: DiscordConfig,
   sessionManager: SessionManager,
+  options: DiscordBotCreationOptions = {},
 ): Promise<DiscordBotResult> {
   const client = new Client({
     intents: [
@@ -260,6 +267,20 @@ export async function createDiscordBot(
     ],
     partials: [Partials.Channel],
   });
+  let acceptingHandlers = true;
+  const activeHandlers = new Set<Promise<void>>();
+  const trackHandler = (handler: () => Promise<void>): void => {
+    if (!acceptingHandlers) return;
+    const pending = handler();
+    activeHandlers.add(pending);
+    const remove = () => { activeHandlers.delete(pending); };
+    void pending.then(remove, remove);
+  };
+  const waitForActiveHandlers = async (): Promise<void> => {
+    while (activeHandlers.size > 0) {
+      await Promise.allSettled([...activeHandlers]);
+    }
+  };
 
   // Install error handlers before anything else so WebSocket errors
   // during login or event handling don't crash the process
@@ -282,19 +303,22 @@ export async function createDiscordBot(
   );
 
   // Thread support: join threads on creation so we receive their messages
-  client.on(Events.ThreadCreate, async (thread) => {
-    if (!thread.joined) {
-      try {
-        await thread.join();
-      } catch (err) {
-        log.warn("discord-bot", `Failed to join thread ${thread.id}:`, err);
+  client.on(Events.ThreadCreate, (thread) => {
+    trackHandler(async () => {
+      if (!thread.joined) {
+        try {
+          await thread.join();
+        } catch (err) {
+          log.warn("discord-bot", `Failed to join thread ${thread.id}:`, err);
+        }
       }
-    }
+    });
   });
 
   // Message handler
-  client.on(Events.MessageCreate, async (message) => {
-    try {
+  client.on(Events.MessageCreate, (message) => {
+    trackHandler(async () => {
+      try {
       // Ignore messages from bots (including ourselves)
       if (message.author.bot) return;
 
@@ -372,6 +396,7 @@ export async function createDiscordBot(
             );
           } catch (err) {
             const stage = mediaPipelineStage(err, "download");
+            recordMediaPipelineError({ transport: "discord", mediaType: "image", stage });
             log.error("discord-bot", `Image media pipeline failed stage=${stage}`);
             await message.reply(mediaPipelineFailureMessage(err, "download")).catch(() => {});
             if (tempPath) discardMediaPath(tempPath);
@@ -398,6 +423,7 @@ export async function createDiscordBot(
             );
           } catch (err) {
             const stage = mediaPipelineStage(err, "transcription");
+            recordMediaPipelineError({ transport: "discord", mediaType: "voice", stage });
             log.error("discord-bot", `Voice media pipeline failed stage=${stage}`);
             await message.reply(mediaPipelineFailureMessage(err, "transcription")).catch(() => {});
           } finally {
@@ -412,31 +438,49 @@ export async function createDiscordBot(
           messageQueue.enqueue(key, binding.agentId, prefix + cleanContent, adapter);
         }
       }
-    } catch (err) {
-      log.error("discord-bot", `Message handler error in ${message.channelId}:`, err);
-    }
+      } catch (err) {
+        log.error("discord-bot", `Message handler error in ${message.channelId}:`, err);
+      }
+    });
   });
 
   // Slash commands handler
-  client.on(Events.InteractionCreate, async (interaction) => {
-    try {
-      if (!interaction.isChatInputCommand()) return;
-      await handleDiscordChatInputCommand(interaction, {
-        config,
-        discordConfig,
-        sessionManager,
-        messageQueue,
-      });
-    } catch (err) {
-      log.error("discord-bot", `Interaction handler error:`, err);
-      if (interaction.isChatInputCommand() && !interaction.replied && !interaction.deferred) {
-        await interaction.reply({ content: "An internal error occurred.", ephemeral: true }).catch(() => {});
+  client.on(Events.InteractionCreate, (interaction) => {
+    trackHandler(async () => {
+      try {
+        if (!interaction.isChatInputCommand()) return;
+        await handleDiscordChatInputCommand(interaction, {
+          config,
+          discordConfig,
+          sessionManager,
+          messageQueue,
+        });
+      } catch (err) {
+        log.error("discord-bot", `Interaction handler error:`, err);
+        if (interaction.isChatInputCommand() && !interaction.replied && !interaction.deferred) {
+          await interaction.reply({ content: "An internal error occurred.", ephemeral: true }).catch(() => {});
+        }
       }
-    }
+    });
   });
+
+  const result: DiscordBotResult = {
+    client,
+    messageQueue,
+    async shutdown(): Promise<void> {
+      acceptingHandlers = false;
+      try {
+        await client.destroy();
+      } finally {
+        await waitForActiveHandlers();
+      }
+    },
+  };
+  options.onCreated?.(result);
 
   // Login and register slash commands
   await client.login(discordConfig.token);
+  if (!acceptingHandlers) return result;
   log.info("discord-bot", `Discord bot logged in as ${client.user!.tag}`);
 
   // Register guild-scoped slash commands (instant, no 1-hour propagation delay)
@@ -450,6 +494,7 @@ export async function createDiscordBot(
   const guildIds = [...new Set(discordConfig.bindings.map((b) => b.guildId))];
 
   for (const guildId of guildIds) {
+    if (!acceptingHandlers) break;
     try {
       await rest.put(
         Routes.applicationGuildCommands(client.user!.id, guildId),
@@ -461,5 +506,5 @@ export async function createDiscordBot(
     }
   }
 
-  return { client, messageQueue };
+  return result;
 }

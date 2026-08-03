@@ -1,12 +1,38 @@
 import { createServer, type Server } from "node:http";
 import client from "prom-client";
 import { log } from "./logger.js";
+import type { RuntimeIdentity, StartupConflictReason } from "./runtime-guard.js";
+import type { MediaPipelineStage } from "./voice.js";
 
 // Use the default registry
 const register = client.register;
 
 // Expose Node.js process metrics (heap, CPU, event loop, GC)
 client.collectDefaultMetrics();
+
+// --- Runtime identity and startup ownership ---
+
+export const botInstanceInfo = new client.Gauge({
+  name: "minime_bot_instance_info",
+  help: "Serving Minime bot process identity",
+  labelNames: ["user", "home", "slot", "pid"] as const,
+});
+
+export const botStartupConflicts = new client.Counter({
+  name: "minime_bot_startup_conflicts_total",
+  help: "Total startup ownership conflicts by bounded reason",
+  labelNames: ["reason"] as const,
+});
+
+/** Publish exactly one identity series for the process that is about to bind metrics. */
+export function initializeInstanceIdentity(identity: RuntimeIdentity): void {
+  botInstanceInfo.reset();
+  botInstanceInfo.set(identity, 1);
+}
+
+export function recordStartupConflictMetric(reason: StartupConflictReason): void {
+  botStartupConflicts.inc({ reason });
+}
 
 // --- Token usage ---
 // Legacy bot_claude_* names are retained for dashboard continuity. These
@@ -198,6 +224,54 @@ export const mediaDownloadRetries = new client.Counter({
   labelNames: ["result"] as const,
 });
 
+// --- Terminal media-pipeline failures ---
+
+const TELEGRAM_MEDIA_TYPES = [
+  "voice",
+  "photo",
+  "document",
+  "animation",
+  "video",
+  "video_note",
+  "audio",
+  "sticker",
+] as const;
+const DISCORD_MEDIA_TYPES = ["image", "voice"] as const;
+const MEDIA_PIPELINE_STAGES: Record<MediaPipelineStage, true> = {
+  metadata: true,
+  download: true,
+  "size-limit": true,
+  conversion: true,
+  transcription: true,
+  "empty-transcript": true,
+};
+export type TelegramMediaType = (typeof TELEGRAM_MEDIA_TYPES)[number];
+export type DiscordMediaType = (typeof DISCORD_MEDIA_TYPES)[number];
+export type MediaPipelineErrorLabels =
+  | { transport: "telegram"; mediaType: TelegramMediaType; stage: MediaPipelineStage }
+  | { transport: "discord"; mediaType: DiscordMediaType; stage: MediaPipelineStage };
+
+export const mediaPipelineErrors = new client.Counter({
+  name: "minime_media_pipeline_errors_total",
+  help: "Total terminal user-visible media pipeline failures by bounded classification",
+  labelNames: ["transport", "media_type", "stage"] as const,
+});
+
+/** Expose zero baselines so Prometheus counts the first failure in each series. */
+function initializeMediaPipelineErrorSeries(): void {
+  const stages = Object.keys(MEDIA_PIPELINE_STAGES) as MediaPipelineStage[];
+  for (const mediaType of TELEGRAM_MEDIA_TYPES) {
+    for (const stage of stages) {
+      mediaPipelineErrors.inc({ transport: "telegram", media_type: mediaType, stage }, 0);
+    }
+  }
+  for (const mediaType of DISCORD_MEDIA_TYPES) {
+    for (const stage of stages) {
+      mediaPipelineErrors.inc({ transport: "discord", media_type: mediaType, stage }, 0);
+    }
+  }
+}
+
 // --- Streaming draft and final delivery reliability ---
 
 export type DraftSchedulerEvent = "throttled" | "coalesced" | "rate_limited" | "failed";
@@ -367,6 +441,15 @@ export function recordMediaDownloadRetry(result: MediaDownloadRetryResult): void
   mediaDownloadRetries.inc({ result });
 }
 
+/** Record one terminal media outcome using only closed, non-identifying labels. */
+export function recordMediaPipelineError(labels: MediaPipelineErrorLabels): void {
+  mediaPipelineErrors.inc({
+    transport: labels.transport,
+    media_type: labels.mediaType,
+    stage: labels.stage,
+  });
+}
+
 /** Record a bounded cosmetic draft scheduler event. */
 export function recordDraftSchedulerEvent(event: DraftSchedulerEvent): void {
   draftSchedulerEvents.inc({ event });
@@ -380,10 +463,14 @@ export function recordFinalDeliveryFailure(): void {
 // --- HTTP server ---
 
 let metricsServer: Server | null = null;
-let metricsListenRetry: ReturnType<typeof setTimeout> | null = null;
 
-export interface MetricsServerOptions {
-  addressInUseRetryMs?: number;
+export class MetricsServerBindError extends Error {
+  readonly reason = "metrics_port_in_use" as const;
+
+  constructor() {
+    super("Metrics server address is in use");
+    this.name = "MetricsServerBindError";
+  }
 }
 
 /**
@@ -391,13 +478,12 @@ export interface MetricsServerOptions {
  * Serves /metrics in standard Prometheus text format.
  * Returns the server instance.
  */
-export function startMetricsServer(
+export async function startMetricsServer(
   port: number,
   host?: string,
-  options: MetricsServerOptions = {},
-): Server {
+): Promise<Server> {
+  initializeMediaPipelineErrorSeries();
   const listenHost = host ?? "127.0.0.1";
-  const addressInUseRetryMs = Math.max(1, options.addressInUseRetryMs ?? 1_000);
   const server = createServer(async (req, res) => {
     if (req.url === "/metrics" && req.method === "GET") {
       try {
@@ -415,40 +501,27 @@ export function startMetricsServer(
     }
   });
 
-  const listen = () => {
-    if (metricsServer !== server) return;
-    server.listen(port, listenHost);
-  };
-
-  server.on("listening", () => {
-    if (metricsServer !== server) {
-      server.close();
-      return;
-    }
-    log.info("metrics", `Prometheus metrics server listening on ${listenHost}:${port}`);
-  });
-
-  server.on("error", (err) => {
-    if ((err as NodeJS.ErrnoException).code === "EADDRINUSE" && metricsServer === server) {
-      if (metricsListenRetry === null) {
-        log.warn(
-          "metrics",
-          `Metrics address ${listenHost}:${port} is still in use; retrying in ${addressInUseRetryMs}ms`,
-        );
-        metricsListenRetry = setTimeout(() => {
-          metricsListenRetry = null;
-          listen();
-        }, addressInUseRetryMs);
-        metricsListenRetry.unref();
-      }
-      return;
-    }
-    log.error("metrics", `Metrics server error: ${err.message}`);
-  });
-
   metricsServer = server;
-  listen();
-  return server;
+  return new Promise<Server>((resolve, reject) => {
+    const onListening = () => {
+      server.off("error", onBindError);
+      server.on("error", (error) => log.error("metrics", `Metrics server error: ${error.message}`));
+      log.info("metrics", `Prometheus metrics server listening on ${listenHost}:${port}`);
+      resolve(server);
+    };
+    const onBindError = (error: Error) => {
+      server.off("listening", onListening);
+      if (metricsServer === server) metricsServer = null;
+      if ((error as NodeJS.ErrnoException).code === "EADDRINUSE") {
+        reject(new MetricsServerBindError());
+        return;
+      }
+      reject(error);
+    };
+    server.once("listening", onListening);
+    server.once("error", onBindError);
+    server.listen(port, listenHost);
+  });
 }
 
 /**
@@ -456,10 +529,6 @@ export function startMetricsServer(
  */
 export function stopMetricsServer(): Promise<void> {
   return new Promise((resolve) => {
-    if (metricsListenRetry !== null) {
-      clearTimeout(metricsListenRetry);
-      metricsListenRetry = null;
-    }
     const server = metricsServer;
     metricsServer = null;
     if (!server || !server.listening) {

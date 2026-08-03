@@ -8,6 +8,36 @@ groups:
           severity: critical
         annotations:
           summary: Minime bot metrics target is unavailable
+      - alert: MinimeBotInstanceIdentityMissing
+        expr: |
+          (up{job="minime-bot"} == 1)
+            unless on (job, instance)
+          minime_bot_instance_info
+        for: 5m
+        labels:
+          severity: critical
+          component: runtime
+          failure_class: identity_missing
+        annotations:
+          summary: Minime bot target is UP without runtime identity
+          description: 'Target "{{ $labels.job }}/{{ $labels.instance }}" is healthy but does not expose minime_bot_instance_info.'
+      - alert: MinimeBotMediaPipelineDegraded
+        expr: |
+          (
+            sum by (job, instance, transport) (
+              increase(minime_media_pipeline_errors_total[10m])
+            ) >= 3
+          )
+            and on (job, instance)
+          (up{job="minime-bot"} == 1)
+        for: 5m
+        labels:
+          severity: warning
+          component: media
+          failure_class: terminal_rate
+        annotations:
+          summary: Minime bot media pipeline is repeatedly failing
+          description: 'Target "{{ $labels.job }}/{{ $labels.instance }}" recorded at least three terminal {{ $labels.transport }} media failures in ten minutes while remaining UP.'
       - alert: MinimeCronTerminalFailure
         expr: |
           max by (cron) (

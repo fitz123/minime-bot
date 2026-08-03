@@ -52,10 +52,106 @@ documents the required Homebrew installation, minimum version, first-time
 browser setup, doctor check, and manual no-pin upgrade policy. Search-only roles
 do not receive Bash solely for URL access.
 
-During an overlapping process replacement, the in-process Prometheus listener
-retries an occupied configured host/port every second until the old listener
-releases it. Scrapes can briefly continue reaching the old process. Other listen
-errors remain logged, and shutdown cancels any pending address retry.
+## Bot runtime identity, startup ownership, and media degradation
+
+The bot publishes three package-owned metric families for runtime ownership and
+terminal media health:
+
+- `minime_bot_instance_info{user,home,slot,pid} 1` identifies the process that
+  owns the metrics listener. Identity is resolved once at startup from the OS
+  username and home, decimal process ID, and either a non-empty
+  `MINIME_BOT_SLOT` or the real working-directory basename.
+- `minime_bot_startup_conflicts_total{reason}` counts a closed conflict reason:
+  `instance_lock_held`, `foreign_media_owner`, `unsafe_media_root`,
+  `metrics_port_in_use`, or `duplicate_telegram_polling`.
+- `minime_media_pipeline_errors_total{transport,media_type,stage}` counts one
+  terminal user-visible failure after internal retries finish. `transport` is
+  `telegram` or `discord`; media types are Telegram
+  `voice|photo|document|animation|video|video_note|audio|sticker` and Discord
+  `image|voice`; stages are
+  `metadata|download|size-limit|conversion|transcription|empty-transcript`.
+  Discord counts independently failed attachments. These counters are
+  process-local event counts, not durable upstream-update deduplication.
+
+The identity labels are deliberate local diagnostics, not general-purpose
+cardinality dimensions. There is one identity series per serving process, but
+PID and slot changes create a new time series across replacements. Restrict the
+metrics endpoint and Prometheus access accordingly. Conflict and media labels
+are closed sets: paths, tokens, chat/session/user identities, URLs, and error
+text must never be added to them.
+
+Before either conversational transport starts, the process inspects an existing
+media root without creating, changing, traversing, or deleting it. A symlink,
+non-directory, unreadable root, or root owned by another UID is a fatal startup
+conflict; a missing root is allowed. The process then claims hashed media-root
+and Telegram-token-fingerprint resources in deterministic order under an
+owner-only OS-temporary namespace. Raw resources are never stored in lock
+names. Partial acquisition rolls back, stale recovery validates both PID and
+process-start identity when available, and release removes only the exact
+nonce/inode claim still owned by the process.
+
+Metrics binding is awaited before transports start. An occupied configured
+address is `metrics_port_in_use`: the contender logs the conflict, releases its
+claims, and exits non-zero instead of retrying while a scrape silently reaches
+another listener. Supervisors should retry the complete process after the prior
+owner has quiesced. During graceful replacement the old owner first stops new
+Telegram/Discord work and watchdogs, drains sessions and queue/media cleanup,
+stops metrics and remaining sessions, and releases runtime claims last. The
+process-exit hook performs only ownership-checked best-effort release.
+
+Every conflict log is exactly searchable by its bounded marker:
+
+```text
+MINIME_STARTUP_GUARD_CONFLICT reason=<reason>
+```
+
+No resource, token, identity, owner ID, path, or underlying error is appended.
+A Telegram 409 increments and logs `duplicate_telegram_polling` once per caught
+polling attempt while retaining the bounded handoff retry behavior.
+
+A fatal conflict before the contender owns the configured metrics port cannot
+make that contender's in-memory conflict counter scrape-visible. The counter is
+observable when the serving process itself sees the conflict, notably Telegram
+409 attempts. For pre-bind failures, alert on target down, missing identity, or
+an installation-specific unexpected identity, and use the stable log marker for
+the conflict reason. Do not treat the conflict counter as durable evidence.
+
+The public `MinimeBotInstanceIdentityMissing` rule selects each UP
+`job="minime-bot"` target that has no `minime_bot_instance_info` series joined
+on `job,instance`. This detects a foreign or older listener that still answers
+the scrape. `MinimeBotMediaPipelineDegraded` sums the ten-minute counter
+increase by `job,instance,transport`, fires at three failures only while that
+same target remains UP, and has a five-minute pending period. Its alert identity
+does not retain PID, stage, or media type. `MinimeBotMetricsDown` remains the
+separate target-down signal.
+
+Expected user, home, and slot values are deployment policy and therefore do not
+belong in the public rules. An external configuration can define one selector
+per target using placeholders like this, replacing every placeholder only in
+the private installation:
+
+```yaml
+- alert: MinimeBotUnexpectedInstanceIdentity
+  expr: |
+    (up{job="JOB_PLACEHOLDER",instance="INSTANCE_PLACEHOLDER"} == 1)
+      unless on (job, instance)
+    (minime_bot_instance_info{
+      job="JOB_PLACEHOLDER",
+      instance="INSTANCE_PLACEHOLDER",
+      user="USER_PLACEHOLDER",
+      home="HOME_PLACEHOLDER",
+      slot="SLOT_PLACEHOLDER"
+    } == 1)
+  for: 5m
+```
+
+Keep `job` and `instance` on the expected series join so simultaneous targets
+are evaluated independently. Validate the public rules and their multi-target,
+counter-reset, target-down, and rolling-window fixtures with:
+
+```sh
+promtool test rules examples/monitoring/minime.rules.test.yml
+```
 
 ## Terminal cron health contract
 
