@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 2026.8.5
+
+- Expose the serving bot instance identity, fail fast on duplicate or foreign
+  runtime ownership, drain accepted work before releasing ownership, and alert
+  on sustained Telegram or Discord media-pipeline failures while liveness is
+  still healthy (#166).
+
 ## 2026.8.4
 
 - Add an optional hot-reloaded plain-text recognition glossary to the existing
