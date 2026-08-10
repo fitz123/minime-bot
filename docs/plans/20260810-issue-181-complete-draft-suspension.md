@@ -43,10 +43,10 @@ npm run build
 **Goal:** Use the reaction handler's existing resolved session key to suspend the active relay before reaction context enters `MessageQueue`, while retaining message-to-topic cache routing and cross-topic isolation.
 **Serves:** The operator requires same-topic reaction updates to receive the same draft lifecycle transition without changing reaction ownership, acknowledged steering, or final delivery.
 
-- [ ] Invoke the existing coordinator for a valid non-empty reaction update immediately before queue/steering handling, using the same resolved key passed to `messageQueue.enqueue`.
-- [ ] Extend reaction tests to prove suspension precedes enqueue/steer, repeated same-key updates stay idempotent, and a reaction mapped to another topic does not suspend the active relay.
-- [ ] Re-run the focused Telegram and stream-relay tests, lint, and build; leave the one-time full suite to the parent gate.
-- [ ] Review the final diff as a cut pass for scope, privacy, and preservation of issue #181 invariants.
+- [x] Invoke the existing coordinator for a valid non-empty reaction update immediately before queue/steering handling, using the same resolved key passed to `messageQueue.enqueue`.
+- [x] Extend reaction tests to prove suspension precedes enqueue/steer, repeated same-key updates stay idempotent, and a reaction mapped to another topic does not suspend the active relay.
+- [x] Re-run the focused Telegram and stream-relay tests, lint, and build; leave the one-time full suite to the parent gate.
+- [x] Review the final diff as a cut pass for scope, privacy, and preservation of issue #181 invariants.
 
 ## Parent-owned post-completion
 

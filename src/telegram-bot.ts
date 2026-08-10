@@ -1278,6 +1278,7 @@ export function createTelegramBot(
       });
 
       const key = sessionKey(chatId, topicId);
+      draftCoordinator.suspend(key);
       messageQueue.enqueue(key, binding.agentId, messageText, createTelegramAdapter(ctx, binding, topicId, config.sessionDefaults));
     } catch (err) {
       log.error("telegram-bot", `Reaction handling error for chat ${chatId}:`, err);
