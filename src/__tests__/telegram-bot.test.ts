@@ -13,6 +13,7 @@ import {
 } from "../poll-progress.js";
 import { ActiveDraftCoordinator } from "../active-draft-coordinator.js";
 import { buildCollectPrompt } from "../message-queue.js";
+import { DRAFT_REFRESH_INTERVAL_MS } from "../stream-relay.js";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -2514,13 +2515,37 @@ describe("command handler wiring", () => {
 
   it("routes reactions through the same acknowledged active-turn path", async (t) => {
     t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    const events: string[] = [];
+    const coordinator = new ActiveDraftCoordinator();
+    let relaySuspensions = 0;
+    const originalRegister = coordinator.register.bind(coordinator);
+    coordinator.register = (key, suspend) => originalRegister(key, () => {
+      relaySuspensions++;
+      events.push(`suspend:${key}`);
+      suspend();
+    });
     const manager = createSteeringSessionManager();
-    const { bot, messageQueue } = initBot(manager);
+    const originalSteer = manager.steerSessionMessage.bind(manager);
+    manager.steerSessionMessage = (chatId, agentId, text) => {
+      events.push(`steer:${chatId}`);
+      return originalSteer(chatId, agentId, text);
+    };
+    const { bot, messageQueue } = initBot(
+      manager,
+      [],
+      { draftCoordinator: coordinator },
+    );
+    const originalEnqueue = messageQueue.enqueue.bind(messageQueue);
+    messageQueue.enqueue = ((...args: Parameters<typeof messageQueue.enqueue>) => {
+      events.push(`enqueue:${args[0]}`);
+      originalEnqueue(...args);
+    }) as typeof messageQueue.enqueue;
     const key = String(testChatId);
 
     await bot.handleUpdate(makeTextUpdate("initial request", 30));
     t.mock.timers.tick(3_000);
     await flushAsyncWork();
+    events.length = 0;
 
     await bot.handleUpdate({
       update_id: 31,
@@ -2539,14 +2564,214 @@ describe("command handler wiring", () => {
       },
     } as never);
 
+    assert.deepStrictEqual(events, [
+      `suspend:${key}`,
+      `enqueue:${key}`,
+      `steer:${key}`,
+    ]);
     assert.deepStrictEqual(manager.steerCalls.map(({ text }) => text), [
       "[From: Test (@tester) | 10:00]\n" +
       "[Reaction: 👍 on message by @tester: \"initial request\"]",
     ]);
     manager.steerCalls[0].resolve(true);
+    await flushAsyncWork();
+
+    events.length = 0;
+    await bot.handleUpdate({
+      update_id: 32,
+      message_reaction: {
+        chat: { id: testChatId, type: "private", first_name: "Test" },
+        message_id: 30,
+        date: 36_002,
+        user: {
+          id: testChatId,
+          is_bot: false,
+          first_name: "Test",
+          username: "tester",
+        },
+        old_reaction: [],
+        new_reaction: [{ type: "emoji", emoji: "❤️" }],
+      },
+    } as never);
+
+    assert.deepStrictEqual(events, [
+      `enqueue:${key}`,
+      `steer:${key}`,
+    ], "repeated same-key reactions do not suspend an already suspended relay");
+    assert.strictEqual(relaySuspensions, 1);
+    manager.steerCalls[1].resolve(true);
     manager.releaseInitial();
     await flushAsyncWork();
     assert.strictEqual(manager.sent.length, 1);
+    messageQueue.clearAll();
+  });
+
+  it("uses the cached reaction topic without suspending another topic's relay", async () => {
+    const topicChatId = -100998;
+    const activeKey = `${topicChatId}:1`;
+    const reactionKey = `${topicChatId}:2`;
+    const topicConfig: BotConfig = {
+      ...handlerConfig,
+      bindings: [{
+        chatId: topicChatId,
+        agentId: "main",
+        kind: "group",
+        requireMention: false,
+      }],
+    };
+    const coordinator = new ActiveDraftCoordinator();
+    let activeRelaySuspensions = 0;
+    coordinator.register(activeKey, () => { activeRelaySuspensions++; });
+    const topicFactory: typeof createTelegramBot = (_config, sessionManager, opts) =>
+      createTelegramBot(topicConfig, sessionManager, opts);
+    const { bot, messageQueue } = initBot(
+      createMockSessionManager(),
+      [],
+      { draftCoordinator: coordinator },
+      undefined,
+      topicFactory,
+    );
+    const enqueuedKeys: string[] = [];
+    messageQueue.enqueue = ((key: string) => {
+      enqueuedKeys.push(key);
+    }) as typeof messageQueue.enqueue;
+
+    await bot.handleUpdate({
+      update_id: 40,
+      message: {
+        message_id: 40,
+        message_thread_id: 2,
+        is_topic_message: true,
+        from: { id: testChatId, is_bot: false, first_name: "Test" },
+        chat: {
+          id: topicChatId,
+          type: "supergroup",
+          title: "Test Forum",
+          is_forum: true,
+        },
+        date: 36_000,
+        text: "other topic message",
+      },
+    } as never);
+    enqueuedKeys.length = 0;
+
+    await bot.handleUpdate({
+      update_id: 41,
+      message_reaction: {
+        chat: {
+          id: topicChatId,
+          type: "supergroup",
+          title: "Test Forum",
+          is_forum: true,
+        },
+        message_id: 40,
+        date: 36_001,
+        user: { id: testChatId, is_bot: false, first_name: "Test" },
+        old_reaction: [],
+        new_reaction: [{ type: "emoji", emoji: "👍" }],
+      },
+    } as never);
+
+    assert.deepStrictEqual(enqueuedKeys, [reactionKey]);
+    assert.strictEqual(activeRelaySuspensions, 0);
+    messageQueue.clearAll();
+  });
+
+  it("wires echo suspension to the exact topic even when passive steering is rejected", () => {
+    const topicChatId = -100999;
+    const topicConfig: BotConfig = {
+      ...handlerConfig,
+      bindings: [{
+        chatId: topicChatId,
+        agentId: "main",
+        kind: "group",
+        requireMention: false,
+      }],
+    };
+    const coordinator = new ActiveDraftCoordinator();
+    let topicOneSuspensions = 0;
+    coordinator.register(`${topicChatId}:1`, () => { topicOneSuspensions++; });
+    const { echoWatcher } = createTelegramBot(
+      topicConfig,
+      createMockSessionManager(),
+      { draftCoordinator: coordinator },
+    );
+    const handleEcho = (
+      echoWatcher as unknown as {
+        handler: (chatId: string, threadId: string | undefined, text: string) => void;
+      }
+    ).handler;
+
+    handleEcho(String(topicChatId), "2", "other topic echo");
+    assert.strictEqual(topicOneSuspensions, 0);
+
+    handleEcho(String(topicChatId), "1", "same topic echo");
+    handleEcho(String(topicChatId), "1", "repeated same topic echo");
+    assert.strictEqual(topicOneSuspensions, 1);
+  });
+
+  it("keeps the active relay suspended after an echo through reset, deltas, and refresh", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    const continueAfterEcho = deferred<void>();
+    const finish = deferred<void>();
+    const manager = createMockSessionManager();
+    manager.sendSessionMessage = () => (async function* () {
+      yield { type: "system", subtype: "init", session_id: "echo-suspension" } as const;
+      yield {
+        type: "stream_event",
+        event: { delta: { type: "text_delta", text: "obsolete preview" } },
+      } as const;
+      await continueAfterEcho.promise;
+      yield {
+        type: "assistant",
+        subtype: "control_request",
+        action: "reset_response_text",
+      } as never;
+      yield {
+        type: "stream_event",
+        event: { delta: { type: "text_delta", text: "permanent final" } },
+      } as const;
+      await finish.promise;
+      yield { type: "result", result: "permanent final", session_id: "echo-suspension" } as const;
+    })();
+    const coordinator = new ActiveDraftCoordinator();
+    const apiCalls: Array<{ method: string; payload: any }> = [];
+    const { bot, echoWatcher, messageQueue } = initBot(
+      manager,
+      apiCalls,
+      { draftCoordinator: coordinator },
+    );
+
+    await bot.handleUpdate(makeTextUpdate("initial request", 32));
+    t.mock.timers.tick(3_000);
+    await flushAsyncWork();
+    assert.deepStrictEqual(
+      apiCalls.filter(({ method }) => method === "sendMessageDraft").map(({ payload }) => payload.text),
+      ["obsolete preview"],
+    );
+
+    (
+      echoWatcher as unknown as {
+        handler: (chatId: string, threadId: string | undefined, text: string) => void;
+      }
+    ).handler(String(testChatId), undefined, "cron said hello");
+    continueAfterEcho.resolve();
+    await flushAsyncWork();
+    t.mock.timers.tick(DRAFT_REFRESH_INTERVAL_MS * 2);
+    await flushAsyncWork();
+    assert.deepStrictEqual(
+      apiCalls.filter(({ method }) => method === "sendMessageDraft").map(({ payload }) => payload.text),
+      ["obsolete preview"],
+      "echo suspension survives response reset, later deltas, and the refresh interval",
+    );
+
+    finish.resolve();
+    await flushAsyncWork();
+    assert.deepStrictEqual(
+      apiCalls.filter(({ method }) => method === "sendMessage").map(({ payload }) => payload.text),
+      ["permanent final"],
+      "the relay still emits exactly one permanent final",
+    );
     messageQueue.clearAll();
   });
 
@@ -2601,13 +2826,16 @@ describe("telegram echo routing", () => {
   });
 
   it("steers valid echo context into an active eligible turn", () => {
+    const events: string[] = [];
     const calls: Array<{ chatId: string; agentId: string; text: string }> = [];
     const delivered = routeTelegramEchoToActiveTurn({
       chatId: "111111111",
       text: "cron said hello",
       bindings: testBindings,
       sessionDefaults: { requireMention: true } as BotConfig["sessionDefaults"],
+      onBeforeSteer: (key) => { events.push(`suspend:${key}`); },
       steerFn: (chatId, agentId, text) => {
+        events.push(`steer:${chatId}`);
         calls.push({ chatId, agentId, text });
         return true;
       },
@@ -2619,14 +2847,17 @@ describe("telegram echo routing", () => {
       agentId: "main",
       text: "[Bot echo - context only, no reply needed]\n\ncron said hello",
     }]);
+    assert.deepStrictEqual(events, ["suspend:111111111", "steer:111111111"]);
   });
 
-  it("rejects malformed echo chat and thread ids before steering", () => {
+  it("rejects malformed and unbound echo ids before suspension or steering", () => {
+    let suspensionCalls = 0;
     let steerCalls = 0;
     const base = {
       text: "cron said hello",
       bindings: testBindings,
       sessionDefaults: { requireMention: false } as BotConfig["sessionDefaults"],
+      onBeforeSteer: () => { suspensionCalls++; },
       steerFn: () => {
         steerCalls++;
         return true;
@@ -2635,16 +2866,20 @@ describe("telegram echo routing", () => {
 
     assert.strictEqual(routeTelegramEchoToActiveTurn({ ...base, chatId: "111111111abc" }), false);
     assert.strictEqual(routeTelegramEchoToActiveTurn({ ...base, chatId: "111111111", threadId: "42abc" }), false);
+    assert.strictEqual(routeTelegramEchoToActiveTurn({ ...base, chatId: "999999999" }), false);
+    assert.strictEqual(suspensionCalls, 0);
     assert.strictEqual(steerCalls, 0);
   });
 
-  it("does not route group echoes when mention is required", () => {
+  it("does not suspend or route group echoes when mention is required", () => {
+    let suspensionCalls = 0;
     let steerCalls = 0;
     const delivered = routeTelegramEchoToActiveTurn({
       chatId: "-1009999999999",
       text: "cron said hello",
       bindings: testBindings,
       sessionDefaults: { requireMention: true } as BotConfig["sessionDefaults"],
+      onBeforeSteer: () => { suspensionCalls++; },
       steerFn: () => {
         steerCalls++;
         return true;
@@ -2652,6 +2887,7 @@ describe("telegram echo routing", () => {
     });
 
     assert.strictEqual(delivered, false);
+    assert.strictEqual(suspensionCalls, 0);
     assert.strictEqual(steerCalls, 0);
   });
 
@@ -2704,6 +2940,7 @@ describe("telegram echo routing", () => {
   });
 
   it("returns false when no active eligible turn accepts the echo", () => {
+    const events: string[] = [];
     const calls: Array<{ chatId: string; agentId: string; text: string }> = [];
 
     const delivered = routeTelegramEchoToActiveTurn({
@@ -2711,7 +2948,9 @@ describe("telegram echo routing", () => {
       text: "cron said hello",
       bindings: testBindings,
       sessionDefaults: { requireMention: false } as BotConfig["sessionDefaults"],
+      onBeforeSteer: (key) => { events.push(`suspend:${key}`); },
       steerFn: (chatId, agentId, text) => {
+        events.push(`steer:${chatId}`);
         calls.push({ chatId, agentId, text });
         return false;
       },
@@ -2721,6 +2960,7 @@ describe("telegram echo routing", () => {
     assert.strictEqual(calls.length, 1);
     assert.strictEqual(calls[0].chatId, "111111111");
     assert.strictEqual(calls[0].agentId, "main");
+    assert.deepStrictEqual(events, ["suspend:111111111", "steer:111111111"]);
   });
 });
 

@@ -217,6 +217,7 @@ export interface TelegramEchoRouteOptions {
   text: string;
   bindings: TelegramBinding[];
   sessionDefaults?: BotConfig["sessionDefaults"];
+  onBeforeSteer?: (key: string) => void;
   steerFn: SteerFn;
 }
 
@@ -244,6 +245,7 @@ export function routeTelegramEchoToActiveTurn(opts: TelegramEchoRouteOptions): b
 
   const key = sessionKey(numericChatId, numericThreadId);
   const framedText = `${ECHO_PREFIX} - context only, no reply needed]\n\n${opts.text}`;
+  opts.onBeforeSteer?.(key);
   return opts.steerFn(key, binding.agentId, framedText);
 }
 
@@ -1276,6 +1278,7 @@ export function createTelegramBot(
       });
 
       const key = sessionKey(chatId, topicId);
+      draftCoordinator.suspend(key);
       messageQueue.enqueue(key, binding.agentId, messageText, createTelegramAdapter(ctx, binding, topicId, config.sessionDefaults));
     } catch (err) {
       log.error("telegram-bot", `Reaction handling error for chat ${chatId}:`, err);
@@ -1299,6 +1302,7 @@ export function createTelegramBot(
         text,
         bindings: config.bindings,
         sessionDefaults: config.sessionDefaults,
+        onBeforeSteer: (key) => { draftCoordinator.suspend(key); },
         steerFn,
       });
       if (!delivered) {
