@@ -13,6 +13,7 @@ import {
 } from "../poll-progress.js";
 import { ActiveDraftCoordinator } from "../active-draft-coordinator.js";
 import { buildCollectPrompt } from "../message-queue.js";
+import { DRAFT_REFRESH_INTERVAL_MS } from "../stream-relay.js";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -2550,6 +2551,104 @@ describe("command handler wiring", () => {
     messageQueue.clearAll();
   });
 
+  it("wires echo suspension to the exact topic even when passive steering is rejected", () => {
+    const topicChatId = -100999;
+    const topicConfig: BotConfig = {
+      ...handlerConfig,
+      bindings: [{
+        chatId: topicChatId,
+        agentId: "main",
+        kind: "group",
+        requireMention: false,
+      }],
+    };
+    const coordinator = new ActiveDraftCoordinator();
+    let topicOneSuspensions = 0;
+    coordinator.register(`${topicChatId}:1`, () => { topicOneSuspensions++; });
+    const { echoWatcher } = createTelegramBot(
+      topicConfig,
+      createMockSessionManager(),
+      { draftCoordinator: coordinator },
+    );
+    const handleEcho = (
+      echoWatcher as unknown as {
+        handler: (chatId: string, threadId: string | undefined, text: string) => void;
+      }
+    ).handler;
+
+    handleEcho(String(topicChatId), "2", "other topic echo");
+    assert.strictEqual(topicOneSuspensions, 0);
+
+    handleEcho(String(topicChatId), "1", "same topic echo");
+    handleEcho(String(topicChatId), "1", "repeated same topic echo");
+    assert.strictEqual(topicOneSuspensions, 1);
+  });
+
+  it("keeps the active relay suspended after an echo through reset, deltas, and refresh", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    const continueAfterEcho = deferred<void>();
+    const finish = deferred<void>();
+    const manager = createMockSessionManager();
+    manager.sendSessionMessage = () => (async function* () {
+      yield { type: "system", subtype: "init", session_id: "echo-suspension" } as const;
+      yield {
+        type: "stream_event",
+        event: { delta: { type: "text_delta", text: "obsolete preview" } },
+      } as const;
+      await continueAfterEcho.promise;
+      yield {
+        type: "assistant",
+        subtype: "control_request",
+        action: "reset_response_text",
+      } as never;
+      yield {
+        type: "stream_event",
+        event: { delta: { type: "text_delta", text: "permanent final" } },
+      } as const;
+      await finish.promise;
+      yield { type: "result", result: "permanent final", session_id: "echo-suspension" } as const;
+    })();
+    const coordinator = new ActiveDraftCoordinator();
+    const apiCalls: Array<{ method: string; payload: any }> = [];
+    const { bot, echoWatcher, messageQueue } = initBot(
+      manager,
+      apiCalls,
+      { draftCoordinator: coordinator },
+    );
+
+    await bot.handleUpdate(makeTextUpdate("initial request", 32));
+    t.mock.timers.tick(3_000);
+    await flushAsyncWork();
+    assert.deepStrictEqual(
+      apiCalls.filter(({ method }) => method === "sendMessageDraft").map(({ payload }) => payload.text),
+      ["obsolete preview"],
+    );
+
+    (
+      echoWatcher as unknown as {
+        handler: (chatId: string, threadId: string | undefined, text: string) => void;
+      }
+    ).handler(String(testChatId), undefined, "cron said hello");
+    continueAfterEcho.resolve();
+    await flushAsyncWork();
+    t.mock.timers.tick(DRAFT_REFRESH_INTERVAL_MS * 2);
+    await flushAsyncWork();
+    assert.deepStrictEqual(
+      apiCalls.filter(({ method }) => method === "sendMessageDraft").map(({ payload }) => payload.text),
+      ["obsolete preview"],
+      "echo suspension survives response reset, later deltas, and the refresh interval",
+    );
+
+    finish.resolve();
+    await flushAsyncWork();
+    assert.deepStrictEqual(
+      apiCalls.filter(({ method }) => method === "sendMessage").map(({ payload }) => payload.text),
+      ["permanent final"],
+      "the relay still emits exactly one permanent final",
+    );
+    messageQueue.clearAll();
+  });
+
   it("drops idle echo context without enqueueing or opening a session", () => {
     const mockSM = createMockSessionManager();
     const { messageQueue, echoWatcher } = createTelegramBot(handlerConfig, mockSM);
@@ -2601,13 +2700,16 @@ describe("telegram echo routing", () => {
   });
 
   it("steers valid echo context into an active eligible turn", () => {
+    const events: string[] = [];
     const calls: Array<{ chatId: string; agentId: string; text: string }> = [];
     const delivered = routeTelegramEchoToActiveTurn({
       chatId: "111111111",
       text: "cron said hello",
       bindings: testBindings,
       sessionDefaults: { requireMention: true } as BotConfig["sessionDefaults"],
+      onBeforeSteer: (key) => { events.push(`suspend:${key}`); },
       steerFn: (chatId, agentId, text) => {
+        events.push(`steer:${chatId}`);
         calls.push({ chatId, agentId, text });
         return true;
       },
@@ -2619,14 +2721,17 @@ describe("telegram echo routing", () => {
       agentId: "main",
       text: "[Bot echo - context only, no reply needed]\n\ncron said hello",
     }]);
+    assert.deepStrictEqual(events, ["suspend:111111111", "steer:111111111"]);
   });
 
-  it("rejects malformed echo chat and thread ids before steering", () => {
+  it("rejects malformed and unbound echo ids before suspension or steering", () => {
+    let suspensionCalls = 0;
     let steerCalls = 0;
     const base = {
       text: "cron said hello",
       bindings: testBindings,
       sessionDefaults: { requireMention: false } as BotConfig["sessionDefaults"],
+      onBeforeSteer: () => { suspensionCalls++; },
       steerFn: () => {
         steerCalls++;
         return true;
@@ -2635,16 +2740,20 @@ describe("telegram echo routing", () => {
 
     assert.strictEqual(routeTelegramEchoToActiveTurn({ ...base, chatId: "111111111abc" }), false);
     assert.strictEqual(routeTelegramEchoToActiveTurn({ ...base, chatId: "111111111", threadId: "42abc" }), false);
+    assert.strictEqual(routeTelegramEchoToActiveTurn({ ...base, chatId: "999999999" }), false);
+    assert.strictEqual(suspensionCalls, 0);
     assert.strictEqual(steerCalls, 0);
   });
 
-  it("does not route group echoes when mention is required", () => {
+  it("does not suspend or route group echoes when mention is required", () => {
+    let suspensionCalls = 0;
     let steerCalls = 0;
     const delivered = routeTelegramEchoToActiveTurn({
       chatId: "-1009999999999",
       text: "cron said hello",
       bindings: testBindings,
       sessionDefaults: { requireMention: true } as BotConfig["sessionDefaults"],
+      onBeforeSteer: () => { suspensionCalls++; },
       steerFn: () => {
         steerCalls++;
         return true;
@@ -2652,6 +2761,7 @@ describe("telegram echo routing", () => {
     });
 
     assert.strictEqual(delivered, false);
+    assert.strictEqual(suspensionCalls, 0);
     assert.strictEqual(steerCalls, 0);
   });
 
@@ -2704,6 +2814,7 @@ describe("telegram echo routing", () => {
   });
 
   it("returns false when no active eligible turn accepts the echo", () => {
+    const events: string[] = [];
     const calls: Array<{ chatId: string; agentId: string; text: string }> = [];
 
     const delivered = routeTelegramEchoToActiveTurn({
@@ -2711,7 +2822,9 @@ describe("telegram echo routing", () => {
       text: "cron said hello",
       bindings: testBindings,
       sessionDefaults: { requireMention: false } as BotConfig["sessionDefaults"],
+      onBeforeSteer: (key) => { events.push(`suspend:${key}`); },
       steerFn: (chatId, agentId, text) => {
+        events.push(`steer:${chatId}`);
         calls.push({ chatId, agentId, text });
         return false;
       },
@@ -2721,6 +2834,7 @@ describe("telegram echo routing", () => {
     assert.strictEqual(calls.length, 1);
     assert.strictEqual(calls[0].chatId, "111111111");
     assert.strictEqual(calls[0].agentId, "main");
+    assert.deepStrictEqual(events, ["suspend:111111111", "steer:111111111"]);
   });
 });
 

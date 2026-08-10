@@ -34,10 +34,10 @@ npm run build
 **Goal:** Route a valid package-owned delivery echo through the existing coordinator immediately before its passive Pi steer attempt, including when the steer is rejected because the active turn has already settled, without suspending malformed, unauthorized, mention-gated, or other-topic routes.
 **Serves:** The operator requires same-session package echoes to suspend the active relay before steering, including the post-settlement/pre-final window, while preserving cross-topic isolation and current passive-echo ownership.
 
-- [ ] Add the minimum callback/hook needed for `routeTelegramEchoToActiveTurn` to expose the already-resolved session key immediately before `steerFn`, and wire it to `draftCoordinator.suspend` in `EchoWatcher`.
-- [ ] Add focused route/integration regressions proving callback-before-steer ordering, suspension even when `steerFn` returns false, and no suspension for malformed, blocked, or another-topic echoes.
-- [ ] Add or extend an active-relay regression proving later reset/deltas/refresh do not emit another native draft after the echo while one permanent final remains exactly once.
-- [ ] Run the focused Telegram and stream-relay tests and lint before Task 2.
+- [x] Add the minimum callback/hook needed for `routeTelegramEchoToActiveTurn` to expose the already-resolved session key immediately before `steerFn`, and wire it to `draftCoordinator.suspend` in `EchoWatcher`.
+- [x] Add focused route/integration regressions proving callback-before-steer ordering, suspension even when `steerFn` returns false, and no suspension for malformed, blocked, or another-topic echoes.
+- [x] Add or extend an active-relay regression proving later reset/deltas/refresh do not emit another native draft after the echo while one permanent final remains exactly once.
+- [x] Run the focused Telegram and stream-relay tests and lint before Task 2.
 
 ### Task 2: Suspend same-topic reaction relays before queue or steering
 **Goal:** Use the reaction handler's existing resolved session key to suspend the active relay before reaction context enters `MessageQueue`, while retaining message-to-topic cache routing and cross-topic isolation.
