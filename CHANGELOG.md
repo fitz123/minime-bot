@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 2026.8.6
+
+- Suspend active Telegram native drafts before package-owned delivery echoes or
+  same-topic reactions reach steering, preserving topic isolation and
+  exactly-once permanent final delivery (#181).
+
 ## 2026.8.5
 
 - Expose the serving bot instance identity, fail fast on duplicate or foreign
