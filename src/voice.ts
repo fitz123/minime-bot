@@ -10,7 +10,10 @@ const execFileAsync = promisify(execFileCb);
 
 export const FFMPEG_BIN = process.env.FFMPEG_BIN ?? "/opt/homebrew/bin/ffmpeg";
 export const WHISPER_BIN = process.env.WHISPER_BIN ?? "/opt/homebrew/bin/whisper-cli";
-export const WHISPER_MODEL = process.env.WHISPER_MODEL ?? join(homedir(), ".minime/models/ggml-medium.bin");
+export const DEFAULT_WHISPER_MODEL_PATH = join(
+  homedir(),
+  ".minime/models/ggml-large-v3-turbo.bin",
+);
 /** Optional path to a plain-text, one-term-per-line Whisper recognition glossary. */
 export const WHISPER_GLOSSARY_PATH_ENV = "WHISPER_GLOSSARY_PATH";
 export const WHISPER_GLOSSARY_PROMPT_MAX_BYTES = 220;
@@ -145,6 +148,7 @@ export interface DownloadFileOptions {
 
 export interface LocalAudioIngestionOptions {
   maxBytes: number;
+  modelPath: string;
   downloadTimeoutMs?: number;
   signal?: AbortSignal;
 }
@@ -360,13 +364,14 @@ export async function convertToWav(
  */
 export async function transcribeAudio(
   filePath: string,
+  modelPath: string,
   signal?: AbortSignal,
 ): Promise<string> {
   const wavPath = await convertToWav(filePath, signal);
   try {
     try {
       const whisperArgs = [
-        "-m", WHISPER_MODEL,
+        "-m", modelPath,
         "-f", wavPath,
         "--no-timestamps",
         "--no-prints",
@@ -420,7 +425,7 @@ export async function ingestLocalAudio(
         : { timeoutMs: options.downloadTimeoutMs }),
       signal: options.signal,
     });
-    return requireTranscript(await transcribeAudio(audioPath, options.signal));
+    return requireTranscript(await transcribeAudio(audioPath, options.modelPath, options.signal));
   } finally {
     await cleanupTempFile(audioPath);
   }

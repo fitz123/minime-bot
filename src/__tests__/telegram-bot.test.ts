@@ -1354,6 +1354,7 @@ describe("command handler wiring", () => {
 
   const handlerConfig: BotConfig = {
     telegramToken: "test:fake-token-for-handler-tests",
+    whisperModelPath: "/tmp/minime-test-whisper-model.bin",
     agents: {
       main: { id: "main", workspaceCwd: "/tmp/test", model: "gpt-5.5" },
     },

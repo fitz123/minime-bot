@@ -489,6 +489,7 @@ function makeConfig(overrides: Partial<BotConfig> = {}): BotConfig {
       maxMediaBytes: 209715200,
     },
     ...overrides,
+    whisperModelPath: overrides.whisperModelPath ?? "/tmp/minime-test-whisper-model.bin",
   };
 }
 

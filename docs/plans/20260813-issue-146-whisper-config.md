@@ -54,13 +54,13 @@ The fixture run will now print the voice-readiness warning (no model file in the
 
 **Serves:** operator inputs 1, 2, 7, 8.
 
-- [ ] in `src/voice.ts`, replace the `WHISPER_MODEL` env constant with exported `DEFAULT_WHISPER_MODEL_PATH` (`~/.minime/models/ggml-large-v3-turbo.bin`); remove all `process.env.WHISPER_MODEL` reads; change `transcribeAudio` and `LocalAudioIngestionOptions`/`ingestLocalAudio` to take a required `modelPath`
-- [ ] in `src/config.ts` + `src/types.ts`, validate optional top-level `whisperModel` (non-empty string, `~/` expansion, absolute path, no filesystem access) and resolve `BotConfig.whisperModelPath` with the package default when absent; extend the `RawConfig` shape
-- [ ] pass `config.whisperModelPath` at both call sites: `src/telegram-bot.ts` voice handler (`ingestLocalAudio` options) and `src/discord-bot.ts` audio-attachment handler (`transcribeAudio`)
-- [ ] write tests in `src/__tests__/config-defaults.test.ts`: absent setting resolves the large-v3-turbo default; `~/` expansion; rejection of empty/non-string/relative values; `process.env.WHISPER_MODEL` has no effect on the resolved path
-- [ ] write tests in `src/__tests__/config-merge.test.ts`: an instance overlay containing `whisperModel` is rejected with `Instance config override is not allowed at whisperModel`; a Primary-like canonical-only load and an ordinary canonical+overlay load resolve the identical `whisperModelPath`
-- [ ] update `src/__tests__/voice.test.ts` / `src/__tests__/voice-transcription.test.ts` for the new signatures and assert the whisper invocation receives `-m <modelPath>` exactly as passed
-- [ ] run focused tests and `npm run typecheck` — must pass before next task
+- [x] in `src/voice.ts`, replace the `WHISPER_MODEL` env constant with exported `DEFAULT_WHISPER_MODEL_PATH` (`~/.minime/models/ggml-large-v3-turbo.bin`); remove all `process.env.WHISPER_MODEL` reads; change `transcribeAudio` and `LocalAudioIngestionOptions`/`ingestLocalAudio` to take a required `modelPath`
+- [x] in `src/config.ts` + `src/types.ts`, validate optional top-level `whisperModel` (non-empty string, `~/` expansion, absolute path, no filesystem access) and resolve `BotConfig.whisperModelPath` with the package default when absent; extend the `RawConfig` shape
+- [x] pass `config.whisperModelPath` at both call sites: `src/telegram-bot.ts` voice handler (`ingestLocalAudio` options) and `src/discord-bot.ts` audio-attachment handler (`transcribeAudio`)
+- [x] write tests in `src/__tests__/config-defaults.test.ts`: absent setting resolves the large-v3-turbo default; `~/` expansion; rejection of empty/non-string/relative values; `process.env.WHISPER_MODEL` has no effect on the resolved path
+- [x] write tests in `src/__tests__/config-merge.test.ts`: an instance overlay containing `whisperModel` is rejected with `Instance config override is not allowed at whisperModel`; a Primary-like canonical-only load and an ordinary canonical+overlay load resolve the identical `whisperModelPath`
+- [x] update `src/__tests__/voice.test.ts` / `src/__tests__/voice-transcription.test.ts` for the new signatures and assert the whisper invocation receives `-m <modelPath>` exactly as passed
+- [x] run focused tests and `npm run typecheck` — must pass before next task
 
 ### Task 2: Degraded-only runtime failure with bounded child-process diagnostics
 

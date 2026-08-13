@@ -53,6 +53,7 @@ function cleanup() {
 
 const testConfig: BotConfig = {
   telegramToken: "test-token",
+  whisperModelPath: "/tmp/minime-test-whisper-model.bin",
   agents: {
     main: {
       id: "main",

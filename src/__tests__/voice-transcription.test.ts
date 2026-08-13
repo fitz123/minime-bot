@@ -67,21 +67,22 @@ const {
   FFMPEG_BIN,
   MediaPipelineError,
   WHISPER_BIN,
-  WHISPER_MODEL,
   ingestLocalAudio,
   requireTranscript,
   transcribeAudio,
 } = await import("../voice.js");
 
+const TEST_MODEL_PATH = "/tmp/minime-test-whisper-model.bin";
+
 function whisperCalls(): typeof execFileCalls {
   return execFileCalls.filter(({ args }) => args.includes("--no-timestamps"));
 }
 
-function historicalWhisperArgs(actualArgs: string[]): string[] {
+function historicalWhisperArgs(actualArgs: string[], modelPath = TEST_MODEL_PATH): string[] {
   const wavPath = actualArgs[actualArgs.indexOf("-f") + 1];
   assert.ok(wavPath);
   return [
-    "-m", WHISPER_MODEL,
+    "-m", modelPath,
     "-f", wavPath,
     "--no-timestamps",
     "--no-prints",
@@ -110,7 +111,7 @@ after(() => {
 });
 
 describe("transcribeAudio ASR postprocessing", () => {
-  it("preserves the exact historical argv when the glossary is absent or unusable", async () => {
+  it("passes the configured model path in the exact Whisper argv", async () => {
     const cases: Array<{ path?: string; contents?: string }> = [
       {},
       { path: "/tmp/minime-test-missing-voice-glossary.txt" },
@@ -128,7 +129,7 @@ describe("transcribeAudio ASR postprocessing", () => {
         delete process.env.WHISPER_GLOSSARY_PATH;
       }
 
-      await transcribeAudio("ignored-input.oga");
+      await transcribeAudio("ignored-input.oga", TEST_MODEL_PATH);
       const [whisper] = whisperCalls();
       assert.ok(whisper);
       assert.deepStrictEqual(whisper.args, historicalWhisperArgs(whisper.args));
@@ -143,7 +144,7 @@ describe("transcribeAudio ASR postprocessing", () => {
       "Beta",
     ].join("\n"));
 
-    await transcribeAudio("ignored-input.oga");
+    await transcribeAudio("ignored-input.oga", TEST_MODEL_PATH);
 
     const [whisper] = whisperCalls();
     assert.ok(whisper);
@@ -158,9 +159,9 @@ describe("transcribeAudio ASR postprocessing", () => {
     const glossaryPath = createGlossary("First Term\n");
     process.env.WHISPER_GLOSSARY_PATH = glossaryPath;
 
-    await transcribeAudio("first-input.oga");
+    await transcribeAudio("first-input.oga", TEST_MODEL_PATH);
     writeFileSync(glossaryPath, "Second Term\nThird Term\n", { mode: 0o600 });
-    await transcribeAudio("second-input.oga");
+    await transcribeAudio("second-input.oga", TEST_MODEL_PATH);
 
     assert.deepStrictEqual(
       whisperCalls().map(({ args }) => args.slice(-2)),
@@ -177,7 +178,7 @@ describe("transcribeAudio ASR postprocessing", () => {
     process.env.WHISPER_GLOSSARY_PATH = glossaryPath;
 
     await assert.rejects(
-      transcribeAudio("ignored-input.oga"),
+      transcribeAudio("ignored-input.oga", TEST_MODEL_PATH),
       (error: Error) => {
         assert.ok(error instanceof MediaPipelineError);
         assert.strictEqual(error.stage, "transcription");
@@ -197,11 +198,11 @@ describe("transcribeAudio ASR postprocessing", () => {
 
     for (const [stdout, expected] of cases) {
       whisperStdout = stdout;
-      assert.strictEqual(await transcribeAudio("ignored-input.oga"), expected);
+      assert.strictEqual(await transcribeAudio("ignored-input.oga", TEST_MODEL_PATH), expected);
     }
 
     whisperStdout = "Продолжение следует…\n";
-    const artifactOnlyTranscript = await transcribeAudio("ignored-input.oga");
+    const artifactOnlyTranscript = await transcribeAudio("ignored-input.oga", TEST_MODEL_PATH);
     assert.strictEqual(artifactOnlyTranscript, "");
     assert.throws(
       () => requireTranscript(artifactOnlyTranscript),
@@ -222,6 +223,7 @@ describe("transcribeAudio ASR postprocessing", () => {
       "https://api.telegram.org/file/botTEST_TOKEN/voice/file.oga",
       {
         maxBytes: 4,
+        modelPath: TEST_MODEL_PATH,
         downloadTimeoutMs: 1_234,
         signal: controller.signal,
       },
@@ -260,7 +262,7 @@ describe("transcribeAudio ASR postprocessing", () => {
       await assert.rejects(
         ingestLocalAudio(
           `https://api.telegram.org/file/botTEST_TOKEN/voice/${failure}.oga`,
-          { maxBytes: 4 },
+          { maxBytes: 4, modelPath: TEST_MODEL_PATH },
         ),
         (error: unknown) =>
           error instanceof MediaPipelineError

@@ -121,6 +121,7 @@ const { SessionManager } = await import("../session-manager.js");
 function makeConfig(model: string): BotConfig {
   return {
     telegramToken: "test-token",
+    whisperModelPath: "/tmp/minime-test-whisper-model.bin",
     agents: {
       main: {
         id: "main",

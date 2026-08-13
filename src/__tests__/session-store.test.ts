@@ -41,6 +41,7 @@ function cleanup() {
 
 function makeConfig(workspaceCwd = WORKSPACE): BotConfig {
   return {
+    whisperModelPath: "/tmp/minime-test-whisper-model.bin",
     agents: {
       main: { id: "main", workspaceCwd, model: "gpt-5.5" },
     },

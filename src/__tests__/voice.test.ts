@@ -16,7 +16,7 @@ import {
   buildWhisperGlossaryPrompt,
   FFMPEG_BIN,
   WHISPER_BIN,
-  WHISPER_MODEL,
+  DEFAULT_WHISPER_MODEL_PATH,
   WHISPER_GLOSSARY_PATH_ENV,
   WHISPER_GLOSSARY_PROMPT_MAX_BYTES,
   WHISPER_GLOSSARY_PROMPT_SEPARATOR,
@@ -631,13 +631,18 @@ describe("convertToWav", () => {
 describe("transcribeAudio", () => {
   it("exports correct whisper-cli paths", () => {
     assert.strictEqual(WHISPER_BIN, "/opt/homebrew/bin/whisper-cli");
-    const expectedModel = process.env.WHISPER_MODEL ?? join(homedir(), ".minime/models/ggml-medium.bin");
-    assert.strictEqual(WHISPER_MODEL, expectedModel);
+    assert.strictEqual(
+      DEFAULT_WHISPER_MODEL_PATH,
+      join(homedir(), ".minime/models/ggml-large-v3-turbo.bin"),
+    );
   });
 
   it("rejects when given a nonexistent audio file", async () => {
     await assert.rejects(
-      () => transcribeAudio("/tmp/minime-nonexistent-audio-99999.oga"),
+      () => transcribeAudio(
+        "/tmp/minime-nonexistent-audio-99999.oga",
+        DEFAULT_WHISPER_MODEL_PATH,
+      ),
       (err: Error) => {
         assert.ok(err instanceof Error);
         return true;

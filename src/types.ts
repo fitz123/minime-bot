@@ -162,6 +162,7 @@ export interface BotConfig {
   agents: Record<string, AgentConfig>;
   bindings: TelegramBinding[];
   sessionDefaults: SessionDefaults;
+  whisperModelPath: string;
   piExtraExtensions?: string[];
   logLevel?: LogLevel;
   metricsPort?: number;

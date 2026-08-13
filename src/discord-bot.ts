@@ -413,7 +413,9 @@ export async function createDiscordBot(
             tempPath = tempFilePath("discord-voice", ext);
             await downloadFile(attachment.url, tempPath, { maxBytes: config.sessionDefaults.maxMediaBytes });
 
-            const transcript = requireTranscript(await transcribeAudio(tempPath));
+            const transcript = requireTranscript(
+              await transcribeAudio(tempPath, config.whisperModelPath),
+            );
 
             messageQueue.enqueue(
               key,

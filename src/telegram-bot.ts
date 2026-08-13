@@ -923,6 +923,7 @@ export function createTelegramBot(
       const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
       const transcript = await ingestLocalAudio(url, {
         maxBytes: config.sessionDefaults.maxMediaBytes,
+        modelPath: config.whisperModelPath,
       });
 
       // Update index with actual transcript content
