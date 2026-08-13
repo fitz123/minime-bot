@@ -9,7 +9,7 @@ import { DEFAULT_MAX_MEDIA_BYTES } from "./media-store.js";
 import { resolveSecret, sopsExtractExpression, type ExecFileSyncLike } from "./secrets.js";
 import { resolveAgentWorkspaceCwd, resolveWorkspaceContract } from "./workspace-contract.js";
 import { resolveBinding } from "./telegram-binding.js";
-import { DEFAULT_WHISPER_MODEL_PATH } from "./voice.js";
+import { DEFAULT_WHISPER_MODEL_PATH } from "./voice-config.js";
 
 const PI_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 const CONFIGURED_SECRET_PLACEHOLDER = "[configured]";

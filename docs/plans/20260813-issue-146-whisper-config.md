@@ -85,11 +85,11 @@ The fixture run will now print the voice-readiness warning (no model file in the
 
 **Serves:** operator input 9 (and closes out 1–8 with docs and full-suite proof).
 
-- [ ] document `whisperModel` in `README.md` near the voice-transcription/glossary section: canonical-config ownership, `large-v3-turbo` default when absent, no instance override, no env selection, degraded-only failure semantics, and the non-fatal validation warning
-- [ ] add a `CHANGELOG.md` Unreleased entry referencing #146
-- [ ] cut pass over the full diff: remove any abstraction beyond the single setting, helper, and warning (no readiness framework, registry, download, or recovery machinery); verify every change traces to a task above
-- [ ] scan the diff for private data: no private identities, chat IDs, tokens, hostnames, private paths, or production values in code, tests, fixtures, or docs
-- [ ] run the complete public validation set: `npm ci`, `npm test`, `npm run build`, `npm pack --dry-run`, `npm run check:schema-guard-contract`, `node dist/cli.js --help`, `npm run workspace:validate -- --workspace test-fixtures/minimal-workspace` — all must pass
+- [x] document `whisperModel` in `README.md` near the voice-transcription/glossary section: canonical-config ownership, `large-v3-turbo` default when absent, no instance override, no env selection, degraded-only failure semantics, and the non-fatal validation warning
+- [x] add a `CHANGELOG.md` Unreleased entry referencing #146
+- [x] cut pass over the full diff: remove any abstraction beyond the single setting, helper, and warning (no readiness framework, registry, download, or recovery machinery); verify every change traces to a task above
+- [x] scan the diff for private data: no private identities, chat IDs, tokens, hostnames, private paths, or production values in code, tests, fixtures, or docs
+- [x] run the complete public validation set: `npm ci`, `npm test`, `npm run build`, `npm pack --dry-run`, `npm run check:schema-guard-contract`, `node dist/cli.js --help`, `npm run workspace:validate -- --workspace test-fixtures/minimal-workspace` — all must pass
 
 ## Post-Completion
 

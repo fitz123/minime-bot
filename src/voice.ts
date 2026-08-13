@@ -1,19 +1,15 @@
-import { tmpdir, homedir } from "node:os";
-import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { open, readFile, writeFile, unlink, chmod } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { execFile as execFileCb } from "node:child_process";
 import { promisify } from "node:util";
 import { recordMediaDownloadRetry } from "./metrics.js";
+export { DEFAULT_WHISPER_MODEL_PATH } from "./voice-config.js";
 
 const execFileAsync = promisify(execFileCb);
 
 export const FFMPEG_BIN = process.env.FFMPEG_BIN ?? "/opt/homebrew/bin/ffmpeg";
 export const WHISPER_BIN = process.env.WHISPER_BIN ?? "/opt/homebrew/bin/whisper-cli";
-export const DEFAULT_WHISPER_MODEL_PATH = join(
-  homedir(),
-  ".minime/models/ggml-large-v3-turbo.bin",
-);
 /** Optional path to a plain-text, one-term-per-line Whisper recognition glossary. */
 export const WHISPER_GLOSSARY_PATH_ENV = "WHISPER_GLOSSARY_PATH";
 export const WHISPER_GLOSSARY_PROMPT_MAX_BYTES = 220;
