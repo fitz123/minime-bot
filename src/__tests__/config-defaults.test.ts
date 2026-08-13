@@ -4,7 +4,11 @@ import { writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { validateSessionDefaults, validateAgent, loadConfig, validatePiExtraExtensions } from "../config.js";
 import { DEFAULT_MAX_MEDIA_BYTES } from "../media-store.js";
-import { MINIME_CONFIG_PATH_ENV, MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
+import {
+  MINIME_CONFIG_PATH_ENV,
+  MINIME_CONTROL_WORKSPACE_ROOT_ENV,
+  MINIME_INSTANCE_CONFIG_PATH_ENV,
+} from "../workspace-contract.js";
 
 const TEST_DIR = join("/tmp", "config-defaults-test-" + Date.now());
 
@@ -539,6 +543,99 @@ bindings:
     );
 
     assert.strictEqual(config.agents.main.workspaceCwd, join(workspaceRoot, "agent-workspace"));
+  });
+
+  it("loads one absolute canonical workspace through two identity-only deployment overlays", () => {
+    const canonicalRoot = join(TEST_DIR, "canonical");
+    const agentWorkspace = join(canonicalRoot, "agent-workspace");
+    const firstRoot = join(TEST_DIR, "deployment-first");
+    const secondRoot = join(TEST_DIR, "deployment-second");
+    mkdirSync(agentWorkspace, { recursive: true });
+    mkdirSync(firstRoot, { recursive: true });
+    mkdirSync(secondRoot, { recursive: true });
+    const configPath = join(canonicalRoot, "config.yaml");
+    writeFileSync(configPath, `
+agents:
+  main:
+    workspaceCwd: ${agentWorkspace}
+    model: gpt-5.5
+bindings:
+  - chatId: 111
+    agentId: main
+    kind: dm
+    label: reserve
+    requireMention: true
+    voiceTranscriptEcho: true
+    typingIndicator: false
+`);
+    const firstOverlay = join(firstRoot, "instance.yaml");
+    const secondOverlay = join(secondRoot, "instance.yaml");
+    writeFileSync(firstOverlay, `
+telegramTokenEnv: FIRST_TELEGRAM_TOKEN
+bindingIdentityOverrides:
+  reserve:
+    chatId: 222
+metricsPort: 9101
+`);
+    writeFileSync(secondOverlay, `
+telegramTokenEnv: SECOND_TELEGRAM_TOKEN
+bindingIdentityOverrides:
+  reserve:
+    chatId: 333
+metricsPort: 9102
+`);
+
+    const first = loadConfig(configPath, {
+      resolveSecrets: false,
+      workspaceRoot: firstRoot,
+      instanceConfigPath: firstOverlay,
+    });
+    const second = loadConfig(configPath, {
+      resolveSecrets: false,
+      workspaceRoot: secondRoot,
+      instanceConfigPath: secondOverlay,
+    });
+
+    assert.strictEqual(first.agents.main.workspaceCwd, agentWorkspace);
+    assert.strictEqual(second.agents.main.workspaceCwd, agentWorkspace);
+    assert.strictEqual(first.bindings[0].chatId, 222);
+    assert.strictEqual(second.bindings[0].chatId, 333);
+    assert.deepStrictEqual(
+      { ...first.bindings[0], chatId: 0 },
+      { ...second.bindings[0], chatId: 0 },
+    );
+    assert.strictEqual(first.metricsPort, 9101);
+    assert.strictEqual(second.metricsPort, 9102);
+  });
+
+  it("discovers MINIME_INSTANCE_CONFIG_PATH relative to the control root", () => {
+    const workspaceRoot = join(TEST_DIR, "workspace-instance-env");
+    mkdirSync(workspaceRoot, { recursive: true });
+    writeFileSync(join(workspaceRoot, "config.yaml"), `
+agents:
+  main:
+    workspaceCwd: /tmp/canonical-agent
+    model: gpt-5.5
+bindings:
+  - { chatId: 111, agentId: main, kind: dm, label: reserve }
+`);
+    writeFileSync(join(workspaceRoot, "instance.yaml"), `
+telegramTokenEnv: INSTANCE_TELEGRAM_TOKEN
+bindingIdentityOverrides:
+  reserve:
+    chatId: 222
+`);
+
+    const config = withEnv(
+      {
+        [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: workspaceRoot,
+        [MINIME_CONFIG_PATH_ENV]: undefined,
+        [MINIME_INSTANCE_CONFIG_PATH_ENV]: "instance.yaml",
+      },
+      () => loadConfig(undefined, { resolveSecrets: false }),
+    );
+
+    assert.strictEqual(config.bindings[0].chatId, 222);
   });
 });
 

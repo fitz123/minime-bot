@@ -25,7 +25,13 @@ import {
 import { generateKnowledgeV2Schema } from "../knowledge/layout.js";
 import { KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES } from "../knowledge/maintenance.js";
 import { generateKnowledgeIndex } from "../knowledge/update.js";
-import { MINIME_AGENT_WORKSPACE_ROOT_ENV, MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
+import {
+  ECHO_DIR_BASE_ENV,
+  MINIME_AGENT_WORKSPACE_ROOT_ENV,
+  MINIME_CONTROL_WORKSPACE_ROOT_ENV,
+  MINIME_INSTANCE_CONFIG_PATH_ENV,
+  MINIME_MEDIA_ROOT_ENV,
+} from "../workspace-contract.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOT_ROOT = resolve(__dirname, "..", "..");
@@ -1229,15 +1235,54 @@ describe("minime-bot CLI", () => {
       assert.match(result.stdout, new RegExp(`control workspace root: ${escapeRegExp(workspace)} \\(cli\\)`));
       assert.match(result.stdout, /package root:/);
       assert.match(result.stdout, /config path:/);
+      assert.match(result.stdout, /instance config path: not configured/);
       assert.match(result.stdout, /crons path:/);
       assert.match(result.stdout, /Pi extension dir:/);
       assert.match(result.stdout, /data dir:/);
       assert.match(result.stdout, /session store path:/);
       assert.match(result.stdout, /log dir:/);
       assert.match(result.stdout, /media base dir:/);
+      assert.match(result.stdout, /echo dir:/);
       assert.match(result.stdout, /runtime dir:/);
       assert.match(result.stdout, new RegExp(`Agent workspaces:\\n  main: ${escapeRegExp(join(workspace, "agent-workspace"))}`));
       assert.match(result.stdout, /Crons: 1/);
+      assert.equal(result.stderr, "");
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("prints configured instance, media, and echo paths", () => {
+    const workspace = createWorkspace();
+    const agentWorkspace = join(workspace, "agent-workspace");
+    const instancePath = join(workspace, "instance.yaml");
+    const mediaRoot = join(workspace, "runtime-media");
+    const echoRoot = join(workspace, "runtime-echo");
+    writeFileSync(join(workspace, "config.yaml"), `
+agents:
+  main:
+    workspaceCwd: ${agentWorkspace}
+    model: gpt-5.5
+telegramTokenEnv: TEST_TELEGRAM_TOKEN
+bindings:
+  - { chatId: 111, agentId: main, kind: dm, label: reserve }
+`);
+    writeFileSync(instancePath, "metricsPort: 9101\n");
+    try {
+      const result = runWithCapture(
+        ["workspace", "validate", "--workspace", workspace],
+        workspace,
+        {
+          [MINIME_INSTANCE_CONFIG_PATH_ENV]: "instance.yaml",
+          [MINIME_MEDIA_ROOT_ENV]: mediaRoot,
+          [ECHO_DIR_BASE_ENV]: echoRoot,
+        },
+      );
+
+      assert.equal(result.code, 0);
+      assert.match(result.stdout, new RegExp(`instance config path: ${escapeRegExp(instancePath)} \\(env\\)`));
+      assert.match(result.stdout, new RegExp(`media base dir: ${escapeRegExp(mediaRoot)} \\(env\\)`));
+      assert.match(result.stdout, new RegExp(`echo dir: ${escapeRegExp(echoRoot)} \\(env\\)`));
       assert.equal(result.stderr, "");
     } finally {
       rmSync(workspace, { recursive: true, force: true });

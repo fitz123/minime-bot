@@ -757,6 +757,9 @@ function formatEffectivePaths(contract: ResolvedWorkspaceContract): string[] {
   return [
     `  control workspace root: ${diagnostics.controlWorkspaceRoot.path} (${diagnostics.controlWorkspaceRoot.source})`,
     `  config path: ${diagnostics.configPath.path} (${diagnostics.configPath.source})`,
+    diagnostics.instanceConfigPath
+      ? `  instance config path: ${diagnostics.instanceConfigPath.path} (${diagnostics.instanceConfigPath.source})`
+      : "  instance config path: not configured",
     `  crons path: ${diagnostics.cronsPath.path} (${diagnostics.cronsPath.source})`,
     `  package root: ${diagnostics.packageRoot.path} (${diagnostics.packageRoot.source})`,
     `  Pi extension dir: ${diagnostics.piExtensionDir.path} (${diagnostics.piExtensionDir.source})`,
@@ -764,6 +767,7 @@ function formatEffectivePaths(contract: ResolvedWorkspaceContract): string[] {
     `  session store path: ${diagnostics.sessionStorePath.path} (${diagnostics.sessionStorePath.source})`,
     `  log dir: ${diagnostics.logDir.path} (${diagnostics.logDir.source})`,
     `  media base dir: ${diagnostics.mediaBaseDir.path} (${diagnostics.mediaBaseDir.source})`,
+    `  echo dir: ${diagnostics.echoDir.path} (${diagnostics.echoDir.source})`,
     `  runtime dir: ${diagnostics.runtimeDir.path} (${diagnostics.runtimeDir.source})`,
   ];
 }
@@ -772,6 +776,7 @@ function runConfigValidate(contract: ResolvedWorkspaceContract, stdout: WriteFn)
   const config = loadConfig(contract.paths.configPath, {
     resolveSecrets: false,
     workspaceRoot: contract.paths.workspaceRoot,
+    instanceConfigPath: contract.paths.instanceConfigPath,
   });
   writeLine(stdout, "Config valid.");
   writeLine(stdout, `Config path: ${contract.paths.configPath}`);

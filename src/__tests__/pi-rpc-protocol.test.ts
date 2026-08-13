@@ -91,6 +91,7 @@ import {
   MINIME_CONFIG_PATH_ENV,
   MINIME_CRONS_PATH_ENV,
   MINIME_CONTROL_WORKSPACE_ROOT_ENV,
+  MINIME_INSTANCE_CONFIG_PATH_ENV,
 } from "../workspace-contract.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -120,6 +121,23 @@ const RETIRED_SCHEMA_PATH_ENV = ["MINIME", "SCHEMA", "PATH"].join("_");
 const RETIRED_GUARD_ROOT_ENV = ["PI", "GUARD", "WORKSPACE", "ROOT"].join("_");
 const RETIRED_CONTROL_WORKSPACE_ENV = ["MINIME", "WORKSPACE", "ROOT"].join("_");
 const RETIRED_AGENT_WORKSPACE_ENV = ["MINIME", "AGENT", "WORKSPACE", "CWD"].join("_");
+
+function withPiEnvironment<T>(updates: Record<string, string | undefined>, fn: () => T): T {
+  const previous = new Map<string, string | undefined>();
+  for (const key of Object.keys(updates)) previous.set(key, process.env[key]);
+  try {
+    for (const [key, value] of Object.entries(updates)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    return fn();
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
 
 describe("NewlineOnlyJsonlSplitter", () => {
   it("does not split on U+2028 or U+2029 inside JSON strings", () => {
@@ -666,6 +684,35 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
       bundle.includes(`\`${MINIME_OUTBOX_ENV}\``),
       "the static directive names the same package-owned key used by the spawn environment",
     );
+  });
+
+  it("keeps canonical context and Pi cwd shared while overlay artifacts use distinct control roots", () => {
+    const canonicalWorkspace = fullPiWorkspace();
+    const firstControlRoot = mkdtempSync(join(tmpdir(), "pi-overlay-first-"));
+    const secondControlRoot = mkdtempSync(join(tmpdir(), "pi-overlay-second-"));
+    fixtures.push(firstControlRoot, secondControlRoot);
+
+    const artifactPaths = [firstControlRoot, secondControlRoot].map((controlRoot) =>
+      withPiEnvironment(
+        {
+          [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: controlRoot,
+          [MINIME_INSTANCE_CONFIG_PATH_ENV]: join(controlRoot, "instance.yaml"),
+        },
+        () => {
+          _resetPiContextCache();
+          const agent = piAgent(canonicalWorkspace);
+          assert.strictEqual(resolveValidatedPiAgentWorkspaceCwd(agent), canonicalWorkspace);
+          const args = buildPiSpawnArgs(agent, undefined, NO_EXTENSIONS);
+          return args[args.indexOf("--append-system-prompt") + 1];
+        },
+      ));
+
+    assert.ok(artifactPaths[0].startsWith(join(firstControlRoot, ".tmp") + "/"));
+    assert.ok(artifactPaths[1].startsWith(join(secondControlRoot, ".tmp") + "/"));
+    assert.notStrictEqual(artifactPaths[0], artifactPaths[1]);
+    assert.match(readFileSync(artifactPaths[0], "utf8"), /BODY_TOKEN/);
+    assert.match(readFileSync(artifactPaths[1], "utf8"), /BODY_TOKEN/);
+    assert.strictEqual(existsSync(join(canonicalWorkspace, ".tmp")), false);
   });
 
   it("omits --system-prompt when the agent has no persona (rides Pi base), keeping the bundle + flag", () => {

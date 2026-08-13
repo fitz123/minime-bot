@@ -105,17 +105,165 @@ export function mergeDeep(
   return result;
 }
 
-// Load config.yaml and merge config.local.yaml on top if it exists.
+// Load config.yaml, merge config.local.yaml, then apply the allowlisted instance overlay.
 // Exported for use by cron-runner.ts and tests.
-export function loadRawMergedConfig(configPath?: string): Record<string, unknown> {
+function isConfigRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function firstInstanceLeafPath(value: unknown, path: string): string {
+  if (!isConfigRecord(value)) return path;
+  const keys = Object.keys(value);
+  if (keys.length === 0) return path;
+  const key = keys[0];
+  return firstInstanceLeafPath(value[key], `${path}.${key}`);
+}
+
+function rejectInstancePath(path: string): never {
+  throw new Error(`Instance config override is not allowed at ${path}`);
+}
+
+const INSTANCE_SCALAR_PATHS = new Set([
+  "telegramTokenSopsKey",
+  "telegramTokenEnv",
+  "metricsPort",
+  "metricsHost",
+  "adminChatId",
+  "defaultDeliveryChatId",
+  "defaultDeliveryThreadId",
+]);
+
+function validateInstanceOverlay(raw: unknown): Record<string, unknown> {
+  if (!isConfigRecord(raw)) {
+    throw new Error("Instance config must be an object");
+  }
+
+  for (const [key, value] of Object.entries(raw)) {
+    if (INSTANCE_SCALAR_PATHS.has(key)) {
+      if (isConfigRecord(value) || Array.isArray(value)) {
+        rejectInstancePath(firstInstanceLeafPath(value, key));
+      }
+      continue;
+    }
+    if (key === "triggerInput") {
+      continue;
+    }
+    if (key === "secrets") {
+      if (!isConfigRecord(value)) rejectInstancePath("secrets");
+      for (const nestedKey of Object.keys(value)) {
+        if (nestedKey !== "sopsFile") {
+          rejectInstancePath(firstInstanceLeafPath(value[nestedKey], `secrets.${nestedKey}`));
+        }
+      }
+      continue;
+    }
+    if (key === "bindingIdentityOverrides") {
+      if (!isConfigRecord(value)) rejectInstancePath("bindingIdentityOverrides");
+      for (const [label, patch] of Object.entries(value)) {
+        const patchPath = `bindingIdentityOverrides.${label}`;
+        if (!isConfigRecord(patch)) rejectInstancePath(patchPath);
+        for (const [patchKey, patchValue] of Object.entries(patch)) {
+          if (patchKey !== "chatId" && patchKey !== "topicId") {
+            rejectInstancePath(firstInstanceLeafPath(patchValue, `${patchPath}.${patchKey}`));
+          }
+        }
+      }
+      continue;
+    }
+    rejectInstancePath(firstInstanceLeafPath(value, key));
+  }
+
+  return raw;
+}
+
+function requireAbsoluteCanonicalAgentWorkspaces(config: Record<string, unknown>): void {
+  if (!isConfigRecord(config.agents)) return;
+  for (const [agentId, rawAgent] of Object.entries(config.agents)) {
+    if (!isConfigRecord(rawAgent) || typeof rawAgent.workspaceCwd !== "string") continue;
+    if (!isAbsolute(rawAgent.workspaceCwd)) {
+      throw new Error(
+        `Instance config requires canonical agents.${agentId}.workspaceCwd to be absolute`,
+      );
+    }
+  }
+}
+
+function applyBindingIdentityOverrides(
+  canonical: Record<string, unknown>,
+  rawOverrides: unknown,
+): Record<string, unknown> {
+  if (rawOverrides === undefined) return canonical;
+  if (!isConfigRecord(rawOverrides)) rejectInstancePath("bindingIdentityOverrides");
+  if (!Array.isArray(canonical.bindings)) {
+    throw new Error("Instance config bindingIdentityOverrides require canonical bindings");
+  }
+
+  const bindings = canonical.bindings.map((binding) =>
+    isConfigRecord(binding) ? { ...binding } : binding,
+  );
+  for (const [label, rawPatch] of Object.entries(rawOverrides)) {
+    const patchPath = `bindingIdentityOverrides.${label}`;
+    if (!isConfigRecord(rawPatch)) rejectInstancePath(patchPath);
+    const matches = bindings
+      .map((binding, index) => ({ binding, index }))
+      .filter(({ binding }) => isConfigRecord(binding) && binding.label === label);
+    if (matches.length === 0) {
+      throw new Error(`${patchPath} does not match a canonical binding label`);
+    }
+    if (matches.length > 1) {
+      throw new Error(`${patchPath} matches a duplicate canonical binding label`);
+    }
+
+    const patch: Record<string, unknown> = {};
+    for (const key of ["chatId", "topicId"] as const) {
+      if (!Object.hasOwn(rawPatch, key)) continue;
+      if (typeof rawPatch[key] !== "number") {
+        throw new Error(`${patchPath}.${key} must be a number`);
+      }
+      patch[key] = rawPatch[key];
+    }
+    bindings[matches[0].index] = {
+      ...(matches[0].binding as Record<string, unknown>),
+      ...patch,
+    };
+  }
+  return { ...canonical, bindings };
+}
+
+function mergeInstanceConfig(
+  canonical: Record<string, unknown>,
+  instance: Record<string, unknown>,
+): Record<string, unknown> {
+  requireAbsoluteCanonicalAgentWorkspaces(canonical);
+  const withBindingIdentity = applyBindingIdentityOverrides(
+    canonical,
+    instance.bindingIdentityOverrides,
+  );
+  const genericOverlay = { ...instance };
+  delete genericOverlay.bindingIdentityOverrides;
+  return mergeDeep(withBindingIdentity, genericOverlay);
+}
+
+export function loadRawMergedConfig(
+  configPath?: string,
+  instanceConfigPath?: string,
+): Record<string, unknown> {
   const path = resolveConfigPath(configPath);
   const base = (parseYaml(readFileSync(path, "utf8")) as Record<string, unknown>) ?? {};
   const localPath = deriveLocalConfigPath(path);
+  let canonical = base;
   if (existsSync(localPath)) {
     const local = (parseYaml(readFileSync(localPath, "utf8")) as Record<string, unknown>) ?? {};
-    return mergeDeep(base, local);
+    canonical = mergeDeep(base, local);
   }
-  return base;
+  const resolvedInstanceConfigPath = instanceConfigPath
+    ? resolve(instanceConfigPath)
+    : resolveWorkspaceContract().paths.instanceConfigPath;
+  if (!resolvedInstanceConfigPath) return canonical;
+  const instance = validateInstanceOverlay(
+    (parseYaml(readFileSync(resolvedInstanceConfigPath, "utf8")) as unknown) ?? {},
+  );
+  return mergeInstanceConfig(canonical, instance);
 }
 
 interface RawConfig {
@@ -147,6 +295,7 @@ interface LoadConfigOptions {
   resolveSecrets?: boolean;
   secretExecFileSync?: ExecFileSyncLike;
   workspaceRoot?: string;
+  instanceConfigPath?: string;
 }
 
 export function resolveConfigWorkspaceRoot(configPath?: string, workspaceRoot?: string): string {
@@ -566,7 +715,7 @@ function findLegacyConfigKey(raw: object, keyPattern: RegExp): string | undefine
 }
 
 export function loadTelegramToken(configPath?: string, options: LoadConfigOptions = {}): string {
-  const raw: RawConfig = loadRawMergedConfig(configPath) as RawConfig;
+  const raw: RawConfig = loadRawMergedConfig(configPath, options.instanceConfigPath) as RawConfig;
   const workspaceRoot = resolveConfigWorkspaceRoot(configPath, options.workspaceRoot);
   const sopsFile = resolveConfiguredSopsFile(raw, workspaceRoot);
   const legacyTelegramKey = findLegacyConfigKey(raw, LEGACY_TELEGRAM_SERVICE_KEY_RE);
@@ -593,7 +742,7 @@ export function loadTelegramToken(configPath?: string, options: LoadConfigOption
 }
 
 export function loadConfig(configPath?: string, options: LoadConfigOptions = {}): BotConfig {
-  const raw: RawConfig = loadRawMergedConfig(configPath) as RawConfig;
+  const raw: RawConfig = loadRawMergedConfig(configPath, options.instanceConfigPath) as RawConfig;
   const resolveSecrets = options.resolveSecrets !== false;
   const workspaceRoot = resolveConfigWorkspaceRoot(configPath, options.workspaceRoot);
 

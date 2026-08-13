@@ -812,6 +812,27 @@ describe("assemblePiContext", () => {
     assert.strictEqual(readFileSync(result.systemPromptPath, "utf8"), "PERSONA_TOKEN body");
   });
 
+  it("reads one canonical context while writing artifacts to two deployment roots", () => {
+    const canonicalWorkspace = fullFixture();
+    const firstDeployment = makeWorkspace({});
+    const secondDeployment = makeWorkspace({});
+    const agent = agentFor(canonicalWorkspace);
+
+    const first = assemblePiContext(agent, { artifactWorkspaceCwd: firstDeployment });
+    _resetPiContextCache();
+    const second = assemblePiContext(agent, { artifactWorkspaceCwd: secondDeployment });
+
+    assert.ok(first && second);
+    assert.ok(first.appendSystemPromptPath.startsWith(join(firstDeployment, ".tmp") + "/"));
+    assert.ok(second.appendSystemPromptPath.startsWith(join(secondDeployment, ".tmp") + "/"));
+    assert.strictEqual(
+      readFileSync(first.appendSystemPromptPath, "utf8"),
+      readFileSync(second.appendSystemPromptPath, "utf8"),
+    );
+    assert.match(readFileSync(first.appendSystemPromptPath, "utf8"), /INTRO_BODY_TOKEN/);
+    assert.strictEqual(existsSync(join(canonicalWorkspace, ".tmp")), false);
+  });
+
   it("keeps file-delivery guidance static across agents, outboxes, and cache destinations", () => {
     const sourceWorkspace = makeWorkspace({ claudeMd: "# Context\n\nBODY" });
     const firstDestination = makeWorkspace({});

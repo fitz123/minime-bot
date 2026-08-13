@@ -27,6 +27,7 @@ import {
   MINIME_CONFIG_PATH_ENV,
   MINIME_CONTROL_WORKSPACE_ROOT_ENV,
   MINIME_CRONS_PATH_ENV,
+  MINIME_INSTANCE_CONFIG_PATH_ENV,
   resolveAgentWorkspaceCwd,
   resolveWorkspaceContract,
   type ResolvedWorkspaceContract,
@@ -199,6 +200,7 @@ const PI_CHILD_ENV_KEY_ALLOWLIST = new Set([
   MINIME_CONFIG_PATH_ENV,
   MINIME_CONTROL_WORKSPACE_ROOT_ENV,
   MINIME_CRONS_PATH_ENV,
+  MINIME_INSTANCE_CONFIG_PATH_ENV,
   MINIME_OUTBOX_ENV,
   "NO_COLOR",
   "PATH",
@@ -596,8 +598,12 @@ export function buildPiSpawnArgs(
   // assembler could not safely deliver.
   const includeFileDelivery = Boolean(runtimeEnvOptions?.outboxPath?.trim());
   try {
+    const contract = resolveWorkspaceContract();
     const context = assemblePiContext(agent, {
       includeFileDelivery,
+      ...(contract.paths.instanceConfigPath
+        ? { artifactWorkspaceCwd: contract.paths.controlWorkspaceRoot }
+        : {}),
     });
     if (context) {
       if (context.systemPromptPath) {

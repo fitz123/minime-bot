@@ -216,4 +216,196 @@ agents:
     assert.strictEqual(agents.main.model, "gpt-5.5");                 // preserved
     assert.strictEqual(agents.main.thinking, "high");                 // preserved
   });
+
+  it("applies every allowed instance leaf after config.local.yaml", () => {
+    const configPath = join(TEST_DIR, "config.yaml");
+    const localPath = join(TEST_DIR, "config.local.yaml");
+    const instancePath = join(TEST_DIR, "instance.yaml");
+    writeFileSync(configPath, `
+agents:
+  main:
+    workspaceCwd: /srv/minime-agent
+    model: gpt-5.5
+bindings:
+  - chatId: 111
+    topicId: 10
+    agentId: main
+    kind: dm
+    label: reserve
+metricsPort: 9000
+`);
+    writeFileSync(localPath, "metricsPort: 9001\n");
+    writeFileSync(instancePath, `
+secrets:
+  sopsFile: deployment.sops.yaml
+telegramTokenSopsKey: telegram.reserve
+telegramTokenEnv: RESERVE_TOKEN
+bindingIdentityOverrides:
+  reserve:
+    chatId: 222
+    topicId: 20
+metricsPort: 9002
+metricsHost: localhost
+adminChatId: 333
+defaultDeliveryChatId: 444
+defaultDeliveryThreadId: 55
+triggerInput:
+  port: 9466
+  bearerEnv: TRIGGER_BEARER
+  chatId: 222
+`);
+
+    const result = loadRawMergedConfig(configPath, instancePath);
+    const binding = (result.bindings as Array<Record<string, unknown>>)[0];
+    assert.deepStrictEqual(result.secrets, { sopsFile: "deployment.sops.yaml" });
+    assert.strictEqual(result.telegramTokenSopsKey, "telegram.reserve");
+    assert.strictEqual(result.telegramTokenEnv, "RESERVE_TOKEN");
+    assert.strictEqual(binding.chatId, 222);
+    assert.strictEqual(binding.topicId, 20);
+    assert.strictEqual(result.metricsPort, 9002);
+    assert.strictEqual(result.metricsHost, "localhost");
+    assert.strictEqual(result.adminChatId, 333);
+    assert.strictEqual(result.defaultDeliveryChatId, 444);
+    assert.strictEqual(result.defaultDeliveryThreadId, 55);
+    assert.deepStrictEqual(result.triggerInput, {
+      port: 9466,
+      bearerEnv: "TRIGGER_BEARER",
+      chatId: 222,
+    });
+    assert.strictEqual(result.bindingIdentityOverrides, undefined);
+  });
+
+  it("patches binding identity without replacing canonical behavior", () => {
+    const configPath = join(TEST_DIR, "config.yaml");
+    const instancePath = join(TEST_DIR, "instance.yaml");
+    writeFileSync(configPath, `
+agents:
+  main:
+    workspaceCwd: /srv/minime-agent
+    model: gpt-5.5
+bindings:
+  - chatId: 111
+    agentId: main
+    kind: group
+    label: reserve
+    requireMention: true
+    voiceTranscriptEcho: true
+    typingIndicator: false
+    topics:
+      - topicId: 7
+        agentId: main
+        requireMention: false
+`);
+    writeFileSync(instancePath, `
+bindingIdentityOverrides:
+  reserve:
+    chatId: 222
+`);
+
+    const result = loadRawMergedConfig(configPath, instancePath);
+    const binding = (result.bindings as Array<Record<string, unknown>>)[0];
+    assert.deepStrictEqual(binding, {
+      chatId: 222,
+      agentId: "main",
+      kind: "group",
+      label: "reserve",
+      requireMention: true,
+      voiceTranscriptEcho: true,
+      typingIndicator: false,
+      topics: [{ topicId: 7, agentId: "main", requireMention: false }],
+    });
+  });
+
+  it("requires an identity override label to resolve exactly once", () => {
+    const configPath = join(TEST_DIR, "config.yaml");
+    const instancePath = join(TEST_DIR, "instance.yaml");
+    writeFileSync(instancePath, "bindingIdentityOverrides:\n  reserve:\n    chatId: 222\n");
+    writeFileSync(configPath, `
+agents:
+  main:
+    workspaceCwd: /srv/minime-agent
+    model: gpt-5.5
+bindings:
+  - { chatId: 111, agentId: main, kind: dm, label: primary }
+`);
+    assert.throws(
+      () => loadRawMergedConfig(configPath, instancePath),
+      /bindingIdentityOverrides\.reserve does not match a canonical binding label/,
+    );
+
+    writeFileSync(configPath, `
+agents:
+  main:
+    workspaceCwd: /srv/minime-agent
+    model: gpt-5.5
+bindings:
+  - { chatId: 111, agentId: main, kind: dm, label: reserve }
+  - { chatId: 112, agentId: main, kind: dm, label: reserve }
+`);
+    assert.throws(
+      () => loadRawMergedConfig(configPath, instancePath),
+      /bindingIdentityOverrides\.reserve matches a duplicate canonical binding label/,
+    );
+  });
+
+  it("rejects behavioral and unknown instance paths without leaking values", () => {
+    const configPath = join(TEST_DIR, "config.yaml");
+    const instancePath = join(TEST_DIR, "instance.yaml");
+    writeFileSync(configPath, `
+agents:
+  main:
+    workspaceCwd: /srv/minime-agent
+    model: gpt-5.5
+bindings:
+  - { chatId: 111, agentId: main, kind: dm, label: reserve }
+`);
+    const cases = [
+      ["bindings", "bindings:\n  - chatId: 999999\n"],
+      ["bindingIdentityOverrides.reserve.requireMention", "bindingIdentityOverrides:\n  reserve:\n    requireMention: true\n"],
+      ["agents.main.workspaceCwd", "agents:\n  main:\n    workspaceCwd: /private/should-not-leak\n"],
+      ["agents.main.model", "agents:\n  main:\n    model: private-model-value\n"],
+      ["agents.main.thinking", "agents:\n  main:\n    thinking: private-thinking-value\n"],
+      ["agents.main.systemPrompt", "agents:\n  main:\n    systemPrompt: private-prompt-value\n"],
+      ["agents.main.askAgent.enabled", "agents:\n  main:\n    askAgent:\n      enabled: true\n"],
+      ["sessionDefaults.idleTimeoutMs", "sessionDefaults:\n  idleTimeoutMs: 12345\n"],
+      ["piExtraExtensions", "piExtraExtensions:\n  - /private/extension.ts\n"],
+      ["discord.tokenEnv", "discord:\n  tokenEnv: PRIVATE_DISCORD_ENV\n"],
+      ["logLevel", "logLevel: private-log-level\n"],
+      ["unknown.private", "unknown:\n  private: private-unknown-value\n"],
+    ] as const;
+
+    for (const [path, yaml] of cases) {
+      writeFileSync(instancePath, yaml);
+      assert.throws(() => loadRawMergedConfig(configPath, instancePath), (error: unknown) => {
+        const message = (error as Error).message;
+        assert.match(message, new RegExp(path.replaceAll(".", "\\.")));
+        assert.doesNotMatch(
+          message,
+          /999999|should-not-leak|private-model-value|private-thinking-value|private-prompt-value|12345|private\/extension|PRIVATE_DISCORD_ENV|private-log-level|private-unknown-value/,
+        );
+        return true;
+      }, path);
+    }
+  });
+
+  it("requires absolute canonical agent workspaces only when an instance overlay is enabled", () => {
+    const configPath = join(TEST_DIR, "config.yaml");
+    const instancePath = join(TEST_DIR, "instance.yaml");
+    writeFileSync(configPath, `
+agents:
+  main:
+    workspaceCwd: ./agent-workspace
+    model: gpt-5.5
+`);
+    writeFileSync(instancePath, "metricsPort: 9002\n");
+
+    assert.strictEqual(
+      ((loadRawMergedConfig(configPath).agents as Record<string, Record<string, unknown>>).main.workspaceCwd),
+      "./agent-workspace",
+    );
+    assert.throws(
+      () => loadRawMergedConfig(configPath, instancePath),
+      /Instance config requires canonical agents\.main\.workspaceCwd to be absolute/,
+    );
+  });
 });

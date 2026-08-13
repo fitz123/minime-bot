@@ -36,7 +36,10 @@ import { EXPECTED_PI_PACKAGE_VERSION } from "../pi-runtime.js";
 import { hasExited, SessionManager, waitForSpawn } from "../session-manager.js";
 import { SessionStore } from "../session-store.js";
 import type { AgentConfig, BotConfig } from "../types.js";
-import { MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
+import {
+  MINIME_CONTROL_WORKSPACE_ROOT_ENV,
+  resolveWorkspaceContract,
+} from "../workspace-contract.js";
 
 const testDirectory = dirname(fileURLToPath(import.meta.url));
 const roundTripFixture = join(testDirectory, "fixtures", "pi-session-round-trip.mjs");
@@ -305,6 +308,42 @@ async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boole
 }
 
 describe("pinned Pi exact interactive session integration", { concurrency: false }, () => {
+  it("keeps transcript and bot session-store roots distinct for one canonical workspace", () => {
+    const root = mkdtempSync(join(tmpdir(), "minime-deployment-isolation-"));
+    const workspace = join(root, "canonical-agent-workspace");
+    const firstControlRoot = join(root, "first-control");
+    const secondControlRoot = join(root, "second-control");
+    mkdirPrivate(workspace);
+    mkdirPrivate(firstControlRoot);
+    mkdirPrivate(secondControlRoot);
+    try {
+      const agent = makeAgent(workspace);
+      const firstLocation = resolveInteractiveSessionLocation(agent, {
+        env: { PI_CODING_AGENT_SESSION_DIR: join(root, "first-pi-sessions") },
+        homeDirectory: root,
+      });
+      const secondLocation = resolveInteractiveSessionLocation(agent, {
+        env: { PI_CODING_AGENT_SESSION_DIR: join(root, "second-pi-sessions") },
+        homeDirectory: root,
+      });
+      const firstContract = resolveWorkspaceContract({
+        cwd: root,
+        env: { [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: firstControlRoot },
+      });
+      const secondContract = resolveWorkspaceContract({
+        cwd: root,
+        env: { [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: secondControlRoot },
+      });
+
+      assert.strictEqual(firstLocation.workspaceRealpath, realpathSync(workspace));
+      assert.strictEqual(secondLocation.workspaceRealpath, realpathSync(workspace));
+      assert.notStrictEqual(firstLocation.sessionDirectory, secondLocation.sessionDirectory);
+      assert.notStrictEqual(firstContract.paths.sessionStorePath, secondContract.paths.sessionStorePath);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("privatizes a default-umask directory created by pinned Pi", () => {
     const createdRoot = mkdtempSync(join(tmpdir(), "minime-exact-binding-mode-"));
     chmodSync(createdRoot, 0o700);
