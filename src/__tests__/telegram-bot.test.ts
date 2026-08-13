@@ -1830,7 +1830,10 @@ describe("command handler wiring", () => {
 
     events.length = 0;
     coordinator.register(key, () => { events.push("suspend-text"); });
-    messageQueue.enqueue = (() => { events.push("enqueue"); }) as typeof messageQueue.enqueue;
+    messageQueue.enqueue = (() => {
+      events.push("enqueue");
+      return true;
+    }) as typeof messageQueue.enqueue;
     await bot.handleUpdate(makeTextUpdate("ordinary input", 14));
     assert.deepStrictEqual(events, ["suspend-text", "enqueue"]);
 
@@ -2634,6 +2637,7 @@ describe("command handler wiring", () => {
     const enqueuedKeys: string[] = [];
     messageQueue.enqueue = ((key: string) => {
       enqueuedKeys.push(key);
+      return true;
     }) as typeof messageQueue.enqueue;
 
     await bot.handleUpdate({

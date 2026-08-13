@@ -42,8 +42,10 @@ import {
   type UpdateProcessingProbe,
 } from "./poll-progress.js";
 import { ActiveDraftCoordinator } from "./active-draft-coordinator.js";
+import { resolveBinding } from "./telegram-binding.js";
 // Re-export for backward compatibility (tests import from here)
 export { isImageMimeType, imageExtensionForMime };
+export { resolveBinding } from "./telegram-binding.js";
 
 type SteerFn = (chatId: string, agentId: string, text: string) => boolean;
 
@@ -247,48 +249,6 @@ export function routeTelegramEchoToActiveTurn(opts: TelegramEchoRouteOptions): b
   const framedText = `${ECHO_PREFIX} - context only, no reply needed]\n\n${opts.text}`;
   opts.onBeforeSteer?.(key);
   return opts.steerFn(key, binding.agentId, framedText);
-}
-
-/**
- * Resolve a Telegram chatId (and optional topicId) to its binding config.
- * Bindings with topicId set only match when both chatId and topicId match.
- * A chatId-only binding serves as a fallback when no topic-specific binding matches.
- */
-export function resolveBinding(
-  chatId: number,
-  bindings: TelegramBinding[],
-  topicId?: number,
-): TelegramBinding | undefined {
-  let fallback: TelegramBinding | undefined;
-  for (const b of bindings) {
-    if (b.chatId !== chatId) continue;
-    if (b.topicId !== undefined) {
-      if (b.topicId === topicId) return b; // exact topic match wins
-    } else {
-      fallback ??= b; // chatId-only binding as fallback
-    }
-  }
-
-  // Check topics array for per-topic overrides
-  if (fallback && topicId !== undefined && fallback.topics) {
-    const topic = fallback.topics.find((t) => t.topicId === topicId);
-    if (topic) {
-      const { topics: _, ...base } = fallback;
-      return {
-        ...base,
-        agentId: topic.agentId ?? fallback.agentId,
-        requireMention: topic.requireMention ?? fallback.requireMention,
-        topicId,
-      };
-    }
-  }
-
-  // Preserve topicId for unlisted forum topics so headers show Topic: <id>
-  if (fallback && topicId !== undefined) {
-    return { ...fallback, topicId };
-  }
-
-  return fallback;
 }
 
 /**

@@ -281,6 +281,56 @@ Validate delivery before installing services:
   --chat-id DESTINATION_PLACEHOLDER --message "synthetic monitoring test"
 ```
 
+## Ordinary bot trigger input
+
+The opt-in trigger input is part of the ordinary `minime-bot` process and
+release. It is disabled unless the bot configuration, or its allowlisted
+instance overlay, contains the complete section:
+
+```yaml
+triggerInput:
+  port: 9466
+  host: 127.0.0.1
+  path: /trigger
+  bearerSopsKey: triggerInput.bearer
+  chatId: <deployment-chat-id>
+  threadId: <optional-topic-id>
+```
+
+The host defaults to `127.0.0.1` and accepts only `127.0.0.1`, `::1`, or
+`localhost`; the path defaults to `/trigger`. Configure exactly one of
+`bearerSopsKey` or `bearerEnv`; the resolved bearer must contain 16–8,192
+printable ASCII bytes. `chatId` and optional `threadId` must resolve to an
+existing Telegram binding, and an enabled input requires a resolved Telegram
+token. Partial configuration fails startup instead of exposing a listener that
+cannot start an ordinary turn. The
+[second ordinary deployment](../README.md#second-ordinary-deployment) keeps the
+listener port, credential reference, and delivery identity in its instance
+overlay while both deployments continue to read one canonical behavior
+configuration.
+
+The only route is an authenticated `POST <path>` with
+`Content-Type: application/json` and exactly this payload shape:
+
+```json
+{"source":"runtime-doctor","text":"bounded human-readable evidence"}
+```
+
+`source` is a lowercase ASCII slug of at most 32 letters, digits, and hyphens.
+`text` is non-empty and limited to 4,096 UTF-16 units, and the complete body is
+limited to 16 KiB. The response body is one status word with no identifier:
+`202` accepted; `429` queue saturated or shutting down; `400` malformed; `401`
+unauthorized; `404` wrong path; `405` wrong method; `413` too large; or `415`
+wrong content type.
+
+Acceptance frames the evidence and enqueues it once through the existing
+ordinary `MessageQueue`, binding, and persistent agent session. The input owns
+no trigger IDs, source schema, task, persistence, separate queue,
+retry/custody state, lifecycle, status/result API, authorization policy, or
+reporting surface. The calling source owns retry, deduplication, and transition
+state; the ordinary full agent retains its existing safety and external-action
+boundaries.
+
 ## Alertmanager webhook installation
 
 Copy `examples/monitoring/ai.minime.alertmanager-webhook.plist`, fill its
@@ -292,7 +342,7 @@ and restrict it with the host firewall where appropriate.
 The webhook flags are `--host` (default `127.0.0.1`), `--port` (default 9876),
 `--path` (default `/alertmanager`), `--max-body` (default 256 KiB), and
 `--body-timeout` (default 5 seconds, capped at 30). Optional bridge flags are
-`--ops-intake-url`, `--alertmanager-url`, and `--bridge-timeout` (default 5
+`--trigger-input-url`, `--alertmanager-url`, and `--bridge-timeout` (default 5
 seconds, capped at 30). `GET /healthz` is its local readiness endpoint. Only
 IPv4 loopback or `localhost` bind hosts are accepted.
 `MINIME_WEBHOOK_HOST`, `MINIME_WEBHOOK_PORT`, and `MINIME_WEBHOOK_PATH` provide
@@ -300,73 +350,47 @@ the corresponding launchd environment settings. The body timeout is an
 absolute input deadline, and the receiver caps concurrent requests so slow
 local clients cannot create unbounded request threads.
 
-Bridge mode is opt-in and requires all of the following settings:
+The monitoring sources share these trigger-input settings:
 
-- `MINIME_OPS_INTAKE_URL` is the loopback HTTP URL ending in
-  `/intake/alertmanager`.
-- `MINIME_ALERTMANAGER_URL` is a loopback HTTP base URL with no credentials,
-  query, fragment, or non-root path.
-- `MINIME_OPS_INTAKE_SOPS_FILE` and `MINIME_OPS_INTAKE_SOPS_KEY` identify the
-  existing Ops intake bearer in SOPS; the key uses the same dotted-identifier
-  grammar as the Telegram key.
-- Optional `MINIME_BRIDGE_TIMEOUT` sets the source-query and Ops-forward
-  deadline above zero and no more than 30 seconds.
+- `MINIME_TRIGGER_INPUT_URL` is the complete loopback HTTP trigger URL.
+- `MINIME_TRIGGER_INPUT_SOPS_FILE` and `MINIME_TRIGGER_INPUT_SOPS_KEY` identify
+  its bearer in SOPS. The key uses the same dotted-identifier grammar as the
+  Telegram key.
 
-Partial or non-loopback bridge configuration fails startup; setting only the
-optional bridge timeout also counts as partial bridge configuration. The named
-Ops secret is decrypted alone into process memory. Its value is never written to
-arguments, logs, errors, or forwarded payloads. Bridge mode preserves the
-256 KiB body ceiling and forwards the original validated Alertmanager v4 body
-with bearer authentication.
+Alertmanager bridge mode additionally requires `MINIME_ALERTMANAGER_URL`, a
+loopback HTTP base URL with no credentials, query, fragment, or non-root path.
+Optional `MINIME_BRIDGE_TIMEOUT` sets the source-query and trigger-forward
+deadline above zero and no more than 30 seconds. Partial settings, a timeout by
+itself, or a non-loopback URL fail startup without logging configured values.
+The named bearer is decrypted alone into memory and never appears in arguments,
+logs, errors, or payloads. Setting none of the bridge variables preserves the
+existing native-only Telegram behavior for a single-instance installation.
 
-Bridge validation accepts up to 1,024 alerts within that byte ceiling, matching
-Ops intake. An empty `groupLabels` map is the valid single group produced by an
-ungrouped route; source verification still requires every delivered firing
-member's label set and episode start to remain current, plus its fingerprint
-when supplied. Valid UTF-8 group-label names are accepted and quoted in
+Bridge validation accepts up to 1,024 alerts within the 256 KiB input ceiling.
+It never forwards that Alertmanager body. It sends only
+`{"source":"alertmanager","text":<bounded summary>}` to the ordinary trigger
+input, with the summary limited to 4,096 UTF-16 units. An empty `groupLabels`
+map is valid for an ungrouped route. Valid UTF-8 group-label names are quoted in
 Prometheus and Alertmanager matchers when they are not legacy-compatible names.
 
-For each firing delivery, the webhook first queries loopback Alertmanager's
-grouped API with group-label and exact-receiver filters. The returned routed
-group must have exactly the delivered `groupLabels` and receiver, and every
-delivered firing member's labels and `startsAt` must exactly match a current
-active, suppressed, or unprocessed member; a supplied fingerprint must match
-too. The server-side filters keep unrelated global alert cardinality outside
-the bounded response. Native deduplication derives its episode identity from
-the verified receiver, group descriptor, and de-duplicated firing-member labels
-and start times, never the opaque webhook `groupKey`. Critical classification
-and firing-batch native text likewise use only that verified firing set, so
-resolved-member text or duplicate multiplicity cannot create a new escalation.
-A batch is critical when at least one de-duplicated decision member has the
-exact, case-sensitive label `severity="critical"`. Firing batches consider only
-verified firing members; resolved-only batches consider their resolved members.
-All other values and casing are noncritical.
-A mismatch is treated as stale or forged input and is acknowledged without
-forwarding. A source-query failure returns 503 so Alertmanager retries.
-Critical source-query failures still use the independent native path; routine
-noncritical failures stay quiet. Once the source is verified, required sinks
-are:
+For a firing delivery, the webhook queries Alertmanager's loopback grouped API
+with exact receiver and group-label filters. One returned group must contain
+every de-duplicated delivered firing identity: labels, `startsAt`, and the
+fingerprint when supplied. For a resolved-only delivery, the same exact query
+must succeed and every delivered resolved identity must be absent. Therefore a
+verified firing or recovery forwards its bounded summary and starts an ordinary
+agent turn. A stale or forged mismatch is acknowledged without forwarding.
+Query failures, timeouts, trigger rejection, and trigger outages return 503 so
+Alertmanager retains and retries the group using its native delivery semantics.
 
-- Noncritical: Ops acceptance is required. Success is quiet. Rejection,
-  timeout, or outage stays quiet and returns 503.
-- Critical: both Ops acceptance and native Telegram delivery are required;
-  failure of either returns 503.
-- Resolved-only: nothing is forwarded to Ops. Noncritical input is
-  acknowledged quietly; critical input uses native Telegram and requires it to
-  succeed.
-
-Routine noncritical source-query and Ops-forward failures deliberately do not
-use a per-group data-plane native fallback. Alertmanager retains and retries
-those groups, while failure of the shared Ops path relies on the separately
-deduplicated Ops-health control-plane escalation. This prevents one shared Ops
-outage from producing a native Telegram message for every warning group.
-
-The webhook returns 2xx only after every required sink succeeds. Its
-process-local native deduplication state prevents a successful critical
-delivery from being repeated while Alertmanager retries an incomplete Ops
-delivery. Ops intake replay and coalescing provide durable task idempotency;
-native deduplication remains the bounded process-local contract described
-below. Setting none of the bridge variables preserves native-only delivery.
+Bridge mode has no direct incident-delivery path. Critical and noncritical
+firing and resolved summaries all use the same verified trigger route. There is
+no native Telegram duplicate after acceptance, no raw/full fallback on source
+verification or forwarding failure, and no per-group retry state in the
+webhook. Alertmanager selects the approved zero control-path-notice outcome;
+the retryable response is the only failure signal. Process-local batch
+deduplication still retains at most 1,024 successful digests for one hour and
+resets on restart.
 
 Merge the example Alertmanager receiver into the active configuration rather
 than replacing operator configuration. Validate the active configuration,
@@ -387,32 +411,19 @@ With bridge mode disabled, post controlled synthetic firing and resolved
 Alertmanager payloads using placeholder labels and confirm one Telegram message
 for each transition. Repost the same payload to confirm batch deduplication.
 
-Validate bridge mode with a real controlled group that is active in the queried
-Alertmanager; an arbitrary manually posted firing body is intentionally treated
-as stale unless its exact group is current. Check the complete delivery matrix:
+Validate bridge mode with a real controlled group that is current in the
+queried Alertmanager; an arbitrary manually posted firing body is intentionally
+treated as stale unless its exact group is current. Confirm that verified
+firing and resolved-only deliveries each reach the trigger input once, stale
+firing and still-active resolved identities are acknowledged without
+forwarding, and query or trigger failure stays quiet on Telegram while returning
+503. Large batches are summarized within the shared 4,096-unit boundary.
 
-- a noncritical firing creates or replays one Ops task and stays quiet on
-  Telegram;
-- a critical firing reaches both Ops and Telegram;
-- a noncritical resolved-only delivery is quiet;
-- noncritical source-query or Ops failure stays quiet and returns 503 until Ops
-  accepts;
-- critical source-query or required-sink failure retains independent native
-  delivery and returns 503 while required work remains incomplete.
-
-A required delivery failure returns a non-2xx response so Alertmanager can
-retry.
-Deduplication is process-local, retains at most 1,024 successful batch digests
-for one hour, and resets when the webhook restarts. It suppresses immediate
-retries; it is not durable exactly-once delivery. Large batches are summarized
-within Telegram's message limit.
-
-Native-only and bridge-critical Telegram lines append
-`cron=<sanitized-name>` when the alert has a `cron` label, for both firing and
-resolved transitions. For a native-only alert without a supplied fingerprint,
-that sanitized cron value also participates in the fallback identity. Alerts
-without a `cron` label retain the previous message and fallback-identity
-format.
+In native-only mode, Telegram lines append `cron=<sanitized-name>` when the
+alert has a `cron` label, for both firing and resolved transitions. For an alert
+without a supplied fingerprint, that sanitized cron value also participates in
+the fallback identity. Alerts without a `cron` label retain the previous
+message and fallback-identity format.
 
 ## Runtime doctor installation
 
@@ -438,10 +449,30 @@ maximum 30), and `MINIME_DOCTOR_LAUNCHCTL` may select the launchctl executable
 log with three backups. `MINIME_DOCTOR_RUNTIME_MAX_AGE` defaults to 3,600
 seconds. All health URLs must be HTTP(S) URLs with a host.
 
+When all three shared `MINIME_TRIGGER_INPUT_*` settings are present, the doctor
+posts `{"source":"runtime-doctor","text":<incident summary>}` to that loopback
+input. It does not also send the incident through Telegram, and trigger failure
+never falls back to the raw incident. When all three settings are absent, direct
+Telegram transition delivery remains unchanged. A partial or non-loopback
+trigger configuration fails before checks run.
+
 `MINIME_DOCTOR_STATE_PATH` is required. Incident state is bounded,
 regular-file versioned JSON written atomically with mode 0600. Identical
 failures are suppressed, a changed failure set is notified once, and a return
 to health sends one recovery.
+In trigger mode, this same document may carry one pending transition using
+`fromIncidents`, `toIncidents`, a consecutive-failure count saturated at three,
+and `noticeSent`. The exact pending transition survives process restart; a
+changed transition resets its count and notice decision. Successful trigger
+acceptance commits `toIncidents` and removes all pending fields.
+
+After three failed deliveries of a firing transition, the doctor may send the
+single sanitized reserve-control-path-unavailable notice through the configured
+Telegram destination. It atomically records `noticeSent` before that attempt,
+so restart or notice-delivery failure cannot duplicate it. Recovered
+transitions send no such notice. This state-backed boundary is the only direct
+trigger-mode message and contains neither the incident summary nor configured
+values.
 Corrupt state is replaced without notifying on that run to prevent a storm.
 The next run can notify an active incident from the repaired baseline. An
 adjacent process-owned advisory lock suppresses overlapping invocations and is
@@ -464,11 +495,12 @@ the configured key without printing its value. Check launchd with
 `launchctl print`, then verify Prometheus targets and rules and Alertmanager
 routing. Revalidate Compose configuration before recreating services.
 
-Bridge-only rollback keeps native delivery live: remove all four required
-bridge settings (and optional `MINIME_BRIDGE_TIMEOUT`) together, restart the
-webhook, verify a controlled native notification, and only then remove unused
-Ops-side wiring. No Alertmanager receiver change is needed because the same
-Node-independent webhook remains its receiver.
+Bridge-only rollback keeps native delivery live: remove all three shared
+trigger-input settings plus `MINIME_ALERTMANAGER_URL` (and optional
+`MINIME_BRIDGE_TIMEOUT`) together, restart the webhook, and verify a controlled
+native notification. No Alertmanager receiver change is needed because the
+same Node-independent webhook remains its receiver. Removing all three shared
+settings from runtime doctor likewise restores its direct Telegram path.
 
 Full monitoring rollback is additive: boot out and remove the two copied
 launchd plists, remove the added Alertmanager receiver/routing and Prometheus

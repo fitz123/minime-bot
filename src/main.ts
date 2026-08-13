@@ -45,6 +45,11 @@ import {
   StartupConflictError,
 } from "./runtime-guard.js";
 import { shutdownServingRuntime } from "./runtime-shutdown.js";
+import {
+  startTriggerInput,
+  TriggerInputBindError,
+  type TriggerInputServer,
+} from "./trigger-input.js";
 
 let activeRuntimeGuard: RuntimeGuard | undefined;
 let removeRuntimeExitHook: (() => void) | undefined;
@@ -98,6 +103,7 @@ async function main(): Promise<void> {
   let telegramPolling: Promise<void> | undefined;
   const messageQueues: MessageQueue[] = [];
   let echoWatcher: EchoWatcher | undefined;
+  let triggerInput: TriggerInputServer | undefined;
   let discordClient: Client | undefined;
   let shutdownDiscord: (() => Promise<void>) | undefined;
   let watchdog: Watchdog | undefined;
@@ -118,6 +124,7 @@ async function main(): Promise<void> {
     log.info("main", `Received ${signal}, shutting down...`);
     if (telegramStartupTimeout) clearTimeout(telegramStartupTimeout);
     telegramPollingRestart?.cancel();
+    if (triggerInput) await triggerInput.stop();
     if (echoWatcher) echoWatcher.stop();
     if (watchdog) watchdog.stop();
     const released = await shutdownServingRuntime({
@@ -195,6 +202,15 @@ async function main(): Promise<void> {
     });
     telegramBot = bot;
     messageQueues.push(messageQueue);
+    if (config.triggerInput) {
+      triggerInput = await startTriggerInput({
+        config: config.triggerInput,
+        bindings: config.bindings,
+        sessionDefaults: config.sessionDefaults,
+        api: bot.api,
+        messageQueue,
+      });
+    }
 
     function handleTelegramPollingFailure(
       generation: number,
@@ -363,7 +379,9 @@ async function main(): Promise<void> {
 main().catch(async (err) => {
   await stopMetricsServer();
   releaseRuntimeGuard();
-  if (!(err instanceof StartupConflictError) && !(err instanceof MetricsServerBindError)) {
+  if (err instanceof TriggerInputBindError) {
+    log.error("main", "Trigger input address is in use");
+  } else if (!(err instanceof StartupConflictError) && !(err instanceof MetricsServerBindError)) {
     log.error("main", "Fatal error:", err);
   }
   process.exit(1);

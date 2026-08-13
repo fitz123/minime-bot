@@ -17,7 +17,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { runCli, type CliRunOptions } from "../cli.js";
+import { runCli, runCliAsync, type CliRunOptions } from "../cli.js";
 import {
   generateLaunchdCronPlists,
   type LaunchdCommandRunner,
@@ -25,7 +25,13 @@ import {
 import { generateKnowledgeV2Schema } from "../knowledge/layout.js";
 import { KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES } from "../knowledge/maintenance.js";
 import { generateKnowledgeIndex } from "../knowledge/update.js";
-import { MINIME_AGENT_WORKSPACE_ROOT_ENV, MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
+import {
+  ECHO_DIR_BASE_ENV,
+  MINIME_AGENT_WORKSPACE_ROOT_ENV,
+  MINIME_CONTROL_WORKSPACE_ROOT_ENV,
+  MINIME_INSTANCE_CONFIG_PATH_ENV,
+  MINIME_MEDIA_ROOT_ENV,
+} from "../workspace-contract.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOT_ROOT = resolve(__dirname, "..", "..");
@@ -241,6 +247,7 @@ describe("minime-bot CLI", () => {
     assert.match(result.stdout, /--op archive\|restore --path <wiki\/pages\/type\/page\.md>/);
     assert.match(result.stdout, /minime-bot knowledge maintain --workspace <agent-workspace>/);
     assert.match(result.stdout, /minime-bot launchd crons sync --workspace <path>/);
+    assert.doesNotMatch(result.stdout, /minime-bot worker/);
     assert.match(result.stdout, /--run-cron-script <absolute-path>/);
     assert.match(result.stdout, /Preserve an explicit executable run-cron\.sh path/);
     assert.doesNotMatch(result.stdout, /minime-bot recovery/);
@@ -250,6 +257,30 @@ describe("minime-bot CLI", () => {
     assert.match(result.stdout, /MINIME_AGENT_WORKSPACE_ROOT/);
     assert.doesNotMatch(result.stdout, /current repo layout/);
     assert.equal(result.stderr, "");
+  });
+
+  it("keeps the asynchronous entrypoint aligned with the remaining command scope", async () => {
+    let stdout = "";
+    let stderr = "";
+    const helpCode = await runCliAsync(["--help"], {
+      stdout: (text) => { stdout += text; },
+      stderr: (text) => { stderr += text; },
+    });
+
+    assert.equal(helpCode, 0);
+    assert.match(stdout, /minime-bot config validate/);
+    assert.equal(stderr, "");
+
+    stdout = "";
+    stderr = "";
+    const removedCode = await runCliAsync(["worker", "start"], {
+      stdout: (text) => { stdout += text; },
+      stderr: (text) => { stderr += text; },
+    });
+
+    assert.equal(removedCode, 2);
+    assert.equal(stdout, "");
+    assert.match(stderr, /unknown command: worker start/);
   });
 
   it("rejects the retired recovery command", () => {
@@ -1229,15 +1260,54 @@ describe("minime-bot CLI", () => {
       assert.match(result.stdout, new RegExp(`control workspace root: ${escapeRegExp(workspace)} \\(cli\\)`));
       assert.match(result.stdout, /package root:/);
       assert.match(result.stdout, /config path:/);
+      assert.match(result.stdout, /instance config path: not configured/);
       assert.match(result.stdout, /crons path:/);
       assert.match(result.stdout, /Pi extension dir:/);
       assert.match(result.stdout, /data dir:/);
       assert.match(result.stdout, /session store path:/);
       assert.match(result.stdout, /log dir:/);
       assert.match(result.stdout, /media base dir:/);
+      assert.match(result.stdout, /echo dir:/);
       assert.match(result.stdout, /runtime dir:/);
       assert.match(result.stdout, new RegExp(`Agent workspaces:\\n  main: ${escapeRegExp(join(workspace, "agent-workspace"))}`));
       assert.match(result.stdout, /Crons: 1/);
+      assert.equal(result.stderr, "");
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("prints configured instance, media, and echo paths", () => {
+    const workspace = createWorkspace();
+    const agentWorkspace = join(workspace, "agent-workspace");
+    const instancePath = join(workspace, "instance.yaml");
+    const mediaRoot = join(workspace, "runtime-media");
+    const echoRoot = join(workspace, "runtime-echo");
+    writeFileSync(join(workspace, "config.yaml"), `
+agents:
+  main:
+    workspaceCwd: ${agentWorkspace}
+    model: gpt-5.5
+telegramTokenEnv: TEST_TELEGRAM_TOKEN
+bindings:
+  - { chatId: 111, agentId: main, kind: dm, label: reserve }
+`);
+    writeFileSync(instancePath, "metricsPort: 9101\n");
+    try {
+      const result = runWithCapture(
+        ["workspace", "validate", "--workspace", workspace],
+        workspace,
+        {
+          [MINIME_INSTANCE_CONFIG_PATH_ENV]: "instance.yaml",
+          [MINIME_MEDIA_ROOT_ENV]: mediaRoot,
+          [ECHO_DIR_BASE_ENV]: echoRoot,
+        },
+      );
+
+      assert.equal(result.code, 0);
+      assert.match(result.stdout, new RegExp(`instance config path: ${escapeRegExp(instancePath)} \\(env\\)`));
+      assert.match(result.stdout, new RegExp(`media base dir: ${escapeRegExp(mediaRoot)} \\(env\\)`));
+      assert.match(result.stdout, new RegExp(`echo dir: ${escapeRegExp(echoRoot)} \\(env\\)`));
       assert.equal(result.stderr, "");
     } finally {
       rmSync(workspace, { recursive: true, force: true });

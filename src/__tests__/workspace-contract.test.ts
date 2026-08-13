@@ -5,9 +5,12 @@ import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
+  ECHO_DIR_BASE_ENV,
   MINIME_CONTROL_WORKSPACE_ROOT_ENV,
   MINIME_CONFIG_PATH_ENV,
   MINIME_CRONS_PATH_ENV,
+  MINIME_INSTANCE_CONFIG_PATH_ENV,
+  MINIME_MEDIA_ROOT_ENV,
   resolveWorkspaceContract,
   type WorkspaceContractPaths,
 } from "../workspace-contract.js";
@@ -43,6 +46,8 @@ describe("workspace contract resolver", () => {
     assert.strictEqual(contract.paths.controlWorkspaceRoot, cwd);
     assert.strictEqual(contract.paths.workspaceRoot, cwd);
     assert.strictEqual(contract.paths.configPath, resolve(cwd, "config.yaml"));
+    assert.strictEqual(contract.paths.instanceConfigPath, undefined);
+    assert.strictEqual(contract.effectivePaths.instanceConfigPath, undefined);
     assert.strictEqual(contract.paths.cronsPath, resolve(cwd, "crons.yaml"));
     assert.strictEqual(contract.paths.piExtensionDir, DEFAULT_PI_EXTENSION_DIR);
     assert.strictEqual(contract.paths.dataDir, resolve(cwd, "data"));
@@ -50,6 +55,7 @@ describe("workspace contract resolver", () => {
     assert.strictEqual(contract.effectivePaths.sessionStorePath.source, "workspace-default");
     assert.strictEqual(contract.paths.logDir, "/tmp/minime-home/.minime/logs");
     assert.strictEqual(contract.paths.mediaBaseDir, "/tmp/bot-media");
+    assert.strictEqual(contract.paths.echoDir, "/tmp/minime-home/.minime/bot-echo");
     assert.strictEqual(contract.paths.runtimeDir, resolve(cwd, ".tmp"));
     assert.strictEqual(contract.effectivePaths.workspaceRoot.source, "cwd-fallback");
     assert.match(contract.warnings.join("\n"), /Pass --workspace or MINIME_CONTROL_WORKSPACE_ROOT/);
@@ -150,19 +156,63 @@ describe("workspace contract resolver", () => {
         [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: workspaceRoot,
         [MINIME_CONFIG_PATH_ENV]: "custom/config.yaml",
         [MINIME_CRONS_PATH_ENV]: absoluteCronsPath,
+        [MINIME_INSTANCE_CONFIG_PATH_ENV]: "instances/ops.yaml",
+        [MINIME_MEDIA_ROOT_ENV]: "runtime/media",
+        [ECHO_DIR_BASE_ENV]: "runtime/echo",
         LOG_DIR: "/tmp/minime-logs",
-        MINIME_TEST_MEDIA_BASE: "/tmp/minime-media",
       },
       homeDir: "/tmp/minime-home",
       pid: 6789,
     });
 
     assert.strictEqual(contract.paths.configPath, join(workspaceRoot, "custom", "config.yaml"));
+    assert.strictEqual(contract.paths.instanceConfigPath, join(workspaceRoot, "instances", "ops.yaml"));
     assert.strictEqual(contract.paths.cronsPath, absoluteCronsPath);
     assert.strictEqual(contract.paths.logDir, "/tmp/minime-logs");
-    assert.strictEqual(contract.paths.mediaBaseDir, "/tmp/minime-media/6789");
+    assert.strictEqual(contract.paths.mediaBaseDir, "/tmp/ignored-cwd/runtime/media");
+    assert.strictEqual(contract.paths.echoDir, "/tmp/ignored-cwd/runtime/echo");
     assert.strictEqual(contract.effectivePaths.configPath.source, "env");
+    assert.strictEqual(contract.effectivePaths.instanceConfigPath?.source, "env");
     assert.strictEqual(contract.effectivePaths.cronsPath.source, "env");
+  });
+
+  it("keeps the per-pid test media root ahead of MINIME_MEDIA_ROOT", () => {
+    const contract = resolveWorkspaceContract({
+      cwd: "/tmp/minime-cwd",
+      env: {
+        [MINIME_MEDIA_ROOT_ENV]: "/tmp/ignored-media-root",
+        MINIME_TEST_MEDIA_BASE: "/tmp/minime-test-media",
+      },
+      homeDir: "/tmp/minime-home",
+      pid: 6789,
+    });
+
+    assert.strictEqual(contract.paths.mediaBaseDir, "/tmp/minime-test-media/6789");
+  });
+
+  it("keeps writable session, media, and echo roots distinct across deployments", () => {
+    const firstRoot = mkdtempSync(join(tmpdir(), "minime-contract-first-"));
+    const secondRoot = mkdtempSync(join(tmpdir(), "minime-contract-second-"));
+    const first = resolveWorkspaceContract({
+      cwd: "/tmp/minime-cwd",
+      env: {
+        [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: firstRoot,
+        [MINIME_MEDIA_ROOT_ENV]: join(firstRoot, "media"),
+        [ECHO_DIR_BASE_ENV]: join(firstRoot, "echo"),
+      },
+    });
+    const second = resolveWorkspaceContract({
+      cwd: "/tmp/minime-cwd",
+      env: {
+        [MINIME_CONTROL_WORKSPACE_ROOT_ENV]: secondRoot,
+        [MINIME_MEDIA_ROOT_ENV]: join(secondRoot, "media"),
+        [ECHO_DIR_BASE_ENV]: join(secondRoot, "echo"),
+      },
+    });
+
+    assert.notStrictEqual(first.paths.sessionStorePath, second.paths.sessionStorePath);
+    assert.notStrictEqual(first.paths.mediaBaseDir, second.paths.mediaBaseDir);
+    assert.notStrictEqual(first.paths.echoDir, second.paths.echoDir);
   });
 
   it("does not guess a package install parent directory as the workspace", () => {

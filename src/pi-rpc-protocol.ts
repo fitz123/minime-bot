@@ -17,6 +17,7 @@ import {
   assemblePiContext,
   FILE_DELIVERY_CONTEXT,
   PiContextArtifactWriteError,
+  type PiContextAssemblyOptions,
 } from "./pi-context-assembler.js";
 import {
   formatPiRuntimeDiagnostic,
@@ -27,6 +28,7 @@ import {
   MINIME_CONFIG_PATH_ENV,
   MINIME_CONTROL_WORKSPACE_ROOT_ENV,
   MINIME_CRONS_PATH_ENV,
+  MINIME_INSTANCE_CONFIG_PATH_ENV,
   resolveAgentWorkspaceCwd,
   resolveWorkspaceContract,
   type ResolvedWorkspaceContract,
@@ -199,6 +201,7 @@ const PI_CHILD_ENV_KEY_ALLOWLIST = new Set([
   MINIME_CONFIG_PATH_ENV,
   MINIME_CONTROL_WORKSPACE_ROOT_ENV,
   MINIME_CRONS_PATH_ENV,
+  MINIME_INSTANCE_CONFIG_PATH_ENV,
   MINIME_OUTBOX_ENV,
   "NO_COLOR",
   "PATH",
@@ -561,6 +564,19 @@ export function resolveValidatedPiAgentWorkspaceCwd(agent: AgentConfig): string 
   return validateAgentWorkspaceCwd(agent, resolveWorkspaceContract());
 }
 
+export function assemblePiContextForCurrentDeployment(
+  agent: AgentConfig,
+  options: PiContextAssemblyOptions = {},
+) {
+  const contract = resolveWorkspaceContract();
+  return assemblePiContext(agent, {
+    ...options,
+    ...(contract.paths.instanceConfigPath
+      ? { artifactWorkspaceCwd: contract.paths.controlWorkspaceRoot }
+      : {}),
+  });
+}
+
 export function buildPiSpawnArgs(
   agent: AgentConfig,
   sessionBinding?: LegacyInteractiveSessionInput,
@@ -596,7 +612,7 @@ export function buildPiSpawnArgs(
   // assembler could not safely deliver.
   const includeFileDelivery = Boolean(runtimeEnvOptions?.outboxPath?.trim());
   try {
-    const context = assemblePiContext(agent, {
+    const context = assemblePiContextForCurrentDeployment(agent, {
       includeFileDelivery,
     });
     if (context) {

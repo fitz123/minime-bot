@@ -389,6 +389,7 @@ describe("restart-bot.sh supervisor mode", () => {
       const statusPath = join(h.dir, "status & logs", "request.status");
       const logPath = join(h.dir, "status & logs", "request.log");
       const configPath = "settings/config.yaml";
+      const instanceConfigPath = join(controlWorkspace, "settings", "instance.yaml");
       const cronsPath = join(controlWorkspace, "settings", "crons.yaml");
       const nodeRuntimeRoot = join(h.dir, "official node");
       const pathPrefix = join(h.dir, "fallback bin");
@@ -397,6 +398,7 @@ describe("restart-bot.sh supervisor mode", () => {
       const { status, stderr } = h.run(["--plist"], {
         MINIME_CONTROL_WORKSPACE_ROOT: controlWorkspace,
         MINIME_CONFIG_PATH: configPath,
+        MINIME_INSTANCE_CONFIG_PATH: instanceConfigPath,
         MINIME_CRONS_PATH: cronsPath,
         MINIME_NODE_RUNTIME_ROOT: nodeRuntimeRoot,
         MINIME_PATH_PREFIX: pathPrefix,
@@ -444,6 +446,7 @@ describe("restart-bot.sh supervisor mode", () => {
           BOT_UID: plistStringDict(plist, "EnvironmentVariables").BOT_UID,
           MINIME_CONTROL_WORKSPACE_ROOT: plistStringDict(plist, "EnvironmentVariables").MINIME_CONTROL_WORKSPACE_ROOT,
           MINIME_CONFIG_PATH: plistStringDict(plist, "EnvironmentVariables").MINIME_CONFIG_PATH,
+          MINIME_INSTANCE_CONFIG_PATH: plistStringDict(plist, "EnvironmentVariables").MINIME_INSTANCE_CONFIG_PATH,
           MINIME_CRONS_PATH: plistStringDict(plist, "EnvironmentVariables").MINIME_CRONS_PATH,
           MINIME_NODE_RUNTIME_ROOT: plistStringDict(plist, "EnvironmentVariables").MINIME_NODE_RUNTIME_ROOT,
           MINIME_PATH_PREFIX: plistStringDict(plist, "EnvironmentVariables").MINIME_PATH_PREFIX,
@@ -458,6 +461,7 @@ describe("restart-bot.sh supervisor mode", () => {
           BOT_UID: "501",
           MINIME_CONTROL_WORKSPACE_ROOT: controlWorkspace,
           MINIME_CONFIG_PATH: configPath,
+          MINIME_INSTANCE_CONFIG_PATH: instanceConfigPath,
           MINIME_CRONS_PATH: cronsPath,
           MINIME_NODE_RUNTIME_ROOT: nodeRuntimeRoot,
           MINIME_PATH_PREFIX: pathPrefix,

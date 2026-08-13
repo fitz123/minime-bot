@@ -13,10 +13,6 @@ Most helpers here back the live Pi extensions:
 - `subagent` for delegated child Pi runs.
 - `ask-agent` for configured full-agent inter-agent questions.
 - `codex-usage` for bounded Codex quota capture and persistence.
-- `ops-worker-parity-attestation` for the ops-only, before-provider context and
-  capability handshake.
-- `ops-worker-conversation-bounds` for the tool-free Ops conversation runner's
-  final provider-payload ceiling.
 
 There are no `memory_*` Pi tool aliases. The package exposes the canonical
 Knowledge tool names only, and the scoped protection exists only to keep managed
@@ -63,16 +59,8 @@ detected Knowledge v2 workspaces. Read-only Git commands remain available.
 
 The standalone `extensions/pi/codex-usage.ts` wrapper is different: it is used
 only by the out-of-band Codex quota sampler and must not be added to the normal
-`PI_EXTENSION_WRAPPER_RELPATHS` list. The helper is also called by the
-ops-worker-only parity wrapper to persist attempt-scoped response telemetry.
-See
+`PI_EXTENSION_WRAPPER_RELPATHS` list. See
 `docs/plans/completed/2026-06-01-pi-phase2-extensions.md` for A1-A3.
-
-Conversational Ops disables normal extensions and loads only the
-`ops-worker-conversation-bounds` wrapper. Its `before_provider_request`
-handler clamps recognized request shapes to 768 output tokens. An unknown or
-invalid provider payload exits with the fixed fail-closed code instead of
-continuing with an unbounded request.
 
 `PI_EXTENSIONS_DISABLED=1` disables every explicit extension for that spawn:
 first-party wrappers and any configured `piExtraExtensions`. That deliberately
@@ -148,28 +136,6 @@ Rationale:
 If a wrapper ever grows logic worth testing, move that logic into a
 `src/pi-extensions/*.ts` helper rather than adding a tsconfig for the wrapper.
 
-## Ops-worker parity resource loading
-
-Ops-worker capability parity intentionally uses two production dependencies at
-runtime. `typescript` performs deterministic AST inspection of each selected
-extension's statically resolved local module closure; dynamic and reflective
-module loading fails closed. The package-owned subagent manifest additionally
-pins its bundled `agents/` and `prompts/` resources.
-`jiti` loads the resulting private, read-only extension snapshots with fixed
-package aliases and resolver settings, so extension-local replacements or
-ambient Jiti configuration cannot change the executed dependency bytes.
-`node:vm` is accepted only through one default binding and a direct
-`new vm.Script(...).runInContext(context)` chain whose context is a unique constant
-initialized by direct `vm.createContext(...)`; other execution methods, aliases,
-extra execution options, loader-bearing options, computed access, re-exports,
-and other VM APIs are rejected. Bare `acorn` imports require
-manifest-covered package metadata and a self-contained import entry with no
-module-loading escape, then execute from a copied, layout-preserving
-`node_modules` snapshot rather than ambient resolution. Skills are pinned as
-bounded directory packages rather than as `SKILL.md` alone, excluding only exact
-generated Python directory names `.venv`, `.pytest_cache`, and `__pycache__`;
-near misses remain included and other symlinks fail closed.
-
 ## Context assembler (workspace context parity at spawn)
 
 `bot/src/pi-context-assembler.ts` gives Pi spawns the same workspace context
@@ -232,10 +198,6 @@ fall back to the visible index or direct reads and report that limitation.
 - **Fail-safe:** every file read is wrapped — a missing/unreadable source is
   `log.warn`-ed and skipped, NEVER thrown. A total failure returns `null` so the
   caller degrades to a bare Pi spawn. The assembler must never break a spawn.
-- **Strict ops-worker mode:** `assemblePiContext(..., { strict: true })` rejects
-  unsafe, missing, or unreadable declared sources. Ops workers use this mode and
-  write the artifacts into their separate execution workspace; they never fall
-  back to a smaller prompt after a canonical primary-context failure.
 - **Manifest:** every accepted source and the assembled persona/bundle contribute
   redacted SHA-256 identities to the returned manifest; no source body or private
   absolute path is persisted in parity evidence.

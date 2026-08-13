@@ -1,7 +1,10 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, chmodSync, mkdirSync, realpathSync, symlinkSync, rmSync, statSync, writeFileSync, utimesSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, chmodSync, mkdirSync, mkdtempSync, realpathSync, symlinkSync, rmSync, statSync, writeFileSync, utimesSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { tmpdir } from "node:os";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   MEDIA_BASE,
   sessionMediaDir,
@@ -92,6 +95,55 @@ describe("sessionMediaDir", () => {
 
   it("returns same path for same chatId", () => {
     assert.strictEqual(sessionMediaDir("abc"), sessionMediaDir("abc"));
+  });
+
+  it("uses MINIME_MEDIA_ROOT and keeps two deployment roots isolated", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "media-root-isolation-"));
+    const firstRoot = join(fixture, "first");
+    const secondRoot = join(fixture, "second");
+    const moduleUrl = pathToFileURL(
+      join(dirname(fileURLToPath(import.meta.url)), "..", "media-store.ts"),
+    ).href;
+    const probe = (root: string) => {
+      const childEnv: NodeJS.ProcessEnv = {
+        ...process.env,
+        MINIME_MEDIA_ROOT: root,
+      };
+      delete childEnv.MINIME_TEST_MEDIA_BASE;
+      const script = [
+        `import { writeFileSync, existsSync } from "node:fs";`,
+        `const media = await import(${JSON.stringify(moduleUrl)});`,
+        `const candidate = media.sessionMediaDir("shared-chat");`,
+        `const observedBeforeWrite = existsSync(candidate);`,
+        `const path = media.allocateMediaPath("shared-chat", "probe", ".txt");`,
+        `writeFileSync(path, "probe");`,
+        `process.stdout.write(JSON.stringify({ base: media.MEDIA_BASE, observedBeforeWrite, path }));`,
+      ].join("\n");
+      const result = spawnSync(
+        process.execPath,
+        ["--import", "tsx", "--input-type=module", "--eval", script],
+        { cwd: dirname(fileURLToPath(import.meta.url)), env: childEnv, encoding: "utf8" },
+      );
+      assert.strictEqual(result.status, 0, result.stderr);
+      return JSON.parse(result.stdout) as {
+        base: string;
+        observedBeforeWrite: boolean;
+        path: string;
+      };
+    };
+
+    try {
+      const first = probe(firstRoot);
+      const second = probe(secondRoot);
+      assert.strictEqual(first.base, firstRoot);
+      assert.strictEqual(second.base, secondRoot);
+      assert.strictEqual(first.observedBeforeWrite, false);
+      assert.strictEqual(second.observedBeforeWrite, false);
+      assert.ok(first.path.startsWith(firstRoot + "/"));
+      assert.ok(second.path.startsWith(secondRoot + "/"));
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
   });
 });
 

@@ -225,6 +225,7 @@ export function validateWorkspaceContract(
       config = loadConfig(contract.paths.configPath, {
         resolveSecrets: false,
         workspaceRoot: contract.paths.workspaceRoot,
+        instanceConfigPath: contract.paths.instanceConfigPath,
       });
     } catch (err) {
       issue(issues, "error", `config does not parse with secret resolution disabled: ${(err as Error).message}`);

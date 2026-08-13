@@ -8,6 +8,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const packageRoot = resolve(__dirname, "..", "..");
 const retiredControlWorkspaceEnv = ["MINIME", "WORKSPACE", "ROOT"].join("_");
 const retiredAgentWorkspaceEnv = ["MINIME", "AGENT", "WORKSPACE", "CWD"].join("_");
+const retiredWorkerProduct = ["ops", "worker"].join("-");
 
 function readPackageFile(relativePath: string): string {
   return readFileSync(resolve(packageRoot, relativePath), "utf-8");
@@ -84,6 +85,58 @@ describe("project naming", () => {
       "test-fixtures/minimal-workspace",
     ]) {
       assert.ok(readme.includes(expected), `README.md should document ${expected}`);
+    }
+  });
+
+  it("packaged docs describe one canonical configuration and no worker product", () => {
+    const normalizedReadme = normalizeDoc(readme);
+    for (const expected of [
+      "two instances of the same ordinary `minime-bot` product from the same package release",
+      "one canonical configuration source",
+      "read the same absolute path directly",
+      "there is no second behavioral configuration",
+      "no manual or automatic synchronization step",
+      "cannot override agents, models, thinking, prompts, session defaults",
+    ]) {
+      assert.ok(normalizedReadme.includes(expected), `README.md should document ${expected}`);
+    }
+    assert.ok(
+      packageJson.files?.includes("docs/monitoring.md"),
+      "npm package should include the ordinary trigger and monitoring guide",
+    );
+    assert.ok(
+      !packageJson.files?.includes(`docs/${retiredWorkerProduct}.md`),
+      "npm package should not include the retired worker product guide",
+    );
+    assert.ok(
+      !packageJson.files?.includes(`dist/${retiredWorkerProduct}/**`),
+      "npm package should not include the retired worker product runtime",
+    );
+    for (const [label, content] of [
+      ["README.md", readme],
+      ["docs/monitoring.md", monitoringDoc],
+    ] as const) {
+      assert.ok(
+        !content.includes(retiredWorkerProduct),
+        `${label} should not describe the retired worker product`,
+      );
+    }
+  });
+
+  it("packaged docs describe the ordinary trigger as stateless queue glue", () => {
+    for (const [label, content] of [
+      ["README.md", normalizeDoc(readme)],
+      ["docs/monitoring.md", normalizeDoc(monitoringDoc)],
+    ] as const) {
+      for (const expected of [
+        "ordinary `MessageQueue`",
+        "persistent agent session",
+        "no trigger IDs",
+        "status/result API",
+        "reporting surface",
+      ]) {
+        assert.ok(content.includes(expected), `${label} should document ${expected}`);
+      }
     }
   });
 

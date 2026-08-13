@@ -2,11 +2,13 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const packageRoot = resolve(__dirname, "..", "..");
+const retiredProductSegment = ["ops", "worker"].join("-");
+const retiredPrimaryResourceModule = ["pi", "primary", "resources"].join("-");
 
 const requiredPackageInputs = [
   "src",
@@ -66,5 +68,18 @@ describe("package root import safety", () => {
       forbiddenTrackedPathPatterns.some((pattern) => pattern.test(file)),
     );
     assert.deepEqual(forbiddenFiles, []);
+  });
+
+  it("does not retain removed product modules, documentation, or CLI imports", () => {
+    const retiredPaths = [
+      join("src", retiredProductSegment, "worker-cli.ts"),
+      join("src", `${retiredPrimaryResourceModule}.ts`),
+      join("docs", `${retiredProductSegment}.md`),
+    ];
+    for (const relativePath of retiredPaths) {
+      assert.equal(existsSync(resolve(packageRoot, relativePath)), false, relativePath);
+    }
+
+    assert.equal(readPackageFile("src/cli.ts").includes(retiredProductSegment), false);
   });
 });

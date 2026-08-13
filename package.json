@@ -30,7 +30,6 @@
     "dist/knowledge/**/*.d.ts",
     "dist/knowledge/**/*.js",
     "dist/knowledge/**/*.js.map",
-    "dist/ops-worker/**",
     "dist/pi-extensions/**/*.d.ts",
     "dist/pi-extensions/**/*.js",
     "dist/pi-extensions/**/*.js.map",
@@ -48,7 +47,6 @@
     "telegram-bot.plist.example",
     "docs/launchd-operations.md",
     "docs/monitoring.md",
-    "docs/ops-worker.md",
     "examples/monitoring/*"
   ],
   "keywords": [

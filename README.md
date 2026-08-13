@@ -41,22 +41,6 @@ minime-bot config validate --workspace /path/to/workspace
 minime-bot workspace validate --workspace /path/to/workspace
 ```
 
-The package also includes an inactive-by-default ops-worker foundation. It
-exposes strict local submission and lifecycle evidence helpers plus loopback
-health/status. Its opt-in feature surface adds continuous authorization,
-primary context/capability attestation, quota-aware waits, typed availability
-verification, a generic all-group Alertmanager incident contract with schema-v6
-typed outcomes and redacted reports, a dedicated second-token Telegram control
-plane with bounded text and locally transcribed voice conversation,
-authenticated loopback Alertmanager intake, and a deterministic fake fault
-lab. Conversational control proposals require a deterministic operator
-confirmation and are revalidated through the same lifecycle path as slash
-commands; incident work preempts conversation, while slash commands remain
-provider-independent. Nothing
-starts automatically: control and intake exist only under an explicit
-`worker start --control-config` with trusted embedding dependencies. See
-[Ops-worker policy, control, intake, and fault lab](docs/ops-worker.md).
-
 Knowledge commands operate on an agent workspace, not the control workspace:
 
 ```bash
@@ -181,6 +165,106 @@ By default, the workspace provides:
 - `config.local.yaml` for local overrides when present.
 - `crons.yaml` for scheduled prompts when present.
 - `data/`, `.tmp/`, logs, and media locations used by runtime state.
+
+### Second ordinary deployment
+
+Primary and a reserve deployment are two instances of the same ordinary
+`minime-bot` product from the same package release. They use one canonical
+configuration source and the same live agent context; the reserve is not a
+separate worker or product. Set `MINIME_CONFIG_PATH` to the same canonical
+`config.yaml` for both processes. When either process uses an instance overlay,
+every canonical `agents.<id>.workspaceCwd` must be absolute, and both processes
+must read the same absolute path directly. A shared configuration or context
+change is therefore made once: there is no second behavioral configuration and
+no manual or automatic synchronization step.
+
+Give each process its own writable roots and runtime identity:
+
+```sh
+MINIME_CONFIG_PATH=/path/to/canonical/config.yaml
+MINIME_CONTROL_WORKSPACE_ROOT=/path/to/deployment/control
+MINIME_INSTANCE_CONFIG_PATH=/path/to/deployment/instance.yaml
+PI_CODING_AGENT_SESSION_DIR=/path/to/deployment/pi-sessions
+MINIME_MEDIA_ROOT=/path/to/deployment/media
+ECHO_DIR_BASE=/path/to/deployment/echo
+LOG_DIR=/path/to/deployment/logs
+CRON_HEALTH_TEXTFILE_DIR=/path/to/deployment/cron-health
+MINIME_BOT_SLOT=reserve
+```
+
+Use different values for every deployment-owned path and slot. The distinct
+control roots isolate bot session stores and `.tmp` runtime state; the other
+roots isolate Pi transcripts, media, echo input, logs, and cron-health
+textfiles. Overlay-enabled deployments still read persona, Knowledge, rules,
+and other context from the canonical agent workspace, but write generated
+context and persona artifacts beneath their own control roots. With no
+instance overlay, relative `workspaceCwd` values and the existing artifact
+location under the agent workspace remain unchanged.
+
+The instance file is an allowlisted identity overlay. A canonical Telegram
+binding needs a unique label; the overlay may change only that binding's
+`chatId` and `topicId`, while preserving its agent, kind, routing, mention,
+voice, typing, and topic behavior. Give each deployment a distinct Telegram
+token and DM identity and, when metrics are enabled, a distinct port:
+
+```yaml
+secrets:
+  sopsFile: /path/to/deployment/secrets.enc.yaml
+telegramTokenSopsKey: telegram.token
+bindingIdentityOverrides:
+  operator-dm:
+    chatId: <deployment-chat-id>
+    topicId: <deployment-topic-id>
+metricsPort: <deployment-metrics-port>
+```
+
+`topicId` is optional. The overlay may also carry deployment delivery IDs,
+metrics host, and the complete `triggerInput` section described below. It
+cannot override agents, models, thinking, prompts, session defaults,
+extensions, Discord configuration, logging behavior, raw bindings, or
+`workspaceCwd`.
+
+### Minimal local trigger input
+
+The optional trigger input runs inside the ordinary bot process and is disabled
+when `triggerInput` is absent. Configure one loopback listener, exactly one
+bearer source, and a Telegram destination that resolves to an existing binding:
+
+```yaml
+triggerInput:
+  port: 9466
+  host: 127.0.0.1
+  path: /trigger
+  bearerSopsKey: triggerInput.bearer
+  chatId: <deployment-chat-id>
+  threadId: <optional-topic-id>
+```
+
+`host` defaults to `127.0.0.1` and accepts only loopback; `path` defaults to
+`/trigger`. `bearerEnv` may replace `bearerSopsKey`, but exactly one is
+required. The resolved bearer must contain 16–8,192 printable ASCII bytes. An
+enabled input also requires a resolved Telegram token and matching binding, so
+partial routing fails at startup.
+
+Send `POST <path>` with `Authorization: Bearer <credential>`,
+`Content-Type: application/json`, and exactly these payload fields:
+
+```json
+{"source":"alertmanager","text":"bounded human-readable evidence"}
+```
+
+`source` is a 1–32 character lowercase ASCII slug using letters, digits, and
+hyphens. `text` is non-empty and limited to 4,096 UTF-16 units; the complete
+request body is limited to 16 KiB. The input frames the evidence and calls the
+existing ordinary `MessageQueue` once, using the binding's agent and persistent
+agent session. It does not parse source-specific schemas.
+
+Responses contain only a status word: `202` means accepted by the ordinary
+queue; `429` means saturated or shutting down; `400`, `401`, `404`, `405`,
+`413`, and `415` cover malformed input, bearer rejection, path, method, body
+size, and content type. There are no trigger IDs, persistence, separate queue,
+retry or custody state, lifecycle, status/result API, authorization policy, or
+reporting surface. Sources retain their own delivery and retry semantics.
 
 ### Codex web search and direct URL workflows
 
@@ -812,11 +896,14 @@ monitoring stack itself. See [Host-native monitoring and Telegram alerts](docs/m
 for prerequisites, configuration, installation, validation, diagnostics, and
 rollback.
 
-The webhook can optionally verify current Alertmanager groups and forward them
-to the generic Ops incident intake. Noncritical bridge failures stay quiet and
-retryable, relying on separately deduplicated Ops-health escalation instead of
-per-group native fallback; required critical dual delivery remains independent.
-Direct native Telegram delivery remains the default.
+The webhook can optionally verify current Alertmanager groups and forward a
+bounded human-readable summary to the ordinary bot trigger input. In bridge
+mode, delivery failures stay quiet on Telegram and return a retryable response
+to Alertmanager; no raw payload, native duplicate, or direct fallback is sent.
+Runtime doctor uses the same input when configured and bounds its optional
+sanitized control-path notice in the doctor's existing transition document.
+With trigger settings absent, both host-native sources retain their existing
+direct Telegram compatibility behavior.
 
 ## Repository Boundaries
 

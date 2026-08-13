@@ -15,11 +15,11 @@ import {
   unlinkSync,
 } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
 import { log } from "./logger.js";
+import { resolveWorkspaceContract } from "./workspace-contract.js";
 
 /** Base directory where deliver.sh writes echo JSON files. */
-export const ECHO_DIR_BASE = join(homedir(), ".minime", "bot-echo");
+export const ECHO_DIR_BASE = resolveWorkspaceContract().paths.echoDir;
 
 /**
  * Shared prefix for echo framing text.

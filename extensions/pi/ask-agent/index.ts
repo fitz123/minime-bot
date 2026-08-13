@@ -9,8 +9,8 @@ import { spawn } from "node:child_process";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "../../../src/config.js";
-import { assemblePiContext } from "../../../src/pi-context-assembler.js";
 import {
+  assemblePiContextForCurrentDeployment,
   buildPiAskAgentChildSpawnEnv,
   resolveValidatedPiAgentWorkspaceCwd,
   resolvePiAskAgentChildExtensionArgs,
@@ -51,7 +51,7 @@ export default function (pi: ExtensionAPI): void {
           config,
           env: process.env,
           validateTargetWorkspace: resolveValidatedPiAgentWorkspaceCwd,
-          assembleContext: assemblePiContext,
+          assembleContext: assemblePiContextForCurrentDeployment,
           runTarget: (request) => runAskAgentTargetChild(request, {
             spawn,
             resolveInvocation: resolvePiInvocation,

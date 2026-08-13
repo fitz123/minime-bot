@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Allow a second ordinary Minime deployment to share one canonical behavior
+  configuration and live context while isolating identity and writable runtime
+  state; add a minimal authenticated ordinary-turn trigger input, route verified
+  Alertmanager summaries through its native retry path with zero direct notices,
+  bound runtime doctor's optional sanitized unavailable notice in its existing
+  transition state, and remove the historical worker product and its
+  worker-only attestation machinery (#132).
+
 ## 2026.8.6
 
 - Suspend active Telegram native drafts before package-owned delivery echoes or

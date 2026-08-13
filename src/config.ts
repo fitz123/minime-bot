@@ -2,11 +2,12 @@ import { readFileSync, existsSync, realpathSync } from "node:fs";
 import { resolve, dirname, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
-import type { BotConfig, AgentConfig, AskAgentConfig, TelegramBinding, TopicOverride, SessionDefaults, DiscordBinding, DiscordChannelOverride, DiscordConfig } from "./types.js";
+import type { BotConfig, AgentConfig, AskAgentConfig, TelegramBinding, TopicOverride, SessionDefaults, DiscordBinding, DiscordChannelOverride, DiscordConfig, TriggerInputConfig } from "./types.js";
 import { log, parseLogLevel } from "./logger.js";
 import { DEFAULT_MAX_MEDIA_BYTES } from "./media-store.js";
 import { resolveSecret, sopsExtractExpression, type ExecFileSyncLike } from "./secrets.js";
 import { resolveAgentWorkspaceCwd, resolveWorkspaceContract } from "./workspace-contract.js";
+import { resolveBinding } from "./telegram-binding.js";
 
 const PI_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 const CONFIGURED_SECRET_PLACEHOLDER = "[configured]";
@@ -105,17 +106,215 @@ export function mergeDeep(
   return result;
 }
 
-// Load config.yaml and merge config.local.yaml on top if it exists.
+// Load config.yaml, merge config.local.yaml, then apply the allowlisted instance overlay.
 // Exported for use by cron-runner.ts and tests.
-export function loadRawMergedConfig(configPath?: string): Record<string, unknown> {
+function isConfigRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function firstInstanceLeafPath(value: unknown, path: string): string {
+  if (!isConfigRecord(value)) return path;
+  const keys = Object.keys(value);
+  if (keys.length === 0) return path;
+  const key = keys[0];
+  return firstInstanceLeafPath(value[key], `${path}.${key}`);
+}
+
+function rejectInstancePath(path: string): never {
+  throw new Error(`Instance config override is not allowed at ${path}`);
+}
+
+const INSTANCE_SCALAR_PATHS = new Set([
+  "telegramTokenSopsKey",
+  "telegramTokenEnv",
+  "metricsPort",
+  "metricsHost",
+  "adminChatId",
+  "defaultDeliveryChatId",
+  "defaultDeliveryThreadId",
+]);
+
+function validateInstanceOverlay(raw: unknown): Record<string, unknown> {
+  if (!isConfigRecord(raw)) {
+    throw new Error("Instance config must be an object");
+  }
+
+  for (const [key, value] of Object.entries(raw)) {
+    if (INSTANCE_SCALAR_PATHS.has(key)) {
+      if (isConfigRecord(value) || Array.isArray(value)) {
+        rejectInstancePath(firstInstanceLeafPath(value, key));
+      }
+      continue;
+    }
+    if (key === "triggerInput") {
+      continue;
+    }
+    if (key === "secrets") {
+      if (!isConfigRecord(value)) rejectInstancePath("secrets");
+      for (const nestedKey of Object.keys(value)) {
+        if (nestedKey !== "sopsFile") {
+          rejectInstancePath(firstInstanceLeafPath(value[nestedKey], `secrets.${nestedKey}`));
+        }
+      }
+      continue;
+    }
+    if (key === "bindingIdentityOverrides") {
+      if (!isConfigRecord(value)) rejectInstancePath("bindingIdentityOverrides");
+      for (const [label, patch] of Object.entries(value)) {
+        const patchPath = `bindingIdentityOverrides.${label}`;
+        if (!isConfigRecord(patch)) rejectInstancePath(patchPath);
+        for (const [patchKey, patchValue] of Object.entries(patch)) {
+          if (patchKey !== "chatId" && patchKey !== "topicId") {
+            rejectInstancePath(firstInstanceLeafPath(patchValue, `${patchPath}.${patchKey}`));
+          }
+        }
+      }
+      continue;
+    }
+    rejectInstancePath(firstInstanceLeafPath(value, key));
+  }
+
+  return raw;
+}
+
+function requireAbsoluteCanonicalAgentWorkspaces(config: Record<string, unknown>): void {
+  if (!isConfigRecord(config.agents)) return;
+  for (const [agentId, rawAgent] of Object.entries(config.agents)) {
+    if (!isConfigRecord(rawAgent) || typeof rawAgent.workspaceCwd !== "string") continue;
+    if (!isAbsolute(rawAgent.workspaceCwd)) {
+      throw new Error(
+        `Instance config requires canonical agents.${agentId}.workspaceCwd to be absolute`,
+      );
+    }
+  }
+}
+
+function applyBindingIdentityOverrides(
+  canonical: Record<string, unknown>,
+  rawOverrides: unknown,
+): Record<string, unknown> {
+  if (rawOverrides === undefined) return canonical;
+  if (!isConfigRecord(rawOverrides)) rejectInstancePath("bindingIdentityOverrides");
+  if (!Array.isArray(canonical.bindings)) {
+    throw new Error("Instance config bindingIdentityOverrides require canonical bindings");
+  }
+
+  const bindings = canonical.bindings.map((binding) =>
+    isConfigRecord(binding) ? { ...binding } : binding,
+  );
+  const patchedPaths = new Map<number, string>();
+  for (const [label, rawPatch] of Object.entries(rawOverrides)) {
+    const patchPath = `bindingIdentityOverrides.${label}`;
+    if (!isConfigRecord(rawPatch)) rejectInstancePath(patchPath);
+    const matches = bindings
+      .map((binding, index) => ({ binding, index }))
+      .filter(({ binding }) => isConfigRecord(binding) && binding.label === label);
+    if (matches.length === 0) {
+      throw new Error(`${patchPath} does not match a canonical binding label`);
+    }
+    if (matches.length > 1) {
+      throw new Error(`${patchPath} matches a duplicate canonical binding label`);
+    }
+
+    const patch: Record<string, unknown> = {};
+    for (const key of ["chatId", "topicId"] as const) {
+      if (!Object.hasOwn(rawPatch, key)) continue;
+      if (typeof rawPatch[key] !== "number") {
+        throw new Error(`${patchPath}.${key} must be a number`);
+      }
+      patch[key] = rawPatch[key];
+    }
+    bindings[matches[0].index] = {
+      ...(matches[0].binding as Record<string, unknown>),
+      ...patch,
+    };
+    patchedPaths.set(matches[0].index, patchPath);
+  }
+
+  for (let leftIndex = 0; leftIndex < bindings.length; leftIndex += 1) {
+    const left = bindings[leftIndex];
+    if (!isConfigRecord(left)) continue;
+    const leftTopicIds = new Set<number>();
+    if (typeof left.topicId === "number") leftTopicIds.add(left.topicId);
+    if (Array.isArray(left.topics)) {
+      for (const topic of left.topics) {
+        if (isConfigRecord(topic) && typeof topic.topicId === "number") {
+          leftTopicIds.add(topic.topicId);
+        }
+      }
+    }
+    for (let rightIndex = leftIndex + 1; rightIndex < bindings.length; rightIndex += 1) {
+      const right = bindings[rightIndex];
+      const nestedTopicCollision = isConfigRecord(right)
+        && Array.isArray(right.topics)
+        && right.topics.some(
+          (topic) => isConfigRecord(topic)
+            && typeof topic.topicId === "number"
+            && leftTopicIds.has(topic.topicId),
+        );
+      if (
+        !isConfigRecord(right)
+        || left.chatId !== right.chatId
+        || (left.topicId !== right.topicId
+          && !(typeof right.topicId === "number" && leftTopicIds.has(right.topicId))
+          && !nestedTopicCollision)
+      ) {
+        continue;
+      }
+      const patchPath = patchedPaths.get(rightIndex) ?? patchedPaths.get(leftIndex);
+      if (patchPath) {
+        throw new Error(`${patchPath} creates an ambiguous Telegram binding route`);
+      }
+    }
+  }
+  return { ...canonical, bindings };
+}
+
+function mergeInstanceConfig(
+  canonical: Record<string, unknown>,
+  instance: Record<string, unknown>,
+): Record<string, unknown> {
+  requireAbsoluteCanonicalAgentWorkspaces(canonical);
+  const withBindingIdentity = applyBindingIdentityOverrides(
+    canonical,
+    instance.bindingIdentityOverrides,
+  );
+  const mergeBase = { ...withBindingIdentity };
+  const genericOverlay = { ...instance };
+  delete genericOverlay.bindingIdentityOverrides;
+  if (
+    Object.hasOwn(instance, "telegramTokenSopsKey")
+    || Object.hasOwn(instance, "telegramTokenEnv")
+  ) {
+    delete mergeBase.telegramTokenSopsKey;
+    delete mergeBase.telegramTokenEnv;
+  }
+  if (Object.hasOwn(instance, "triggerInput")) {
+    delete mergeBase.triggerInput;
+  }
+  return mergeDeep(mergeBase, genericOverlay);
+}
+
+export function loadRawMergedConfig(
+  configPath?: string,
+  instanceConfigPath?: string,
+): Record<string, unknown> {
   const path = resolveConfigPath(configPath);
   const base = (parseYaml(readFileSync(path, "utf8")) as Record<string, unknown>) ?? {};
   const localPath = deriveLocalConfigPath(path);
+  let canonical = base;
   if (existsSync(localPath)) {
     const local = (parseYaml(readFileSync(localPath, "utf8")) as Record<string, unknown>) ?? {};
-    return mergeDeep(base, local);
+    canonical = mergeDeep(base, local);
   }
-  return base;
+  const resolvedInstanceConfigPath = instanceConfigPath
+    ? resolve(instanceConfigPath)
+    : resolveWorkspaceContract().paths.instanceConfigPath;
+  if (!resolvedInstanceConfigPath) return canonical;
+  const instance = validateInstanceOverlay(
+    (parseYaml(readFileSync(resolvedInstanceConfigPath, "utf8")) as unknown) ?? {},
+  );
+  return mergeInstanceConfig(canonical, instance);
 }
 
 interface RawConfig {
@@ -139,6 +338,7 @@ interface RawConfig {
   adminChatId?: number;
   defaultDeliveryChatId?: number;
   defaultDeliveryThreadId?: number;
+  triggerInput?: unknown;
   defaultModel?: unknown;
   defaultFallbackModel?: unknown;
 }
@@ -147,6 +347,7 @@ interface LoadConfigOptions {
   resolveSecrets?: boolean;
   secretExecFileSync?: ExecFileSyncLike;
   workspaceRoot?: string;
+  instanceConfigPath?: string;
 }
 
 export function resolveConfigWorkspaceRoot(configPath?: string, workspaceRoot?: string): string {
@@ -561,12 +762,119 @@ function validateConfiguredSopsSource(
   }
 }
 
+const TRIGGER_INPUT_HOSTS = new Set<TriggerInputConfig["host"]>([
+  "127.0.0.1",
+  "::1",
+  "localhost",
+]);
+const TRIGGER_INPUT_BEARER = /^[\x21-\x7e]{16,8192}$/;
+
+const TRIGGER_INPUT_KEYS = new Set([
+  "port",
+  "host",
+  "path",
+  "bearerSopsKey",
+  "bearerEnv",
+  "chatId",
+  "threadId",
+]);
+
+function validateTriggerInput(
+  raw: unknown,
+  bindings: TelegramBinding[],
+  telegramToken: string | undefined,
+  sopsFile: string | undefined,
+  options: LoadConfigOptions,
+): TriggerInputConfig | undefined {
+  if (raw === undefined) return undefined;
+  if (!isConfigRecord(raw)) {
+    throw new Error("triggerInput must be an object");
+  }
+  for (const key of Object.keys(raw)) {
+    if (!TRIGGER_INPUT_KEYS.has(key)) {
+      throw new Error(`triggerInput.${key} is not supported`);
+    }
+  }
+
+  if (!Number.isInteger(raw.port) || (raw.port as number) < 1 || (raw.port as number) > 65535) {
+    throw new Error("triggerInput.port must be an integer between 1 and 65535");
+  }
+
+  let host: TriggerInputConfig["host"] = "127.0.0.1";
+  if (raw.host !== undefined) {
+    if (typeof raw.host !== "string" || !TRIGGER_INPUT_HOSTS.has(raw.host as TriggerInputConfig["host"])) {
+      throw new Error("triggerInput.host must be one of 127.0.0.1, ::1, or localhost");
+    }
+    host = raw.host as TriggerInputConfig["host"];
+  }
+
+  let path = "/trigger";
+  if (raw.path !== undefined) {
+    if (typeof raw.path !== "string" || !/^\/[^\s?#]*$/.test(raw.path)) {
+      throw new Error("triggerInput.path must be an absolute HTTP path without whitespace, query, or fragment");
+    }
+    path = raw.path;
+  }
+
+  const bearerSopsKey = optionalConfigString(raw.bearerSopsKey, "triggerInput.bearerSopsKey");
+  const bearerEnv = optionalConfigString(raw.bearerEnv, "triggerInput.bearerEnv");
+  if ((bearerSopsKey ? 1 : 0) + (bearerEnv ? 1 : 0) !== 1) {
+    throw new Error("triggerInput requires exactly one of bearerSopsKey or bearerEnv");
+  }
+  validateConfiguredSopsSource(sopsFile, bearerSopsKey, "triggerInput.bearerSopsKey");
+
+  if (!Number.isSafeInteger(raw.chatId) || raw.chatId === 0) {
+    throw new Error("triggerInput.chatId must be a non-zero safe integer");
+  }
+  const chatId = raw.chatId as number;
+
+  let threadId: number | undefined;
+  if (raw.threadId !== undefined) {
+    if (!Number.isSafeInteger(raw.threadId) || (raw.threadId as number) < 0) {
+      throw new Error("triggerInput.threadId must be a non-negative safe integer");
+    }
+    threadId = raw.threadId as number;
+  }
+
+  if (bindings.length === 0) {
+    throw new Error("triggerInput requires a configured Telegram binding");
+  }
+  if (!telegramToken) {
+    throw new Error("triggerInput requires a resolved Telegram token");
+  }
+  if (!resolveBinding(chatId, bindings, threadId)) {
+    throw new Error("triggerInput chatId/threadId does not match a configured Telegram binding");
+  }
+
+  const bearer = options.resolveSecrets === false
+    ? CONFIGURED_SECRET_PLACEHOLDER
+    : resolveSecret({
+      sopsFile,
+      sopsKey: bearerSopsKey,
+      envVar: bearerEnv,
+      fieldName: "triggerInput.bearer",
+      execFileSync: options.secretExecFileSync,
+    });
+  if (options.resolveSecrets !== false && !TRIGGER_INPUT_BEARER.test(bearer)) {
+    throw new Error("triggerInput.bearer must be 16 to 8192 printable ASCII bytes");
+  }
+
+  return {
+    port: raw.port as number,
+    host,
+    path,
+    bearer,
+    chatId,
+    threadId,
+  };
+}
+
 function findLegacyConfigKey(raw: object, keyPattern: RegExp): string | undefined {
   return Object.keys(raw).find((key) => keyPattern.test(key));
 }
 
 export function loadTelegramToken(configPath?: string, options: LoadConfigOptions = {}): string {
-  const raw: RawConfig = loadRawMergedConfig(configPath) as RawConfig;
+  const raw: RawConfig = loadRawMergedConfig(configPath, options.instanceConfigPath) as RawConfig;
   const workspaceRoot = resolveConfigWorkspaceRoot(configPath, options.workspaceRoot);
   const sopsFile = resolveConfiguredSopsFile(raw, workspaceRoot);
   const legacyTelegramKey = findLegacyConfigKey(raw, LEGACY_TELEGRAM_SERVICE_KEY_RE);
@@ -593,7 +901,7 @@ export function loadTelegramToken(configPath?: string, options: LoadConfigOption
 }
 
 export function loadConfig(configPath?: string, options: LoadConfigOptions = {}): BotConfig {
-  const raw: RawConfig = loadRawMergedConfig(configPath) as RawConfig;
+  const raw: RawConfig = loadRawMergedConfig(configPath, options.instanceConfigPath) as RawConfig;
   const resolveSecrets = options.resolveSecrets !== false;
   const workspaceRoot = resolveConfigWorkspaceRoot(configPath, options.workspaceRoot);
 
@@ -673,6 +981,14 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
   // Validate Discord config (optional)
   const discord = validateDiscordConfig(raw.discord, agents, sopsFile, options);
 
+  const triggerInput = validateTriggerInput(
+    raw.triggerInput,
+    bindings,
+    telegramToken,
+    sopsFile,
+    options,
+  );
+
   // At least one platform must be configured
   if (bindings.length === 0 && !discord) {
     throw new Error("At least one platform must be configured (Telegram bindings or discord section)");
@@ -732,7 +1048,7 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
     defaultDeliveryThreadId = raw.defaultDeliveryThreadId;
   }
 
-  return { telegramToken, agents, bindings, sessionDefaults, piExtraExtensions, logLevel, metricsPort, metricsHost, discord, adminChatId, defaultDeliveryChatId, defaultDeliveryThreadId };
+  return { telegramToken, agents, bindings, sessionDefaults, piExtraExtensions, logLevel, metricsPort, metricsHost, discord, adminChatId, defaultDeliveryChatId, defaultDeliveryThreadId, triggerInput };
 }
 
 function realpathOrResolve(path: string): string {

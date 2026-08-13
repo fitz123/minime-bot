@@ -41,9 +41,11 @@ import {
   resolveCronHealthTextfileDir,
 } from "./cron-outbox.js";
 import {
+  ECHO_DIR_BASE_ENV,
   MINIME_CONFIG_PATH_ENV,
   MINIME_CONTROL_WORKSPACE_ROOT_ENV,
   MINIME_CRONS_PATH_ENV,
+  MINIME_INSTANCE_CONFIG_PATH_ENV,
   resolveWorkspaceContract,
   type ResolvedWorkspaceContract,
 } from "./workspace-contract.js";
@@ -1078,8 +1080,17 @@ function renderExplicitEnvEntries(
   if (contract.effectivePaths.configPath.source === "env") {
     entries.push(renderEnvEntry(MINIME_CONFIG_PATH_ENV, contract.paths.configPath));
   }
+  if (contract.paths.instanceConfigPath) {
+    entries.push(renderEnvEntry(
+      MINIME_INSTANCE_CONFIG_PATH_ENV,
+      contract.paths.instanceConfigPath,
+    ));
+  }
   if (contract.effectivePaths.cronsPath.source === "env") {
     entries.push(renderEnvEntry(MINIME_CRONS_PATH_ENV, contract.paths.cronsPath));
+  }
+  if (contract.effectivePaths.echoDir.source === "env") {
+    entries.push(renderEnvEntry(ECHO_DIR_BASE_ENV, contract.paths.echoDir));
   }
   const nodeRuntimeRoot = env[MINIME_NODE_RUNTIME_ROOT_ENV];
   if (nodeRuntimeRoot?.trim()) {

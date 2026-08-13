@@ -835,6 +835,31 @@ describe("MessageQueue acknowledged mid-turn steering", () => {
 // -------------------------------------------------------------------
 
 describe("MessageQueue queue cap", () => {
+  it("reports pending and collect admission while rejecting saturation and shutdown", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
+    const process = createMockProcess();
+    process.setBlocking(true);
+    const queue = new MessageQueue(process.processFn, { debounceMs: 10, queueCap: 1 });
+    const platform = mockPlatform(undefined, false);
+
+    assert.strictEqual(queue.enqueue("chat1", "main", "pending", platform), true);
+    assert.strictEqual(queue.enqueue("chat1", "main", "pending overflow", platform), false);
+
+    t.mock.timers.tick(10);
+    await flushMicrotasks();
+    assert.strictEqual(queue.isBusy("chat1"), true);
+    assert.strictEqual(queue.enqueue("chat1", "main", "collect", platform), true);
+    assert.strictEqual(queue.enqueue("chat1", "main", "collect overflow", platform), false);
+
+    queue.beginShutdown();
+    assert.strictEqual(queue.enqueue("chat2", "main", "after shutdown", platform), false);
+
+    process.setBlocking(false);
+    process.unblock();
+    await queue.waitForIdle();
+    queue.clearAll();
+  });
+
   it("rejects a concurrent debounce burst visibly while processing each accepted input once", async (t) => {
     t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
     const { processFn, calls } = createMockProcess();

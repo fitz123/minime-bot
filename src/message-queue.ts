@@ -203,7 +203,7 @@ export class MessageQueue {
 
   /**
    * Enqueue a message for a chat. Handles debouncing and mid-turn collect.
-   * Fire-and-forget: returns immediately, processing happens in background.
+   * Returns whether the message was accepted; processing happens in background.
    *
    * `cleanup` runs when the message is consumed (successful delivery or rejection)
    * and is the right hook for turn-scoped temp files.
@@ -221,10 +221,10 @@ export class MessageQueue {
     platform: PlatformContext,
     cleanup?: CleanupFn,
     dropCleanup?: CleanupFn,
-  ): void {
+  ): boolean {
     if (!this.acceptingMessages) {
       this.runCleanups([cleanup, dropCleanup]);
-      return;
+      return false;
     }
     const state = this.getState(chatId, agentId);
     state.latestPlatform = platform;
@@ -244,14 +244,15 @@ export class MessageQueue {
         this.attemptAcknowledgedSteer(chatId, state);
       } else {
         this.rejectSaturatedInput(chatId, state, "collect", platform, cleanup, dropCleanup);
+        return false;
       }
-      return;
+      return true;
     }
 
     // Pre-send debounce: add to pending and reset timer
     if (state.pendingTexts.length >= this.queueCap) {
       this.rejectSaturatedInput(chatId, state, "debounce", platform, cleanup, dropCleanup);
-      return;
+      return false;
     }
     state.pendingTexts.push(text);
     state.pendingCleanups.push(cleanup ?? (() => {}));
@@ -264,6 +265,7 @@ export class MessageQueue {
     state.debounceTimer = setTimeout(() => {
       this.startFlush(chatId);
     }, this.debounceMs);
+    return true;
   }
 
   private startFlush(chatId: string): void {

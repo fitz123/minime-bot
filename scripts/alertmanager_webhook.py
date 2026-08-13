@@ -21,9 +21,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
 from monitoring_native import (
+    CONTROL_PATH_UNAVAILABLE_NOTICE,
     HTTP_RESPONSE_MAX_BYTES,
-    OPS_INTAKE_SOPS_FILE_ENV,
-    OPS_INTAKE_SOPS_KEY_ENV,
+    MINIME_TRIGGER_INPUT_SOPS_FILE,
+    MINIME_TRIGGER_INPUT_SOPS_KEY,
+    MINIME_TRIGGER_INPUT_URL,
     TELEGRAM_TEXT_MAX_UTF16_UNITS,
     DeliveryConfig,
     DeliveryError,
@@ -31,9 +33,14 @@ from monitoring_native import (
     normalize_loopback_http_url,
     post_loopback_json_with_bearer,
     request_with_deadline,
-    resolve_ops_intake_bearer,
+    resolve_trigger_input_bearer,
     send_telegram,
 )
+
+# Alertmanager deliberately selects the approved zero-notice outcome. The
+# shared notice is imported so both trigger sources use one source-side contract,
+# but only runtime doctor sends it from durable transition state.
+_ = CONTROL_PATH_UNAVAILABLE_NOTICE
 
 MAX_BODY_DEFAULT = 256 * 1024
 MAX_CONCURRENT_REQUESTS = 32
@@ -43,7 +50,6 @@ MAX_LABELS = 64
 MAX_LABEL_BYTES = 2 * 1024
 MAX_KEY_BYTES = 256
 MAX_RECEIVER_BYTES = 1024
-OPS_INTAKE_URL_ENV = "MINIME_OPS_INTAKE_URL"
 ALERTMANAGER_URL_ENV = "MINIME_ALERTMANAGER_URL"
 BRIDGE_TIMEOUT_ENV = "MINIME_BRIDGE_TIMEOUT"
 _SAFE_TEXT = re.compile(r"[^A-Za-z0-9 ._:/@+-]+")
@@ -57,14 +63,12 @@ _RFC3339_TIMESTAMP = re.compile(
 
 @dataclass(frozen=True)
 class ParsedAlertmanagerBatch:
-    native_key: str
     bridge_key: str
     message: str
     has_firing: bool
-    critical: bool
     receiver: str
     group_labels: dict[str, str]
-    firing_members: tuple[AlertmanagerMemberIdentity, ...]
+    members: tuple[AlertmanagerMemberIdentity, ...]
 
 
 @dataclass(frozen=True)
@@ -76,7 +80,7 @@ class AlertmanagerMemberIdentity:
 
 @dataclass(frozen=True)
 class BridgeConfig:
-    ops_intake_url: str
+    trigger_input_url: str
     alertmanager_url: str
     bearer: str
     timeout: float
@@ -216,27 +220,6 @@ def _matcher_label_name(value: str) -> str:
     return value if _LEGACY_LABEL_NAME.fullmatch(value) else json.dumps(value, ensure_ascii=False)
 
 
-def _bridge_native_key(
-    receiver: str,
-    group_labels: dict[str, str],
-    members: list[tuple[str, AlertmanagerMemberIdentity]],
-) -> str:
-    group_identity = [receiver, sorted(group_labels.items())]
-    identities = sorted(
-        json.dumps(
-            [group_identity, status, member.labels, member.starts_at],
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        for status, member in members
-    )
-    try:
-        identity_bytes = "\n".join(identities).encode("utf-8")
-    except UnicodeEncodeError:
-        raise ValueError("invalid alert identity") from None
-    return hashlib.sha256(identity_bytes).hexdigest()
-
-
 def _bridge_native_message(
     members: list[tuple[str, AlertmanagerMemberIdentity]],
 ) -> str:
@@ -286,7 +269,6 @@ def parse_bridge_alertmanager_payload(body: bytes) -> ParsedAlertmanagerBatch:
     )
     firing_count = 0
     members: list[tuple[str, AlertmanagerMemberIdentity]] = []
-    firing_members: list[AlertmanagerMemberIdentity] = []
     for alert in alerts:
         if not isinstance(alert, dict) or len(alert) > MAX_ALERT_FIELDS:
             raise ValueError("invalid bridge alert")
@@ -315,11 +297,10 @@ def parse_bridge_alertmanager_payload(body: bytes) -> ParsedAlertmanagerBatch:
             fingerprint=fingerprint,
         )
         members.append((status, member))
+        if any(labels.get(key) != value for key, value in group_labels.items()):
+            raise ValueError("group labels do not match alert")
         if status == "firing":
             firing_count += 1
-            firing_members.append(member)
-            if any(labels.get(key) != value for key, value in group_labels.items()):
-                raise ValueError("group labels do not match firing alert")
     if (
         (payload["status"] == "firing" and firing_count == 0)
         or (payload["status"] == "resolved" and firing_count != 0)
@@ -329,25 +310,25 @@ def parse_bridge_alertmanager_payload(body: bytes) -> ParsedAlertmanagerBatch:
         tuple[str, tuple[tuple[str, str], ...], int],
         tuple[str, AlertmanagerMemberIdentity],
     ] = {}
+    verification_members_by_identity: dict[
+        tuple[tuple[tuple[str, str], ...], int, str | None],
+        AlertmanagerMemberIdentity,
+    ] = {}
     for status, member in members:
         if firing_count > 0 and status != "firing":
             continue
         identity = (status, member.labels, member.starts_at)
         decision_members_by_identity.setdefault(identity, (status, member))
+        verification_identity = (member.labels, member.starts_at, member.fingerprint)
+        verification_members_by_identity.setdefault(verification_identity, member)
     decision_members = list(decision_members_by_identity.values())
-    critical = any(
-        dict(member.labels).get("severity") == "critical"
-        for _, member in decision_members
-    )
     return ParsedAlertmanagerBatch(
-        native_key=_bridge_native_key(receiver, group_labels, decision_members),
         bridge_key=hashlib.sha256(body).hexdigest(),
         message=_bridge_native_message(decision_members),
         has_firing=firing_count > 0,
-        critical=critical,
         receiver=receiver,
         group_labels=group_labels,
-        firing_members=tuple(firing_members),
+        members=tuple(verification_members_by_identity.values()),
     )
 
 
@@ -418,13 +399,14 @@ def _active_alert_groups_url(
     return f"{base_url}/api/v2/alerts/groups?{urllib.parse.urlencode(parameters)}"
 
 
-def alertmanager_has_exact_group(
+def alertmanager_batch_is_current(
     config: BridgeConfig,
     receiver: str,
     group_labels: dict[str, str],
-    firing_members: tuple[AlertmanagerMemberIdentity, ...],
+    members: tuple[AlertmanagerMemberIdentity, ...],
+    has_firing: bool,
 ) -> bool:
-    """Require an exact routed group containing every delivered firing alert."""
+    """Authenticate a firing or resolved delivery against the exact routed group."""
     try:
         response = request_with_deadline(
             _active_alert_groups_url(
@@ -513,33 +495,43 @@ def alertmanager_has_exact_group(
             member_key = (tuple(sorted(alert_labels.items())), starts_at)
             current_group_members.setdefault(member_key, set()).add(fingerprint)
         matching_group_members.append(current_group_members)
-    return bool(firing_members) and any(
-        all(
-            (
-                member.labels,
-                member.starts_at,
-            ) in current_group
-            and (
-                member.fingerprint is None
-                or member.fingerprint in current_group[(member.labels, member.starts_at)]
-            )
-            for member in firing_members
+    def member_present(
+        member: AlertmanagerMemberIdentity,
+        current_group: dict[tuple[tuple[tuple[str, str], ...], int], set[str | None]],
+    ) -> bool:
+        key = (member.labels, member.starts_at)
+        return key in current_group and (
+            member.fingerprint is None
+            or member.fingerprint in current_group[key]
         )
-        for current_group in matching_group_members
+
+    if has_firing:
+        return bool(members) and any(
+            all(member_present(member, current_group) for member in members)
+            for current_group in matching_group_members
+        )
+    return all(
+        not any(member_present(member, current_group) for current_group in matching_group_members)
+        for member in members
     )
 
 
-def forward_to_ops(config: BridgeConfig, body: bytes) -> bool:
+def forward_to_trigger(config: BridgeConfig, message: str) -> bool:
+    body = json.dumps(
+        {"source": "alertmanager", "text": message},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
     try:
         response = post_loopback_json_with_bearer(
-            config.ops_intake_url,
+            config.trigger_input_url,
             body,
             config.bearer,
             timeout=config.timeout,
         )
     except (MonitoringError, OSError, TimeoutError, ValueError):
         return False
-    return 200 <= response.status <= 299
+    return response.status == 202
 
 
 class WebhookApplication:
@@ -552,11 +544,17 @@ class WebhookApplication:
         deliver: Callable[[str], None],
         deduplicator: BatchDeduplicator | None = None,
         bridge: BridgeConfig | None = None,
-        native_deduplicator: BatchDeduplicator | None = None,
         verify_group: Callable[
-            [BridgeConfig, str, dict[str, str], tuple[AlertmanagerMemberIdentity, ...]], bool
-        ] = alertmanager_has_exact_group,
-        forward: Callable[[BridgeConfig, bytes], bool] = forward_to_ops,
+            [
+                BridgeConfig,
+                str,
+                dict[str, str],
+                tuple[AlertmanagerMemberIdentity, ...],
+                bool,
+            ],
+            bool,
+        ] = alertmanager_batch_is_current,
+        forward: Callable[[BridgeConfig, str], bool] = forward_to_trigger,
     ):
         self.path = path
         self.max_body = max_body
@@ -564,68 +562,35 @@ class WebhookApplication:
         self.deliver = deliver
         self.deduplicator = deduplicator or BatchDeduplicator()
         self.bridge = bridge
-        self.native_deduplicator = native_deduplicator or BatchDeduplicator()
         self.verify_group = verify_group
         self.forward = forward
-
-
-def _deliver_native_once(
-    app: WebhookApplication,
-    key: str,
-    message: str,
-) -> bool:
-    claim = app.native_deduplicator.claim(key)
-    if claim == "committed":
-        return True
-    if claim == "in_flight":
-        return False
-    try:
-        app.deliver(message)
-    except (MonitoringError, OSError):
-        app.native_deduplicator.release(key)
-        return False
-    app.native_deduplicator.commit(key)
-    return True
 
 
 def _deliver_bridge_batch(
     app: WebhookApplication,
     batch: ParsedAlertmanagerBatch,
-    body: bytes,
 ) -> bool:
     bridge = app.bridge
     if bridge is None:
         raise RuntimeError("bridge delivery requires bridge configuration")
-    if not batch.has_firing:
-        return (
-            _deliver_native_once(app, batch.native_key, batch.message)
-            if batch.critical
-            else True
-        )
     try:
         source_present = app.verify_group(
             bridge,
             batch.receiver,
             batch.group_labels,
-            batch.firing_members,
+            batch.members,
+            batch.has_firing,
         )
     except Exception:
-        # Verification remains retryable; only critical delivery has an independent native sink.
-        if batch.critical:
-            _deliver_native_once(app, batch.native_key, batch.message)
         return False
     if not source_present:
-        # Stale or forged local deliveries are acknowledged without granting Ops authority.
+        # Stale or forged local deliveries are acknowledged without starting an agent turn.
         return True
 
     try:
-        ops_succeeded = app.forward(bridge, body)
+        return app.forward(bridge, batch.message)
     except Exception:
-        ops_succeeded = False
-    if batch.critical:
-        native_succeeded = _deliver_native_once(app, batch.native_key, batch.message)
-        return ops_succeeded and native_succeeded
-    return ops_succeeded
+        return False
 
 
 class BoundedThreadingHTTPServer(ThreadingHTTPServer):
@@ -764,7 +729,7 @@ def handler_for(app: WebhookApplication) -> type[BaseHTTPRequestHandler]:
                 self._reply(503, "delivery in progress")
                 return
             if batch is not None:
-                succeeded = _deliver_bridge_batch(app, batch, body)
+                succeeded = _deliver_bridge_batch(app, batch)
                 if not succeeded:
                     app.deduplicator.release(key)
                     self._reply(503, "delivery failed")
@@ -791,7 +756,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--body-timeout", type=float, default=5.0)
     parser.add_argument("--chat-id", default=os.environ.get("MINIME_TELEGRAM_CHAT_ID", ""))
     parser.add_argument("--thread-id", default=os.environ.get("MINIME_TELEGRAM_THREAD_ID"))
-    parser.add_argument("--ops-intake-url", default=os.environ.get(OPS_INTAKE_URL_ENV, ""))
+    parser.add_argument(
+        "--trigger-input-url",
+        default=os.environ.get(MINIME_TRIGGER_INPUT_URL, ""),
+    )
     parser.add_argument("--alertmanager-url", default=os.environ.get(ALERTMANAGER_URL_ENV, ""))
     parser.add_argument(
         "--bridge-timeout",
@@ -803,10 +771,10 @@ def _parser() -> argparse.ArgumentParser:
 
 def _load_bridge(args: argparse.Namespace) -> BridgeConfig | None:
     sources = [
-        args.ops_intake_url,
+        args.trigger_input_url,
         args.alertmanager_url,
-        os.environ.get(OPS_INTAKE_SOPS_FILE_ENV, ""),
-        os.environ.get(OPS_INTAKE_SOPS_KEY_ENV, ""),
+        os.environ.get(MINIME_TRIGGER_INPUT_SOPS_FILE, ""),
+        os.environ.get(MINIME_TRIGGER_INPUT_SOPS_KEY, ""),
     ]
     timeout_supplied = args.bridge_timeout is not None
     if not any(sources) and not timeout_supplied:
@@ -814,15 +782,12 @@ def _load_bridge(args: argparse.Namespace) -> BridgeConfig | None:
     timeout = 5.0 if args.bridge_timeout is None else args.bridge_timeout
     if not all(sources) or not math.isfinite(timeout) or not 0 < timeout <= 30:
         raise DeliveryError("bridge configuration is incomplete")
-    ops_intake_url = normalize_loopback_http_url(
-        args.ops_intake_url,
-        required_path="/intake/alertmanager",
-    )
+    trigger_input_url = normalize_loopback_http_url(args.trigger_input_url)
     alertmanager_url = normalize_loopback_http_url(
         args.alertmanager_url,
         base_only=True,
     )
-    bearer = resolve_ops_intake_bearer()
+    bearer = resolve_trigger_input_bearer()
     try:
         encoded_bearer = bearer.encode("ascii")
     except UnicodeEncodeError:
@@ -833,7 +798,7 @@ def _load_bridge(args: argparse.Namespace) -> BridgeConfig | None:
     ):
         raise DeliveryError("bridge bearer is invalid")
     return BridgeConfig(
-        ops_intake_url=ops_intake_url,
+        trigger_input_url=trigger_input_url,
         alertmanager_url=alertmanager_url,
         bearer=bearer,
         timeout=timeout,

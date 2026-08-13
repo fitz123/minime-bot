@@ -1,12 +1,13 @@
 import { describe, it, after } from "node:test";
 import assert from "node:assert/strict";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import type {
   SpawnSyncOptionsWithStringEncoding,
@@ -24,6 +25,7 @@ import {
   MINIME_CONFIG_PATH_ENV,
   MINIME_CRONS_PATH_ENV,
   MINIME_CONTROL_WORKSPACE_ROOT_ENV,
+  MINIME_INSTANCE_CONFIG_PATH_ENV,
 } from "../workspace-contract.js";
 import { installCronTestEnv } from "./cron-test-env.js";
 
@@ -392,6 +394,52 @@ describe("cron-runner runPi", () => {
     assert.ok(personaPath.endsWith(join(".tmp", "pi-context-main.persona.md")));
     assert.ok(bundlePath.endsWith(join(".tmp", "pi-context-main.bundle.md")));
     assert.ok(args.includes("--no-context-files"));
+  });
+
+  it("writes overlay cron context artifacts under the deployment control root", () => {
+    const sharedWorkspace = makeWorkspace();
+    const controlRoot = makeWorkspace();
+    const instanceConfigPath = join(controlRoot, "instance.yaml");
+    writeFileSync(join(sharedWorkspace, "CLAUDE.md"), "# Shared Cron Context\n", "utf8");
+    writeFileSync(instanceConfigPath, "metricsPort: 9001\n", "utf8");
+    const oldControlRoot = process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
+    const oldInstanceConfig = process.env[MINIME_INSTANCE_CONFIG_PATH_ENV];
+
+    try {
+      process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = controlRoot;
+      process.env[MINIME_INSTANCE_CONFIG_PATH_ENV] = instanceConfigPath;
+      const captures: SpawnCapture[] = [];
+      const deps = makeDeps(captures, {
+        buildAgentConfig: (_cron, cwd) => makeAgent(cwd, { systemPrompt: "SHARED_PERSONA" }),
+        assembleContext: assemblePiContext,
+      });
+
+      runPi(makeCron(), sharedWorkspace, deps);
+
+      const personaPath = flagValue(captures[0].args, "--system-prompt");
+      const bundlePath = flagValue(captures[0].args, "--append-system-prompt");
+      assert.strictEqual(dirname(personaPath), join(controlRoot, ".tmp"));
+      assert.strictEqual(dirname(bundlePath), join(controlRoot, ".tmp"));
+      assert.strictEqual(
+        existsSync(join(sharedWorkspace, ".tmp", "pi-context-main.persona.md")),
+        false,
+      );
+      assert.strictEqual(
+        existsSync(join(sharedWorkspace, ".tmp", "pi-context-main.bundle.md")),
+        false,
+      );
+    } finally {
+      if (oldControlRoot === undefined) {
+        delete process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV];
+      } else {
+        process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = oldControlRoot;
+      }
+      if (oldInstanceConfig === undefined) {
+        delete process.env[MINIME_INSTANCE_CONFIG_PATH_ENV];
+      } else {
+        process.env[MINIME_INSTANCE_CONFIG_PATH_ENV] = oldInstanceConfig;
+      }
+    }
   });
 
   it("validates the agent workspace before assembling cron context", () => {

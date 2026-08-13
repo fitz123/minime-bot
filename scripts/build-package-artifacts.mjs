@@ -16,8 +16,6 @@ const wrappers = [
   ["codex-transport-overflow.ts", "codex-transport-overflow.js"],
   ["web-tools.ts", "web-tools.js"],
   ["knowledge-tools.ts", "knowledge-tools.js"],
-  ["ops-worker-conversation-bounds.ts", "ops-worker-conversation-bounds.js"],
-  ["ops-worker-parity-attestation.ts", "ops-worker-parity-attestation.js"],
   [join("subagent", "agents.ts"), join("subagent", "agents.js")],
   [join("subagent", "index.ts"), join("subagent", "index.js")],
   [join("ask-agent", "index.ts"), join("ask-agent", "index.js")],

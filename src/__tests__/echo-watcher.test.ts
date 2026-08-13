@@ -1,5 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   mkdirSync,
@@ -10,8 +11,9 @@ import {
   statSync,
   symlinkSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   EchoWatcher,
   ECHO_PREFIX,
@@ -83,6 +85,42 @@ afterEach(() => {
 describe("ECHO_PREFIX", () => {
   it("starts with [Bot echo", () => {
     assert.strictEqual(ECHO_PREFIX, "[Bot echo");
+  });
+
+  it("uses ECHO_DIR_BASE and does not observe another deployment root", () => {
+    const firstRoot = mkdtempSync(join(tmpdir(), "echo-root-first-"));
+    const secondRoot = mkdtempSync(join(tmpdir(), "echo-root-second-"));
+    fixtures.push(firstRoot, secondRoot);
+    writeEchoFile(TEST_CHAT_ID, "first deployment only", { baseDir: firstRoot });
+    const moduleUrl = pathToFileURL(
+      join(dirname(fileURLToPath(import.meta.url)), "..", "echo-watcher.ts"),
+    ).href;
+    const probe = (root: string) => {
+      const script = [
+        `const echo = await import(${JSON.stringify(moduleUrl)});`,
+        `const calls = [];`,
+        `new echo.EchoWatcher({ handler: (...args) => calls.push(args) }).drain();`,
+        `process.stdout.write(JSON.stringify({ root: echo.ECHO_DIR_BASE, calls }));`,
+      ].join("\n");
+      const result = spawnSync(
+        process.execPath,
+        ["--import", "tsx", "--input-type=module", "--eval", script],
+        {
+          cwd: dirname(fileURLToPath(import.meta.url)),
+          env: { ...process.env, ECHO_DIR_BASE: root },
+          encoding: "utf8",
+        },
+      );
+      assert.strictEqual(result.status, 0, result.stderr);
+      return JSON.parse(result.stdout) as { root: string; calls: unknown[][] };
+    };
+
+    const second = probe(secondRoot);
+    const first = probe(firstRoot);
+    assert.strictEqual(second.root, secondRoot);
+    assert.strictEqual(first.root, firstRoot);
+    assert.strictEqual(second.calls.length, 0);
+    assert.strictEqual(first.calls.length, 1);
   });
 });
 

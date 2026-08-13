@@ -6,6 +6,9 @@ export const MINIME_CONTROL_WORKSPACE_ROOT_ENV = "MINIME_CONTROL_WORKSPACE_ROOT"
 export const MINIME_AGENT_WORKSPACE_ROOT_ENV = "MINIME_AGENT_WORKSPACE_ROOT";
 export const MINIME_CONFIG_PATH_ENV = "MINIME_CONFIG_PATH";
 export const MINIME_CRONS_PATH_ENV = "MINIME_CRONS_PATH";
+export const MINIME_INSTANCE_CONFIG_PATH_ENV = "MINIME_INSTANCE_CONFIG_PATH";
+export const MINIME_MEDIA_ROOT_ENV = "MINIME_MEDIA_ROOT";
+export const ECHO_DIR_BASE_ENV = "ECHO_DIR_BASE";
 
 export type WorkspacePathSource =
   | "cli"
@@ -30,19 +33,23 @@ export interface WorkspaceContractPaths {
   /** Internal alias for controlWorkspaceRoot; the canonical concept is the control workspace. */
   workspaceRoot: string;
   configPath: string;
+  instanceConfigPath?: string;
   cronsPath: string;
   piExtensionDir: string;
   dataDir: string;
   sessionStorePath: string;
   logDir: string;
   mediaBaseDir: string;
+  echoDir: string;
   runtimeDir: string;
 }
 
 export type WorkspaceContractPathName = keyof WorkspaceContractPaths;
 
 export type WorkspaceContractEffectivePaths = {
-  [K in WorkspaceContractPathName]: WorkspacePathDiagnostic;
+  [K in Exclude<WorkspaceContractPathName, "instanceConfigPath">]: WorkspacePathDiagnostic;
+} & {
+  instanceConfigPath?: WorkspacePathDiagnostic;
 };
 
 export interface ResolvedWorkspaceContract {
@@ -194,6 +201,10 @@ export function resolveWorkspaceContract(
     workspaceRootDiag.path,
     "config.yaml",
   );
+  const instanceConfigPathOverride = optionalEnvPath(env, MINIME_INSTANCE_CONFIG_PATH_ENV);
+  const instanceConfigPathDiag = instanceConfigPathOverride
+    ? runtimePath(instanceConfigPathOverride, workspaceRootDiag.path, "env")
+    : undefined;
   const cronsPathDiag = pathOverrideOrWorkspaceDefault(
     env,
     MINIME_CRONS_PATH_ENV,
@@ -222,11 +233,20 @@ export function resolveWorkspaceContract(
     cwd,
     logDirOverride ? "env" : "runtime-default",
   );
-  const mediaBaseOverride = env.MINIME_TEST_MEDIA_BASE?.trim();
+  const testMediaBaseOverride = env.MINIME_TEST_MEDIA_BASE?.trim();
+  const mediaBaseOverride = optionalEnvPath(env, MINIME_MEDIA_ROOT_ENV);
   const mediaBaseDirDiag = runtimePath(
-    mediaBaseOverride ? join(mediaBaseOverride, String(pid)) : "/tmp/bot-media",
+    testMediaBaseOverride
+      ? join(testMediaBaseOverride, String(pid))
+      : (mediaBaseOverride ?? "/tmp/bot-media"),
     cwd,
-    mediaBaseOverride ? "env" : "runtime-default",
+    testMediaBaseOverride || mediaBaseOverride ? "env" : "runtime-default",
+  );
+  const echoDirOverride = optionalEnvPath(env, ECHO_DIR_BASE_ENV);
+  const echoDirDiag = runtimePath(
+    echoDirOverride ?? join(homeDir, ".minime", "bot-echo"),
+    cwd,
+    echoDirOverride ? "env" : "runtime-default",
   );
   const runtimeDirDiag: WorkspacePathDiagnostic = {
     path: normalize(resolve(workspaceRootDiag.path, ".tmp")),
@@ -239,12 +259,14 @@ export function resolveWorkspaceContract(
     controlWorkspaceRoot: workspaceRootDiag,
     workspaceRoot: workspaceRootDiag,
     configPath: configPathDiag,
+    ...(instanceConfigPathDiag ? { instanceConfigPath: instanceConfigPathDiag } : {}),
     cronsPath: cronsPathDiag,
     piExtensionDir: piExtensionDirDiag,
     dataDir: dataDirDiag,
     sessionStorePath: sessionStorePathDiag,
     logDir: logDirDiag,
     mediaBaseDir: mediaBaseDirDiag,
+    echoDir: echoDirDiag,
     runtimeDir: runtimeDirDiag,
   };
 
