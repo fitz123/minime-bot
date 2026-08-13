@@ -27,7 +27,12 @@ import {
   DEFAULT_CRON_HEALTH_TEXTFILE_DIR,
   resolveCronHealthMetricArtifacts,
 } from "../cron-outbox.js";
-import { MINIME_CONFIG_PATH_ENV, MINIME_CRONS_PATH_ENV } from "../workspace-contract.js";
+import {
+  ECHO_DIR_BASE_ENV,
+  MINIME_CONFIG_PATH_ENV,
+  MINIME_CRONS_PATH_ENV,
+  MINIME_INSTANCE_CONFIG_PATH_ENV,
+} from "../workspace-contract.js";
 
 interface Fixture {
   root: string;
@@ -1051,13 +1056,15 @@ fi
     }
   });
 
-  it("persists explicit config and crons path env overrides in rendered plists", () => {
+  it("persists explicit deployment path env overrides in rendered plists", () => {
     const fixture = createFixture();
     try {
       const settingsDir = join(fixture.workspace, "settings");
       mkdirSync(settingsDir, { recursive: true });
       const configPath = join(settingsDir, "config.yaml");
+      const instanceConfigPath = join(settingsDir, "instance.yaml");
       const cronsPath = join(settingsDir, "crons.yaml");
+      const echoDir = join(fixture.root, "echo");
       writeFileSync(configPath, "agents: {}\n", "utf8");
       writeFileSync(cronsPath, cronYaml("active", "0 8 * * *"), "utf8");
 
@@ -1067,7 +1074,9 @@ fi
         env: {
           ...fixture.env,
           [MINIME_CONFIG_PATH_ENV]: "settings/config.yaml",
+          [MINIME_INSTANCE_CONFIG_PATH_ENV]: "settings/instance.yaml",
           [MINIME_CRONS_PATH_ENV]: "settings/crons.yaml",
+          [ECHO_DIR_BASE_ENV]: echoDir,
         },
         homeDir: fixture.home,
       });
@@ -1079,7 +1088,15 @@ fi
       );
       assert.match(
         plist,
+        new RegExp(`<key>${MINIME_INSTANCE_CONFIG_PATH_ENV}</key>\\s*<string>${escapeRegex(instanceConfigPath)}</string>`),
+      );
+      assert.match(
+        plist,
         new RegExp(`<key>${MINIME_CRONS_PATH_ENV}</key>\\s*<string>${escapeRegex(cronsPath)}</string>`),
+      );
+      assert.match(
+        plist,
+        new RegExp(`<key>${ECHO_DIR_BASE_ENV}</key>\\s*<string>${escapeRegex(echoDir)}</string>`),
       );
     } finally {
       cleanup(fixture);

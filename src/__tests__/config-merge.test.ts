@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
-import { mergeDeep, loadRawMergedConfig } from "../config.js";
+import { loadConfig, mergeDeep, loadRawMergedConfig } from "../config.js";
 
 const TEST_DIR = join("/tmp", "config-merge-test-" + Date.now());
 
@@ -314,6 +314,45 @@ bindingIdentityOverrides:
       typingIndicator: false,
       topics: [{ topicId: 7, agentId: "main", requireMention: false }],
     });
+  });
+
+  it("rejects an instance identity patch that collides with another binding route", () => {
+    const configPath = join(TEST_DIR, "config.yaml");
+    const instancePath = join(TEST_DIR, "instance.yaml");
+    writeFileSync(configPath, `
+agents:
+  primary:
+    workspaceCwd: /srv/minime-agent
+    model: gpt-5.5
+  reserve:
+    workspaceCwd: /srv/minime-agent
+    model: gpt-5.5
+telegramTokenEnv: TEST_TELEGRAM_TOKEN
+bindings:
+  - { chatId: 111, agentId: primary, kind: dm, label: primary }
+  - { chatId: 222, agentId: reserve, kind: dm, label: reserve }
+`);
+    writeFileSync(instancePath, `
+bindingIdentityOverrides:
+  reserve:
+    chatId: 111
+`);
+
+    assert.throws(
+      () => loadConfig(configPath, {
+        resolveSecrets: false,
+        instanceConfigPath: instancePath,
+      }),
+      (error: unknown) => {
+        const message = (error as Error).message;
+        assert.match(
+          message,
+          /bindingIdentityOverrides\.reserve creates an ambiguous Telegram binding route/,
+        );
+        assert.doesNotMatch(message, /111|222/);
+        return true;
+      },
+    );
   });
 
   it("requires an identity override label to resolve exactly once", () => {

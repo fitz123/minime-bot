@@ -392,6 +392,7 @@ generate_supervisor_plist() {
     write_env_entry "BOT_UID" "$BOT_UID"
     write_env_entry "MINIME_CONTROL_WORKSPACE_ROOT" "${MINIME_CONTROL_WORKSPACE_ROOT:-}"
     write_env_entry_if_set "MINIME_CONFIG_PATH" "${MINIME_CONFIG_PATH:-}"
+    write_env_entry_if_set "MINIME_INSTANCE_CONFIG_PATH" "${MINIME_INSTANCE_CONFIG_PATH:-}"
     write_env_entry_if_set "MINIME_CRONS_PATH" "${MINIME_CRONS_PATH:-}"
     write_env_entry_if_set "MINIME_NODE_RUNTIME_ROOT" "${MINIME_NODE_RUNTIME_ROOT:-}"
     write_env_entry_if_set "MINIME_PATH_PREFIX" "${MINIME_PATH_PREFIX:-}"

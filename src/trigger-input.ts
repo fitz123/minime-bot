@@ -294,6 +294,7 @@ export async function startTriggerInput(
         if (error) log.error("trigger-input", "Failed to stop trigger input");
         resolvePromise();
       });
+      server.closeAllConnections();
     }),
   };
 }

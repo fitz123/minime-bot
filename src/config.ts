@@ -202,6 +202,7 @@ function applyBindingIdentityOverrides(
   const bindings = canonical.bindings.map((binding) =>
     isConfigRecord(binding) ? { ...binding } : binding,
   );
+  const patchedPaths = new Map<number, string>();
   for (const [label, rawPatch] of Object.entries(rawOverrides)) {
     const patchPath = `bindingIdentityOverrides.${label}`;
     if (!isConfigRecord(rawPatch)) rejectInstancePath(patchPath);
@@ -227,6 +228,26 @@ function applyBindingIdentityOverrides(
       ...(matches[0].binding as Record<string, unknown>),
       ...patch,
     };
+    patchedPaths.set(matches[0].index, patchPath);
+  }
+
+  for (let leftIndex = 0; leftIndex < bindings.length; leftIndex += 1) {
+    const left = bindings[leftIndex];
+    if (!isConfigRecord(left)) continue;
+    for (let rightIndex = leftIndex + 1; rightIndex < bindings.length; rightIndex += 1) {
+      const right = bindings[rightIndex];
+      if (
+        !isConfigRecord(right)
+        || left.chatId !== right.chatId
+        || left.topicId !== right.topicId
+      ) {
+        continue;
+      }
+      const patchPath = patchedPaths.get(rightIndex) ?? patchedPaths.get(leftIndex);
+      if (patchPath) {
+        throw new Error(`${patchPath} creates an ambiguous Telegram binding route`);
+      }
+    }
   }
   return { ...canonical, bindings };
 }

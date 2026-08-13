@@ -52,7 +52,10 @@ import {
   normalizePiProcessOutput as normalizeSpawnOutput,
   sanitizePiProcessOutput as sanitizeCapturedOutput,
 } from "./pi-process-utils.js";
-import { MINIME_AGENT_WORKSPACE_ROOT_ENV } from "./workspace-contract.js";
+import {
+  MINIME_AGENT_WORKSPACE_ROOT_ENV,
+  resolveWorkspaceContract,
+} from "./workspace-contract.js";
 import { loadMergedCrons } from "./cron-loader.js";
 import {
   clearCronOutboxRecord,
@@ -1135,7 +1138,12 @@ function runPi(
   ];
 
   try {
-    const context = deps.assembleContext(agent);
+    const contract = resolveWorkspaceContract();
+    const context = contract.paths.instanceConfigPath
+      ? deps.assembleContext(agent, {
+        artifactWorkspaceCwd: contract.paths.controlWorkspaceRoot,
+      })
+      : deps.assembleContext(agent);
     if (context) {
       if (context.systemPromptPath) {
         args.push("--system-prompt", context.systemPromptPath);

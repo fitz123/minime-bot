@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createConnection } from "node:net";
 import { loadConfig } from "../config.js";
 import { MessageQueue } from "../message-queue.js";
 import type { PlatformContext, TelegramBinding, TriggerInputConfig } from "../types.js";
@@ -130,6 +131,69 @@ describe("trigger input", () => {
     await server.stop();
     assert.strictEqual(server.server.listening, false);
     await assert.rejects(() => request(server));
+  });
+
+  it("stops promptly after a partial upload reaches the body deadline", async () => {
+    const { server } = await start();
+    const socket = createConnection({
+      host: "127.0.0.1",
+      port: server.address.port,
+    });
+    socket.setEncoding("utf8");
+    try {
+      await new Promise<void>((resolvePromise, rejectPromise) => {
+        socket.once("connect", resolvePromise);
+        socket.once("error", rejectPromise);
+      });
+      const responsePromise = new Promise<string>((resolvePromise, rejectPromise) => {
+        let received = "";
+        const deadline = setTimeout(
+          () => rejectPromise(new Error("partial upload did not receive its deadline response")),
+          7_000,
+        );
+        socket.on("data", (chunk: string) => {
+          received += chunk;
+          if (!received.includes("malformed")) return;
+          clearTimeout(deadline);
+          resolvePromise(received);
+        });
+        socket.once("error", (error) => {
+          clearTimeout(deadline);
+          rejectPromise(error);
+        });
+      });
+      socket.write([
+        "POST /trigger HTTP/1.1",
+        `Host: 127.0.0.1:${server.address.port}`,
+        "Authorization: Bearer test-bearer",
+        "Content-Type: application/json",
+        "Content-Length: 1024",
+        "Connection: keep-alive",
+        "",
+        '{"source":"test-source",',
+      ].join("\r\n"));
+
+      const response = await responsePromise;
+      assert.match(response, /^HTTP\/1\.1 400 /);
+      assert.match(response, /\r\nmalformed\r\n/);
+
+      let stopDeadline: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          server.stop(),
+          new Promise<never>((_resolvePromise, rejectPromise) => {
+            stopDeadline = setTimeout(
+              () => rejectPromise(new Error("trigger input stop remained blocked")),
+              1_000,
+            );
+          }),
+        ]);
+      } finally {
+        if (stopDeadline) clearTimeout(stopDeadline);
+      }
+    } finally {
+      socket.destroy();
+    }
   });
 
   it("logs a stable listener status without configured routing or bearer values", async () => {
