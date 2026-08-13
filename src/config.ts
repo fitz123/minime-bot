@@ -234,12 +234,30 @@ function applyBindingIdentityOverrides(
   for (let leftIndex = 0; leftIndex < bindings.length; leftIndex += 1) {
     const left = bindings[leftIndex];
     if (!isConfigRecord(left)) continue;
+    const leftTopicIds = new Set<number>();
+    if (typeof left.topicId === "number") leftTopicIds.add(left.topicId);
+    if (Array.isArray(left.topics)) {
+      for (const topic of left.topics) {
+        if (isConfigRecord(topic) && typeof topic.topicId === "number") {
+          leftTopicIds.add(topic.topicId);
+        }
+      }
+    }
     for (let rightIndex = leftIndex + 1; rightIndex < bindings.length; rightIndex += 1) {
       const right = bindings[rightIndex];
+      const nestedTopicCollision = isConfigRecord(right)
+        && Array.isArray(right.topics)
+        && right.topics.some(
+          (topic) => isConfigRecord(topic)
+            && typeof topic.topicId === "number"
+            && leftTopicIds.has(topic.topicId),
+        );
       if (
         !isConfigRecord(right)
         || left.chatId !== right.chatId
-        || left.topicId !== right.topicId
+        || (left.topicId !== right.topicId
+          && !(typeof right.topicId === "number" && leftTopicIds.has(right.topicId))
+          && !nestedTopicCollision)
       ) {
         continue;
       }

@@ -1379,6 +1379,11 @@ describe("Alertmanager webhook", () => {
       inconsistent.status = "resolved";
       const invalidGroupLabel = alertmanagerPayload({ alertname: "InvalidLabel" });
       invalidGroupLabel.groupLabels = { "invalid-label": "value" };
+      const mismatchedResolvedGroup = alertmanagerPayload({
+        alertname: "ResolvedMember",
+        status: "resolved",
+      });
+      mismatchedResolvedGroup.groupLabels = { alertname: "UnrelatedGroup" };
       const tooManyAlerts = {
         receiver: "minime-native-webhook",
         status: "firing",
@@ -1395,6 +1400,7 @@ describe("Alertmanager webhook", () => {
         { ...alertmanagerPayload({ alertname: "MissingDescriptor" }), groupLabels: undefined },
         inconsistent,
         invalidGroupLabel,
+        mismatchedResolvedGroup,
         tooManyAlerts,
       ]) {
         assert.equal((await postWebhook(port, invalid)).status, 400);

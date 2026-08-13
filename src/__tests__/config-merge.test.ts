@@ -452,6 +452,42 @@ bindingIdentityOverrides:
     );
   });
 
+  it("rejects an instance topic route that shadows a canonical nested topic", () => {
+    const configPath = join(TEST_DIR, "config.yaml");
+    const instancePath = join(TEST_DIR, "instance.yaml");
+    writeFileSync(configPath, `
+agents:
+  primary:
+    workspaceCwd: /srv/minime-agent
+    model: gpt-5.5
+  reserve:
+    workspaceCwd: /srv/minime-agent
+    model: gpt-5.5
+telegramTokenEnv: TEST_TELEGRAM_TOKEN
+bindings:
+  - chatId: 111
+    agentId: primary
+    kind: group
+    label: primary
+    topics:
+      - { topicId: 7, agentId: primary }
+  - { chatId: 222, topicId: 7, agentId: reserve, kind: group, label: reserve }
+`);
+    writeFileSync(instancePath, `
+bindingIdentityOverrides:
+  reserve:
+    chatId: 111
+`);
+
+    assert.throws(
+      () => loadConfig(configPath, {
+        resolveSecrets: false,
+        instanceConfigPath: instancePath,
+      }),
+      /bindingIdentityOverrides\.reserve creates an ambiguous Telegram binding route/,
+    );
+  });
+
   it("requires an identity override label to resolve exactly once", () => {
     const configPath = join(TEST_DIR, "config.yaml");
     const instancePath = join(TEST_DIR, "instance.yaml");

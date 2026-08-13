@@ -297,10 +297,10 @@ def parse_bridge_alertmanager_payload(body: bytes) -> ParsedAlertmanagerBatch:
             fingerprint=fingerprint,
         )
         members.append((status, member))
+        if any(labels.get(key) != value for key, value in group_labels.items()):
+            raise ValueError("group labels do not match alert")
         if status == "firing":
             firing_count += 1
-            if any(labels.get(key) != value for key, value in group_labels.items()):
-                raise ValueError("group labels do not match firing alert")
     if (
         (payload["status"] == "firing" and firing_count == 0)
         or (payload["status"] == "resolved" and firing_count != 0)
