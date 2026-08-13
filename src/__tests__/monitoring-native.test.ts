@@ -1868,7 +1868,8 @@ describe("runtime doctor", () => {
         }
         if (request.url?.includes("/sendMessage")) {
           directMessages.push(new URLSearchParams(body).get("text") ?? "");
-          response.end(JSON.stringify({ ok: true }));
+          response.statusCode = 503;
+          response.end(JSON.stringify({ ok: false, error_code: 503 }));
           return;
         }
         response.statusCode = 404;

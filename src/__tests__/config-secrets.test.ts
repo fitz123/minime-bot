@@ -175,7 +175,7 @@ bindings:
 
   it("resolves and trims an enabled trigger bearer from its sole env source", () => {
     process.env.TEST_TELEGRAM_TOKEN_ENV = "telegram-token";
-    process.env.TEST_TRIGGER_BEARER = " trigger-bearer ";
+    process.env.TEST_TRIGGER_BEARER = " synthetic-trigger-bearer ";
     writeFileSync(
       configPath,
       minimalAgentsYaml + `
@@ -192,7 +192,7 @@ triggerInput:
     );
 
     const config = loadConfig(configPath);
-    assert.strictEqual(config.triggerInput?.bearer, "trigger-bearer");
+    assert.strictEqual(config.triggerInput?.bearer, "synthetic-trigger-bearer");
   });
 
   it("resolves an enabled trigger bearer through the shared SOPS file", () => {
@@ -235,6 +235,41 @@ triggerInput:
     }]);
   });
 
+  it("enforces the monitoring-source bearer value contract", () => {
+    process.env.TEST_TELEGRAM_TOKEN_ENV = "telegram-token";
+    writeFileSync(
+      configPath,
+      minimalAgentsYaml + `
+telegramTokenEnv: TEST_TELEGRAM_TOKEN_ENV
+bindings:
+  - chatId: 111
+    agentId: main
+    kind: dm
+triggerInput:
+  port: 9466
+  bearerEnv: TEST_TRIGGER_BEARER
+  chatId: 111
+`,
+    );
+
+    for (const valid of ["a".repeat(16), "~".repeat(8 * 1024)]) {
+      process.env.TEST_TRIGGER_BEARER = valid;
+      assert.strictEqual(loadConfig(configPath).triggerInput?.bearer, valid);
+    }
+    for (const invalid of [
+      "a".repeat(15),
+      "a".repeat((8 * 1024) + 1),
+      `${"a".repeat(15)}\u007f`,
+      "é".repeat(16),
+    ]) {
+      process.env.TEST_TRIGGER_BEARER = invalid;
+      assert.throws(
+        () => loadConfig(configPath),
+        /triggerInput\.bearer must be 16 to 8192 printable ASCII bytes/,
+      );
+    }
+  });
+
   it("fails closed when an enabled trigger bearer cannot be resolved", () => {
     process.env.TEST_TELEGRAM_TOKEN_ENV = "telegram-token";
     writeFileSync(
@@ -261,7 +296,7 @@ triggerInput:
   });
 
   it("fails closed before startup when an enabled trigger has no resolved Telegram token", () => {
-    process.env.TEST_TRIGGER_BEARER = "trigger-bearer";
+    process.env.TEST_TRIGGER_BEARER = "synthetic-trigger-bearer";
     writeFileSync(
       configPath,
       minimalAgentsYaml + `

@@ -242,8 +242,9 @@ triggerInput:
 
 `host` defaults to `127.0.0.1` and accepts only loopback; `path` defaults to
 `/trigger`. `bearerEnv` may replace `bearerSopsKey`, but exactly one is
-required. An enabled input also requires a resolved Telegram token and matching
-binding, so partial routing fails at startup.
+required. The resolved bearer must contain 16–8,192 printable ASCII bytes. An
+enabled input also requires a resolved Telegram token and matching binding, so
+partial routing fails at startup.
 
 Send `POST <path>` with `Authorization: Bearer <credential>`,
 `Content-Type: application/json`, and exactly these payload fields:

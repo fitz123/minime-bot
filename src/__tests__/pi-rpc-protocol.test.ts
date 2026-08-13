@@ -36,6 +36,7 @@ import {
   PI_EXTENSION_WRAPPER_RELPATHS,
   PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS,
   PI_SUBAGENT_CHILD_WRAPPER_RELPATHS,
+  assemblePiContextForCurrentDeployment,
   buildGetStateCommand,
   buildPiAcknowledgedSteerCommand,
   buildPiExtensionUiCancellationCommand,
@@ -702,16 +703,23 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
           _resetPiContextCache();
           const agent = piAgent(canonicalWorkspace);
           assert.strictEqual(resolveValidatedPiAgentWorkspaceCwd(agent), canonicalWorkspace);
+          const directContext = assemblePiContextForCurrentDeployment(agent);
           const args = buildPiSpawnArgs(agent, undefined, NO_EXTENSIONS);
-          return args[args.indexOf("--append-system-prompt") + 1];
+          return {
+            direct: directContext?.appendSystemPromptPath,
+            interactive: args[args.indexOf("--append-system-prompt") + 1],
+          };
         },
       ));
 
-    assert.ok(artifactPaths[0].startsWith(join(firstControlRoot, ".tmp") + "/"));
-    assert.ok(artifactPaths[1].startsWith(join(secondControlRoot, ".tmp") + "/"));
-    assert.notStrictEqual(artifactPaths[0], artifactPaths[1]);
-    assert.match(readFileSync(artifactPaths[0], "utf8"), /BODY_TOKEN/);
-    assert.match(readFileSync(artifactPaths[1], "utf8"), /BODY_TOKEN/);
+    assert.ok(artifactPaths[0].direct?.startsWith(join(firstControlRoot, ".tmp") + "/"));
+    assert.ok(artifactPaths[0].interactive.startsWith(join(firstControlRoot, ".tmp") + "/"));
+    assert.ok(artifactPaths[1].direct?.startsWith(join(secondControlRoot, ".tmp") + "/"));
+    assert.ok(artifactPaths[1].interactive.startsWith(join(secondControlRoot, ".tmp") + "/"));
+    assert.notStrictEqual(artifactPaths[0].direct, artifactPaths[1].direct);
+    assert.notStrictEqual(artifactPaths[0].interactive, artifactPaths[1].interactive);
+    assert.match(readFileSync(artifactPaths[0].interactive, "utf8"), /BODY_TOKEN/);
+    assert.match(readFileSync(artifactPaths[1].interactive, "utf8"), /BODY_TOKEN/);
     assert.strictEqual(existsSync(join(canonicalWorkspace, ".tmp")), false);
   });
 

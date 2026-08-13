@@ -738,6 +738,7 @@ const TRIGGER_INPUT_HOSTS = new Set<TriggerInputConfig["host"]>([
   "::1",
   "localhost",
 ]);
+const TRIGGER_INPUT_BEARER = /^[\x21-\x7e]{16,8192}$/;
 
 const TRIGGER_INPUT_KEYS = new Set([
   "port",
@@ -825,6 +826,9 @@ function validateTriggerInput(
       fieldName: "triggerInput.bearer",
       execFileSync: options.secretExecFileSync,
     });
+  if (options.resolveSecrets !== false && !TRIGGER_INPUT_BEARER.test(bearer)) {
+    throw new Error("triggerInput.bearer must be 16 to 8192 printable ASCII bytes");
+  }
 
   return {
     port: raw.port as number,

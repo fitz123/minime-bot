@@ -299,8 +299,9 @@ triggerInput:
 
 The host defaults to `127.0.0.1` and accepts only `127.0.0.1`, `::1`, or
 `localhost`; the path defaults to `/trigger`. Configure exactly one of
-`bearerSopsKey` or `bearerEnv`. `chatId` and optional `threadId` must resolve to
-an existing Telegram binding, and an enabled input requires a resolved Telegram
+`bearerSopsKey` or `bearerEnv`; the resolved bearer must contain 16–8,192
+printable ASCII bytes. `chatId` and optional `threadId` must resolve to an
+existing Telegram binding, and an enabled input requires a resolved Telegram
 token. Partial configuration fails startup instead of exposing a listener that
 cannot start an ordinary turn. The
 [second ordinary deployment](../README.md#second-ordinary-deployment) keeps the

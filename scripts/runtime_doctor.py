@@ -530,7 +530,7 @@ def run_doctor(
                     try:
                         send_telegram(
                             CONTROL_PATH_UNAVAILABLE_NOTICE,
-                            DeliveryConfig(config.chat_id, config.thread_id),
+                            DeliveryConfig(config.chat_id, config.thread_id, attempts=1),
                         )
                     except (MonitoringError, OSError):
                         active_logger.error("doctor_control_path_notice_failed")

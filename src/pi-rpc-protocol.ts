@@ -17,6 +17,7 @@ import {
   assemblePiContext,
   FILE_DELIVERY_CONTEXT,
   PiContextArtifactWriteError,
+  type PiContextAssemblyOptions,
 } from "./pi-context-assembler.js";
 import {
   formatPiRuntimeDiagnostic,
@@ -563,6 +564,19 @@ export function resolveValidatedPiAgentWorkspaceCwd(agent: AgentConfig): string 
   return validateAgentWorkspaceCwd(agent, resolveWorkspaceContract());
 }
 
+export function assemblePiContextForCurrentDeployment(
+  agent: AgentConfig,
+  options: PiContextAssemblyOptions = {},
+) {
+  const contract = resolveWorkspaceContract();
+  return assemblePiContext(agent, {
+    ...options,
+    ...(contract.paths.instanceConfigPath
+      ? { artifactWorkspaceCwd: contract.paths.controlWorkspaceRoot }
+      : {}),
+  });
+}
+
 export function buildPiSpawnArgs(
   agent: AgentConfig,
   sessionBinding?: LegacyInteractiveSessionInput,
@@ -598,12 +612,8 @@ export function buildPiSpawnArgs(
   // assembler could not safely deliver.
   const includeFileDelivery = Boolean(runtimeEnvOptions?.outboxPath?.trim());
   try {
-    const contract = resolveWorkspaceContract();
-    const context = assemblePiContext(agent, {
+    const context = assemblePiContextForCurrentDeployment(agent, {
       includeFileDelivery,
-      ...(contract.paths.instanceConfigPath
-        ? { artifactWorkspaceCwd: contract.paths.controlWorkspaceRoot }
-        : {}),
     });
     if (context) {
       if (context.systemPromptPath) {
