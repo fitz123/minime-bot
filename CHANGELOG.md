@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 2026.8.8
+
+- Allow an instance overlay to disable an inherited Discord transport identity with exact `discord: false`, while rejecting all other Discord overrides (#132).
+
 ## 2026.8.7
 
 - Allow a second ordinary Minime deployment to share one canonical behavior
