@@ -36,6 +36,8 @@ const RETIRED_GUARD_WRAPPER = ["guardian", "protect", "files"].join("-");
 const RETIRED_GUARD_WRAPPER_PATTERN = new RegExp(RETIRED_GUARD_WRAPPER);
 const RETIRED_CONTROL_WORKSPACE_ENV = ["MINIME", "WORKSPACE", "ROOT"].join("_");
 const RETIRED_AGENT_WORKSPACE_ENV = ["MINIME", "AGENT", "WORKSPACE", "CWD"].join("_");
+const RETIRED_PRODUCT_SEGMENT = ["ops", "worker"].join("-");
+const RETIRED_PRIMARY_RESOURCE_MODULE = ["pi", "primary", "resources"].join("-");
 const RETIRED_RECOVERY_PACKAGE_PREFIXES = [
   "dist/pi-extensions/recovery-mode.",
   "dist/pi-extensions/recovery-protocol.",
@@ -325,7 +327,6 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/config.js",
     "dist/cron-runner.js",
     "dist/pi-rpc-protocol.js",
-    "dist/pi-primary-resources.js",
     "dist/pi-runtime.js",
     "dist/workspace-contract.js",
     "dist/workspace-validator.js",
@@ -338,15 +339,10 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/knowledge/sync.d.ts",
     "dist/knowledge/sync.js",
     "dist/pi-extensions/codex-transport-overflow.js",
-    "dist/pi-extensions/ops-worker-conversation-bounds.js",
-    "dist/pi-extensions/ops-worker-parity-attestation.js",
-    "dist/ops-worker/parity.js",
     "dist/extensions/pi/codex-usage.js",
     "dist/extensions/pi/acknowledged-steer.js",
     "dist/extensions/pi/compaction-continuation.js",
     "dist/extensions/pi/codex-transport-overflow.js",
-    "dist/extensions/pi/ops-worker-conversation-bounds.js",
-    "dist/extensions/pi/ops-worker-parity-attestation.js",
     "dist/extensions/pi/knowledge-tools.js",
     "dist/extensions/pi/web-tools.js",
     "dist/extensions/pi/ask-agent/index.js",
@@ -385,6 +381,14 @@ function assertPackFiles(files: readonly string[]): void {
   assert.ok(!files.some((file) => file.startsWith("extensions/")), "source Pi wrappers should not be packed");
   assert.ok(!files.some((file) => file.startsWith("test-fixtures/")), "workspace fixtures should not be packed");
   assert.ok(!files.some((file) => file.startsWith("dist/__tests__/")), "compiled tests should not be packed");
+  assert.ok(
+    !files.some((file) => file.includes(RETIRED_PRODUCT_SEGMENT)),
+    "retired product artifacts should not be packed",
+  );
+  assert.ok(
+    !files.some((file) => file.includes(RETIRED_PRIMARY_RESOURCE_MODULE)),
+    "retired resource attestation artifacts should not be packed",
+  );
   assert.ok(!files.includes("schema.md"), "retired root schema contract should not be packed");
   assert.ok(!files.some((file) => RETIRED_GUARD_WRAPPER_PATTERN.test(file)), "retired guard contract should not be packed");
   assert.ok(

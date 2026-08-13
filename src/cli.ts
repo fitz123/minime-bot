@@ -47,11 +47,6 @@ import {
   syncLaunchdCrons,
   type LaunchdCommandRunner,
 } from "./launchd-cron-plists.js";
-import {
-  runOpsWorkerCliCommand,
-  type OpsWorkerCliDependencies,
-} from "./ops-worker/worker-cli.js";
-
 type WriteFn = (text: string) => void;
 
 export interface CliRunOptions {
@@ -62,7 +57,6 @@ export interface CliRunOptions {
   launchdCommandRunner?: LaunchdCommandRunner;
   launchdHomeDir?: string;
   launchdUid?: number;
-  workerDependencies?: OpsWorkerCliDependencies;
 }
 
 interface ParsedArgs {
@@ -98,17 +92,6 @@ const HELP_TEXT = `Usage:
   minime-bot knowledge migrate --workspace <agent-workspace> --dry-run [--report <path>]
   minime-bot knowledge migrate --workspace <agent-workspace> --apply [--allow-dirty] [--report <path>]
   minime-bot launchd crons sync --workspace <path> [--dry-run] [--no-prune] [--launch-agents-dir <path>] [--run-cron-script <absolute-path>]
-  minime-bot worker start --state-dir <path> --agent-workspace <path> [--host 127.0.0.1] [--port 9465] [--control-config <path>] [--once]
-  minime-bot worker status|list --state-dir <path> [--json]
-  minime-bot worker inspect --state-dir <path> --id <task-id> [--json]
-  minime-bot worker submit --state-dir <path> --template <registered> --authorization <registered> --done-check <registered> --correlation-key <key> --delivery-key <adapter-delivery-key> --resource-key <normalized-resource-key> --objective <text> [--done-check-params <json>] [--json]
-  minime-bot worker checkpoint --state-dir <path> --id <task-id> --checkpoint-id <id> --summary <text> --payload <json> [--artifact <relative-path>] [--lifecycle <json>] [--json]
-  minime-bot worker receipt-query --state-dir <path> --id <task-id> --boundary <fixed-boundary> --operation-id <id> --intent <json> --query-observed-at <timestamp> --query-result <json> [--json]
-  minime-bot worker receipt-claim --state-dir <path> --id <task-id> --boundary <fixed-boundary> --operation-id <id> --intent <json> [--json]
-  minime-bot worker receipt-finish --state-dir <path> --id <task-id> --boundary <fixed-boundary> --operation-id <id> --intent <json> --result <APPLIED|ALREADY_APPLIED|NOT_NEEDED> --evidence <json> [--lifecycle <json>] [--json]
-  minime-bot worker retry --state-dir <path> --id <task-id> [--json]
-  minime-bot worker cancel --state-dir <path> --id <task-id> --reason <text> [--json]
-
 Options:
   --workspace <path>         Control/app workspace root for config/workspace commands. Agent workspace root for knowledge commands.
   --run-cron-script <path>  Preserve an explicit executable run-cron.sh path during launchd cron sync.
@@ -116,7 +99,6 @@ Options:
 
 Config/workspace defaults: ${MINIME_CONTROL_WORKSPACE_ROOT_ENV}, then source repo root or package cwd.
 Knowledge defaults: explicit --workspace, then ${MINIME_AGENT_WORKSPACE_ROOT_ENV}. Knowledge commands do not resolve config secrets.
-Ops worker: inactive unless worker start is invoked. --control-config enables the dedicated second-token Telegram poller/reporter and, when configured, authenticated Alertmanager intake only for that started worker. CLI submission uses trusted registries; checkpoint and receipt commands record evidence only, and the loopback HTTP surface otherwise remains health/status only.
 `;
 
 function writeLine(write: WriteFn, text = ""): void {
@@ -857,12 +839,6 @@ export function runCli(argv: readonly string[] = process.argv.slice(2), options:
     if (scope === "launchd") {
       return runLaunchdCommand(action, rest, parsed, options, stdout);
     }
-    if (scope === "worker") {
-      throw new CliUsageError(
-        "worker commands require the asynchronous CLI entrypoint",
-      );
-    }
-
     if (rest.length > 0) {
       throw new CliUsageError(`unexpected argument: ${rest[0]}`);
     }
@@ -893,32 +869,7 @@ export async function runCliAsync(
   argv: readonly string[] = process.argv.slice(2),
   options: CliRunOptions = {},
 ): Promise<number> {
-  const stdout = options.stdout ?? ((text: string) => process.stdout.write(text));
-  const stderr = options.stderr ?? ((text: string) => process.stderr.write(text));
-  let parsed: ParsedArgs;
-  try {
-    parsed = parseArgs(argv);
-  } catch (error) {
-    writeLine(stderr, `Error: ${(error as Error).message}`);
-    return 2;
-  }
-  if (parsed.help || parsed.command[0] !== "worker") {
-    return runCli(argv, options);
-  }
-  if (parsed.workspace !== undefined) {
-    writeLine(
-      stderr,
-      "Error: worker commands do not accept --workspace; use --agent-workspace for worker start",
-    );
-    return 2;
-  }
-  const [, action, ...rest] = parsed.command;
-  return runOpsWorkerCliCommand(action, rest, {
-    cwd: cwdForCli(options),
-    stdout,
-    stderr,
-    dependencies: options.workerDependencies,
-  });
+  return runCli(argv, options);
 }
 
 function realpathOrResolve(path: string): string {

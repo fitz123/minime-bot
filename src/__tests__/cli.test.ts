@@ -17,7 +17,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { runCli, type CliRunOptions } from "../cli.js";
+import { runCli, runCliAsync, type CliRunOptions } from "../cli.js";
 import {
   generateLaunchdCronPlists,
   type LaunchdCommandRunner,
@@ -247,6 +247,7 @@ describe("minime-bot CLI", () => {
     assert.match(result.stdout, /--op archive\|restore --path <wiki\/pages\/type\/page\.md>/);
     assert.match(result.stdout, /minime-bot knowledge maintain --workspace <agent-workspace>/);
     assert.match(result.stdout, /minime-bot launchd crons sync --workspace <path>/);
+    assert.doesNotMatch(result.stdout, /minime-bot worker/);
     assert.match(result.stdout, /--run-cron-script <absolute-path>/);
     assert.match(result.stdout, /Preserve an explicit executable run-cron\.sh path/);
     assert.doesNotMatch(result.stdout, /minime-bot recovery/);
@@ -256,6 +257,30 @@ describe("minime-bot CLI", () => {
     assert.match(result.stdout, /MINIME_AGENT_WORKSPACE_ROOT/);
     assert.doesNotMatch(result.stdout, /current repo layout/);
     assert.equal(result.stderr, "");
+  });
+
+  it("keeps the asynchronous entrypoint aligned with the remaining command scope", async () => {
+    let stdout = "";
+    let stderr = "";
+    const helpCode = await runCliAsync(["--help"], {
+      stdout: (text) => { stdout += text; },
+      stderr: (text) => { stderr += text; },
+    });
+
+    assert.equal(helpCode, 0);
+    assert.match(stdout, /minime-bot config validate/);
+    assert.equal(stderr, "");
+
+    stdout = "";
+    stderr = "";
+    const removedCode = await runCliAsync(["worker", "start"], {
+      stdout: (text) => { stdout += text; },
+      stderr: (text) => { stderr += text; },
+    });
+
+    assert.equal(removedCode, 2);
+    assert.equal(stdout, "");
+    assert.match(stderr, /unknown command: worker start/);
   });
 
   it("rejects the retired recovery command", () => {

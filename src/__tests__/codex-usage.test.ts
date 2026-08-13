@@ -13,6 +13,7 @@ import { join } from "node:path";
 import {
   CODEX_USAGE_TEXTFILE_NAME,
   captureCodexQuotaFromHeaders,
+  captureCodexQuotaFromProviderResponse,
   DEFAULT_NODE_EXPORTER_TEXTFILE_DIR,
   extractCodexResponseHeaders,
   formatCodexQuotaPrometheus,
@@ -237,13 +238,18 @@ describe("codex usage paths and Prometheus formatting", () => {
 });
 
 describe("codex usage atomic writes", () => {
-  it("captures parsed quota headers to an attempt file without promoting canonical state", () => {
+  it("captures a provider response as an ordinary quota snapshot without promoting canonical state", () => {
     const dir = tempDir();
     const stateFile = join(dir, "state.json");
     const attemptFile = join(dir, "attempts", "quota-attempt.json");
 
-    const result = captureCodexQuotaFromHeaders(
-      { "x-codex-primary-used-percent": "12.5" },
+    const result = captureCodexQuotaFromProviderResponse(
+      {
+        status: 200,
+        providerResponse: {
+          headers: { "x-codex-primary-used-percent": "12.5" },
+        },
+      },
       {
         env: { CODEX_QUOTA_ATTEMPT_FILE: attemptFile },
         now: new Date("2026-06-05T12:00:00.000Z"),
@@ -253,7 +259,11 @@ describe("codex usage atomic writes", () => {
     assert.equal(result.status, "captured");
     assert.equal(existsSync(attemptFile), true);
     assert.equal(existsSync(stateFile), false);
-    assert.equal(JSON.parse(readFileSync(attemptFile, "utf8")).windows["5h"].usedPercent, 12.5);
+    const captured = JSON.parse(readFileSync(attemptFile, "utf8"));
+    assert.equal(captured.provider, "codex");
+    assert.equal(captured.windows["5h"].usedPercent, 12.5);
+    assert.equal("version" in captured, false);
+    assert.equal("responseStatus" in captured, false);
   });
 
   it("writes JSON state and Prometheus textfiles atomically", () => {
