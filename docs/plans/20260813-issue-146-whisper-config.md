@@ -76,10 +76,10 @@ The fixture run will now print the voice-readiness warning (no model file in the
 
 **Serves:** operator inputs 5, 6.
 
-- [ ] in `src/workspace-validator.ts`, after successful config load, emit a **warning** when `config.whisperModelPath` is not an existing readable regular file: include the effective path, state that only voice transcription is degraded while startup/deploy/non-voice behavior are unaffected, and state that validation does not download or replace models
-- [ ] confirm no code path escalates the warning to an error and that `runWorkspaceValidate` in `src/cli.ts` needs no change to keep exiting 0 with the warning present
-- [ ] write tests in `src/__tests__/cli.test.ts`: missing model produces the warning with the effective path and `Workspace valid.` plus success exit; a readable model file produces no warning; the warning coexists with other warnings without becoming a hard failure
-- [ ] run `npm run workspace:validate -- --workspace test-fixtures/minimal-workspace` and assert warning-with-success behavior; run focused tests — must pass before next task
+- [x] in `src/workspace-validator.ts`, after successful config load, emit a **warning** when `config.whisperModelPath` is not an existing readable regular file: include the effective path, state that only voice transcription is degraded while startup/deploy/non-voice behavior are unaffected, and state that validation does not download or replace models
+- [x] confirm no code path escalates the warning to an error and that `runWorkspaceValidate` in `src/cli.ts` needs no change to keep exiting 0 with the warning present
+- [x] write tests in `src/__tests__/cli.test.ts`: missing model produces the warning with the effective path and `Workspace valid.` plus success exit; a readable model file produces no warning; the warning coexists with other warnings without becoming a hard failure
+- [x] run `npm run workspace:validate -- --workspace test-fixtures/minimal-workspace` and assert warning-with-success behavior; run focused tests — must pass before next task
 
 ### Task 4: Documentation, cut pass, private-data scan, full validation
 

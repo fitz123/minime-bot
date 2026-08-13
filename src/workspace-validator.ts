@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readFileSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, lstatSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { loadConfig } from "./config.js";
@@ -54,6 +54,18 @@ function existsAsDirectory(path: string): boolean {
 
 function existsAsFile(path: string): boolean {
   return safeStat(path)?.isFile() === true;
+}
+
+function existsAsReadableFile(path: string): boolean {
+  if (!existsAsFile(path)) {
+    return false;
+  }
+  try {
+    accessSync(path, constants.R_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -227,6 +239,15 @@ export function validateWorkspaceContract(
         workspaceRoot: contract.paths.workspaceRoot,
         instanceConfigPath: contract.paths.instanceConfigPath,
       });
+      if (!existsAsReadableFile(config.whisperModelPath)) {
+        issue(
+          issues,
+          "warning",
+          `Whisper model is not a readable regular file: ${config.whisperModelPath}. ` +
+            "Only voice transcription is degraded; startup, deploy, and non-voice behavior are unaffected. " +
+            "Workspace validation does not download or replace models.",
+        );
+      }
     } catch (err) {
       issue(issues, "error", `config does not parse with secret resolution disabled: ${(err as Error).message}`);
     }
