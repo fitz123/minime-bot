@@ -132,6 +132,27 @@ describe("trigger input", () => {
     await assert.rejects(() => request(server));
   });
 
+  it("logs a stable listener status without configured routing or bearer values", async () => {
+    const originalLog = console.log;
+    const messages: string[] = [];
+    console.log = (...args: unknown[]) => messages.push(args.map(String).join(" "));
+    const config = testConfig({
+      path: "/private-route-placeholder",
+      bearer: "private-bearer-placeholder",
+    });
+    try {
+      const { server } = await start({ config });
+      const message = messages.at(-1) ?? "";
+      assert.match(message, /INFO \[trigger-input\] Trigger input listening$/);
+      assert.ok(!message.includes(config.host));
+      assert.ok(!message.includes(String(server.address.port)));
+      assert.ok(!message.includes(config.path));
+      assert.ok(!message.includes(config.bearer));
+    } finally {
+      console.log = originalLog;
+    }
+  });
+
   it("enqueues one framed ordinary turn for the resolved topic binding and session key", async () => {
     const queue = new CapturingQueue();
     const bindings: TelegramBinding[] = [{

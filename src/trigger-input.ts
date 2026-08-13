@@ -280,10 +280,7 @@ export async function startTriggerInput(
     await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()));
     throw new Error("Trigger input did not expose a TCP address");
   }
-  log.info(
-    "trigger-input",
-    `Trigger input listening on ${options.config.host}:${address.port}${options.config.path}`,
-  );
+  log.info("trigger-input", "Trigger input listening");
 
   return {
     server,

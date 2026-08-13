@@ -281,6 +281,55 @@ Validate delivery before installing services:
   --chat-id DESTINATION_PLACEHOLDER --message "synthetic monitoring test"
 ```
 
+## Ordinary bot trigger input
+
+The opt-in trigger input is part of the ordinary `minime-bot` process and
+release. It is disabled unless the bot configuration, or its allowlisted
+instance overlay, contains the complete section:
+
+```yaml
+triggerInput:
+  port: 9466
+  host: 127.0.0.1
+  path: /trigger
+  bearerSopsKey: triggerInput.bearer
+  chatId: <deployment-chat-id>
+  threadId: <optional-topic-id>
+```
+
+The host defaults to `127.0.0.1` and accepts only `127.0.0.1`, `::1`, or
+`localhost`; the path defaults to `/trigger`. Configure exactly one of
+`bearerSopsKey` or `bearerEnv`. `chatId` and optional `threadId` must resolve to
+an existing Telegram binding, and an enabled input requires a resolved Telegram
+token. Partial configuration fails startup instead of exposing a listener that
+cannot start an ordinary turn. The
+[second ordinary deployment](../README.md#second-ordinary-deployment) keeps the
+listener port, credential reference, and delivery identity in its instance
+overlay while both deployments continue to read one canonical behavior
+configuration.
+
+The only route is an authenticated `POST <path>` with
+`Content-Type: application/json` and exactly this payload shape:
+
+```json
+{"source":"runtime-doctor","text":"bounded human-readable evidence"}
+```
+
+`source` is a lowercase ASCII slug of at most 32 letters, digits, and hyphens.
+`text` is non-empty and limited to 4,096 UTF-16 units, and the complete body is
+limited to 16 KiB. The response body is one status word with no identifier:
+`202` accepted; `429` queue saturated or shutting down; `400` malformed; `401`
+unauthorized; `404` wrong path; `405` wrong method; `413` too large; or `415`
+wrong content type.
+
+Acceptance frames the evidence and enqueues it once through the existing
+ordinary `MessageQueue`, binding, and persistent agent session. The input owns
+no trigger IDs, source schema, task, persistence, separate queue,
+retry/custody state, lifecycle, status/result API, authorization policy, or
+reporting surface. The calling source owns retry, deduplication, and transition
+state; the ordinary full agent retains its existing safety and external-action
+boundaries.
+
 ## Alertmanager webhook installation
 
 Copy `examples/monitoring/ai.minime.alertmanager-webhook.plist`, fill its
