@@ -29,6 +29,14 @@
     <string>/PATH/TO/secrets.sops.yaml</string>
     <key>MINIME_TELEGRAM_SOPS_KEY</key>
     <string>telegram.bot_token</string>
+    <key>MINIME_TRIGGER_INPUT_URL</key>
+    <string>http://127.0.0.1:TRIGGER_INPUT_PORT/trigger</string>
+    <key>MINIME_TRIGGER_INPUT_SOPS_FILE</key>
+    <string>/PATH/TO/secrets.sops.yaml</string>
+    <key>MINIME_TRIGGER_INPUT_SOPS_KEY</key>
+    <string>trigger_input.bearer</string>
+    <key>MINIME_ALERTMANAGER_URL</key>
+    <string>http://127.0.0.1:ALERTMANAGER_PORT</string>
     <key>MINIME_SOPS_EXECUTABLE</key>
     <string>/PATH/TO/sops</string>
   </dict>

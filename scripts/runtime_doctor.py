@@ -23,15 +23,24 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from monitoring_native import (
+    CONTROL_PATH_UNAVAILABLE_NOTICE,
+    MINIME_TRIGGER_INPUT_SOPS_FILE,
+    MINIME_TRIGGER_INPUT_SOPS_KEY,
+    MINIME_TRIGGER_INPUT_URL,
     DeliveryConfig,
+    DeliveryError,
     MonitoringError,
+    normalize_loopback_http_url,
+    post_loopback_json_with_bearer,
     request_with_deadline,
+    resolve_trigger_input_bearer,
     send_telegram,
 )
 
 STATE_VERSION = 1
 TCC_STATUS_MAX_BYTES = 1024
 STATE_MAX_BYTES = 64 * 1024
+MAX_CONSECUTIVE_FAILURES = 3
 ENV_PREFIX = "MINIME_DOCTOR_"
 INCIDENT_ACTIONS = {
     "alertmanager_unhealthy": "check Alertmanager health and recreate its current service",
@@ -66,6 +75,8 @@ class DoctorConfig:
     runtime_max_age: float
     tcc_status_path: Path | None
     log_path: Path | None
+    trigger_input_url: str | None
+    trigger_input_bearer: str | None
 
     @classmethod
     def from_environ(cls, env: dict[str, str] | os._Environ[str] = os.environ) -> "DoctorConfig":
@@ -94,6 +105,30 @@ class DoctorConfig:
                     parsed.port
                 except ValueError:
                     raise ValueError("health URL is invalid") from None
+        trigger_sources = [
+            env.get(MINIME_TRIGGER_INPUT_URL, ""),
+            env.get(MINIME_TRIGGER_INPUT_SOPS_FILE, ""),
+            env.get(MINIME_TRIGGER_INPUT_SOPS_KEY, ""),
+        ]
+        if any(trigger_sources) and not all(trigger_sources):
+            raise ValueError("trigger input configuration is incomplete")
+        trigger_input_url: str | None = None
+        trigger_input_bearer: str | None = None
+        if all(trigger_sources):
+            try:
+                trigger_input_url = normalize_loopback_http_url(trigger_sources[0])
+                trigger_input_bearer = resolve_trigger_input_bearer(environ=env)
+            except MonitoringError:
+                raise ValueError("trigger input configuration is invalid") from None
+            try:
+                encoded_bearer = trigger_input_bearer.encode("ascii")
+            except UnicodeEncodeError:
+                raise ValueError("trigger input bearer is invalid") from None
+            if (
+                not 16 <= len(encoded_bearer) <= 8 * 1024
+                or any(byte < 0x21 or byte > 0x7E for byte in encoded_bearer)
+            ):
+                raise ValueError("trigger input bearer is invalid")
         return cls(
             state_path=Path(state),
             chat_id=env.get("MINIME_TELEGRAM_CHAT_ID", ""),
@@ -111,7 +146,23 @@ class DoctorConfig:
             runtime_max_age=runtime_max_age,
             tcc_status_path=Path(tcc) if tcc else None,
             log_path=Path(log) if log else None,
+            trigger_input_url=trigger_input_url,
+            trigger_input_bearer=trigger_input_bearer,
         )
+
+
+@dataclass(frozen=True)
+class PendingTransition:
+    from_incidents: frozenset[str]
+    to_incidents: frozenset[str]
+    consecutive_failures: int
+    notice_sent: bool
+
+
+@dataclass(frozen=True)
+class DoctorState:
+    incidents: frozenset[str]
+    pending: PendingTransition | None = None
 
 
 def make_logger(path: Path | None) -> logging.Logger:
@@ -250,6 +301,26 @@ def incident_message(incidents: set[str]) -> str:
     return "\n".join(lines)
 
 
+def send_trigger_input(message: str, config: DoctorConfig) -> None:
+    if config.trigger_input_url is None or config.trigger_input_bearer is None:
+        raise DeliveryError("trigger input is not configured")
+    body = json.dumps(
+        {"source": "runtime-doctor", "text": message},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    try:
+        response = post_loopback_json_with_bearer(
+            config.trigger_input_url,
+            body,
+            config.trigger_input_bearer,
+            timeout=config.timeout,
+        )
+    except (MonitoringError, OSError, TimeoutError, ValueError):
+        raise DeliveryError("trigger input delivery failed") from None
+    if response.status != 202:
+        raise DeliveryError("trigger input delivery failed")
+
+
 def _read_state_document(path: Path) -> tuple[dict[str, Any] | None, bool]:
     descriptor: int | None = None
     try:
@@ -268,32 +339,86 @@ def _read_state_document(path: Path) -> tuple[dict[str, Any] | None, bool]:
     finally:
         if descriptor is not None:
             os.close(descriptor)
-    incidents = (
-        value.get("incidents")
-        if isinstance(value, dict) and value.get("version") == STATE_VERSION
-        else None
-    )
-    if not isinstance(incidents, list) or not all(
-        isinstance(item, str) and item in INCIDENT_ACTIONS for item in incidents
-    ):
+    if not isinstance(value, dict) or value.get("version") != STATE_VERSION:
         return None, True
     return value, False
 
 
-def read_state(path: Path) -> tuple[set[str], bool]:
+def _parse_incident_list(value: Any) -> frozenset[str]:
+    if (
+        not isinstance(value, list)
+        or not all(isinstance(item, str) and item in INCIDENT_ACTIONS for item in value)
+        or len(value) != len(set(value))
+    ):
+        raise ValueError("invalid incident list")
+    return frozenset(value)
+
+
+def _read_doctor_state(path: Path) -> tuple[DoctorState, bool]:
     value, corrupt = _read_state_document(path)
     if corrupt or value is None:
-        return set(), corrupt
-    return set(value["incidents"]), False
+        return DoctorState(frozenset()), corrupt
+    try:
+        incidents = _parse_incident_list(value.get("incidents"))
+        pending_fields = (
+            "fromIncidents",
+            "toIncidents",
+            "consecutiveFailures",
+            "noticeSent",
+        )
+        present = [field in value for field in pending_fields]
+        if any(present) and not all(present):
+            raise ValueError("partial pending transition")
+        pending = None
+        if all(present):
+            from_incidents = _parse_incident_list(value["fromIncidents"])
+            to_incidents = _parse_incident_list(value["toIncidents"])
+            failures = value["consecutiveFailures"]
+            notice_sent = value["noticeSent"]
+            if (
+                from_incidents != incidents
+                or to_incidents == from_incidents
+                or isinstance(failures, bool)
+                or not isinstance(failures, int)
+                or not 1 <= failures <= MAX_CONSECUTIVE_FAILURES
+                or not isinstance(notice_sent, bool)
+                or (notice_sent and failures < MAX_CONSECUTIVE_FAILURES)
+            ):
+                raise ValueError("invalid pending transition")
+            pending = PendingTransition(
+                from_incidents,
+                to_incidents,
+                failures,
+                notice_sent,
+            )
+        return DoctorState(incidents, pending), False
+    except ValueError:
+        return DoctorState(frozenset()), True
 
 
-def _write_state_document(path: Path, incidents: set[str]) -> None:
+def read_state(path: Path) -> tuple[set[str], bool]:
+    state, corrupt = _read_doctor_state(path)
+    return set(state.incidents), corrupt
+
+
+def _write_state_document(
+    path: Path,
+    incidents: set[str] | frozenset[str],
+    pending: PendingTransition | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     document: dict[str, Any] = {
         "version": STATE_VERSION,
         "incidents": sorted(incidents),
         "updated_at": int(time.time()),
     }
+    if pending is not None:
+        document.update({
+            "fromIncidents": sorted(pending.from_incidents),
+            "toIncidents": sorted(pending.to_incidents),
+            "consecutiveFailures": pending.consecutive_failures,
+            "noticeSent": pending.notice_sent,
+        })
     payload = json.dumps(
         document,
         separators=(",", ":"),
@@ -355,20 +480,62 @@ def run_doctor(
         return 0
     try:
         incidents = collect_incidents(config)
-        notify = deliver or (lambda message: send_telegram(message, DeliveryConfig(config.chat_id, config.thread_id)))
-        previous, corrupt = read_state(config.state_path)
+        trigger_mode = config.trigger_input_url is not None
+        notify = deliver or (
+            (lambda message: send_trigger_input(message, config))
+            if trigger_mode
+            else (
+                lambda message: send_telegram(
+                    message,
+                    DeliveryConfig(config.chat_id, config.thread_id),
+                )
+            )
+        )
+        state, corrupt = _read_doctor_state(config.state_path)
         if corrupt:
             active_logger.error("doctor_state_corrupt_reset")
             write_state(config.state_path, set())
             return 0
+        previous = set(state.incidents)
         if incidents == previous:
-            if not config.state_path.exists():
+            if state.pending is not None or not config.state_path.exists():
                 write_state(config.state_path, incidents)
             active_logger.info("doctor_state_unchanged codes=%s", ",".join(sorted(incidents)) or "healthy")
             return 0
         try:
             notify(incident_message(incidents))
         except (MonitoringError, OSError):
+            if trigger_mode:
+                pending = state.pending
+                if (
+                    pending is None
+                    or pending.from_incidents != frozenset(previous)
+                    or pending.to_incidents != frozenset(incidents)
+                ):
+                    failures = 0
+                    notice_sent = False
+                else:
+                    failures = pending.consecutive_failures
+                    notice_sent = pending.notice_sent
+                failures = min(failures + 1, MAX_CONSECUTIVE_FAILURES)
+                send_notice = bool(incidents) and failures >= MAX_CONSECUTIVE_FAILURES and not notice_sent
+                pending = PendingTransition(
+                    frozenset(previous),
+                    frozenset(incidents),
+                    failures,
+                    notice_sent or send_notice,
+                )
+                _write_state_document(config.state_path, previous, pending)
+                if send_notice:
+                    try:
+                        send_telegram(
+                            CONTROL_PATH_UNAVAILABLE_NOTICE,
+                            DeliveryConfig(config.chat_id, config.thread_id),
+                        )
+                    except (MonitoringError, OSError):
+                        active_logger.error("doctor_control_path_notice_failed")
+                    else:
+                        active_logger.info("doctor_control_path_notice_sent")
             active_logger.error("doctor_notification_failed")
             return 1
         write_state(config.state_path, incidents)

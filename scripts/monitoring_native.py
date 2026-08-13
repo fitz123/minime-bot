@@ -24,14 +24,16 @@ from typing import Any, Callable
 TOKEN_ENV = "MINIME_TELEGRAM_BOT_TOKEN"
 SOPS_FILE_ENV = "MINIME_TELEGRAM_SOPS_FILE"
 SOPS_KEY_ENV = "MINIME_TELEGRAM_SOPS_KEY"
-OPS_INTAKE_SOPS_FILE_ENV = "MINIME_OPS_INTAKE_SOPS_FILE"
-OPS_INTAKE_SOPS_KEY_ENV = "MINIME_OPS_INTAKE_SOPS_KEY"
+MINIME_TRIGGER_INPUT_URL = "MINIME_TRIGGER_INPUT_URL"
+MINIME_TRIGGER_INPUT_SOPS_FILE = "MINIME_TRIGGER_INPUT_SOPS_FILE"
+MINIME_TRIGGER_INPUT_SOPS_KEY = "MINIME_TRIGGER_INPUT_SOPS_KEY"
 SOPS_EXECUTABLE_ENV = "MINIME_SOPS_EXECUTABLE"
 API_BASE_ENV = "MINIME_TELEGRAM_API_BASE"
 INSECURE_TEST_ENV = "MINIME_TELEGRAM_ALLOW_INSECURE_TEST_API"
 DEFAULT_API_BASE = "https://api.telegram.org"
 TELEGRAM_TEXT_MAX_UTF16_UNITS = 4096
 HTTP_RESPONSE_MAX_BYTES = 1_000_000
+CONTROL_PATH_UNAVAILABLE_NOTICE = "Reserve engineer control path unavailable; delivery will retry."
 _KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*$")
 _ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
@@ -148,17 +150,17 @@ def resolve_token(
     )
 
 
-def resolve_ops_intake_bearer(
+def resolve_trigger_input_bearer(
     *,
     environ: dict[str, str] | os._Environ[str] = os.environ,
     sops_timeout: float = 5.0,
     run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> str:
-    """Resolve the Ops bearer only from its named SOPS source."""
+    """Resolve the trigger-input bearer only from its named SOPS source."""
     return resolve_secret(
         value_env=None,
-        sops_file_env=OPS_INTAKE_SOPS_FILE_ENV,
-        sops_key_env=OPS_INTAKE_SOPS_KEY_ENV,
+        sops_file_env=MINIME_TRIGGER_INPUT_SOPS_FILE,
+        sops_key_env=MINIME_TRIGGER_INPUT_SOPS_KEY,
         environ=environ,
         sops_timeout=sops_timeout,
         run=run,

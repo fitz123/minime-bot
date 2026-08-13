@@ -21,6 +21,8 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { TelegramAdapterApi } from "../telegram-adapter.js";
+import { startTriggerInput } from "../trigger-input.js";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const python = process.env.PYTHON ?? "/usr/bin/python3";
@@ -28,7 +30,7 @@ const nativeScript = join(root, "scripts", "monitoring_native.py");
 const webhookScript = join(root, "scripts", "alertmanager_webhook.py");
 const doctorScript = join(root, "scripts", "runtime_doctor.py");
 const syntheticSecret = "synthetic_test_token_42";
-const syntheticOpsSecret = "synthetic_ops_bearer_58"; // gitleaks:allow -- test-only canary
+const syntheticTriggerSecret = "synthetic_trigger_bearer_58"; // gitleaks:allow -- test-only canary
 const temporaryDirectories: string[] = [];
 
 interface RunResult {
@@ -104,18 +106,24 @@ function telegramEnv(base: string): NodeJS.ProcessEnv {
   };
 }
 
-function bridgeEnv(base: string): NodeJS.ProcessEnv {
+function triggerInputEnv(base: string): NodeJS.ProcessEnv {
   const dir = tempDir();
   const sops = join(dir, "synthetic-sops");
-  writeFileSync(sops, `#!/bin/sh\nprintf '%s\\n' '${syntheticOpsSecret}'\n`);
+  writeFileSync(sops, `#!/bin/sh\nprintf '%s\\n' '${syntheticTriggerSecret}'\n`);
   chmodSync(sops, 0o755);
   return {
-    ...telegramEnv(base),
-    MINIME_OPS_INTAKE_URL: `${base}/intake/alertmanager`,
-    MINIME_ALERTMANAGER_URL: base,
-    MINIME_OPS_INTAKE_SOPS_FILE: join(dir, "ops-secrets.sops.yaml"),
-    MINIME_OPS_INTAKE_SOPS_KEY: "intake.bearer",
+    MINIME_TRIGGER_INPUT_URL: `${base}/trigger`,
+    MINIME_TRIGGER_INPUT_SOPS_FILE: join(dir, "trigger-secrets.sops.yaml"),
+    MINIME_TRIGGER_INPUT_SOPS_KEY: "trigger.bearer",
     MINIME_SOPS_EXECUTABLE: sops,
+  };
+}
+
+function bridgeEnv(base: string, triggerBase = base): NodeJS.ProcessEnv {
+  return {
+    ...telegramEnv(base),
+    ...triggerInputEnv(triggerBase),
+    MINIME_ALERTMANAGER_URL: base,
   };
 }
 
@@ -193,10 +201,10 @@ function assertSecretAbsent(result: RunResult): void {
   assert.ok(!result.stderr.includes(syntheticSecret));
 }
 
-function assertOpsSecretAbsent(result: RunResult): void {
-  assert.ok(!result.args.join(" ").includes(syntheticOpsSecret));
-  assert.ok(!result.stdout.includes(syntheticOpsSecret));
-  assert.ok(!result.stderr.includes(syntheticOpsSecret));
+function assertTriggerSecretAbsent(result: RunResult): void {
+  assert.ok(!result.args.join(" ").includes(syntheticTriggerSecret));
+  assert.ok(!result.stdout.includes(syntheticTriggerSecret));
+  assert.ok(!result.stderr.includes(syntheticTriggerSecret));
 }
 
 function spawnWebhook(port: number, env: NodeJS.ProcessEnv, extra: string[] = []): ChildProcessWithoutNullStreams {
@@ -282,32 +290,32 @@ describe("host-native secret and Telegram delivery", () => {
     assertSecretAbsent(timed);
   });
 
-  it("resolves the named Ops bearer through the generalized SOPS path", async () => {
+  it("resolves the named trigger-input bearer through the generalized SOPS path", async () => {
     const dir = tempDir();
-    const argsFile = join(dir, "ops-sops-args.json");
+    const argsFile = join(dir, "trigger-sops-args.json");
     const sops = join(dir, "sops");
     writeFileSync(
       sops,
-      `#!/bin/sh\n/usr/bin/python3 -c 'import json,sys; open(sys.argv[1], "w").write(json.dumps(sys.argv[2:]))' "${argsFile}" "$@"\nprintf '%s\\n' '${syntheticOpsSecret}'\n`,
+      `#!/bin/sh\n/usr/bin/python3 -c 'import json,sys; open(sys.argv[1], "w").write(json.dumps(sys.argv[2:]))' "${argsFile}" "$@"\nprintf '%s\\n' '${syntheticTriggerSecret}'\n`,
     );
     chmodSync(sops, 0o755);
     const result = await runPython(
       [
         "-c",
-        "import os,sys; sys.path.insert(0, 'scripts'); import monitoring_native as m; assert m.resolve_ops_intake_bearer() == os.environ['EXPECTED_OPS_BEARER']; print('ok')",
+        "import os,sys; sys.path.insert(0, 'scripts'); import monitoring_native as m; assert m.resolve_trigger_input_bearer() == os.environ['EXPECTED_TRIGGER_BEARER']; print('ok')",
       ],
       {
         MINIME_SOPS_EXECUTABLE: sops,
-        MINIME_OPS_INTAKE_SOPS_FILE: join(dir, "ops.sops.yaml"),
-        MINIME_OPS_INTAKE_SOPS_KEY: "intake.bearer",
-        EXPECTED_OPS_BEARER: syntheticOpsSecret,
+        MINIME_TRIGGER_INPUT_SOPS_FILE: join(dir, "trigger.sops.yaml"),
+        MINIME_TRIGGER_INPUT_SOPS_KEY: "trigger.bearer",
+        EXPECTED_TRIGGER_BEARER: syntheticTriggerSecret,
       },
     );
     assert.equal(result.status, 0, result.stderr);
-    assertOpsSecretAbsent(result);
+    assertTriggerSecretAbsent(result);
     const args = JSON.parse(readFileSync(argsFile, "utf8")) as string[];
-    assert.deepEqual(args.slice(0, 3), ["-d", "--extract", '["intake"]["bearer"]']);
-    assert.ok(!args.join(" ").includes(syntheticOpsSecret));
+    assert.deepEqual(args.slice(0, 3), ["-d", "--extract", '["trigger"]["bearer"]']);
+    assert.ok(!args.join(" ").includes(syntheticTriggerSecret));
   });
 
   it("requires explicit test mode for every custom Telegram API origin", async () => {
@@ -698,9 +706,9 @@ describe("Alertmanager webhook", () => {
     );
   });
 
-  it("forwards only exact active groups to Ops and keeps noncritical success quiet", async () => {
-    const opsBodies: string[] = [];
-    const opsAuthorization: Array<string | undefined> = [];
+  it("forwards only exact active groups to trigger input and keeps noncritical success quiet", async () => {
+    const triggerBodies: string[] = [];
+    const triggerAuthorization: Array<string | undefined> = [];
     const telegramMessages: string[] = [];
     const alertmanagerQueries: string[] = [];
     const synthetic = await startServer((request, response) => {
@@ -731,10 +739,11 @@ describe("Alertmanager webhook", () => {
       let body = "";
       request.setEncoding("utf8").on("data", (chunk) => (body += chunk));
       request.on("end", () => {
-        if (request.url === "/intake/alertmanager") {
-          opsBodies.push(body);
-          opsAuthorization.push(request.headers.authorization);
-          response.end(JSON.stringify({ ok: true }));
+        if (request.url === "/trigger") {
+          triggerBodies.push(body);
+          triggerAuthorization.push(request.headers.authorization);
+          response.statusCode = 202;
+          response.end("accepted");
         } else if (request.url?.includes("/sendMessage")) {
           telegramMessages.push(new URLSearchParams(body).get("text") ?? "");
           response.end(JSON.stringify({ ok: true }));
@@ -753,10 +762,14 @@ describe("Alertmanager webhook", () => {
       const exact = alertmanagerPayload({ alertname: "ExactActive", fingerprint: "exact-active" });
       assert.equal((await postWebhook(port, exact)).status, 200);
       assert.equal((await postWebhook(port, exact)).status, 200, "completed batches must deduplicate");
-      assert.equal(opsBodies.length, 1);
-      assert.equal(opsBodies[0], JSON.stringify(exact), "the validated original body must be forwarded verbatim");
-      assert.deepEqual(opsAuthorization, [`Bearer ${syntheticOpsSecret}`]);
-      assert.equal(telegramMessages.length, 0, "noncritical Ops success must stay quiet");
+      assert.equal(triggerBodies.length, 1);
+      assert.deepEqual(JSON.parse(triggerBodies[0]), {
+        source: "alertmanager",
+        text: "minime monitoring\nFIRING alert=ExactActive severity=warning instance=local",
+      });
+      assert.ok(!triggerBodies[0].includes("alerts"), "raw Alertmanager fields must not be forwarded");
+      assert.deepEqual(triggerAuthorization, [`Bearer ${syntheticTriggerSecret}`]);
+      assert.equal(telegramMessages.length, 0, "noncritical trigger input success must stay quiet");
       assert.equal(alertmanagerQueries.length, 1);
       const query = new URL(alertmanagerQueries[0], synthetic.base).searchParams;
       for (const state of ["active", "silenced", "inhibited", "muted"]) {
@@ -767,7 +780,7 @@ describe("Alertmanager webhook", () => {
 
       const mismatch = alertmanagerPayload({ alertname: "StaleOrForged", fingerprint: "mismatch" });
       assert.equal((await postWebhook(port, mismatch)).status, 200);
-      assert.equal(opsBodies.length, 1, "a mismatched group must never reach authenticated Ops intake");
+      assert.equal(triggerBodies.length, 1, "a mismatched group must never reach authenticated trigger input intake");
       assert.equal(telegramMessages.length, 0, "a stale or forged mismatch must not page natively");
 
       const forgedMember = alertmanagerPayload({
@@ -777,12 +790,25 @@ describe("Alertmanager webhook", () => {
       });
       assert.equal((await postWebhook(port, forgedMember)).status, 200);
       assert.equal(
-        opsBodies.length,
+        triggerBodies.length,
         1,
         "a current group-label subset must not authenticate different firing labels",
       );
       assert.equal(telegramMessages.length, 0, "an unverified critical member must not page");
       assert.equal(alertmanagerQueries.length, 3);
+
+      const mixedFingerprints = structuredClone(exact);
+      const duplicateIdentity = structuredClone(
+        (mixedFingerprints.alerts as Array<Record<string, unknown>>)[0],
+      );
+      duplicateIdentity.fingerprint = "forged-second-fingerprint";
+      (mixedFingerprints.alerts as Array<Record<string, unknown>>).push(duplicateIdentity);
+      assert.equal((await postWebhook(port, mixedFingerprints)).status, 200);
+      assert.equal(
+        triggerBodies.length,
+        1,
+        "every supplied fingerprint for a delivered identity must be current",
+      );
 
       const mixedForgedResolved = structuredClone(exact);
       (mixedForgedResolved.alerts as Array<Record<string, unknown>>).push({
@@ -799,7 +825,7 @@ describe("Alertmanager webhook", () => {
         fingerprint: "forged-resolved-critical",
       });
       assert.equal((await postWebhook(port, mixedForgedResolved)).status, 200);
-      assert.equal(opsBodies.length, 2, "only the genuine firing member grants Ops forwarding");
+      assert.equal(triggerBodies.length, 2, "only the genuine firing member grants trigger input forwarding");
       assert.equal(
         telegramMessages.length,
         0,
@@ -812,14 +838,14 @@ describe("Alertmanager webhook", () => {
         startsAt: "2026-07-22T01:00:00Z",
       });
       assert.equal((await postWebhook(port, forgedEpisodeStart)).status, 200);
-      assert.equal(opsBodies.length, 2, "an unverified episode start must not reach Ops");
+      assert.equal(triggerBodies.length, 2, "an unverified episode start must not reach trigger input");
 
       const forgedFingerprint = alertmanagerPayload({
         alertname: "ExactActive",
         fingerprint: "forged-fingerprint",
       });
       assert.equal((await postWebhook(port, forgedFingerprint)).status, 200);
-      assert.equal(opsBodies.length, 2, "an unverified fingerprint must not reach Ops");
+      assert.equal(triggerBodies.length, 2, "an unverified fingerprint must not reach trigger input");
 
       const forgedDescriptor = alertmanagerPayload({
         alertname: "ExactActive",
@@ -828,13 +854,13 @@ describe("Alertmanager webhook", () => {
       forgedDescriptor.groupLabels = { alertname: "ExactActive", instance: "local" };
       assert.equal((await postWebhook(port, forgedDescriptor)).status, 200);
       assert.equal(
-        opsBodies.length,
+        triggerBodies.length,
         2,
         "real member labels must not authenticate a descriptor Alertmanager never grouped by",
       );
-      assert.equal(alertmanagerQueries.length, 7);
-      assert.ok(!child.spawnargs.join(" ").includes(syntheticOpsSecret));
-      assert.ok(!stderr.includes(syntheticOpsSecret));
+      assert.equal(alertmanagerQueries.length, 8);
+      assert.ok(!child.spawnargs.join(" ").includes(syntheticTriggerSecret));
+      assert.ok(!stderr.includes(syntheticTriggerSecret));
     } finally {
       child.kill("SIGTERM");
       await new Promise((resolvePromise) => child.once("close", resolvePromise));
@@ -843,7 +869,7 @@ describe("Alertmanager webhook", () => {
   });
 
   it("requires one routed group to contain every delivered firing member", async () => {
-    let opsForwards = 0;
+    let triggerForwards = 0;
     const synthetic = await startServer((request, response) => {
       if (request.method === "GET" && request.url?.startsWith("/api/v2/alerts/groups?")) {
         const member = (instance: string, fingerprint: string) => ({
@@ -860,8 +886,9 @@ describe("Alertmanager webhook", () => {
       }
       request.resume();
       request.on("end", () => {
-        if (request.url === "/intake/alertmanager") opsForwards += 1;
-        response.end(JSON.stringify({ ok: true }));
+        if (request.url === "/trigger") triggerForwards += 1;
+        response.statusCode = 202;
+        response.end("accepted");
       });
     });
     const port = await reservePort();
@@ -885,7 +912,7 @@ describe("Alertmanager webhook", () => {
       (payload.alerts as Array<Record<string, unknown>>).push(second);
 
       assert.equal((await postWebhook(port, payload)).status, 200);
-      assert.equal(opsForwards, 0, "members split across groups must not authenticate a batch");
+      assert.equal(triggerForwards, 0, "members split across groups must not authenticate a batch");
     } finally {
       child.kill("SIGTERM");
       await new Promise((resolvePromise) => child.once("close", resolvePromise));
@@ -893,8 +920,8 @@ describe("Alertmanager webhook", () => {
     }
   });
 
-  it("forwards an ungrouped 64-alert firing batch instead of rejecting the required Ops sink", async () => {
-    const opsBodies: string[] = [];
+  it("forwards an ungrouped 64-alert firing batch instead of rejecting the required trigger input sink", async () => {
+    const triggerBodies: string[] = [];
     const synthetic = await startServer((request, response) => {
       if (request.method === "GET") {
         response.end(JSON.stringify([alertmanagerApiGroup(
@@ -915,9 +942,10 @@ describe("Alertmanager webhook", () => {
       let body = "";
       request.setEncoding("utf8").on("data", (chunk) => (body += chunk));
       request.on("end", () => {
-        if (request.url === "/intake/alertmanager") {
-          opsBodies.push(body);
-          response.end(JSON.stringify({ ok: true }));
+        if (request.url === "/trigger") {
+          triggerBodies.push(body);
+          response.statusCode = 202;
+          response.end("accepted");
         } else if (request.url?.includes("/sendMessage")) {
           response.end(JSON.stringify({ ok: true }));
         }
@@ -942,14 +970,18 @@ describe("Alertmanager webhook", () => {
       }));
 
       assert.equal((await postWebhook(port, payload)).status, 200);
-      assert.equal(opsBodies.length, 1);
-      assert.equal(opsBodies[0], JSON.stringify(payload));
+      assert.equal(triggerBodies.length, 1);
+      const forwarded = JSON.parse(triggerBodies[0]) as { source: string; text: string };
+      assert.equal(forwarded.source, "alertmanager");
+      assert.match(forwarded.text, /^minime monitoring\nFIRING/);
+      assert.ok(Buffer.from(forwarded.text, "utf16le").byteLength / 2 <= 4096);
+      assert.ok(!triggerBodies[0].includes("groupKey"));
 
       const stale = alertmanagerPayload({ alertname: "ForgedUngrouped" });
       stale.groupKey = "{}:{}";
       stale.groupLabels = {};
       assert.equal((await postWebhook(port, stale)).status, 200);
-      assert.equal(opsBodies.length, 1, "ungrouped source verification must not be vacuous");
+      assert.equal(triggerBodies.length, 1, "ungrouped source verification must not be vacuous");
     } finally {
       child.kill("SIGTERM");
       await new Promise((resolvePromise) => child.once("close", resolvePromise));
@@ -957,9 +989,103 @@ describe("Alertmanager webhook", () => {
     }
   });
 
-  it("keeps several noncritical groups quiet and retryable through source and Ops failures", async () => {
+  it("forwards an exactly 4096-UTF-16-unit batch through the real trigger input", async () => {
+    const firstLabels = Array.from({ length: 10 }, (_, index) => ({
+      alertname: String(index).padEnd(120, "A"),
+      severity: "S".repeat(120),
+      instance: "I".repeat(120),
+    }));
+    const labels = [...firstLabels, {
+      alertname: "A".repeat(35),
+      severity: "S".repeat(35),
+      instance: "I".repeat(35),
+    }];
+    const alerts = labels.map((memberLabels, index) => ({
+      status: "firing",
+      labels: memberLabels,
+      annotations: {},
+      startsAt: "2026-07-22T00:00:00Z",
+      endsAt: "0001-01-01T00:00:00Z",
+      generatorURL: "http://127.0.0.1/prometheus/graph",
+      fingerprint: `maximum-${index}`,
+    }));
+    const payload = {
+      ...alertmanagerPayload({ alertname: "MaximumBatch" }),
+      status: "firing",
+      alerts,
+      groupLabels: {},
+      commonLabels: {},
+      groupKey: "{}:{}",
+    };
+    const enqueued: string[] = [];
+    const trigger = await startTriggerInput({
+      config: {
+        port: 0,
+        host: "127.0.0.1",
+        path: "/trigger",
+        bearer: syntheticTriggerSecret,
+        chatId: 111,
+      },
+      bindings: [{
+        chatId: 111,
+        agentId: "main",
+        kind: "dm",
+        typingIndicator: false,
+      }],
+      sessionDefaults: {
+        idleTimeoutMs: 60_000,
+        maxConcurrentSessions: 1,
+        maxMessageAgeMs: 60_000,
+        requireMention: true,
+        maxMediaBytes: 1024,
+      },
+      api: {} as TelegramAdapterApi,
+      messageQueue: {
+        enqueue(_chatId, _agentId, text) {
+          enqueued.push(text);
+          return true;
+        },
+      },
+    });
+    let directAttempts = 0;
+    const source = await startServer((request, response) => {
+      if (request.method === "GET") {
+        response.end(JSON.stringify([alertmanagerApiGroup(
+          {},
+          alerts.map((alert) => ({
+            labels: alert.labels,
+            status: { state: "active" },
+            startsAt: alert.startsAt,
+            fingerprint: alert.fingerprint,
+          })),
+        )]));
+        return;
+      }
+      directAttempts += 1;
+      response.end(JSON.stringify({ ok: true }));
+    });
+    const port = await reservePort();
+    const triggerBase = `http://127.0.0.1:${trigger.address.port}`;
+    const child = spawnWebhook(port, bridgeEnv(source.base, triggerBase));
+    try {
+      await waitUntilReady(child);
+      assert.equal((await postWebhook(port, payload)).status, 200);
+      assert.equal(enqueued.length, 1);
+      const evidence = enqueued[0].split("\n\n", 2)[1];
+      assert.equal(Buffer.from(evidence, "utf16le").byteLength / 2, 4096);
+      assert.match(evidence, /^minime monitoring\nFIRING/);
+      assert.equal(directAttempts, 0);
+    } finally {
+      child.kill("SIGTERM");
+      await new Promise((resolvePromise) => child.once("close", resolvePromise));
+      await trigger.stop();
+      await closeServer(source.server);
+    }
+  });
+
+  it("keeps several noncritical groups quiet and retryable through source and trigger input failures", async () => {
     const alertmanagerQueries = new Map<string, number>();
-    const opsAttempts = new Map<string, number>();
+    const triggerAttempts = new Map<string, number>();
     const telegramMessages: string[] = [];
     const synthetic = await startServer((request, response) => {
       if (request.method === "GET" && request.url?.startsWith("/api/v2/alerts/groups?")) {
@@ -988,15 +1114,15 @@ describe("Alertmanager webhook", () => {
       let body = "";
       request.setEncoding("utf8").on("data", (chunk) => (body += chunk));
       request.on("end", () => {
-        if (request.url === "/intake/alertmanager") {
-          const payload = JSON.parse(body) as {
-            alerts: Array<{ labels: { alertname: string } }>;
-          };
-          const alertname = payload.alerts[0].labels.alertname;
-          const attempt = (opsAttempts.get(alertname) ?? 0) + 1;
-          opsAttempts.set(alertname, attempt);
-          response.statusCode = attempt === 1 ? 503 : 200;
-          response.end(JSON.stringify({ ok: attempt > 1 }));
+        if (request.url === "/trigger") {
+          const payload = JSON.parse(body) as { source: string; text: string };
+          assert.equal(payload.source, "alertmanager");
+          const alertname = /alert=([^ ]+)/.exec(payload.text)?.[1];
+          assert.ok(alertname);
+          const attempt = (triggerAttempts.get(alertname) ?? 0) + 1;
+          triggerAttempts.set(alertname, attempt);
+          response.statusCode = attempt === 1 ? 429 : 202;
+          response.end(attempt > 1 ? "accepted" : "saturated");
         } else if (request.url?.includes("/sendMessage")) {
           telegramMessages.push(new URLSearchParams(body).get("text") ?? "");
           response.end(JSON.stringify({ ok: true }));
@@ -1011,8 +1137,8 @@ describe("Alertmanager webhook", () => {
       for (const alertname of alertnames) {
         const payload = alertmanagerPayload({ alertname });
         assert.equal((await postWebhook(port, payload)).status, 503, "query failure must remain retryable");
-        assert.equal((await postWebhook(port, payload)).status, 503, "Ops rejection must remain retryable");
-        assert.equal((await postWebhook(port, payload)).status, 200, "Ops acceptance must converge");
+        assert.equal((await postWebhook(port, payload)).status, 503, "trigger input rejection must remain retryable");
+        assert.equal((await postWebhook(port, payload)).status, 200, "trigger input acceptance must converge");
         assert.equal((await postWebhook(port, payload)).status, 200, "completed batches must deduplicate");
       }
       assert.deepEqual(
@@ -1020,7 +1146,7 @@ describe("Alertmanager webhook", () => {
         Object.fromEntries(alertnames.map((alertname) => [alertname, 3])),
       );
       assert.deepEqual(
-        Object.fromEntries(opsAttempts),
+        Object.fromEntries(triggerAttempts),
         Object.fromEntries(alertnames.map((alertname) => [alertname, 2])),
       );
       assert.equal(telegramMessages.length, 0, "warning retries must not fan out natively");
@@ -1031,18 +1157,18 @@ describe("Alertmanager webhook", () => {
     }
   });
 
-  it("returns 503 for an Ops timeout without native fallback and converges on retry", async () => {
-    let opsAttempts = 0;
+  it("returns 503 for a critical trigger timeout without direct fallback and converges on retry", async () => {
+    let triggerAttempts = 0;
     let telegramAttempts = 0;
     const synthetic = await startServer((request, response) => {
       if (request.method === "GET") {
         response.end(JSON.stringify([alertmanagerApiGroup(
-          { alertname: "SlowOps" },
+          { alertname: "SlowTrigger" },
           [{
-            labels: { alertname: "SlowOps", severity: "warning", instance: "local" },
+            labels: { alertname: "SlowTrigger", severity: "critical", instance: "local" },
             status: { state: "unprocessed" },
             startsAt: "2026-07-22T00:00:00Z",
-            fingerprint: "slow-ops",
+            fingerprint: "slow-trigger",
           }],
         )]));
         return;
@@ -1050,9 +1176,12 @@ describe("Alertmanager webhook", () => {
       let body = "";
       request.setEncoding("utf8").on("data", (chunk) => (body += chunk));
       request.on("end", () => {
-        if (request.url === "/intake/alertmanager") {
-          opsAttempts += 1;
-          if (opsAttempts > 1) response.end(JSON.stringify({ ok: true }));
+        if (request.url === "/trigger") {
+          triggerAttempts += 1;
+          if (triggerAttempts > 1) {
+            response.statusCode = 202;
+            response.end("accepted");
+          }
         } else if (request.url?.includes("/sendMessage")) {
           telegramAttempts += 1;
           response.end(JSON.stringify({ ok: true }));
@@ -1063,10 +1192,14 @@ describe("Alertmanager webhook", () => {
     const child = spawnWebhook(port, { ...bridgeEnv(synthetic.base), MINIME_BRIDGE_TIMEOUT: "0.5" });
     try {
       await waitUntilReady(child);
-      const payload = alertmanagerPayload({ alertname: "SlowOps", fingerprint: "slow-ops" });
+      const payload = alertmanagerPayload({
+        alertname: "SlowTrigger",
+        severity: "critical",
+        fingerprint: "slow-trigger",
+      });
       assert.equal((await postWebhook(port, payload)).status, 503);
       assert.equal((await postWebhook(port, payload)).status, 200);
-      assert.equal(opsAttempts, 2);
+      assert.equal(triggerAttempts, 2);
       assert.equal(telegramAttempts, 0);
     } finally {
       child.kill("SIGTERM");
@@ -1075,9 +1208,9 @@ describe("Alertmanager webhook", () => {
     }
   });
 
-  it("retains critical native delivery when source verification is unavailable", async () => {
+  it("keeps verification failures retryable and emits zero direct notices", async () => {
     let sourceQueries = 0;
-    let opsAttempts = 0;
+    let triggerAttempts = 0;
     let telegramAttempts = 0;
     const synthetic = await startServer((request, response) => {
       if (request.method === "GET") {
@@ -1088,7 +1221,7 @@ describe("Alertmanager webhook", () => {
       }
       request.resume();
       request.on("end", () => {
-        if (request.url === "/intake/alertmanager") opsAttempts += 1;
+        if (request.url === "/trigger") triggerAttempts += 1;
         if (request.url?.includes("/sendMessage")) telegramAttempts += 1;
         response.end(JSON.stringify({ ok: true }));
       });
@@ -1104,8 +1237,8 @@ describe("Alertmanager webhook", () => {
       assert.equal((await postWebhook(port, critical)).status, 503);
       assert.equal((await postWebhook(port, critical)).status, 503);
       assert.equal(sourceQueries, 2);
-      assert.equal(opsAttempts, 0);
-      assert.equal(telegramAttempts, 1, "critical native delivery must remain independently deduplicated");
+      assert.equal(triggerAttempts, 0);
+      assert.equal(telegramAttempts, 0, "Alertmanager selects the zero-notice boundary");
     } finally {
       child.kill("SIGTERM");
       await new Promise((resolvePromise) => child.once("close", resolvePromise));
@@ -1113,36 +1246,39 @@ describe("Alertmanager webhook", () => {
     }
   });
 
-  it("requires critical dual delivery and handles resolved-only groups without Ops", async () => {
+  it("forwards verified critical firing and resolved summaries without direct delivery", async () => {
     let sourceQueries = 0;
-    let opsAttempts = 0;
-    let telegramAttempts = 0;
+    const triggerBodies: Array<{ source: string; text: string }> = [];
+    let directAttempts = 0;
     const synthetic = await startServer((request, response) => {
       if (request.method === "GET") {
         sourceQueries += 1;
-        response.end(JSON.stringify([alertmanagerApiGroup(
-          { alertname: "CriticalDual" },
+        const filter = new URL(request.url ?? "/", synthetic.base).searchParams
+          .getAll("filter")[0];
+        const alertname = JSON.parse((filter ?? "=").split("=").slice(1).join("=")) as string;
+        const active = alertname === "CriticalFiring" || alertname === "StillActiveResolved";
+        response.end(JSON.stringify(active ? [alertmanagerApiGroup(
+          { alertname },
           [{
-            labels: { alertname: "CriticalDual", severity: "critical", instance: "local" },
+            labels: { alertname, severity: "critical", instance: "local" },
             status: { state: "active" },
-            startsAt: sourceQueries >= 3
-              ? "2026-07-22T01:00:00Z"
-              : "2026-07-22T00:00:00Z",
-            fingerprint: "critical-dual",
+            startsAt: "2026-07-22T00:00:00Z",
+            fingerprint: alertname,
           }],
-        )]));
+        )] : []));
         return;
       }
-      request.resume();
+      let body = "";
+      request.setEncoding("utf8").on("data", (chunk) => (body += chunk));
       request.on("end", () => {
-        if (request.url === "/intake/alertmanager") {
-          opsAttempts += 1;
-          assert.equal(request.headers.authorization, `Bearer ${syntheticOpsSecret}`);
-          response.end(JSON.stringify({ ok: true }));
+        if (request.url === "/trigger") {
+          triggerBodies.push(JSON.parse(body) as { source: string; text: string });
+          assert.equal(request.headers.authorization, `Bearer ${syntheticTriggerSecret}`);
+          response.statusCode = 202;
+          response.end("accepted");
         } else if (request.url?.includes("/sendMessage")) {
-          telegramAttempts += 1;
-          response.statusCode = telegramAttempts === 1 ? 400 : 200;
-          response.end(JSON.stringify({ ok: telegramAttempts > 1, error_code: 400 }));
+          directAttempts += 1;
+          response.end(JSON.stringify({ ok: true }));
         }
       });
     });
@@ -1151,56 +1287,39 @@ describe("Alertmanager webhook", () => {
     try {
       await waitUntilReady(child);
       const critical = alertmanagerPayload({
-        alertname: "CriticalDual",
+        alertname: "CriticalFiring",
         severity: "critical",
-        fingerprint: "critical-dual",
+        fingerprint: "CriticalFiring",
       });
-      assert.equal((await postWebhook(port, critical)).status, 503, "native failure must fail dual delivery");
       assert.equal((await postWebhook(port, critical)).status, 200);
-      assert.equal(opsAttempts, 2, "Ops replay must be harmless while native delivery retries");
-      assert.equal(telegramAttempts, 2);
-
-      const resolvedEpisode = alertmanagerPayload({
-        alertname: "CriticalDual",
+      const staleResolved = alertmanagerPayload({
+        alertname: "StillActiveResolved",
         severity: "critical",
         status: "resolved",
-        fingerprint: "critical-dual",
+        fingerprint: "StillActiveResolved",
       });
-      assert.equal((await postWebhook(port, resolvedEpisode)).status, 200);
-      const refiredEpisode = alertmanagerPayload({
-        alertname: "CriticalDual",
+      assert.equal((await postWebhook(port, staleResolved)).status, 200);
+      const verifiedResolved = alertmanagerPayload({
+        alertname: "RecoveredGroup",
         severity: "critical",
-        fingerprint: "critical-dual",
-        startsAt: "2026-07-22T01:00:00Z",
-      });
-      assert.equal((await postWebhook(port, refiredEpisode)).status, 200);
-      assert.equal((await postWebhook(port, refiredEpisode)).status, 200);
-      assert.equal(opsAttempts, 3, "the new firing episode must reach Ops exactly once");
-      assert.equal(telegramAttempts, 4, "the resolved and re-fired episodes must both notify");
-
-      const duplicatedRefire = structuredClone(refiredEpisode);
-      (duplicatedRefire.alerts as Array<Record<string, unknown>>).push(
-        structuredClone((duplicatedRefire.alerts as Array<Record<string, unknown>>)[0]),
-      );
-      assert.equal((await postWebhook(port, duplicatedRefire)).status, 200);
-      assert.equal(opsAttempts, 4, "duplicate multiplicity may replay only the idempotent Ops sink");
-      assert.equal(telegramAttempts, 4, "duplicate multiplicity must not bypass native deduplication");
-
-      const opaqueGroupKeyChange = structuredClone(refiredEpisode);
-      opaqueGroupKeyChange.groupKey = "locally-forged-opaque-group-key";
-      assert.equal((await postWebhook(port, opaqueGroupKeyChange)).status, 200);
-      assert.equal(opsAttempts, 5, "opaque envelope changes may be replayed safely to Ops");
-      assert.equal(telegramAttempts, 4, "opaque groupKey changes must not bypass native dedup");
-
-      const resolvedWarning = alertmanagerPayload({
-        alertname: "ResolvedWarning",
         status: "resolved",
-        fingerprint: "resolved-warning",
+        fingerprint: "RecoveredGroup",
       });
-      assert.equal((await postWebhook(port, resolvedWarning)).status, 200);
-      assert.equal(sourceQueries, 5, "resolved-only batches must not query or forward to Ops");
-      assert.equal(opsAttempts, 5);
-      assert.equal(telegramAttempts, 4, "only critical resolved delivery uses the native path");
+      assert.equal((await postWebhook(port, verifiedResolved)).status, 200);
+      assert.equal((await postWebhook(port, verifiedResolved)).status, 200);
+
+      assert.equal(sourceQueries, 3);
+      assert.deepEqual(triggerBodies, [
+        {
+          source: "alertmanager",
+          text: "minime monitoring\nFIRING alert=CriticalFiring severity=critical instance=local",
+        },
+        {
+          source: "alertmanager",
+          text: "minime monitoring\nRESOLVED alert=RecoveredGroup severity=critical instance=local",
+        },
+      ]);
+      assert.equal(directAttempts, 0);
     } finally {
       child.kill("SIGTERM");
       await new Promise((resolvePromise) => child.once("close", resolvePromise));
@@ -1212,13 +1331,13 @@ describe("Alertmanager webhook", () => {
     const dir = tempDir();
     const common = {
       MINIME_TELEGRAM_BOT_TOKEN: syntheticSecret,
-      MINIME_OPS_INTAKE_SOPS_FILE: join(dir, "private-ops-secrets.sops.yaml"),
-      MINIME_OPS_INTAKE_SOPS_KEY: "intake.bearer",
+      MINIME_TRIGGER_INPUT_SOPS_FILE: join(dir, "private-trigger-secrets.sops.yaml"),
+      MINIME_TRIGGER_INPUT_SOPS_KEY: "trigger.bearer",
     };
     const cases: NodeJS.ProcessEnv[] = [
-      { ...common, MINIME_OPS_INTAKE_URL: "http://example.invalid/intake/alertmanager", MINIME_ALERTMANAGER_URL: "http://127.0.0.1:9093" },
-      { ...common, MINIME_OPS_INTAKE_URL: "http://127.0.0.1:9466/intake/alertmanager", MINIME_ALERTMANAGER_URL: "http://example.invalid" },
-      { MINIME_OPS_INTAKE_URL: "http://127.0.0.1:9466/intake/alertmanager" },
+      { ...common, MINIME_TRIGGER_INPUT_URL: "http://example.invalid/trigger", MINIME_ALERTMANAGER_URL: "http://127.0.0.1:9093" },
+      { ...common, MINIME_TRIGGER_INPUT_URL: "http://127.0.0.1:9466/trigger", MINIME_ALERTMANAGER_URL: "http://example.invalid" },
+      { MINIME_TRIGGER_INPUT_URL: "http://127.0.0.1:9466/trigger" },
       { MINIME_BRIDGE_TIMEOUT: "5" },
       { MINIME_BRIDGE_TIMEOUT: "nan" },
     ];
@@ -1228,7 +1347,7 @@ describe("Alertmanager webhook", () => {
       assert.match(result.stderr, /bridge configuration rejected/);
       assert.ok(!result.stderr.includes("Traceback"));
       assertSecretAbsent(result);
-      assertOpsSecretAbsent(result);
+      assertTriggerSecretAbsent(result);
       assert.ok(!result.stderr.includes(dir));
     }
   });
@@ -1236,7 +1355,7 @@ describe("Alertmanager webhook", () => {
   it("rejects malformed bridge batches and retries malformed or oversized source responses", async () => {
     let sourceResponse = "[]";
     let sourceQueries = 0;
-    let opsAttempts = 0;
+    let triggerAttempts = 0;
     let telegramAttempts = 0;
     const synthetic = await startServer((request, response) => {
       if (request.method === "GET") {
@@ -1247,7 +1366,7 @@ describe("Alertmanager webhook", () => {
       let body = "";
       request.setEncoding("utf8").on("data", (chunk) => (body += chunk));
       request.on("end", () => {
-        if (request.url === "/intake/alertmanager") opsAttempts += 1;
+        if (request.url === "/trigger") triggerAttempts += 1;
         if (request.url?.includes("/sendMessage")) telegramAttempts += 1;
         response.end(JSON.stringify({ ok: true }));
       });
@@ -1281,7 +1400,7 @@ describe("Alertmanager webhook", () => {
         assert.equal((await postWebhook(port, invalid)).status, 400);
       }
       assert.equal(sourceQueries, 0);
-      assert.equal(opsAttempts, 0);
+      assert.equal(triggerAttempts, 0);
       assert.equal(telegramAttempts, 0);
 
       sourceResponse = "{";
@@ -1295,7 +1414,7 @@ describe("Alertmanager webhook", () => {
         503,
       );
       assert.equal(sourceQueries, 2);
-      assert.equal(opsAttempts, 0);
+      assert.equal(triggerAttempts, 0);
       assert.equal(telegramAttempts, 0, "noncritical source failures must stay quiet");
     } finally {
       child.kill("SIGTERM");
@@ -1728,6 +1847,153 @@ describe("runtime doctor", () => {
     }
   });
 
+  it("routes transitions through trigger input and persists the bounded notice decision across restarts", async () => {
+    const dir = tempDir();
+    const state = join(dir, "doctor-trigger-state.json");
+    const missingNode = join(dir, "private-missing-node");
+    const missingTcc = join(dir, "private-missing-tcc");
+    const triggerBodies: Array<{ source: string; text: string }> = [];
+    const directMessages: string[] = [];
+    let acceptTrigger = false;
+    const endpoint = await startServer((request, response) => {
+      let body = "";
+      request.setEncoding("utf8").on("data", (chunk) => (body += chunk));
+      request.on("end", () => {
+        if (request.url === "/trigger") {
+          assert.equal(request.headers.authorization, `Bearer ${syntheticTriggerSecret}`);
+          triggerBodies.push(JSON.parse(body) as { source: string; text: string });
+          response.statusCode = acceptTrigger ? 202 : 429;
+          response.end(acceptTrigger ? "accepted" : "saturated");
+          return;
+        }
+        if (request.url?.includes("/sendMessage")) {
+          directMessages.push(new URLSearchParams(body).get("text") ?? "");
+          response.end(JSON.stringify({ ok: true }));
+          return;
+        }
+        response.statusCode = 404;
+        response.end();
+      });
+    });
+    const common = {
+      ...telegramEnv(endpoint.base),
+      ...triggerInputEnv(endpoint.base),
+      MINIME_DOCTOR_STATE_PATH: state,
+    };
+    const firingEnv = {
+      ...common,
+      MINIME_DOCTOR_NODE_EXECUTABLE: missingNode,
+    };
+    const results: RunResult[] = [];
+    try {
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        const result = await runPython([doctorScript], firingEnv);
+        results.push(result);
+        assert.equal(result.status, 1);
+      }
+      assert.equal(triggerBodies.length, 4);
+      assert.ok(triggerBodies.every((body) => body.source === "runtime-doctor"));
+      assert.ok(triggerBodies.every((body) => body.text.includes("node_unavailable")));
+      assert.deepEqual(directMessages, [
+        "Reserve engineer control path unavailable; delivery will retry.",
+      ]);
+      const firingState = JSON.parse(readFileSync(state, "utf8")) as Record<string, unknown>;
+      assert.deepEqual(firingState.incidents, []);
+      assert.deepEqual(firingState.fromIncidents, []);
+      assert.deepEqual(firingState.toIncidents, ["node_unavailable"]);
+      assert.equal(firingState.consecutiveFailures, 3);
+      assert.equal(firingState.noticeSent, true);
+
+      const changed = await runPython([doctorScript], {
+        ...common,
+        MINIME_DOCTOR_TCC_STATUS_PATH: missingTcc,
+      });
+      results.push(changed);
+      assert.equal(changed.status, 1);
+      const changedState = JSON.parse(readFileSync(state, "utf8")) as Record<string, unknown>;
+      assert.deepEqual(changedState.fromIncidents, []);
+      assert.deepEqual(changedState.toIncidents, ["tcc_unknown"]);
+      assert.equal(changedState.consecutiveFailures, 1);
+      assert.equal(changedState.noticeSent, false);
+      assert.equal(directMessages.length, 1, "a changed transition must reset notice state");
+
+      acceptTrigger = true;
+      const convergedFiring = await runPython([doctorScript], {
+        ...common,
+        MINIME_DOCTOR_TCC_STATUS_PATH: missingTcc,
+      });
+      results.push(convergedFiring);
+      assert.equal(convergedFiring.status, 0, convergedFiring.stderr);
+      const committedFiring = JSON.parse(readFileSync(state, "utf8")) as Record<string, unknown>;
+      assert.deepEqual(committedFiring.incidents, ["tcc_unknown"]);
+      assert.ok(!("fromIncidents" in committedFiring));
+      assert.ok(!("noticeSent" in committedFiring));
+
+      acceptTrigger = false;
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        const result = await runPython([doctorScript], common);
+        results.push(result);
+        assert.equal(result.status, 1);
+      }
+      const recoveryState = JSON.parse(readFileSync(state, "utf8")) as Record<string, unknown>;
+      assert.deepEqual(recoveryState.fromIncidents, ["tcc_unknown"]);
+      assert.deepEqual(recoveryState.toIncidents, []);
+      assert.equal(recoveryState.consecutiveFailures, 3);
+      assert.equal(recoveryState.noticeSent, false);
+      assert.equal(directMessages.length, 1, "recovered transitions must never send a notice");
+
+      acceptTrigger = true;
+      const convergedRecovery = await runPython([doctorScript], common);
+      results.push(convergedRecovery);
+      assert.equal(convergedRecovery.status, 0, convergedRecovery.stderr);
+      const healthy = JSON.parse(readFileSync(state, "utf8")) as Record<string, unknown>;
+      assert.deepEqual(healthy.incidents, []);
+      assert.ok(!("fromIncidents" in healthy));
+      assert.ok(!("toIncidents" in healthy));
+      assert.ok(!("consecutiveFailures" in healthy));
+      assert.ok(!("noticeSent" in healthy));
+
+      for (const result of results) {
+        for (const privateValue of [missingNode, missingTcc, endpoint.base, syntheticTriggerSecret]) {
+          assert.ok(!result.stdout.includes(privateValue));
+          assert.ok(!result.stderr.includes(privateValue));
+        }
+        assert.ok(!result.stderr.includes("FIRING minime_runtime_health"));
+      }
+    } finally {
+      await closeServer(endpoint.server);
+    }
+  });
+
+  it("rejects partial and non-loopback doctor trigger settings without exposing values", async () => {
+    const dir = tempDir();
+    const privateFile = join(dir, "private-trigger-secrets.sops.yaml");
+    const privateUrl = "http://example.invalid/private-trigger";
+    const cases: NodeJS.ProcessEnv[] = [
+      { MINIME_TRIGGER_INPUT_URL: "http://127.0.0.1:9466/trigger" },
+      {
+        MINIME_TRIGGER_INPUT_SOPS_FILE: privateFile,
+        MINIME_TRIGGER_INPUT_SOPS_KEY: "trigger.bearer",
+      },
+      {
+        MINIME_TRIGGER_INPUT_URL: privateUrl,
+        MINIME_TRIGGER_INPUT_SOPS_FILE: privateFile,
+        MINIME_TRIGGER_INPUT_SOPS_KEY: "trigger.bearer",
+      },
+    ];
+    for (const triggerSettings of cases) {
+      const result = await runPython([doctorScript], {
+        MINIME_DOCTOR_STATE_PATH: join(dir, "state.json"),
+        ...triggerSettings,
+      });
+      assert.equal(result.status, 2);
+      assert.match(result.stderr, /doctor configuration invalid/);
+      assert.ok(!result.stderr.includes("Traceback"));
+      assert.ok(!result.stderr.includes(privateFile));
+      assert.ok(!result.stderr.includes(privateUrl));
+    }
+  });
+
   it("sanitizes malformed configuration and runtime filesystem failures", async () => {
     const dir = tempDir();
     const privateUrl = "file:///private/configured/health";
@@ -1824,6 +2090,9 @@ describe("monitoring package examples", () => {
       assert.match(plist, /<string>\/usr\/bin\/python3<\/string>/);
       assert.match(plist, /<string>\/usr\/bin:\/bin<\/string>/);
       assert.match(plist, /<key>MINIME_SOPS_EXECUTABLE<\/key>/);
+      assert.match(plist, /<key>MINIME_TRIGGER_INPUT_URL<\/key>/);
+      assert.match(plist, /<key>MINIME_TRIGGER_INPUT_SOPS_FILE<\/key>/);
+      assert.match(plist, /<key>MINIME_TRIGGER_INPUT_SOPS_KEY<\/key>/);
       assert.ok(!plist.includes("users/"));
       assert.ok(!plist.includes("node_modules"));
     }
