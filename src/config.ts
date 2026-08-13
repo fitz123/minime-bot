@@ -261,9 +261,20 @@ function mergeInstanceConfig(
     canonical,
     instance.bindingIdentityOverrides,
   );
+  const mergeBase = { ...withBindingIdentity };
   const genericOverlay = { ...instance };
   delete genericOverlay.bindingIdentityOverrides;
-  return mergeDeep(withBindingIdentity, genericOverlay);
+  if (
+    Object.hasOwn(instance, "telegramTokenSopsKey")
+    || Object.hasOwn(instance, "telegramTokenEnv")
+  ) {
+    delete mergeBase.telegramTokenSopsKey;
+    delete mergeBase.telegramTokenEnv;
+  }
+  if (Object.hasOwn(instance, "triggerInput")) {
+    delete mergeBase.triggerInput;
+  }
+  return mergeDeep(mergeBase, genericOverlay);
 }
 
 export function loadRawMergedConfig(

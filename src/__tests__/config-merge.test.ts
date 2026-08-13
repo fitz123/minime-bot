@@ -275,6 +275,103 @@ triggerInput:
     assert.strictEqual(result.bindingIdentityOverrides, undefined);
   });
 
+  it("replaces the canonical Telegram token source group from the instance overlay", () => {
+    const configPath = join(TEST_DIR, "config.yaml");
+    const instancePath = join(TEST_DIR, "instance.yaml");
+    writeFileSync(configPath, `
+agents:
+  main:
+    workspaceCwd: /srv/minime-agent
+    model: gpt-5.5
+secrets:
+  sopsFile: canonical.sops.yaml
+telegramTokenSopsKey: telegram.primary
+`);
+    writeFileSync(instancePath, "telegramTokenEnv: RESERVE_TELEGRAM_TOKEN\n");
+
+    let result = loadRawMergedConfig(configPath, instancePath);
+    assert.strictEqual(result.telegramTokenSopsKey, undefined);
+    assert.strictEqual(result.telegramTokenEnv, "RESERVE_TELEGRAM_TOKEN");
+
+    writeFileSync(configPath, `
+agents:
+  main:
+    workspaceCwd: /srv/minime-agent
+    model: gpt-5.5
+telegramTokenEnv: PRIMARY_TELEGRAM_TOKEN
+`);
+    writeFileSync(instancePath, `
+telegramTokenSopsKey: telegram.reserve
+secrets:
+  sopsFile: reserve.sops.yaml
+`);
+
+    result = loadRawMergedConfig(configPath, instancePath);
+    assert.strictEqual(result.telegramTokenSopsKey, "telegram.reserve");
+    assert.strictEqual(result.telegramTokenEnv, undefined);
+  });
+
+  it("replaces canonical triggerInput as a whole instance-owned section", () => {
+    const configPath = join(TEST_DIR, "config.yaml");
+    const instancePath = join(TEST_DIR, "instance.yaml");
+    writeFileSync(configPath, `
+agents:
+  main:
+    workspaceCwd: /srv/minime-agent
+    model: gpt-5.5
+triggerInput:
+  port: 9465
+  host: localhost
+  path: /primary-trigger
+  bearerEnv: PRIMARY_TRIGGER_BEARER
+  chatId: 111
+  threadId: 10
+`);
+    writeFileSync(instancePath, `
+triggerInput:
+  port: 9466
+  bearerSopsKey: trigger.reserve
+  chatId: 222
+`);
+
+    const result = loadRawMergedConfig(configPath, instancePath);
+    assert.deepStrictEqual(result.triggerInput, {
+      port: 9466,
+      bearerSopsKey: "trigger.reserve",
+      chatId: 222,
+    });
+  });
+
+  it("rejects a partial instance triggerInput instead of inheriting canonical fields", () => {
+    const configPath = join(TEST_DIR, "config.yaml");
+    const instancePath = join(TEST_DIR, "instance.yaml");
+    writeFileSync(configPath, `
+agents:
+  main:
+    workspaceCwd: /srv/minime-agent
+    model: gpt-5.5
+telegramTokenEnv: TEST_TELEGRAM_TOKEN
+bindings:
+  - { chatId: 111, agentId: main, kind: dm }
+triggerInput:
+  port: 9465
+  bearerEnv: PRIMARY_TRIGGER_BEARER
+  chatId: 111
+`);
+    writeFileSync(instancePath, `
+triggerInput:
+  chatId: 111
+`);
+
+    assert.throws(
+      () => loadConfig(configPath, {
+        resolveSecrets: false,
+        instanceConfigPath: instancePath,
+      }),
+      /triggerInput\.port must be an integer between 1 and 65535/,
+    );
+  });
+
   it("patches binding identity without replacing canonical behavior", () => {
     const configPath = join(TEST_DIR, "config.yaml");
     const instancePath = join(TEST_DIR, "instance.yaml");
