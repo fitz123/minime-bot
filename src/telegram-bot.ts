@@ -13,6 +13,7 @@ import {
   downloadFile,
   ingestLocalAudio,
   cleanupTempFile,
+  mediaPipelineFailureDetail,
   mediaPipelineFailureMessage,
   mediaPipelineStage,
   toMediaPipelineError,
@@ -944,7 +945,8 @@ export function createTelegramBot(
     } catch (err) {
       const stage = mediaPipelineStage(err, "transcription");
       recordMediaPipelineError({ transport: "telegram", mediaType: "voice", stage });
-      log.error("telegram-bot", `Voice media pipeline failed stage=${stage}`);
+      const detail = mediaPipelineFailureDetail(err, "transcription", config.whisperModelPath);
+      log.error("telegram-bot", `Voice media pipeline failed stage=${stage}${detail ? ` ${detail}` : ""}`);
       await ctx.reply(mediaPipelineFailureMessage(err, "transcription")).catch(() => {});
     }
   });

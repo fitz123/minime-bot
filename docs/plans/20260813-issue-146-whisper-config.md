@@ -66,11 +66,11 @@ The fixture run will now print the voice-readiness warning (no model file in the
 
 **Serves:** operator inputs 3, 4, 8.
 
-- [ ] add a bounded failure-detail helper in `src/voice.ts` that renders effective binary and model paths for the failing stage, the child error/exit code, and a length-capped single-line stderr excerpt from the retained `cause`, never environment contents or secrets
-- [ ] append the helper output to the `Voice media pipeline failed stage=...` log lines in `src/telegram-bot.ts` and `src/discord-bot.ts`
-- [ ] write tests for the helper: whisper child failure with stderr (missing/unreadable model) includes both paths and the capped excerpt; missing-binary `ENOENT` case; over-long stderr is truncated to the cap; non-exec causes degrade gracefully
-- [ ] write regression tests proving startup independence and voice-only degradation: `loadConfig` succeeds when `whisperModelPath` points at a nonexistent file (no filesystem probe), and a transcription failure still produces the existing bounded user-facing reply plus the enriched log while the pipeline error stays contained to the voice request
-- [ ] run focused tests and `npm run typecheck` — must pass before next task
+- [x] add a bounded failure-detail helper in `src/voice.ts` that renders effective binary and model paths for the failing stage, the child error/exit code, and a length-capped single-line stderr excerpt from the retained `cause`, never environment contents or secrets
+- [x] append the helper output to the `Voice media pipeline failed stage=...` log lines in `src/telegram-bot.ts` and `src/discord-bot.ts`
+- [x] write tests for the helper: whisper child failure with stderr (missing/unreadable model) includes both paths and the capped excerpt; missing-binary `ENOENT` case; over-long stderr is truncated to the cap; non-exec causes degrade gracefully
+- [x] write regression tests proving startup independence and voice-only degradation: `loadConfig` succeeds when `whisperModelPath` points at a nonexistent file (no filesystem probe), and a transcription failure still produces the existing bounded user-facing reply plus the enriched log while the pipeline error stays contained to the voice request
+- [x] run focused tests and `npm run typecheck` — must pass before next task
 
 ### Task 3: Non-fatal voice-readiness warning in workspace validation
 

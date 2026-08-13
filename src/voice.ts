@@ -23,6 +23,9 @@ const DEFAULT_DOWNLOAD_TIMEOUT_MS = 30_000;
 const DOWNLOAD_MAX_ATTEMPTS = 3;
 const DOWNLOAD_RETRY_BASE_DELAY_MS = 100;
 const DOWNLOAD_MAX_RETRY_AFTER_MS = 5_000;
+const FAILURE_PATH_MAX_CHARS = 512;
+const FAILURE_STDERR_MAX_CHARS = 400;
+const FAILURE_METADATA_MAX_CHARS = 64;
 const KNOWN_TRAILING_ASR_ARTIFACT_PATTERNS: readonly RegExp[] = [
   /(?<![\p{L}\p{M}\p{N}_])продолжение\s+следует(?:\s*[.!?…]+)?\s*$/iu,
 ];
@@ -82,6 +85,77 @@ export function mediaPipelineFailureMessage(
     case "empty-transcript":
       return "Could not transcribe the audio (empty result). Please try again or send text.";
   }
+}
+
+function singleLineDiagnostic(value: string, maxChars: number): string {
+  const normalized = value
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "")
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  return normalized.length <= maxChars
+    ? normalized
+    : `${normalized.slice(0, maxChars - 1)}…`;
+}
+
+function diagnosticField(value: string, maxChars: number): string {
+  return JSON.stringify(singleLineDiagnostic(value, maxChars));
+}
+
+/** Format bounded, allowlisted child-process diagnostics for an internal voice failure log. */
+export function mediaPipelineFailureDetail(
+  error: unknown,
+  fallback: MediaPipelineStage,
+  modelPath: string,
+): string {
+  const stage = mediaPipelineStage(error, fallback);
+  const fields: string[] = [];
+  if (stage === "conversion") {
+    fields.push(`binary=${diagnosticField(FFMPEG_BIN, FAILURE_PATH_MAX_CHARS)}`);
+  } else if (stage === "transcription" || stage === "empty-transcript") {
+    fields.push(
+      `binary=${diagnosticField(WHISPER_BIN, FAILURE_PATH_MAX_CHARS)}`,
+      `model=${diagnosticField(modelPath, FAILURE_PATH_MAX_CHARS)}`,
+    );
+  }
+
+  const cause = error instanceof MediaPipelineError ? error.cause : error;
+  if (!cause || typeof cause !== "object") return fields.join(" ");
+  const child = cause as {
+    code?: unknown;
+    status?: unknown;
+    exitCode?: unknown;
+    signal?: unknown;
+    killed?: unknown;
+    stderr?: unknown;
+  };
+  const exitCode = typeof child.status === "number"
+    ? child.status
+    : typeof child.exitCode === "number"
+      ? child.exitCode
+      : typeof child.code === "number"
+        ? child.code
+        : undefined;
+  if (exitCode !== undefined && Number.isFinite(exitCode)) {
+    fields.push(`exit=${exitCode}`);
+  } else if (typeof child.code === "string" && child.code) {
+    fields.push(`code=${diagnosticField(child.code, FAILURE_METADATA_MAX_CHARS)}`);
+  }
+  if (typeof child.signal === "string" && child.signal) {
+    fields.push(`signal=${diagnosticField(child.signal, FAILURE_METADATA_MAX_CHARS)}`);
+  }
+  if (child.killed === true) fields.push("killed=true");
+
+  const stderr = typeof child.stderr === "string"
+    ? child.stderr
+    : Buffer.isBuffer(child.stderr)
+      ? child.stderr.toString("utf8")
+      : undefined;
+  if (stderr !== undefined) {
+    const excerpt = singleLineDiagnostic(stderr, FAILURE_STDERR_MAX_CHARS);
+    if (excerpt) fields.push(`stderr=${JSON.stringify(excerpt)}`);
+  }
+  return fields.join(" ");
 }
 
 export function requireTranscript(transcript: string): string {

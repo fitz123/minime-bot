@@ -378,6 +378,20 @@ bindings:
     );
   });
 
+  it("loads a configured Whisper model path without probing the filesystem", () => {
+    const workspaceRoot = join(TEST_DIR, "workspace-whisper-missing-file");
+    const missingModelPath = join(workspaceRoot, "models", "does-not-exist.bin");
+    mkdirSync(workspaceRoot, { recursive: true });
+    writeConfigWithPiExtraExtensions(
+      workspaceRoot,
+      `whisperModel: ${JSON.stringify(missingModelPath)}`,
+    );
+
+    const config = loadWorkspaceConfig(workspaceRoot);
+
+    assert.strictEqual(config.whisperModelPath, missingModelPath);
+  });
+
   it("rejects empty, non-string, and relative whisperModel values", () => {
     const cases: Array<[string, string, RegExp]> = [
       ["empty", 'whisperModel: ""', /whisperModel must be a non-empty string/],

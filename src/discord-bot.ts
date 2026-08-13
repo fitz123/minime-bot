@@ -11,6 +11,7 @@ import {
   downloadFile,
   transcribeAudio,
   cleanupTempFile,
+  mediaPipelineFailureDetail,
   mediaPipelineFailureMessage,
   mediaPipelineStage,
   requireTranscript,
@@ -426,7 +427,8 @@ export async function createDiscordBot(
           } catch (err) {
             const stage = mediaPipelineStage(err, "transcription");
             recordMediaPipelineError({ transport: "discord", mediaType: "voice", stage });
-            log.error("discord-bot", `Voice media pipeline failed stage=${stage}`);
+            const detail = mediaPipelineFailureDetail(err, "transcription", config.whisperModelPath);
+            log.error("discord-bot", `Voice media pipeline failed stage=${stage}${detail ? ` ${detail}` : ""}`);
             await message.reply(mediaPipelineFailureMessage(err, "transcription")).catch(() => {});
           } finally {
             if (tempPath) await cleanupTempFile(tempPath);

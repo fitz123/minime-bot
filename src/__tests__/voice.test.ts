@@ -10,6 +10,7 @@ import {
   cleanupTempFile,
   transcribeAudio,
   convertToWav,
+  mediaPipelineFailureDetail,
   mediaPipelineFailureMessage,
   requireTranscript,
   stripKnownTrailingAsrArtifacts,
@@ -470,6 +471,72 @@ describe("media pipeline stages", () => {
       assert.match(message, pattern);
       assert.ok(message.length < 120);
     }
+  });
+
+  it("formats bounded Whisper child stderr with effective binary and model paths", () => {
+    const child = Object.assign(new Error("sensitive command details must stay hidden"), {
+      code: 2,
+      stderr: "whisper_model_load: failed to open model\npermission denied",
+    });
+    const modelPath = "/tmp/missing-whisper-model.bin";
+
+    const detail = mediaPipelineFailureDetail(
+      new MediaPipelineError("transcription", child),
+      "transcription",
+      modelPath,
+    );
+
+    assert.match(detail, new RegExp(`binary=${JSON.stringify(WHISPER_BIN)}`));
+    assert.match(detail, new RegExp(`model=${JSON.stringify(modelPath)}`));
+    assert.match(detail, /exit=2/);
+    assert.match(detail, /stderr="whisper_model_load: failed to open model permission denied"/);
+    assert.doesNotMatch(detail, /sensitive command details/);
+    assert.doesNotMatch(detail, /[\r\n]/);
+  });
+
+  it("reports a missing conversion binary by ENOENT without leaking the child message", () => {
+    const child = Object.assign(new Error("spawn details containing private input"), {
+      code: "ENOENT",
+    });
+
+    const detail = mediaPipelineFailureDetail(
+      new MediaPipelineError("conversion", child),
+      "transcription",
+      "/tmp/unused-model.bin",
+    );
+
+    assert.match(detail, new RegExp(`binary=${JSON.stringify(FFMPEG_BIN)}`));
+    assert.match(detail, /code="ENOENT"/);
+    assert.doesNotMatch(detail, /model=/);
+    assert.doesNotMatch(detail, /private input/);
+  });
+
+  it("caps an over-long stderr excerpt and keeps it on one line", () => {
+    const child = Object.assign(new Error("failure"), {
+      stderr: `${"x".repeat(500)}\ntrailing output`,
+    });
+
+    const detail = mediaPipelineFailureDetail(
+      new MediaPipelineError("transcription", child),
+      "transcription",
+      "/tmp/model.bin",
+    );
+
+    assert.match(detail, new RegExp(`stderr="${"x".repeat(399)}…"$`));
+    assert.doesNotMatch(detail, /trailing output|[\r\n]/);
+  });
+
+  it("degrades gracefully when the retained cause is not an exec failure", () => {
+    const detail = mediaPipelineFailureDetail(
+      new MediaPipelineError("transcription", new Error("private non-exec detail")),
+      "download",
+      "/tmp/model.bin",
+    );
+
+    assert.strictEqual(
+      detail,
+      `binary=${JSON.stringify(WHISPER_BIN)} model=${JSON.stringify("/tmp/model.bin")}`,
+    );
   });
 });
 
