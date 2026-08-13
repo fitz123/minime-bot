@@ -1354,6 +1354,7 @@ describe("command handler wiring", () => {
 
   const handlerConfig: BotConfig = {
     telegramToken: "test:fake-token-for-handler-tests",
+    whisperModelPath: "/tmp/minime-test-whisper-model.bin",
     agents: {
       main: { id: "main", workspaceCwd: "/tmp/test", model: "gpt-5.5" },
     },
@@ -2448,24 +2449,33 @@ describe("command handler wiring", () => {
     messageQueue.clearAll();
   });
 
-  it("preserves a later-stage voice classification at the terminal boundary", async (t) => {
+  it("contains transcription failure to the voice request with bounded reply and enriched log", async (t) => {
     mediaPipelineErrors.reset();
     const actualVoice = await import("../voice.js");
+    const child = Object.assign(new Error("command details must not be logged"), {
+      code: 1,
+      stderr: "failed to load configured model\nfile is unreadable",
+    });
     t.mock.module("../voice.js", {
       namedExports: {
         ...actualVoice,
         ingestLocalAudio: async () => {
-          throw new actualVoice.MediaPipelineError("conversion");
+          throw new actualVoice.MediaPipelineError("transcription", child);
         },
       },
     });
-    const failingVoiceModulePath = "../telegram-bot.js?media-pipeline-conversion";
+    const errorLogs: string[] = [];
+    t.mock.method(console, "error", (...args: unknown[]) => {
+      errorLogs.push(args.map(String).join(" "));
+    });
+    const failingVoiceModulePath = "../telegram-bot.js?media-pipeline-transcription";
     const { createTelegramBot: createFailingVoiceBot } = await import(
       failingVoiceModulePath
     ) as { createTelegramBot: typeof createTelegramBot };
+    const apiCalls: Array<{ method: string; payload: any }> = [];
     const { bot, messageQueue } = initBot(
       createMockSessionManager(),
-      [],
+      apiCalls,
       undefined,
       (method, payload) => method === "getFile"
         ? { file_id: payload.file_id, file_path: `files/${payload.file_id}` }
@@ -2474,16 +2484,31 @@ describe("command handler wiring", () => {
     );
 
     await bot.handleUpdate(makeMediaUpdate({
-      voice: { file_id: "voice-conversion", file_unique_id: "voice-conversion-u1", duration: 1 },
+      voice: { file_id: "voice-failure", file_unique_id: "voice-failure-u1", duration: 1 },
     }, 330) as never);
+    await bot.handleUpdate(makeCommandUpdate("start", 331));
 
     assert.deepStrictEqual(
       (await mediaPipelineErrors.get()).values.map(({ labels, value }) => ({ labels, value })),
       [{
-        labels: { transport: "telegram", media_type: "voice", stage: "conversion" },
+        labels: { transport: "telegram", media_type: "voice", stage: "transcription" },
         value: 1,
       }],
     );
+    assert.deepStrictEqual(
+      apiCalls.filter(({ method }) => method === "sendMessage").map(({ payload }) => payload.text),
+      [
+        "Could not transcribe the audio. Please try again or send text.",
+        'Connected to agent "main" (gpt-5.5). Send a message to start.',
+      ],
+    );
+    assert.strictEqual(errorLogs.length, 1);
+    assert.match(errorLogs[0], /Voice media pipeline failed stage=transcription/);
+    assert.match(errorLogs[0], new RegExp(`binary=${JSON.stringify(actualVoice.WHISPER_BIN)}`));
+    assert.match(errorLogs[0], new RegExp(`model=${JSON.stringify(handlerConfig.whisperModelPath)}`));
+    assert.match(errorLogs[0], /exit=1/);
+    assert.match(errorLogs[0], /stderr="failed to load configured model file is unreadable"/);
+    assert.doesNotMatch(errorLogs[0], /command details must not be logged|[\r\n]/);
     messageQueue.clearAll();
   });
 

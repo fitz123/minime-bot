@@ -1,9 +1,11 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { validateSessionDefaults, validateAgent, loadConfig, validatePiExtraExtensions } from "../config.js";
 import { DEFAULT_MAX_MEDIA_BYTES } from "../media-store.js";
+import { DEFAULT_WHISPER_MODEL_PATH } from "../voice.js";
 import {
   MINIME_CONFIG_PATH_ENV,
   MINIME_CONTROL_WORKSPACE_ROOT_ENV,
@@ -345,6 +347,79 @@ bindings:
       () => loadConfig(undefined, { resolveSecrets: false }),
     );
   }
+
+  it("uses the large-v3-turbo model default when whisperModel is absent", () => {
+    const workspaceRoot = join(TEST_DIR, "workspace-whisper-default");
+    mkdirSync(workspaceRoot, { recursive: true });
+    writeConfigWithPiExtraExtensions(workspaceRoot, "");
+
+    const config = loadWorkspaceConfig(workspaceRoot);
+
+    assert.strictEqual(config.whisperModelPath, DEFAULT_WHISPER_MODEL_PATH);
+    assert.strictEqual(
+      config.whisperModelPath,
+      join(homedir(), ".minime/models/ggml-large-v3-turbo.bin"),
+    );
+  });
+
+  it("expands a leading ~/ in whisperModel", () => {
+    const workspaceRoot = join(TEST_DIR, "workspace-whisper-home");
+    mkdirSync(workspaceRoot, { recursive: true });
+    writeConfigWithPiExtraExtensions(
+      workspaceRoot,
+      'whisperModel: "~/.minime/models/custom-whisper.bin"',
+    );
+
+    const config = loadWorkspaceConfig(workspaceRoot);
+
+    assert.strictEqual(
+      config.whisperModelPath,
+      join(homedir(), ".minime/models/custom-whisper.bin"),
+    );
+  });
+
+  it("loads a configured Whisper model path without probing the filesystem", () => {
+    const workspaceRoot = join(TEST_DIR, "workspace-whisper-missing-file");
+    const missingModelPath = join(workspaceRoot, "models", "does-not-exist.bin");
+    mkdirSync(workspaceRoot, { recursive: true });
+    writeConfigWithPiExtraExtensions(
+      workspaceRoot,
+      `whisperModel: ${JSON.stringify(missingModelPath)}`,
+    );
+
+    const config = loadWorkspaceConfig(workspaceRoot);
+
+    assert.strictEqual(config.whisperModelPath, missingModelPath);
+  });
+
+  it("rejects empty, non-string, and relative whisperModel values", () => {
+    const cases: Array<[string, string, RegExp]> = [
+      ["empty", 'whisperModel: ""', /whisperModel must be a non-empty string/],
+      ["non-string", "whisperModel: 42", /whisperModel must be a non-empty string/],
+      ["relative", "whisperModel: models/custom.bin", /whisperModel must be an absolute path or start with ~\//],
+    ];
+
+    for (const [name, whisperModelYaml, expected] of cases) {
+      const workspaceRoot = join(TEST_DIR, `workspace-whisper-invalid-${name}`);
+      mkdirSync(workspaceRoot, { recursive: true });
+      writeConfigWithPiExtraExtensions(workspaceRoot, whisperModelYaml);
+      assert.throws(() => loadWorkspaceConfig(workspaceRoot), expected, name);
+    }
+  });
+
+  it("ignores WHISPER_MODEL when resolving an absent whisperModel setting", () => {
+    const workspaceRoot = join(TEST_DIR, "workspace-whisper-env-inert");
+    mkdirSync(workspaceRoot, { recursive: true });
+    writeConfigWithPiExtraExtensions(workspaceRoot, "");
+
+    const config = withEnv(
+      { WHISPER_MODEL: "/tmp/legacy-env-model.bin" },
+      () => loadWorkspaceConfig(workspaceRoot),
+    );
+
+    assert.strictEqual(config.whisperModelPath, DEFAULT_WHISPER_MODEL_PATH);
+    assert.notStrictEqual(config.whisperModelPath, "/tmp/legacy-env-model.bin");
+  });
 
   it("uses MINIME_CONTROL_WORKSPACE_ROOT config.yaml when no config path is passed", () => {
     const workspaceRoot = join(TEST_DIR, "workspace-default");

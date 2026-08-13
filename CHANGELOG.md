@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Make the canonical shared config own the local Whisper model path, default to
+  `large-v3-turbo`, keep missing models non-fatal outside the affected voice
+  request, and surface bounded runtime diagnostics plus a non-fatal workspace
+  validation warning (#146).
+
 ## 2026.8.8
 
 - Allow an instance overlay to disable an inherited Discord transport identity with exact `discord: false`, while rejecting all other Discord overrides (#132).

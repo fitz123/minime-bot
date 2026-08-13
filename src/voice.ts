@@ -1,16 +1,15 @@
-import { tmpdir, homedir } from "node:os";
-import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { open, readFile, writeFile, unlink, chmod } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { execFile as execFileCb } from "node:child_process";
 import { promisify } from "node:util";
 import { recordMediaDownloadRetry } from "./metrics.js";
+export { DEFAULT_WHISPER_MODEL_PATH } from "./voice-config.js";
 
 const execFileAsync = promisify(execFileCb);
 
 export const FFMPEG_BIN = process.env.FFMPEG_BIN ?? "/opt/homebrew/bin/ffmpeg";
 export const WHISPER_BIN = process.env.WHISPER_BIN ?? "/opt/homebrew/bin/whisper-cli";
-export const WHISPER_MODEL = process.env.WHISPER_MODEL ?? join(homedir(), ".minime/models/ggml-medium.bin");
 /** Optional path to a plain-text, one-term-per-line Whisper recognition glossary. */
 export const WHISPER_GLOSSARY_PATH_ENV = "WHISPER_GLOSSARY_PATH";
 export const WHISPER_GLOSSARY_PROMPT_MAX_BYTES = 220;
@@ -20,6 +19,9 @@ const DEFAULT_DOWNLOAD_TIMEOUT_MS = 30_000;
 const DOWNLOAD_MAX_ATTEMPTS = 3;
 const DOWNLOAD_RETRY_BASE_DELAY_MS = 100;
 const DOWNLOAD_MAX_RETRY_AFTER_MS = 5_000;
+const FAILURE_PATH_MAX_CHARS = 512;
+const FAILURE_STDERR_MAX_CHARS = 400;
+const FAILURE_METADATA_MAX_CHARS = 64;
 const KNOWN_TRAILING_ASR_ARTIFACT_PATTERNS: readonly RegExp[] = [
   /(?<![\p{L}\p{M}\p{N}_])продолжение\s+следует(?:\s*[.!?…]+)?\s*$/iu,
 ];
@@ -79,6 +81,77 @@ export function mediaPipelineFailureMessage(
     case "empty-transcript":
       return "Could not transcribe the audio (empty result). Please try again or send text.";
   }
+}
+
+function singleLineDiagnostic(value: string, maxChars: number): string {
+  const normalized = value
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "")
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  return normalized.length <= maxChars
+    ? normalized
+    : `${normalized.slice(0, maxChars - 1)}…`;
+}
+
+function diagnosticField(value: string, maxChars: number): string {
+  return JSON.stringify(singleLineDiagnostic(value, maxChars));
+}
+
+/** Format bounded, allowlisted child-process diagnostics for an internal voice failure log. */
+export function mediaPipelineFailureDetail(
+  error: unknown,
+  fallback: MediaPipelineStage,
+  modelPath: string,
+): string {
+  const stage = mediaPipelineStage(error, fallback);
+  const fields: string[] = [];
+  if (stage === "conversion") {
+    fields.push(`binary=${diagnosticField(FFMPEG_BIN, FAILURE_PATH_MAX_CHARS)}`);
+  } else if (stage === "transcription" || stage === "empty-transcript") {
+    fields.push(
+      `binary=${diagnosticField(WHISPER_BIN, FAILURE_PATH_MAX_CHARS)}`,
+      `model=${diagnosticField(modelPath, FAILURE_PATH_MAX_CHARS)}`,
+    );
+  }
+
+  const cause = error instanceof MediaPipelineError ? error.cause : error;
+  if (!cause || typeof cause !== "object") return fields.join(" ");
+  const child = cause as {
+    code?: unknown;
+    status?: unknown;
+    exitCode?: unknown;
+    signal?: unknown;
+    killed?: unknown;
+    stderr?: unknown;
+  };
+  const exitCode = typeof child.status === "number"
+    ? child.status
+    : typeof child.exitCode === "number"
+      ? child.exitCode
+      : typeof child.code === "number"
+        ? child.code
+        : undefined;
+  if (exitCode !== undefined && Number.isFinite(exitCode)) {
+    fields.push(`exit=${exitCode}`);
+  } else if (typeof child.code === "string" && child.code) {
+    fields.push(`code=${diagnosticField(child.code, FAILURE_METADATA_MAX_CHARS)}`);
+  }
+  if (typeof child.signal === "string" && child.signal) {
+    fields.push(`signal=${diagnosticField(child.signal, FAILURE_METADATA_MAX_CHARS)}`);
+  }
+  if (child.killed === true) fields.push("killed=true");
+
+  const stderr = typeof child.stderr === "string"
+    ? child.stderr
+    : Buffer.isBuffer(child.stderr)
+      ? child.stderr.toString("utf8")
+      : undefined;
+  if (stderr !== undefined) {
+    const excerpt = singleLineDiagnostic(stderr, FAILURE_STDERR_MAX_CHARS);
+    if (excerpt) fields.push(`stderr=${JSON.stringify(excerpt)}`);
+  }
+  return fields.join(" ");
 }
 
 export function requireTranscript(transcript: string): string {
@@ -145,6 +218,7 @@ export interface DownloadFileOptions {
 
 export interface LocalAudioIngestionOptions {
   maxBytes: number;
+  modelPath: string;
   downloadTimeoutMs?: number;
   signal?: AbortSignal;
 }
@@ -360,13 +434,14 @@ export async function convertToWav(
  */
 export async function transcribeAudio(
   filePath: string,
+  modelPath: string,
   signal?: AbortSignal,
 ): Promise<string> {
   const wavPath = await convertToWav(filePath, signal);
   try {
     try {
       const whisperArgs = [
-        "-m", WHISPER_MODEL,
+        "-m", modelPath,
         "-f", wavPath,
         "--no-timestamps",
         "--no-prints",
@@ -420,7 +495,7 @@ export async function ingestLocalAudio(
         : { timeoutMs: options.downloadTimeoutMs }),
       signal: options.signal,
     });
-    return requireTranscript(await transcribeAudio(audioPath, options.signal));
+    return requireTranscript(await transcribeAudio(audioPath, options.modelPath, options.signal));
   } finally {
     await cleanupTempFile(audioPath);
   }

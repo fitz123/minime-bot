@@ -1,4 +1,5 @@
 import { readFileSync, existsSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
 import { resolve, dirname, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
@@ -8,6 +9,7 @@ import { DEFAULT_MAX_MEDIA_BYTES } from "./media-store.js";
 import { resolveSecret, sopsExtractExpression, type ExecFileSyncLike } from "./secrets.js";
 import { resolveAgentWorkspaceCwd, resolveWorkspaceContract } from "./workspace-contract.js";
 import { resolveBinding } from "./telegram-binding.js";
+import { DEFAULT_WHISPER_MODEL_PATH } from "./voice-config.js";
 
 const PI_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 const CONFIGURED_SECRET_PLACEHOLDER = "[configured]";
@@ -351,6 +353,7 @@ interface RawConfig {
   triggerInput?: unknown;
   defaultModel?: unknown;
   defaultFallbackModel?: unknown;
+  whisperModel?: unknown;
 }
 
 interface LoadConfigOptions {
@@ -746,6 +749,21 @@ function optionalConfigString(value: unknown, fieldName: string): string | undef
   return trimmed === "" ? undefined : trimmed;
 }
 
+function resolveWhisperModelPath(value: unknown): string {
+  if (value === undefined) return DEFAULT_WHISPER_MODEL_PATH;
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error("whisperModel must be a non-empty string");
+  }
+  const configuredPath = value.trim();
+  const expandedPath = configuredPath.startsWith("~/")
+    ? resolve(homedir(), configuredPath.slice(2))
+    : configuredPath;
+  if (!isAbsolute(expandedPath)) {
+    throw new Error("whisperModel must be an absolute path or start with ~/");
+  }
+  return expandedPath;
+}
+
 function resolveConfiguredSopsFile(raw: RawConfig, controlWorkspaceRoot: string): string | undefined {
   if (raw.secrets === undefined) return undefined;
   if (typeof raw.secrets !== "object" || raw.secrets === null || Array.isArray(raw.secrets)) {
@@ -930,6 +948,7 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
   }
   const defaultModel = typeof raw.defaultModel === "string" ? raw.defaultModel : undefined;
   const piExtraExtensions = validatePiExtraExtensions(raw.piExtraExtensions);
+  const whisperModelPath = resolveWhisperModelPath(raw.whisperModel);
 
   // Validate agents (needed before validating bindings)
   if (!raw.agents || typeof raw.agents !== "object") {
@@ -1058,7 +1077,7 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
     defaultDeliveryThreadId = raw.defaultDeliveryThreadId;
   }
 
-  return { telegramToken, agents, bindings, sessionDefaults, piExtraExtensions, logLevel, metricsPort, metricsHost, discord, adminChatId, defaultDeliveryChatId, defaultDeliveryThreadId, triggerInput };
+  return { telegramToken, agents, bindings, sessionDefaults, whisperModelPath, piExtraExtensions, logLevel, metricsPort, metricsHost, discord, adminChatId, defaultDeliveryChatId, defaultDeliveryThreadId, triggerInput };
 }
 
 function realpathOrResolve(path: string): string {

@@ -46,6 +46,8 @@ function createWorkspace(options: {
   const workspace = mkdtempSync(join(tmpdir(), "minime-validator-workspace-"));
   fixtures.push(workspace);
   mkdirSync(join(workspace, "agent-workspace"), { recursive: true });
+  const whisperModelPath = join(workspace, "models", "fixture-whisper-model.bin");
+  writeFixtureFile(workspace, "models/fixture-whisper-model.bin", "model fixture\n");
   writeFileSync(
     join(workspace, "config.yaml"),
     [
@@ -58,6 +60,7 @@ function createWorkspace(options: {
       "  - chatId: 111",
       "    agentId: main",
       "    kind: dm",
+      `whisperModel: ${JSON.stringify(whisperModelPath)}`,
       "",
     ].join("\n"),
   );
@@ -108,6 +111,8 @@ function createSiblingWorkspaceFixture(): {
   mkdirSync(controlWorkspace, { recursive: true });
   mkdirSync(agentMain, { recursive: true });
   mkdirSync(agentReviewer, { recursive: true });
+  const whisperModelPath = join(root, "models", "fixture-whisper-model.bin");
+  writeFixtureFile(root, "models/fixture-whisper-model.bin", "model fixture\n");
   writeFileSync(
     join(controlWorkspace, "config.yaml"),
     [
@@ -136,6 +141,7 @@ function createSiblingWorkspaceFixture(): {
       "        - channelId: \"review-channel\"",
       "          agentId: reviewer",
       "          label: Review",
+      `whisperModel: ${JSON.stringify(whisperModelPath)}`,
       "",
     ].join("\n"),
   );

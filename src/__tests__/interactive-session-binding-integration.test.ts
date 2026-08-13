@@ -98,6 +98,7 @@ function makeAgent(workspaceCwd: string): AgentConfig {
 
 function makeConfig(agent: AgentConfig, piExtraExtensions?: string[]): BotConfig {
   return {
+    whisperModelPath: "/tmp/minime-test-whisper-model.bin",
     agents: { [agent.id]: agent },
     bindings: [],
     sessionDefaults: {

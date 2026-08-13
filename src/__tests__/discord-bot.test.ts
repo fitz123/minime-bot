@@ -59,6 +59,7 @@ describe("Discord media failure handling", () => {
     REST.prototype.put = async () => ({}) as never;
 
     const config: BotConfig = {
+      whisperModelPath: "/tmp/minime-test-whisper-model.bin",
       agents: { main: { id: "main", workspaceCwd: "/tmp/test", model: "gpt-5.5" } },
       bindings: [],
       sessionDefaults: {
@@ -149,6 +150,7 @@ describe("Discord shutdown", () => {
     };
 
     const config: BotConfig = {
+      whisperModelPath: "/tmp/minime-test-whisper-model.bin",
       agents: { main: { id: "main", workspaceCwd: "/tmp/test", model: "gpt-5.5" } },
       bindings: [],
       sessionDefaults: {
@@ -203,6 +205,7 @@ describe("Discord shutdown", () => {
     REST.prototype.put = async () => ({}) as never;
 
     const config: BotConfig = {
+      whisperModelPath: "/tmp/minime-test-whisper-model.bin",
       agents: { main: { id: "main", workspaceCwd: "/tmp/test", model: "gpt-5.5" } },
       bindings: [],
       sessionDefaults: {
@@ -277,6 +280,7 @@ describe("Discord recovery notice delivery", () => {
     REST.prototype.put = async () => ({}) as never;
 
     const config: BotConfig = {
+      whisperModelPath: "/tmp/minime-test-whisper-model.bin",
       agents: { main: { id: "main", workspaceCwd: "/tmp/test", model: "gpt-5.5" } },
       bindings: [],
       sessionDefaults: {
@@ -362,6 +366,7 @@ describe("Discord stale-message handling", () => {
     REST.prototype.put = async () => ({}) as never;
 
     const config: BotConfig = {
+      whisperModelPath: "/tmp/minime-test-whisper-model.bin",
       agents: { main: { id: "main", workspaceCwd: "/tmp/test", model: "gpt-5.5" } },
       bindings: [],
       sessionDefaults: {
@@ -550,6 +555,7 @@ describe("Discord slash command status wiring", () => {
     const calls: string[] = [];
     const replies: Array<string | { content: string; ephemeral?: boolean }> = [];
     const config: BotConfig = {
+      whisperModelPath: "/tmp/minime-test-whisper-model.bin",
       agents: {
         main: { id: "main", workspaceCwd: "/tmp/test", model: "gpt-5.5" },
       },

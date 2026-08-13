@@ -78,6 +78,12 @@ crons:
   return workspace;
 }
 
+function configureWhisperModel(workspace: string, modelPath: string): void {
+  const configPath = join(workspace, "config.yaml");
+  const config = readFileSync(configPath, "utf8");
+  writeFileSync(configPath, `${config.trimEnd()}\nwhisperModel: ${JSON.stringify(modelPath)}\n`);
+}
+
 function writeWorkspaceFile(workspace: string, relPath: string, content: string): string {
   const path = join(workspace, ...relPath.split("/"));
   mkdirSync(dirname(path), { recursive: true });
@@ -1277,6 +1283,66 @@ describe("minime-bot CLI", () => {
     }
   });
 
+  it("warns about a missing Whisper model without failing workspace validation", () => {
+    const workspace = createWorkspace();
+    const missingModelPath = join(workspace, "models", "missing-whisper-model.bin");
+    configureWhisperModel(workspace, missingModelPath);
+    try {
+      const result = runWithCapture(["workspace", "validate", "--workspace", workspace], workspace);
+
+      assert.equal(result.code, 0);
+      assert.match(result.stdout, /Workspace valid\./);
+      assert.match(result.stdout, /Warnings:/);
+      assert.match(
+        result.stdout,
+        new RegExp(`Whisper model is not a readable regular file: ${escapeRegExp(missingModelPath)}`),
+      );
+      assert.match(
+        result.stdout,
+        /Only voice transcription is degraded; startup, deploy, and non-voice behavior are unaffected\./,
+      );
+      assert.match(result.stdout, /Workspace validation does not download or replace models\./);
+      assert.equal(result.stderr, "");
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("does not warn when the configured Whisper model is a readable regular file", () => {
+    const workspace = createWorkspace();
+    const modelPath = writeWorkspaceFile(workspace, "models/readable-whisper-model.bin", "model fixture\n");
+    configureWhisperModel(workspace, modelPath);
+    try {
+      const result = runWithCapture(["workspace", "validate", "--workspace", workspace], workspace);
+
+      assert.equal(result.code, 0);
+      assert.match(result.stdout, /Workspace valid\./);
+      assert.doesNotMatch(result.stdout, /Whisper model is not a readable regular file/);
+      assert.equal(result.stderr, "");
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the Whisper readiness warning non-fatal alongside other warnings", () => {
+    const workspace = createWorkspace();
+    const missingModelPath = join(workspace, "models", "missing-whisper-model.bin");
+    configureWhisperModel(workspace, missingModelPath);
+    rmSync(join(workspace, "crons.yaml"));
+    try {
+      const result = runWithCapture(["workspace", "validate", "--workspace", workspace], workspace);
+
+      assert.equal(result.code, 0);
+      assert.match(result.stdout, /Workspace valid\./);
+      assert.match(result.stdout, /Whisper model is not a readable regular file/);
+      assert.match(result.stdout, /crons file is not present/);
+      assert.doesNotMatch(result.stdout, /Hard failures:/);
+      assert.equal(result.stderr, "");
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
   it("prints configured instance, media, and echo paths", () => {
     const workspace = createWorkspace();
     const agentWorkspace = join(workspace, "agent-workspace");
@@ -1325,6 +1391,7 @@ bindings:
     assert.match(result.stdout, /Workspace valid\./);
     assert.match(result.stdout, new RegExp(`control workspace root: ${escapeRegExp(MINIMAL_WORKSPACE_FIXTURE)} \\(env\\)`));
     assert.match(result.stdout, /config path: .*minimal-workspace\/config\.yaml \(workspace-default\)/);
+    assert.match(result.stdout, /Whisper model is not a readable regular file: \/nonexistent\/minime-bot\/fixture-whisper-model\.bin/);
     assert.equal(result.stderr, "");
   });
 

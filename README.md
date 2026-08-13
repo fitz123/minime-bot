@@ -672,7 +672,17 @@ outcomes. Permanent HTTP, size-limit, conversion, transcription, and empty
 transcript failures are not retried; user replies identify the failed stage
 without exposing transport details.
 
-For locally transcribed Telegram and Discord voice, optional
+For locally transcribed Telegram and Discord voice, the canonical `config.yaml`
+may set `whisperModel` to an absolute model path (a leading `~/` expands to the
+user home directory). When absent, it defaults to
+`~/.minime/models/ggml-large-v3-turbo.bin`. Instance overlays cannot override
+this setting, and `WHISPER_MODEL` no longer selects the model. A missing,
+unreadable, or unusable model file degrades only voice transcription: startup,
+deployment, and non-voice behavior continue, while the affected voice request
+receives the existing bounded failure reply. Workspace validation reports the
+effective path as a non-fatal warning and does not download or replace models.
+
+The optional
 `WHISPER_GLOSSARY_PATH` selects a UTF-8 plain-text glossary with one trimmed
 term per line; blank lines and lines whose first non-whitespace character is
 `#` are ignored. The first spelling and order win under NFKC,

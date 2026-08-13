@@ -660,6 +660,59 @@ bindings:
     }
   });
 
+  it("rejects whisperModel in an instance overlay", () => {
+    const configPath = join(TEST_DIR, "config.yaml");
+    const instancePath = join(TEST_DIR, "instance.yaml");
+    writeFileSync(configPath, `
+agents:
+  main:
+    workspaceCwd: /srv/minime-agent
+    model: gpt-5.5
+bindings:
+  - { chatId: 111, agentId: main, kind: dm }
+`);
+    writeFileSync(instancePath, "whisperModel: /srv/models/instance-only.bin\n");
+
+    assert.throws(
+      () => loadRawMergedConfig(configPath, instancePath),
+      (error: unknown) => {
+        assert.strictEqual(
+          (error as Error).message,
+          "Instance config override is not allowed at whisperModel",
+        );
+        return true;
+      },
+    );
+  });
+
+  it("resolves the same canonical whisper model with and without an ordinary overlay", () => {
+    const configPath = join(TEST_DIR, "config.yaml");
+    const instancePath = join(TEST_DIR, "instance.yaml");
+    writeFileSync(configPath, `
+whisperModel: /srv/models/shared-whisper.bin
+agents:
+  main:
+    workspaceCwd: /srv/minime-agent
+    model: gpt-5.5
+telegramTokenEnv: PRIMARY_TELEGRAM_TOKEN
+bindings:
+  - { chatId: 111, agentId: main, kind: dm }
+`);
+    writeFileSync(instancePath, `
+telegramTokenEnv: ORDINARY_TELEGRAM_TOKEN
+metricsPort: 9101
+`);
+
+    const primary = loadConfig(configPath, { resolveSecrets: false });
+    const ordinary = loadConfig(configPath, {
+      resolveSecrets: false,
+      instanceConfigPath: instancePath,
+    });
+
+    assert.strictEqual(primary.whisperModelPath, "/srv/models/shared-whisper.bin");
+    assert.strictEqual(ordinary.whisperModelPath, primary.whisperModelPath);
+  });
+
   it("requires absolute canonical agent workspaces only when an instance overlay is enabled", () => {
     const configPath = join(TEST_DIR, "config.yaml");
     const instancePath = join(TEST_DIR, "instance.yaml");
