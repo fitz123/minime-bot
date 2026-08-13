@@ -221,8 +221,14 @@ metricsPort: <deployment-metrics-port>
 `topicId` is optional. The overlay may also carry deployment delivery IDs,
 metrics host, and the complete `triggerInput` section described below. It
 cannot override agents, models, thinking, prompts, session defaults,
-extensions, Discord configuration, logging behavior, raw bindings, or
-`workspaceCwd`.
+extensions, logging behavior, raw bindings, or `workspaceCwd`. Exact
+`discord: false` is the sole Discord entry allowed. Add it when the canonical
+Discord identity belongs to Primary: it disables the inherited transport for
+that deployment so two processes do not share one Discord application
+identity. This is transport-identity isolation only; the canonical Discord
+configuration remains unchanged for Primary, the deployment remains the same
+full ordinary product, and Discord tokens, bindings, copied configuration, or
+nested overrides are not allowed in the overlay.
 
 ### Minimal local trigger input
 

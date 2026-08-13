@@ -342,6 +342,106 @@ triggerInput:
     });
   });
 
+  it("keeps canonical Discord configured when no instance overlay is used", () => {
+    const configPath = join(TEST_DIR, "config.yaml");
+    writeFileSync(configPath, `
+agents:
+  main:
+    workspaceCwd: /srv/minime-agent
+    model: gpt-5.5
+discord:
+  tokenEnv: PRIMARY_DISCORD_TOKEN
+  bindings:
+    - guildId: "primary-guild"
+      channelId: "primary-channel"
+      agentId: main
+      kind: dm
+`);
+
+    const config = loadConfig(configPath, { resolveSecrets: false });
+
+    assert.deepStrictEqual(config.discord, {
+      token: "[configured]",
+      bindings: [{
+        channelId: "primary-channel",
+        guildId: "primary-guild",
+        agentId: "main",
+        kind: "dm",
+        label: undefined,
+        requireMention: undefined,
+        typingIndicator: undefined,
+        channels: undefined,
+      }],
+    });
+  });
+
+  it("allows exact discord false to remove only the inherited transport", () => {
+    const configPath = join(TEST_DIR, "config.yaml");
+    const instancePath = join(TEST_DIR, "instance.yaml");
+    writeFileSync(configPath, `
+agents:
+  main:
+    workspaceCwd: /srv/minime-agent
+    model: gpt-5.5
+telegramTokenEnv: PRIMARY_TELEGRAM_TOKEN
+bindings:
+  - { chatId: 111, agentId: main, kind: dm, label: reserve }
+discord:
+  tokenEnv: PRIMARY_DISCORD_TOKEN
+  bindings:
+    - guildId: "primary-guild"
+      channelId: "primary-channel"
+      agentId: main
+      kind: dm
+`);
+    writeFileSync(instancePath, "discord: false\n");
+
+    const canonical = loadConfig(configPath, { resolveSecrets: false });
+    const overlaid = loadConfig(configPath, {
+      resolveSecrets: false,
+      instanceConfigPath: instancePath,
+    });
+
+    assert.ok(canonical.discord);
+    assert.strictEqual(overlaid.discord, undefined);
+    assert.deepStrictEqual(overlaid.agents, canonical.agents);
+    assert.deepStrictEqual(overlaid.bindings, canonical.bindings);
+    assert.deepStrictEqual(overlaid.sessionDefaults, canonical.sessionDefaults);
+  });
+
+  it("rejects every other Discord instance value without leaking values", () => {
+    const configPath = join(TEST_DIR, "config.yaml");
+    const instancePath = join(TEST_DIR, "instance.yaml");
+    writeFileSync(configPath, `
+agents:
+  main:
+    workspaceCwd: /srv/minime-agent
+    model: gpt-5.5
+discord:
+  tokenEnv: PRIMARY_DISCORD_TOKEN
+  bindings:
+    - guildId: "primary-guild"
+      channelId: "primary-channel"
+      agentId: main
+      kind: dm
+`);
+    const cases = [
+      ["discord.tokenEnv", "discord:\n  tokenEnv: PRIVATE_DISCORD_TOKEN\n"],
+      ["discord", "discord: true\n"],
+      ["discord", "discord: null\n"],
+      ["discord", "discord: PRIVATE_DISCORD_CONFIG\n"],
+    ] as const;
+
+    for (const [path, yaml] of cases) {
+      writeFileSync(instancePath, yaml);
+      assert.throws(() => loadRawMergedConfig(configPath, instancePath), (error: unknown) => {
+        const message = (error as Error).message;
+        assert.strictEqual(message, `Instance config override is not allowed at ${path}`);
+        return true;
+      }, path);
+    }
+  });
+
   it("rejects a partial instance triggerInput instead of inheriting canonical fields", () => {
     const configPath = join(TEST_DIR, "config.yaml");
     const instancePath = join(TEST_DIR, "instance.yaml");

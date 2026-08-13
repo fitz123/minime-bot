@@ -149,6 +149,12 @@ function validateInstanceOverlay(raw: unknown): Record<string, unknown> {
     if (key === "triggerInput") {
       continue;
     }
+    if (key === "discord") {
+      if (value !== false) {
+        rejectInstancePath(firstInstanceLeafPath(value, "discord"));
+      }
+      continue;
+    }
     if (key === "secrets") {
       if (!isConfigRecord(value)) rejectInstancePath("secrets");
       for (const nestedKey of Object.keys(value)) {
@@ -282,6 +288,10 @@ function mergeInstanceConfig(
   const mergeBase = { ...withBindingIdentity };
   const genericOverlay = { ...instance };
   delete genericOverlay.bindingIdentityOverrides;
+  if (instance.discord === false) {
+    delete mergeBase.discord;
+    delete genericOverlay.discord;
+  }
   if (
     Object.hasOwn(instance, "telegramTokenSopsKey")
     || Object.hasOwn(instance, "telegramTokenEnv")
