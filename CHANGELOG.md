@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 2026.8.7
+
 - Allow a second ordinary Minime deployment to share one canonical behavior
   configuration and live context while isolating identity and writable runtime
   state; add a minimal authenticated ordinary-turn trigger input, route verified
