@@ -2,11 +2,12 @@ import { readFileSync, existsSync, realpathSync } from "node:fs";
 import { resolve, dirname, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
-import type { BotConfig, AgentConfig, AskAgentConfig, TelegramBinding, TopicOverride, SessionDefaults, DiscordBinding, DiscordChannelOverride, DiscordConfig } from "./types.js";
+import type { BotConfig, AgentConfig, AskAgentConfig, TelegramBinding, TopicOverride, SessionDefaults, DiscordBinding, DiscordChannelOverride, DiscordConfig, TriggerInputConfig } from "./types.js";
 import { log, parseLogLevel } from "./logger.js";
 import { DEFAULT_MAX_MEDIA_BYTES } from "./media-store.js";
 import { resolveSecret, sopsExtractExpression, type ExecFileSyncLike } from "./secrets.js";
 import { resolveAgentWorkspaceCwd, resolveWorkspaceContract } from "./workspace-contract.js";
+import { resolveBinding } from "./telegram-binding.js";
 
 const PI_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 const CONFIGURED_SECRET_PLACEHOLDER = "[configured]";
@@ -287,6 +288,7 @@ interface RawConfig {
   adminChatId?: number;
   defaultDeliveryChatId?: number;
   defaultDeliveryThreadId?: number;
+  triggerInput?: unknown;
   defaultModel?: unknown;
   defaultFallbackModel?: unknown;
 }
@@ -710,6 +712,109 @@ function validateConfiguredSopsSource(
   }
 }
 
+const TRIGGER_INPUT_HOSTS = new Set<TriggerInputConfig["host"]>([
+  "127.0.0.1",
+  "::1",
+  "localhost",
+]);
+
+const TRIGGER_INPUT_KEYS = new Set([
+  "port",
+  "host",
+  "path",
+  "bearerSopsKey",
+  "bearerEnv",
+  "chatId",
+  "threadId",
+]);
+
+function validateTriggerInput(
+  raw: unknown,
+  bindings: TelegramBinding[],
+  telegramToken: string | undefined,
+  sopsFile: string | undefined,
+  options: LoadConfigOptions,
+): TriggerInputConfig | undefined {
+  if (raw === undefined) return undefined;
+  if (!isConfigRecord(raw)) {
+    throw new Error("triggerInput must be an object");
+  }
+  for (const key of Object.keys(raw)) {
+    if (!TRIGGER_INPUT_KEYS.has(key)) {
+      throw new Error(`triggerInput.${key} is not supported`);
+    }
+  }
+
+  if (!Number.isInteger(raw.port) || (raw.port as number) < 1 || (raw.port as number) > 65535) {
+    throw new Error("triggerInput.port must be an integer between 1 and 65535");
+  }
+
+  let host: TriggerInputConfig["host"] = "127.0.0.1";
+  if (raw.host !== undefined) {
+    if (typeof raw.host !== "string" || !TRIGGER_INPUT_HOSTS.has(raw.host as TriggerInputConfig["host"])) {
+      throw new Error("triggerInput.host must be one of 127.0.0.1, ::1, or localhost");
+    }
+    host = raw.host as TriggerInputConfig["host"];
+  }
+
+  let path = "/trigger";
+  if (raw.path !== undefined) {
+    if (typeof raw.path !== "string" || !/^\/[^\s?#]*$/.test(raw.path)) {
+      throw new Error("triggerInput.path must be an absolute HTTP path without whitespace, query, or fragment");
+    }
+    path = raw.path;
+  }
+
+  const bearerSopsKey = optionalConfigString(raw.bearerSopsKey, "triggerInput.bearerSopsKey");
+  const bearerEnv = optionalConfigString(raw.bearerEnv, "triggerInput.bearerEnv");
+  if ((bearerSopsKey ? 1 : 0) + (bearerEnv ? 1 : 0) !== 1) {
+    throw new Error("triggerInput requires exactly one of bearerSopsKey or bearerEnv");
+  }
+  validateConfiguredSopsSource(sopsFile, bearerSopsKey, "triggerInput.bearerSopsKey");
+
+  if (!Number.isSafeInteger(raw.chatId) || raw.chatId === 0) {
+    throw new Error("triggerInput.chatId must be a non-zero safe integer");
+  }
+  const chatId = raw.chatId as number;
+
+  let threadId: number | undefined;
+  if (raw.threadId !== undefined) {
+    if (!Number.isSafeInteger(raw.threadId) || (raw.threadId as number) < 0) {
+      throw new Error("triggerInput.threadId must be a non-negative safe integer");
+    }
+    threadId = raw.threadId as number;
+  }
+
+  if (bindings.length === 0) {
+    throw new Error("triggerInput requires a configured Telegram binding");
+  }
+  if (!telegramToken) {
+    throw new Error("triggerInput requires a resolved Telegram token");
+  }
+  if (!resolveBinding(chatId, bindings, threadId)) {
+    throw new Error("triggerInput chatId/threadId does not match a configured Telegram binding");
+  }
+
+  const bearer = options.resolveSecrets === false
+    ? CONFIGURED_SECRET_PLACEHOLDER
+    : resolveSecret({
+      sopsFile,
+      sopsKey: bearerSopsKey,
+      envVar: bearerEnv,
+      fieldName: "triggerInput.bearer",
+      execFileSync: options.secretExecFileSync,
+    });
+
+  return {
+    port: raw.port as number,
+    host,
+    path,
+    bearer,
+    chatId,
+    threadId,
+  };
+}
+
 function findLegacyConfigKey(raw: object, keyPattern: RegExp): string | undefined {
   return Object.keys(raw).find((key) => keyPattern.test(key));
 }
@@ -822,6 +927,14 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
   // Validate Discord config (optional)
   const discord = validateDiscordConfig(raw.discord, agents, sopsFile, options);
 
+  const triggerInput = validateTriggerInput(
+    raw.triggerInput,
+    bindings,
+    telegramToken,
+    sopsFile,
+    options,
+  );
+
   // At least one platform must be configured
   if (bindings.length === 0 && !discord) {
     throw new Error("At least one platform must be configured (Telegram bindings or discord section)");
@@ -881,7 +994,7 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
     defaultDeliveryThreadId = raw.defaultDeliveryThreadId;
   }
 
-  return { telegramToken, agents, bindings, sessionDefaults, piExtraExtensions, logLevel, metricsPort, metricsHost, discord, adminChatId, defaultDeliveryChatId, defaultDeliveryThreadId };
+  return { telegramToken, agents, bindings, sessionDefaults, piExtraExtensions, logLevel, metricsPort, metricsHost, discord, adminChatId, defaultDeliveryChatId, defaultDeliveryThreadId, triggerInput };
 }
 
 function realpathOrResolve(path: string): string {

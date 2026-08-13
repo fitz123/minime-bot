@@ -1,6 +1,10 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { createTelegramAdapter, setBotUsername } from "../telegram-adapter.js";
+import {
+  createTelegramAdapter,
+  createTelegramApiAdapter,
+  setBotUsername,
+} from "../telegram-adapter.js";
 import type { SessionDefaults, TelegramBinding } from "../types.js";
 import { getThread, clearThreadCache } from "../message-thread-cache.js";
 import { lookupMessage, clearMessageIndex } from "../message-content-index.js";
@@ -30,6 +34,26 @@ function mockContext(opts: {
       return { message_id: id };
     },
     api: {
+      async sendMessage(_cId: number, text: string, sendOpts: any = {}) {
+        if (failOnHtml && sendOpts.parse_mode === "HTML") {
+          throw new Error("Bad Request: can't parse entities");
+        }
+        const id = nextMsgId++;
+        sentMessages.push({ text, opts: sendOpts });
+        return { message_id: id };
+      },
+      async sendPhoto(_cId: number, _file: any, sendOpts: any = {}) {
+        const id = nextMsgId++;
+        sentMessages.push({ text: "[photo]", opts: sendOpts });
+        return { message_id: id };
+      },
+      async sendDocument(_cId: number, _file: any, sendOpts: any = {}) {
+        const id = nextMsgId++;
+        sentMessages.push({ text: "[document]", opts: sendOpts });
+        return { message_id: id };
+      },
+      async deleteMessage() {},
+      async sendMessageDraft() { return true; },
       async editMessageText(cId: number, msgId: number, text: string, editOpts?: any) {
         if (failOnHtml && editOpts?.parse_mode === "HTML") {
           throw new Error("Bad Request: can't parse entities");
@@ -75,6 +99,35 @@ describe("createTelegramAdapter", () => {
       const adapter = createTelegramAdapter(ctx, defaultBinding);
       assert.strictEqual(adapter.maxMessageLength, 4096);
       assert.strictEqual(adapter.typingIntervalMs, 5000);
+    });
+  });
+
+  it("creates the same platform behavior directly over bot.api", async () => {
+    const ctx = mockContext();
+    const adapter = createTelegramApiAdapter({
+      api: ctx.api,
+      chatId: 12345,
+      binding: defaultBinding,
+      threadId: 77,
+      sessionDefaults: {
+        idleTimeoutMs: 1,
+        maxConcurrentSessions: 1,
+        maxMessageAgeMs: 1,
+        requireMention: true,
+        maxMediaBytes: 1,
+      },
+    });
+
+    assert.strictEqual(await adapter.sendMessage("API message"), "100");
+    assert.deepStrictEqual(ctx._sentMessages[0], {
+      text: "API message",
+      opts: { message_thread_id: 77, parse_mode: "HTML" },
+    });
+    await adapter.sendTyping();
+    assert.deepStrictEqual(ctx._chatActions[0], {
+      chatId: 12345,
+      action: "typing",
+      opts: { message_thread_id: 77 },
     });
   });
 

@@ -639,6 +639,172 @@ bindingIdentityOverrides:
   });
 });
 
+describe("loadConfig triggerInput validation", () => {
+  beforeEach(() => {
+    mkdirSync(TEST_DIR, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(TEST_DIR, { recursive: true, force: true });
+  });
+
+  const baseConfig = `
+agents:
+  main:
+    workspaceCwd: /tmp/x
+    model: gpt-5.5
+telegramTokenEnv: TEST_TELEGRAM_TOKEN
+bindings:
+  - chatId: 111
+    agentId: main
+    kind: dm
+`;
+
+  function loadTriggerConfig(triggerYaml: string) {
+    const configPath = join(TEST_DIR, "config.yaml");
+    writeFileSync(configPath, `${baseConfig}\n${triggerYaml}\n`);
+    return loadConfig(configPath, { resolveSecrets: false });
+  }
+
+  it("is disabled by default", () => {
+    const config = loadTriggerConfig("");
+    assert.strictEqual(config.triggerInput, undefined);
+  });
+
+  it("applies loopback and path defaults for a complete trigger input", () => {
+    const config = loadTriggerConfig(`
+triggerInput:
+  port: 9466
+  bearerEnv: TEST_TRIGGER_BEARER
+  chatId: 111
+`);
+
+    assert.deepStrictEqual(config.triggerInput, {
+      port: 9466,
+      host: "127.0.0.1",
+      path: "/trigger",
+      bearer: "[configured]",
+      chatId: 111,
+      threadId: undefined,
+    });
+  });
+
+  it("accepts only the explicit loopback host forms and a custom absolute path", () => {
+    for (const host of ["127.0.0.1", "::1", "localhost"]) {
+      const config = loadTriggerConfig(`
+triggerInput:
+  port: 9466
+  host: "${host}"
+  path: /ordinary-turn
+  bearerEnv: TEST_TRIGGER_BEARER
+  chatId: 111
+  threadId: 0
+`);
+      assert.strictEqual(config.triggerInput?.host, host);
+      assert.strictEqual(config.triggerInput?.path, "/ordinary-turn");
+      assert.strictEqual(config.triggerInput?.threadId, 0);
+    }
+  });
+
+  it("rejects partial, unsafe, and unknown trigger input fields", () => {
+    const cases: Array<[string, string, RegExp]> = [
+      ["non-object", "triggerInput: enabled", /triggerInput must be an object/],
+      ["missing port", "triggerInput:\n  bearerEnv: X\n  chatId: 111", /triggerInput\.port/],
+      ["invalid port", "triggerInput:\n  port: 0\n  bearerEnv: X\n  chatId: 111", /triggerInput\.port/],
+      ["external host", "triggerInput:\n  port: 9466\n  host: 0.0.0.0\n  bearerEnv: X\n  chatId: 111", /triggerInput\.host/],
+      ["relative path", "triggerInput:\n  port: 9466\n  path: trigger\n  bearerEnv: X\n  chatId: 111", /triggerInput\.path/],
+      ["missing bearer", "triggerInput:\n  port: 9466\n  chatId: 111", /exactly one of bearerSopsKey or bearerEnv/],
+      ["two bearers", "triggerInput:\n  port: 9466\n  bearerSopsKey: trigger\.bearer\n  bearerEnv: X\n  chatId: 111", /exactly one of bearerSopsKey or bearerEnv/],
+      ["missing chat", "triggerInput:\n  port: 9466\n  bearerEnv: X", /triggerInput\.chatId/],
+      ["unsafe chat", `triggerInput:\n  port: 9466\n  bearerEnv: X\n  chatId: ${Number.MAX_SAFE_INTEGER + 1}`, /triggerInput\.chatId/],
+      ["invalid thread", "triggerInput:\n  port: 9466\n  bearerEnv: X\n  chatId: 111\n  threadId: -1", /triggerInput\.threadId/],
+      ["unknown key", "triggerInput:\n  port: 9466\n  bearerEnv: X\n  chatId: 111\n  retryCount: 3", /triggerInput\.retryCount is not supported/],
+    ];
+
+    for (const [name, yaml, expected] of cases) {
+      assert.throws(() => loadTriggerConfig(yaml), expected, name);
+    }
+  });
+
+  it("rejects a target that does not resolve to a configured Telegram binding", () => {
+    assert.throws(
+      () => loadTriggerConfig(`
+triggerInput:
+  port: 9466
+  bearerEnv: TEST_TRIGGER_BEARER
+  chatId: 222
+`),
+      /chatId\/threadId does not match a configured Telegram binding/,
+    );
+  });
+
+  it("rejects a topic-specific binding when the configured thread is absent", () => {
+    const configPath = join(TEST_DIR, "config.yaml");
+    writeFileSync(configPath, `
+agents:
+  main:
+    workspaceCwd: /tmp/x
+    model: gpt-5.5
+telegramTokenEnv: TEST_TELEGRAM_TOKEN
+bindings:
+  - chatId: -100111
+    topicId: 7
+    agentId: main
+    kind: group
+triggerInput:
+  port: 9466
+  bearerEnv: TEST_TRIGGER_BEARER
+  chatId: -100111
+`);
+
+    assert.throws(
+      () => loadConfig(configPath, { resolveSecrets: false }),
+      /chatId\/threadId does not match a configured Telegram binding/,
+    );
+  });
+
+  it("fails closed without a Telegram binding", () => {
+    const configPath = join(TEST_DIR, "config.yaml");
+    writeFileSync(configPath, `
+agents:
+  main:
+    workspaceCwd: /tmp/x
+    model: gpt-5.5
+bindings: []
+discord:
+  tokenEnv: TEST_DISCORD_TOKEN
+  bindings:
+    - guildId: "999"
+      agentId: main
+      kind: channel
+triggerInput:
+  port: 9466
+  bearerEnv: TEST_TRIGGER_BEARER
+  chatId: 111
+`);
+
+    assert.throws(
+      () => loadConfig(configPath, { resolveSecrets: false }),
+      /triggerInput requires a configured Telegram binding/,
+    );
+  });
+
+  it("fails closed when Telegram bindings have no token source", () => {
+    const configPath = join(TEST_DIR, "config.yaml");
+    writeFileSync(configPath, baseConfig.replace("telegramTokenEnv: TEST_TELEGRAM_TOKEN\n", "") + `
+triggerInput:
+  port: 9466
+  bearerEnv: TEST_TRIGGER_BEARER
+  chatId: 111
+`);
+
+    assert.throws(
+      () => loadConfig(configPath, { resolveSecrets: false }),
+      /Telegram bindings require a token source/,
+    );
+  });
+});
+
 describe("loadConfig top-level defaultModel validation", () => {
   beforeEach(() => {
     mkdirSync(TEST_DIR, { recursive: true });

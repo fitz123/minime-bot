@@ -67,6 +67,16 @@ export interface DiscordConfig {
   bindings: DiscordBinding[];
 }
 
+/** Resolved configuration for the opt-in local ordinary-turn trigger input. */
+export interface TriggerInputConfig {
+  port: number;
+  host: "127.0.0.1" | "::1" | "localhost";
+  path: string;
+  bearer: string;
+  chatId: number;
+  threadId?: number;
+}
+
 export interface CronJob {
   name: string;
   schedule: string;
@@ -160,6 +170,7 @@ export interface BotConfig {
   adminChatId?: number;
   defaultDeliveryChatId?: number;
   defaultDeliveryThreadId?: number;
+  triggerInput?: TriggerInputConfig;
 }
 
 /** Bounded outcome from a cosmetic streaming-draft request. */
