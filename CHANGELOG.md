@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 2026.8.9
+
 - Make the canonical shared config own the local Whisper model path, default to
   `large-v3-turbo`, keep missing models non-fatal outside the affected voice
   request, and surface bounded runtime diagnostics plus a non-fatal workspace
