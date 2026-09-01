@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Remove the fixed 30-minute response-silence kill behavior so accepted Pi
+  turns can continue until normal settlement (#208).
+
 ## 2026.8.9
 
 - Make the canonical shared config own the local Whisper model path, default to

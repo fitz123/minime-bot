@@ -49,13 +49,13 @@ npm run workspace:validate -- --workspace test-fixtures/minimal-workspace
 
 **Serves:** Ninja's approved request to disable the recurring 30-minute limit globally, release/deploy the change, and determine through an exact workflow replay whether the removal should remain permanent.
 
-- [ ] Remove `RESPONSE_ACTIVITY_TIMEOUT_MS` and only the response-activity timer/SIGTERM/SIGKILL machinery inside `sendSessionMessage()` from `src/session-manager.ts`.
-- [ ] Pass no activity callback to `readPiStream` while preserving prompt correlation, steering settlement, retry telemetry, result metrics, queue completion, and post-turn idle-window behavior.
-- [ ] Replace the existing watchdog-refresh test in `src/__tests__/session-manager.test.ts` with a fake-timer regression that advances well beyond 30 minutes of silence, proves the accepted turn/session remains alive and un-killed, then supplies settlement and proves normal completion.
-- [ ] Keep the existing issue-#172 idle-lifecycle, explicit teardown, crash, queue, and LRU tests unchanged; do not remove unrelated assertions.
-- [ ] Add a concise `CHANGELOG.md` Unreleased entry referencing #208 and the removed fixed kill behavior.
-- [ ] Run the focused session-manager test file and typecheck; both must pass before Ralphex review.
-- [ ] Perform a final scope/privacy cut pass: no replacement mechanism or config surface, no unrelated hunks, and no private data.
+- [x] Remove `RESPONSE_ACTIVITY_TIMEOUT_MS` and only the response-activity timer/SIGTERM/SIGKILL machinery inside `sendSessionMessage()` from `src/session-manager.ts`.
+- [x] Pass no activity callback to `readPiStream` while preserving prompt correlation, steering settlement, retry telemetry, result metrics, queue completion, and post-turn idle-window behavior.
+- [x] Replace the existing watchdog-refresh test in `src/__tests__/session-manager.test.ts` with a fake-timer regression that advances well beyond 30 minutes of silence, proves the accepted turn/session remains alive and un-killed, then supplies settlement and proves normal completion.
+- [x] Keep the existing issue-#172 idle-lifecycle, explicit teardown, crash, queue, and LRU tests unchanged; do not remove unrelated assertions.
+- [x] Add a concise `CHANGELOG.md` Unreleased entry referencing #208 and the removed fixed kill behavior.
+- [x] Run the focused session-manager test file and typecheck; both must pass before Ralphex review.
+- [x] Perform a final scope/privacy cut pass: no replacement mechanism or config surface, no unrelated hunks, and no private data.
 
 ## Post-Completion
 

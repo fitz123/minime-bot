@@ -2957,65 +2957,45 @@ describe("SessionManager Pi dispatch", () => {
     await manager.closeAll();
   });
 
-  it("refreshes the activity watchdog for filtered lifecycle records before settlement", async (t) => {
+  it("keeps an accepted Pi turn alive beyond 30 minutes of response silence", async (t) => {
     t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
     const { SessionManager } = await import("../session-manager.js");
     const manager = new SessionManager(() => dispatchConfig, TEST_STORE_PATH);
     const { child, stdout, stdinWrites } = makeCapturingChild();
-    injectSession(manager, "pi-activity", "pi", child);
-    // Keep the unrelated session-idle timer beyond the cumulative fake time
-    // needed to prove each 30-minute response-watchdog refresh independently.
-    manager.getActive("pi-activity")!.idleTimeoutMs = 100_000_000;
+    injectSession(manager, "pi-silent", "pi", child);
+    const session = manager.getActive("pi-silent")!;
+    // Keep the independent session-idle timer beyond this regression's
+    // simulated one-hour response silence.
+    session.idleTimeoutMs = 100_000_000;
 
-    const response = manager.sendSessionMessage("pi-activity", "pi", "keep working");
+    const response = manager.sendSessionMessage("pi-silent", "pi", "keep working");
     const resultPromise = response.next();
     while (stdinWrites.length === 0) {
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
 
     try {
-      t.mock.timers.tick(1_799_999);
+      t.mock.timers.tick(3_600_000);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.strictEqual(child.killed, false, "response silence must not kill the Pi child");
+      assert.strictEqual(child.exitCode, null, "the Pi child remains running");
+      assert.strictEqual(manager.getActive("pi-silent"), session, "the active session remains resident");
+      const health = manager.getSessionHealth("pi-silent");
+      assert.strictEqual(health?.alive, true, "the active session remains healthy");
+      assert.strictEqual(health?.processingMs, 3_600_000, "the accepted turn remains active through the silence");
+
       stdout.push(JSON.stringify({
         type: "agent_end",
         messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
       }) + "\n");
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      t.mock.timers.tick(2);
-      assert.strictEqual(child.killed, false, "filtered agent_end refreshes the watchdog");
-
-      for (const [record, label] of [
-        [{
-          type: "summarization_retry_scheduled",
-          attempt: 1,
-          maxAttempts: 2,
-          delayMs: 1,
-          errorMessage: "WebSocket error",
-        }, "scheduled summarization retry"],
-        [{
-          type: "summarization_retry_attempt_start",
-          source: "compaction",
-          reason: "threshold",
-        }, "compaction retry attempt"],
-        [{
-          type: "summarization_retry_attempt_start",
-          source: "branchSummary",
-        }, "branch-summary retry attempt"],
-        [{ type: "summarization_retry_finished" }, "finished summarization retry"],
-        [{ type: "compaction_start", reason: "threshold" }, "compaction"],
-      ] as const) {
-        t.mock.timers.tick(1_799_997);
-        stdout.push(JSON.stringify(record) + "\n");
-        await new Promise<void>((resolve) => setImmediate(resolve));
-        t.mock.timers.tick(2);
-        assert.strictEqual(child.killed, false, `filtered ${label} activity refreshes the watchdog`);
-      }
-
       stdout.push(JSON.stringify({ type: "agent_settled" }) + "\n");
       const result = await resultPromise;
       assert.strictEqual(result.done, false);
       assert.strictEqual(result.value.type, "result");
       assert.strictEqual((result.value as { result: string }).result, "done");
       assert.strictEqual((await response.next()).done, true);
+      assert.strictEqual(session.processingStartedAt, null, "settlement completes the accepted turn normally");
+      assert.strictEqual(child.killed, false, "normal settlement leaves the Pi child alive");
     } finally {
       await manager.closeAll();
     }
