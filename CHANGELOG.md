@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 2026.9.0
+
 - Probe Pi through its correlated RPC control plane before enforcing the fixed
   30-minute response-silence boundary, preserving verified-live turns (#208).
 
