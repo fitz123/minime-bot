@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-- Remove the fixed 30-minute response-silence kill behavior so accepted Pi
-  turns can continue until normal settlement (#208).
+- Probe Pi through its correlated RPC control plane before enforcing the fixed
+  30-minute response-silence boundary, preserving verified-live turns (#208).
 
 ## 2026.8.9
 

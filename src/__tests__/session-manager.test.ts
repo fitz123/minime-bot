@@ -2603,16 +2603,26 @@ describe("SessionManager Pi dispatch", () => {
    * driven by the test. Mirrors the reuse-path pattern used elsewhere in this
    * file (mock injected into the private active map — no module mocking).
    */
-  function makeCapturingChild(): { child: ChildProcess; stdout: Readable; stdinWrites: string[] } {
+  function makeCapturingChild(options?: {
+    failGetStateWrite?: boolean;
+    ignoreSigterm?: boolean;
+  }): { child: ChildProcess; stdout: Readable; stdinWrites: string[]; killSignals: string[] } {
     const stdinWrites: string[] = [];
+    const killSignals: string[] = [];
     const stdout = new Readable({ read() {} });
     const stderr = new Readable({ read() {} });
     const stdin = new Writable({
       write(chunk, _enc, cb) {
         stdinWrites.push(chunk.toString());
+        const command = JSON.parse(chunk.toString()) as { type?: string };
+        if (options?.failGetStateWrite && command.type === "get_state") {
+          cb(new Error("get_state write failed"));
+          return;
+        }
         cb();
       },
     });
+    stdin.on("error", () => {});
     const child = new EventEmitter() as unknown as ChildProcess;
     Object.assign(child, {
       stdout, stderr, stdin,
@@ -2621,15 +2631,19 @@ describe("SessionManager Pi dispatch", () => {
       signalCode: null,
       killed: false,
       kill(signal?: string) {
+        killSignals.push(signal ?? "SIGTERM");
         (child as unknown as Record<string, unknown>).killed = true;
+        if (options?.ignoreSigterm && signal !== "SIGKILL") return true;
         process.nextTick(() => {
-          (child as unknown as Record<string, unknown>).exitCode = 0;
-          child.emit("exit", 0, signal ?? "SIGTERM");
+          if (!stdout.destroyed) stdout.push(null);
+          const code = signal === "SIGKILL" ? 137 : 0;
+          (child as unknown as Record<string, unknown>).exitCode = code;
+          child.emit("exit", code, signal ?? "SIGTERM");
         });
         return true;
       },
     });
-    return { child, stdout, stdinWrites };
+    return { child, stdout, stdinWrites, killSignals };
   }
 
   function injectSession(
@@ -2957,15 +2971,14 @@ describe("SessionManager Pi dispatch", () => {
     await manager.closeAll();
   });
 
-  it("keeps an accepted Pi turn alive beyond 30 minutes of response silence", async (t) => {
+  it("probes a silent accepted turn twice with unique ids and settles normally once", async (t) => {
     t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
     const { SessionManager } = await import("../session-manager.js");
     const manager = new SessionManager(() => dispatchConfig, TEST_STORE_PATH);
     const { child, stdout, stdinWrites } = makeCapturingChild();
     injectSession(manager, "pi-silent", "pi", child);
     const session = manager.getActive("pi-silent")!;
-    // Keep the independent session-idle timer beyond this regression's
-    // simulated one-hour response silence.
+    // Keep the independent session-idle timer beyond the two watchdog windows.
     session.idleTimeoutMs = 100_000_000;
 
     const response = manager.sendSessionMessage("pi-silent", "pi", "keep working");
@@ -2975,14 +2988,39 @@ describe("SessionManager Pi dispatch", () => {
     }
 
     try {
-      t.mock.timers.tick(3_600_000);
+      assert.strictEqual(JSON.parse(stdinWrites[0]).type, "prompt");
+      t.mock.timers.tick(1_800_000);
       await new Promise<void>((resolve) => setImmediate(resolve));
-      assert.strictEqual(child.killed, false, "response silence must not kill the Pi child");
-      assert.strictEqual(child.exitCode, null, "the Pi child remains running");
-      assert.strictEqual(manager.getActive("pi-silent"), session, "the active session remains resident");
-      const health = manager.getSessionHealth("pi-silent");
-      assert.strictEqual(health?.alive, true, "the active session remains healthy");
-      assert.strictEqual(health?.processingMs, 3_600_000, "the accepted turn remains active through the silence");
+      assert.strictEqual(stdinWrites.length, 2, "the first expiry writes exactly one probe");
+      const firstProbe = JSON.parse(stdinWrites[1]) as { type: string; id: string };
+      assert.strictEqual(firstProbe.type, "get_state");
+      assert.match(firstProbe.id, /^minime-response-liveness-/);
+
+      stdout.push(JSON.stringify({
+        type: "response",
+        command: "get_state",
+        id: firstProbe.id,
+        success: true,
+        data: { isStreaming: true },
+      }) + "\n");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.strictEqual(child.killed, false, "verified streaming keeps the Pi child alive");
+      assert.strictEqual(session.processingStartedAt, 1_000, "the accepted turn remains processing");
+
+      t.mock.timers.tick(1_800_000);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.strictEqual(stdinWrites.length, 3, "the re-armed window writes one new probe");
+      const secondProbe = JSON.parse(stdinWrites[2]) as { type: string; id: string };
+      assert.strictEqual(secondProbe.type, "get_state");
+      assert.notStrictEqual(secondProbe.id, firstProbe.id, "each expiry has a unique correlation id");
+
+      stdout.push(JSON.stringify({
+        type: "response",
+        command: "get_state",
+        id: secondProbe.id,
+        success: true,
+        data: { isStreaming: true },
+      }) + "\n");
 
       stdout.push(JSON.stringify({
         type: "agent_end",
@@ -2996,9 +3034,203 @@ describe("SessionManager Pi dispatch", () => {
       assert.strictEqual((await response.next()).done, true);
       assert.strictEqual(session.processingStartedAt, null, "settlement completes the accepted turn normally");
       assert.strictEqual(child.killed, false, "normal settlement leaves the Pi child alive");
+      t.mock.timers.tick(1_800_000);
+      assert.strictEqual(stdinWrites.length, 3, "normal cleanup removes the response watchdog");
     } finally {
       await manager.closeAll();
     }
+  });
+
+  it("refreshes the activity watchdog for filtered lifecycle records before settlement", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+    const { SessionManager } = await import("../session-manager.js");
+    const manager = new SessionManager(() => dispatchConfig, TEST_STORE_PATH);
+    const { child, stdout, stdinWrites } = makeCapturingChild();
+    injectSession(manager, "pi-activity", "pi", child);
+    manager.getActive("pi-activity")!.idleTimeoutMs = 100_000_000;
+    const response = manager.sendSessionMessage("pi-activity", "pi", "keep working");
+    const resultPromise = response.next();
+    while (stdinWrites.length === 0) await new Promise<void>((resolve) => setImmediate(resolve));
+
+    try {
+      for (const record of [
+        { type: "summarization_retry_scheduled", attempt: 1, maxAttempts: 2 },
+        { type: "summarization_retry_attempt_start", source: "compaction" },
+        { type: "summarization_retry_finished" },
+        { type: "compaction_start", reason: "threshold" },
+      ]) {
+        t.mock.timers.tick(1_799_999);
+        stdout.push(JSON.stringify(record) + "\n");
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        t.mock.timers.tick(2);
+        assert.strictEqual(child.killed, false, `${record.type} refreshes the watchdog`);
+        assert.strictEqual(stdinWrites.length, 1, `${record.type} prevents a liveness probe`);
+      }
+      stdout.push(piAgentEnd("done", "pi-activity"));
+      assert.strictEqual((await resultPromise).done, false);
+      assert.strictEqual((await response.next()).done, true);
+    } finally {
+      await manager.closeAll();
+    }
+  });
+
+  for (const exactResponse of [
+    { success: true, data: { isStreaming: false }, label: "non-streaming" },
+    { success: false, data: { isStreaming: true }, label: "failed" },
+  ] as const) {
+    it(`terminates after an exact ${exactResponse.label} liveness response`, async (t) => {
+      t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+      const { SessionManager } = await import("../session-manager.js");
+      const manager = new SessionManager(() => dispatchConfig, TEST_STORE_PATH);
+      const { child, stdout, stdinWrites, killSignals } = makeCapturingChild();
+      injectSession(manager, `pi-${exactResponse.label}`, "pi", child);
+      manager.getActive(`pi-${exactResponse.label}`)!.idleTimeoutMs = 100_000_000;
+      const response = manager.sendSessionMessage(`pi-${exactResponse.label}`, "pi", "work");
+      const completion = response.next().catch((error: unknown) => error);
+      while (stdinWrites.length === 0) await new Promise<void>((resolve) => setImmediate(resolve));
+
+      t.mock.timers.tick(1_800_000);
+      const probe = JSON.parse(stdinWrites[1]) as { id: string };
+      stdout.push(JSON.stringify({
+        type: "response",
+        command: "get_state",
+        id: probe.id,
+        success: exactResponse.success,
+        data: exactResponse.data,
+      }) + "\n");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.deepStrictEqual(killSignals, ["SIGTERM"]);
+      assert.ok(await completion instanceof Error);
+      await manager.closeAll();
+    });
+  }
+
+  it("terminates when no exact liveness response arrives by the probe deadline", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+    const { SessionManager } = await import("../session-manager.js");
+    const manager = new SessionManager(() => dispatchConfig, TEST_STORE_PATH);
+    const { child, stdinWrites, killSignals } = makeCapturingChild();
+    injectSession(manager, "pi-missing-probe", "pi", child);
+    manager.getActive("pi-missing-probe")!.idleTimeoutMs = 100_000_000;
+    const response = manager.sendSessionMessage("pi-missing-probe", "pi", "work");
+    const completion = response.next().catch((error: unknown) => error);
+    while (stdinWrites.length === 0) await new Promise<void>((resolve) => setImmediate(resolve));
+
+    t.mock.timers.tick(1_800_000);
+    assert.strictEqual(stdinWrites.length, 2);
+    t.mock.timers.tick(9_999);
+    assert.deepStrictEqual(killSignals, []);
+    t.mock.timers.tick(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepStrictEqual(killSignals, ["SIGTERM"]);
+    assert.ok(await completion instanceof Error);
+    await manager.closeAll();
+  });
+
+  it("ignores stale get_state responses while an exact liveness probe is pending", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+    const { SessionManager } = await import("../session-manager.js");
+    const manager = new SessionManager(() => dispatchConfig, TEST_STORE_PATH);
+    const { child, stdout, stdinWrites, killSignals } = makeCapturingChild();
+    injectSession(manager, "pi-stale-probe", "pi", child);
+    manager.getActive("pi-stale-probe")!.idleTimeoutMs = 100_000_000;
+    const response = manager.sendSessionMessage("pi-stale-probe", "pi", "work");
+    const completion = response.next().catch((error: unknown) => error);
+    while (stdinWrites.length === 0) await new Promise<void>((resolve) => setImmediate(resolve));
+
+    t.mock.timers.tick(1_800_000);
+    stdout.push(JSON.stringify({
+      type: "response",
+      command: "get_state",
+      id: "stale-liveness-id",
+      success: true,
+      data: { isStreaming: true },
+    }) + "\n");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    t.mock.timers.tick(10_000);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepStrictEqual(killSignals, ["SIGTERM"], "stale state cannot extend the deadline");
+    assert.ok(await completion instanceof Error);
+    await manager.closeAll();
+  });
+
+  it("cancels a pending probe when genuine filtered lifecycle activity arrives", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+    const { SessionManager } = await import("../session-manager.js");
+    const manager = new SessionManager(() => dispatchConfig, TEST_STORE_PATH);
+    const { child, stdout, stdinWrites, killSignals } = makeCapturingChild();
+    injectSession(manager, "pi-intervening-activity", "pi", child);
+    manager.getActive("pi-intervening-activity")!.idleTimeoutMs = 100_000_000;
+    const response = manager.sendSessionMessage("pi-intervening-activity", "pi", "work");
+    const completion = response.next();
+    while (stdinWrites.length === 0) await new Promise<void>((resolve) => setImmediate(resolve));
+
+    try {
+      t.mock.timers.tick(1_800_000);
+      assert.strictEqual(stdinWrites.length, 2);
+      stdout.push(JSON.stringify({ type: "summarization_retry_finished" }) + "\n");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      t.mock.timers.tick(10_000);
+      assert.deepStrictEqual(killSignals, [], "genuine activity cancels the probe deadline");
+      t.mock.timers.tick(1_790_000);
+      assert.strictEqual(stdinWrites.length, 3, "genuine activity re-arms the full silence window");
+
+      const probe = JSON.parse(stdinWrites[2]) as { id: string };
+      stdout.push(JSON.stringify({
+        type: "response", command: "get_state", id: probe.id,
+        success: true, data: { isStreaming: true },
+      }) + "\n");
+      stdout.push(piAgentEnd("done", "pi-intervening-activity"));
+      assert.strictEqual((await completion).done, false);
+      assert.strictEqual((await response.next()).done, true);
+    } finally {
+      await manager.closeAll();
+    }
+  });
+
+  for (const writeFailure of ["synchronous", "asynchronous"] as const) {
+    it(`terminates after ${writeFailure} liveness probe write failure`, async (t) => {
+      t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+      const { SessionManager } = await import("../session-manager.js");
+      const manager = new SessionManager(() => dispatchConfig, TEST_STORE_PATH);
+      const { child, stdinWrites, killSignals } = makeCapturingChild({
+        failGetStateWrite: writeFailure === "asynchronous",
+      });
+      injectSession(manager, `pi-${writeFailure}-write`, "pi", child);
+      manager.getActive(`pi-${writeFailure}-write`)!.idleTimeoutMs = 100_000_000;
+      const response = manager.sendSessionMessage(`pi-${writeFailure}-write`, "pi", "work");
+      const completion = response.next().catch((error: unknown) => error);
+      while (stdinWrites.length === 0) await new Promise<void>((resolve) => setImmediate(resolve));
+      if (writeFailure === "synchronous") child.stdin!.destroy();
+
+      t.mock.timers.tick(1_800_000);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.deepStrictEqual(killSignals, ["SIGTERM"]);
+      assert.ok(await completion instanceof Error);
+      await manager.closeAll();
+    });
+  }
+
+  it("escalates an ignored liveness-probe SIGTERM to SIGKILL after five seconds", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+    const { SessionManager } = await import("../session-manager.js");
+    const manager = new SessionManager(() => dispatchConfig, TEST_STORE_PATH);
+    const { child, stdinWrites, killSignals } = makeCapturingChild({ ignoreSigterm: true });
+    injectSession(manager, "pi-kill-escalation", "pi", child);
+    manager.getActive("pi-kill-escalation")!.idleTimeoutMs = 100_000_000;
+    const response = manager.sendSessionMessage("pi-kill-escalation", "pi", "work");
+    const completion = response.next().catch((error: unknown) => error);
+    while (stdinWrites.length === 0) await new Promise<void>((resolve) => setImmediate(resolve));
+
+    t.mock.timers.tick(1_810_000);
+    assert.deepStrictEqual(killSignals, ["SIGTERM"]);
+    t.mock.timers.tick(4_999);
+    assert.deepStrictEqual(killSignals, ["SIGTERM"]);
+    t.mock.timers.tick(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepStrictEqual(killSignals, ["SIGTERM", "SIGKILL"]);
+    assert.ok(await completion instanceof Error);
+    await manager.closeAll();
   });
 
   it("does not truncate the in-flight Pi turn when an 'already processing' rejection arrives mid-stream (Defects A+B wedge)", async () => {
