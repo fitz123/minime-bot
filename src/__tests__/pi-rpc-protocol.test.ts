@@ -2328,6 +2328,21 @@ describe("Pi RPC prompt and steer commands", () => {
     });
   });
 
+  it("reports asynchronous get_state write failures through the shared writer callback", async () => {
+    const stdin = new Writable({
+      write(_chunk, _enc, cb) {
+        cb(new Error("get_state write failed"));
+      },
+    });
+    stdin.on("error", () => {});
+    const child = createMockChild({ stdin });
+    const writeError = new Promise<Error>((resolveError) => {
+      sendPiGetState(child, "probe-id", resolveError);
+    });
+
+    assert.match((await writeError).message, /get_state write failed/);
+  });
+
   it("writes prompt commands to stdin", () => {
     const chunks: Buffer[] = [];
     const stdin = new Writable({
@@ -3334,11 +3349,14 @@ describe("readPiStream", () => {
     const child = new EventEmitter() as unknown as ChildProcess;
     Object.assign(child, { stdout, stdin, exitCode: null, killed: false });
     const promptId = "prompt-with-agent-run";
+    const activityEvents: Array<{ type?: string; command?: string; id?: string }> = [];
 
     try {
       const collect = (async () => {
         const lines: StreamLine[] = [];
-        for await (const line of readPiStream(child, undefined, promptId)) lines.push(line);
+        for await (const line of readPiStream(child, (event) => {
+          activityEvents.push({ type: event.type, command: event.command, id: event.id });
+        }, promptId)) lines.push(line);
         return lines;
       })();
       stdout.push(`${JSON.stringify({
@@ -3353,6 +3371,13 @@ describe("readPiStream", () => {
       assert.strictEqual(lines.length, 1, "the internal state probe is not user-facing");
       assert.strictEqual(lines[0].type, "result");
       assert.strictEqual((lines[0] as { result: string }).result, "model answer");
+      assert.deepStrictEqual(activityEvents, [
+        { type: "response", command: "prompt", id: promptId },
+        { type: "response", command: "get_state", id: `${promptId}-state` },
+        { type: "agent_start", command: undefined, id: undefined },
+        { type: "agent_end", command: undefined, id: undefined },
+        { type: "agent_settled", command: undefined, id: undefined },
+      ], "activity observation preserves the internal probe and terminal settlement order");
     } finally {
       stdout.destroy();
       stdin.destroy();
@@ -3608,16 +3633,20 @@ describe("readPiStream", () => {
       { type: "agent_settled" },
     ];
     const child = childWithStdout(records.map((record) => JSON.stringify(record)));
-    let activityCount = 0;
+    const activityEvents: Array<Record<string, unknown>> = [];
     const lines: StreamLine[] = [];
 
-    for await (const line of readPiStream(child, () => {
-      activityCount += 1;
+    for await (const line of readPiStream(child, (event) => {
+      activityEvents.push(event);
     })) {
       lines.push(line);
     }
 
-    assert.strictEqual(activityCount, records.length);
+    assert.deepStrictEqual(
+      activityEvents,
+      records,
+      "the callback receives each parsed record in stream order",
+    );
     assert.strictEqual(
       lines.filter(
         (line) =>

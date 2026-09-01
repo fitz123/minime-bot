@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Probe Pi through its correlated RPC control plane before enforcing the fixed
+  30-minute response-silence boundary, preserving verified-live turns (#208).
+
 ## 2026.8.9
 
 - Make the canonical shared config own the local Whisper model path, default to

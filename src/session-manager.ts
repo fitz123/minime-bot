@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { on } from "node:events";
 import PQueue from "p-queue";
 import type { BoundSessionState, PendingSessionRecoveryNotice, PlatformContext, SessionRecoveryReason, SessionState, StreamLine, BotConfig, AgentConfig } from "./types.js";
-import { spawnPiRpcSession, sendPiPrompt, sendPiSteer, sendPiAcknowledgedSteer, sendPiGetState, readPiStream, parsePiStartupIdentityRecord, assertPiSessionIdentityMatchesBinding, PiStartupBlockingUiError, NewlineOnlyJsonlSplitter, normalizePiModel, PI_EXTENSIONS_DISABLED_ENV, type PiAcknowledgedSteerResult, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions, type PiStartupDiagnostics } from "./pi-rpc-protocol.js";
+import { spawnPiRpcSession, sendPiPrompt, sendPiSteer, sendPiAcknowledgedSteer, sendPiGetState, readPiStream, parsePiStartupIdentityRecord, assertPiSessionIdentityMatchesBinding, PiStartupBlockingUiError, NewlineOnlyJsonlSplitter, normalizePiModel, PI_EXTENSIONS_DISABLED_ENV, type PiAcknowledgedSteerResult, type PiRpcEvent, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions, type PiStartupDiagnostics } from "./pi-rpc-protocol.js";
 import { SessionStore } from "./session-store.js";
 import { log } from "./logger.js";
 import { recordResultMetrics, recordPiRetry, recordPiTurnDuration, sessionsActive, sessionCrashes, piSessionResumeDiscarded } from "./metrics.js";
@@ -28,6 +28,7 @@ const OUTBOX_DIR_NAME = "bot-outbox";
 const STARTUP_TIMEOUT_MS = 10_000;
 const PI_EXACT_OPEN_REJECTION_SETTLE_MS = 300;
 const RESPONSE_ACTIVITY_TIMEOUT_MS = 1_800_000; // 30 minutes with no events = hung
+const RESPONSE_LIVENESS_PROBE_TIMEOUT_MS = 10_000;
 const CRASH_BACKOFF_BASE_MS = 5_000; // Base delay for crash backoff
 const MAX_CRASH_BACKOFF_MS = 60_000; // Maximum backoff delay (1 minute)
 export const MAX_CRASH_RESTARTS = 5; // Block session after this many consecutive crashes
@@ -1048,15 +1049,82 @@ export class SessionManager {
     // Start the queue task — do NOT await, so we can yield concurrently
     const taskPromise = session.queue.add(async () => {
       let activityTimer: ReturnType<typeof setTimeout> | null = null;
+      let probeTimer: ReturnType<typeof setTimeout> | null = null;
+      let responseLivenessProbeId: string | null = null;
       let killEscalationTimer: ReturnType<typeof setTimeout> | null = null;
+      const clearProbe = () => {
+        if (probeTimer) { clearTimeout(probeTimer); probeTimer = null; }
+        responseLivenessProbeId = null;
+      };
       const clearActivityTimers = () => {
         if (activityTimer) { clearTimeout(activityTimer); activityTimer = null; }
+        clearProbe();
         // Only cancel the SIGKILL escalation if the child has already exited;
         // if SIGTERM was sent and the child is still alive, let escalation
         // complete to avoid orphaning the process.
         if (killEscalationTimer && hasExited(session.child)) {
           clearTimeout(killEscalationTimer); killEscalationTimer = null;
         }
+      };
+      const terminateUnresponsiveChild = () => {
+        clearProbe();
+        if (hasExited(session.child)) return;
+        log.error("session-manager", `Response liveness probe failed for chat ${chatId} — killing subprocess`);
+        if (!session.child.killed) {
+          session.child.kill("SIGTERM");
+        }
+        // Escalate to SIGKILL if SIGTERM doesn't terminate within 5s.
+        if (!killEscalationTimer) {
+          killEscalationTimer = setTimeout(() => {
+            if (!hasExited(session.child)) {
+              log.error("session-manager", `Subprocess ignored SIGTERM for chat ${chatId} — sending SIGKILL`);
+              session.child.kill("SIGKILL");
+            }
+          }, 5000);
+        }
+      };
+      const resetActivityTimer = () => {
+        // Only reset the activity timer; never cancel a pending SIGKILL escalation.
+        // Once we've decided to kill the process, the escalation must complete.
+        if (activityTimer) { clearTimeout(activityTimer); activityTimer = null; }
+        activityTimer = setTimeout(() => {
+          activityTimer = null;
+          if (hasExited(session.child) || responseLivenessProbeId) return;
+          const probeId = `minime-response-liveness-${randomUUID()}`;
+          responseLivenessProbeId = probeId;
+          probeTimer = setTimeout(() => {
+            if (responseLivenessProbeId === probeId) {
+              terminateUnresponsiveChild();
+            }
+          }, RESPONSE_LIVENESS_PROBE_TIMEOUT_MS);
+          try {
+            sendPiGetState(session.child, probeId, () => {
+              if (responseLivenessProbeId === probeId) {
+                terminateUnresponsiveChild();
+              }
+            });
+          } catch {
+            if (responseLivenessProbeId === probeId) {
+              terminateUnresponsiveChild();
+            }
+          }
+        }, RESPONSE_ACTIVITY_TIMEOUT_MS);
+      };
+      const observeResponseActivity = (event: PiRpcEvent) => {
+        if (event.type === "response" && event.command === "get_state") {
+          if (!responseLivenessProbeId || event.id !== responseLivenessProbeId) return;
+          clearProbe();
+          if (event.success === true && event.data?.isStreaming === true) {
+            resetActivityTimer();
+          } else {
+            terminateUnresponsiveChild();
+          }
+          return;
+        }
+        // A genuine event from the shared stream proves the child is alive even
+        // when Pi filters it from user-facing output.
+        clearProbe();
+        resetActivityTimer();
       };
       try {
         // Always deliver Pi prompts with streamingBehavior:"followUp" (Defect
@@ -1076,32 +1144,8 @@ export class SessionManager {
 
         // Read response lines through agent_settled, when readPiStream emits the
         // accepted prompt's single terminal result.
-        // Activity timeout: if no events arrive for RESPONSE_ACTIVITY_TIMEOUT_MS,
-        // kill the subprocess to unstick the queue (handles hung processes).
-        let gotResult = false;
-        const resetActivityTimer = () => {
-          // Only reset the activity timer; never cancel a pending SIGKILL escalation.
-          // Once we've decided to kill the process, the escalation must complete.
-          if (activityTimer) { clearTimeout(activityTimer); activityTimer = null; }
-          activityTimer = setTimeout(() => {
-            if (!hasExited(session.child)) {
-              log.error("session-manager", `Response activity timeout for chat ${chatId} — killing subprocess`);
-              if (!session.child.killed) {
-                session.child.kill("SIGTERM");
-              }
-              // Escalate to SIGKILL if SIGTERM doesn't terminate within 5s
-              if (!killEscalationTimer) {
-                killEscalationTimer = setTimeout(() => {
-                  if (!hasExited(session.child)) {
-                    log.error("session-manager", `Subprocess ignored SIGTERM for chat ${chatId} — sending SIGKILL`);
-                    session.child.kill("SIGKILL");
-                  }
-                }, 5000);
-              }
-            }
-          }, RESPONSE_ACTIVITY_TIMEOUT_MS);
-        };
         resetActivityTimer();
+        let gotResult = false;
         // Pi turns carry no duration_ms in their result, so measure wall-clock
         // from the prompt send for the Pi-specific
         // histogram. processingStartedAt is reset to null after the loop, so
@@ -1109,7 +1153,7 @@ export class SessionManager {
         const turnStartedAt = session.processingStartedAt ?? Date.now();
         const stream = readPiStream(
           session.child,
-          resetActivityTimer,
+          observeResponseActivity,
           promptId,
           (result) => this.observeAcknowledgedSteerResult(session, result),
         );

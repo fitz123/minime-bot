@@ -952,8 +952,12 @@ export function sendPiAcknowledgedSteer(
  * session id, which `parsePiEvent` surfaces as a `SystemInit` — the bot's only
  * hook for capturing + persisting that id for resume.
  */
-export function sendPiGetState(child: ChildProcess, id?: string): void {
-  writePiCommand(child, buildGetStateCommand(id));
+export function sendPiGetState(
+  child: ChildProcess,
+  id?: string,
+  onWriteError?: (error: Error) => void,
+): void {
+  writePiCommand(child, buildGetStateCommand(id), onWriteError);
 }
 
 let piPromptCommandSequence = 0;
@@ -1798,14 +1802,14 @@ function handlePiStreamRecord(
   child: ChildProcess,
   record: string,
   state: PiRpcParseState,
-  onActivity?: () => void,
+  onActivity?: (event: PiRpcEvent) => void,
   onAcknowledgedSteerResult?: (result: PiAcknowledgedSteerResult) => void,
 ): StreamLine | null {
   const event = parsePiJsonlRecord(record);
   if (!event) {
     return null;
   }
-  onActivity?.();
+  onActivity?.(event);
   const acknowledgedSteerResult = asPiAcknowledgedSteerResult(event);
   if (acknowledgedSteerResult) {
     onAcknowledgedSteerResult?.(acknowledgedSteerResult);
@@ -1886,17 +1890,18 @@ function handlePiPromptCompletionProbe(
  * remains active through low-level run boundaries and ends only on the settled
  * result, prompt preflight rejection, or an EOF/close fallback. Blocking
  * extension UI requests are cancelled through the child's shared JSONL stdin
- * writer before stream delivery. `onActivity` runs for every valid JSON record,
- * including lifecycle and UI records that do not become user-facing lines, so
- * callers can maintain an accurate inactivity watchdog. Malformed JSON records
- * and untranslatable events are skipped (never throw mid-stream).
+ * writer before stream delivery. `onActivity` receives every decoded valid JSON
+ * record, including lifecycle and UI records that do not become user-facing
+ * lines, so callers can maintain an accurate correlated inactivity watchdog.
+ * Malformed JSON records and untranslatable events are skipped (never throw
+ * mid-stream).
  * `onAcknowledgedSteerResult` observes structurally valid results from the
  * first-party atomic steering gate before normal nonterminal translation; it
  * does not add another stdout reader.
  */
 export async function* readPiStream(
   child: ChildProcess,
-  onActivity?: () => void,
+  onActivity?: (event: PiRpcEvent) => void,
   expectedPromptId?: string,
   onAcknowledgedSteerResult?: (result: PiAcknowledgedSteerResult) => void,
 ): AsyncGenerator<StreamLine> {
