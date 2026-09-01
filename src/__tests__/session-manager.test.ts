@@ -3062,7 +3062,6 @@ describe("SessionManager Pi dispatch", () => {
         t.mock.timers.tick(1_799_999);
         stdout.push(JSON.stringify(record) + "\n");
         await new Promise<void>((resolve) => setImmediate(resolve));
-        t.mock.timers.tick(2);
         assert.strictEqual(child.killed, false, `${record.type} refreshes the watchdog`);
         assert.strictEqual(stdinWrites.length, 1, `${record.type} prevents a liveness probe`);
       }
@@ -3086,22 +3085,30 @@ describe("SessionManager Pi dispatch", () => {
       injectSession(manager, `pi-${exactResponse.label}`, "pi", child);
       manager.getActive(`pi-${exactResponse.label}`)!.idleTimeoutMs = 100_000_000;
       const response = manager.sendSessionMessage(`pi-${exactResponse.label}`, "pi", "work");
-      const completion = response.next().catch((error: unknown) => error);
+      const completion = response.next();
       while (stdinWrites.length === 0) await new Promise<void>((resolve) => setImmediate(resolve));
 
-      t.mock.timers.tick(1_800_000);
-      const probe = JSON.parse(stdinWrites[1]) as { id: string };
-      stdout.push(JSON.stringify({
-        type: "response",
-        command: "get_state",
-        id: probe.id,
-        success: exactResponse.success,
-        data: exactResponse.data,
-      }) + "\n");
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      assert.deepStrictEqual(killSignals, ["SIGTERM"]);
-      assert.ok(await completion instanceof Error);
-      await manager.closeAll();
+      try {
+        t.mock.timers.tick(1_800_000);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        const probe = JSON.parse(stdinWrites[1]) as { id: string };
+        stdout.push(JSON.stringify({
+          type: "response",
+          command: "get_state",
+          id: probe.id,
+          success: exactResponse.success,
+          data: exactResponse.data,
+        }) + "\n");
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.deepStrictEqual(killSignals, ["SIGTERM"]);
+        const result = await completion;
+        assert.strictEqual(result.done, false);
+        assert.strictEqual(result.value.type, "result");
+        assert.strictEqual((result.value as { is_error?: boolean }).is_error, true);
+        assert.strictEqual((await response.next()).done, true);
+      } finally {
+        await manager.closeAll();
+      }
     });
   }
 
@@ -3113,18 +3120,25 @@ describe("SessionManager Pi dispatch", () => {
     injectSession(manager, "pi-missing-probe", "pi", child);
     manager.getActive("pi-missing-probe")!.idleTimeoutMs = 100_000_000;
     const response = manager.sendSessionMessage("pi-missing-probe", "pi", "work");
-    const completion = response.next().catch((error: unknown) => error);
+    const completion = response.next();
     while (stdinWrites.length === 0) await new Promise<void>((resolve) => setImmediate(resolve));
 
-    t.mock.timers.tick(1_800_000);
-    assert.strictEqual(stdinWrites.length, 2);
-    t.mock.timers.tick(9_999);
-    assert.deepStrictEqual(killSignals, []);
-    t.mock.timers.tick(1);
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    assert.deepStrictEqual(killSignals, ["SIGTERM"]);
-    assert.ok(await completion instanceof Error);
-    await manager.closeAll();
+    try {
+      t.mock.timers.tick(1_800_000);
+      assert.strictEqual(stdinWrites.length, 2);
+      t.mock.timers.tick(9_999);
+      assert.deepStrictEqual(killSignals, []);
+      t.mock.timers.tick(1);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.deepStrictEqual(killSignals, ["SIGTERM"]);
+      const result = await completion;
+      assert.strictEqual(result.done, false);
+      assert.strictEqual(result.value.type, "result");
+      assert.strictEqual((result.value as { is_error?: boolean }).is_error, true);
+      assert.strictEqual((await response.next()).done, true);
+    } finally {
+      await manager.closeAll();
+    }
   });
 
   it("ignores stale get_state responses while an exact liveness probe is pending", async (t) => {
@@ -3135,23 +3149,30 @@ describe("SessionManager Pi dispatch", () => {
     injectSession(manager, "pi-stale-probe", "pi", child);
     manager.getActive("pi-stale-probe")!.idleTimeoutMs = 100_000_000;
     const response = manager.sendSessionMessage("pi-stale-probe", "pi", "work");
-    const completion = response.next().catch((error: unknown) => error);
+    const completion = response.next();
     while (stdinWrites.length === 0) await new Promise<void>((resolve) => setImmediate(resolve));
 
-    t.mock.timers.tick(1_800_000);
-    stdout.push(JSON.stringify({
-      type: "response",
-      command: "get_state",
-      id: "stale-liveness-id",
-      success: true,
-      data: { isStreaming: true },
-    }) + "\n");
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    t.mock.timers.tick(10_000);
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    assert.deepStrictEqual(killSignals, ["SIGTERM"], "stale state cannot extend the deadline");
-    assert.ok(await completion instanceof Error);
-    await manager.closeAll();
+    try {
+      t.mock.timers.tick(1_800_000);
+      stdout.push(JSON.stringify({
+        type: "response",
+        command: "get_state",
+        id: "stale-liveness-id",
+        success: true,
+        data: { isStreaming: true },
+      }) + "\n");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      t.mock.timers.tick(10_000);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.deepStrictEqual(killSignals, ["SIGTERM"], "stale state cannot extend the deadline");
+      const result = await completion;
+      assert.strictEqual(result.done, false);
+      assert.strictEqual(result.value.type, "result");
+      assert.strictEqual((result.value as { is_error?: boolean }).is_error, true);
+      assert.strictEqual((await response.next()).done, true);
+    } finally {
+      await manager.closeAll();
+    }
   });
 
   it("cancels a pending probe when genuine filtered lifecycle activity arrives", async (t) => {
@@ -3199,15 +3220,22 @@ describe("SessionManager Pi dispatch", () => {
       injectSession(manager, `pi-${writeFailure}-write`, "pi", child);
       manager.getActive(`pi-${writeFailure}-write`)!.idleTimeoutMs = 100_000_000;
       const response = manager.sendSessionMessage(`pi-${writeFailure}-write`, "pi", "work");
-      const completion = response.next().catch((error: unknown) => error);
+      const completion = response.next();
       while (stdinWrites.length === 0) await new Promise<void>((resolve) => setImmediate(resolve));
       if (writeFailure === "synchronous") child.stdin!.destroy();
 
-      t.mock.timers.tick(1_800_000);
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      assert.deepStrictEqual(killSignals, ["SIGTERM"]);
-      assert.ok(await completion instanceof Error);
-      await manager.closeAll();
+      try {
+        t.mock.timers.tick(1_800_000);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.deepStrictEqual(killSignals, ["SIGTERM"]);
+        const result = await completion;
+        assert.strictEqual(result.done, false);
+        assert.strictEqual(result.value.type, "result");
+        assert.strictEqual((result.value as { is_error?: boolean }).is_error, true);
+        assert.strictEqual((await response.next()).done, true);
+      } finally {
+        await manager.closeAll();
+      }
     });
   }
 
@@ -3219,18 +3247,27 @@ describe("SessionManager Pi dispatch", () => {
     injectSession(manager, "pi-kill-escalation", "pi", child);
     manager.getActive("pi-kill-escalation")!.idleTimeoutMs = 100_000_000;
     const response = manager.sendSessionMessage("pi-kill-escalation", "pi", "work");
-    const completion = response.next().catch((error: unknown) => error);
+    const completion = response.next();
     while (stdinWrites.length === 0) await new Promise<void>((resolve) => setImmediate(resolve));
 
-    t.mock.timers.tick(1_810_000);
-    assert.deepStrictEqual(killSignals, ["SIGTERM"]);
-    t.mock.timers.tick(4_999);
-    assert.deepStrictEqual(killSignals, ["SIGTERM"]);
-    t.mock.timers.tick(1);
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    assert.deepStrictEqual(killSignals, ["SIGTERM", "SIGKILL"]);
-    assert.ok(await completion instanceof Error);
-    await manager.closeAll();
+    try {
+      t.mock.timers.tick(1_800_000);
+      assert.deepStrictEqual(killSignals, []);
+      t.mock.timers.tick(10_000);
+      assert.deepStrictEqual(killSignals, ["SIGTERM"]);
+      t.mock.timers.tick(4_999);
+      assert.deepStrictEqual(killSignals, ["SIGTERM"]);
+      t.mock.timers.tick(1);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.deepStrictEqual(killSignals, ["SIGTERM", "SIGKILL"]);
+      const result = await completion;
+      assert.strictEqual(result.done, false);
+      assert.strictEqual(result.value.type, "result");
+      assert.strictEqual((result.value as { is_error?: boolean }).is_error, true);
+      assert.strictEqual((await response.next()).done, true);
+    } finally {
+      await manager.closeAll();
+    }
   });
 
   it("does not truncate the in-flight Pi turn when an 'already processing' rejection arrives mid-stream (Defects A+B wedge)", async () => {
