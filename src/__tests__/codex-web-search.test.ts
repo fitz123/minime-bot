@@ -207,6 +207,20 @@ function expireRetryWindowAfterSleep(): {
   };
 }
 
+async function settleCodexSearchPromptly<T>(pending: Promise<T>): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      pending,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error("Codex search did not settle promptly")), 250);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
 describe("Codex web search auth and request", () => {
   it("resolves the active model's refreshed OAuth token and locally validated account id", async () => {
     const { context, calls } = makeContext({ model: "gpt-current", accountId: "account-current" });
@@ -838,6 +852,25 @@ describe("Codex web search retries", () => {
     assert.equal(warnings.at(-1)?.elapsedMs, CODEX_WEB_SEARCH_RETRY_WINDOW_MS);
   });
 
+  it("rejects a successful attempt that completes at the retry deadline", async () => {
+    const { context } = makeContext();
+    const warnings: CodexWebSearchWarn[] = [];
+    let elapsed = 0;
+    const result = await executeCodexWebSearch({ query: "safe query" }, {
+      context,
+      now: () => elapsed,
+      warn: (event) => warnings.push(event),
+      fetchImpl: (async () => {
+        elapsed = CODEX_WEB_SEARCH_RETRY_WINDOW_MS;
+        return sseResponse(successSse());
+      }) as typeof fetch,
+    });
+
+    assert.equal(result.failure?.classification, "timeout");
+    assert.equal(warnings.at(-1)?.detail, "retry-exhausted");
+    assert.equal(warnings.at(-1)?.elapsedMs, CODEX_WEB_SEARCH_RETRY_WINDOW_MS);
+  });
+
   it("does not wait when Retry-After exceeds the remaining window", async () => {
     const clock = makeVirtualRetryClock();
     const { context } = makeContext();
@@ -996,6 +1029,49 @@ describe("Codex web search retries", () => {
 });
 
 describe("Codex web search cleanup and bounded failures", () => {
+  it("does not await non-settling response and reader cancellation", async () => {
+    let cancellations = 0;
+    const pendingCancellationResponse = (body: string, status: number): Response => {
+      const encoded = new TextEncoder().encode(body);
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          if (encoded.byteLength > 0) controller.enqueue(encoded);
+        },
+        cancel() {
+          cancellations += 1;
+          return new Promise<void>(() => {});
+        },
+      }), { status, headers: { "Content-Type": "text/event-stream" } });
+    };
+
+    const clock = makeVirtualRetryClock();
+    const { context } = makeContext();
+    let fetchCalls = 0;
+    const recovered = await settleCodexSearchPromptly(executeCodexWebSearch({ query: "safe query" }, {
+      context,
+      ...clock,
+      fetchImpl: (async () => {
+        fetchCalls += 1;
+        return fetchCalls === 1
+          ? pendingCancellationResponse("", 429)
+          : pendingCancellationResponse(successSse(), 200);
+      }) as typeof fetch,
+    }));
+    assert.equal(recovered.ok, true);
+    assert.equal(fetchCalls, 2);
+
+    const classified = await settleCodexSearchPromptly(executeCodexWebSearch({ query: "safe query" }, {
+      context,
+      ...expireRetryWindowAfterSleep(),
+      fetchImpl: (async () => pendingCancellationResponse(
+        JSON.stringify({ error: { code: "rate_limit_exceeded" } }),
+        400,
+      )) as typeof fetch,
+    }));
+    assert.equal(classified.failure?.classification, "rate_limit");
+    assert.equal(cancellations, 3);
+  });
+
   it("classifies HTTP failures and cancels bodies when status is sufficient", async () => {
     const expected = new Map([
       [401, "auth"],

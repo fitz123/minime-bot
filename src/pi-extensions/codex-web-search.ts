@@ -723,7 +723,7 @@ export async function parseCodexWebSearchSse(
     return sawTerminal;
   };
   const abortReader = (): void => {
-    void reader.cancel().catch(() => {});
+    cancelCodexWebSearchStream(() => reader.cancel());
   };
   signal?.addEventListener("abort", abortReader, { once: true });
 
@@ -757,11 +757,7 @@ export async function parseCodexWebSearchSse(
   } finally {
     signal?.removeEventListener("abort", abortReader);
     if (!streamFinished) {
-      try {
-        await reader.cancel();
-      } catch {
-        // Preserve the primary failure classification.
-      }
+      cancelCodexWebSearchStream(() => reader.cancel());
     }
     try {
       reader.releaseLock();
@@ -794,13 +790,19 @@ export async function parseCodexWebSearchSse(
   };
 }
 
-/** Release an HTTP error body without reading provider diagnostics. */
-export async function cancelCodexWebSearchResponse(response: Response): Promise<void> {
+function cancelCodexWebSearchStream(cancel: () => Promise<void>): void {
   try {
-    await response.body?.cancel();
+    void cancel().catch(() => {});
   } catch {
-    // Cleanup must not replace the bounded failure classification.
+    // Cleanup must not replace the bounded result or failure classification.
   }
+}
+
+/** Release an HTTP error body without reading provider diagnostics. */
+export function cancelCodexWebSearchResponse(response: Response): Promise<void> {
+  const body = response.body;
+  if (body) cancelCodexWebSearchStream(() => body.cancel());
+  return Promise.resolve();
 }
 
 async function readBoundedCodexErrorCode(
@@ -820,7 +822,7 @@ async function readBoundedCodexErrorCode(
     return undefined;
   };
   const abortReader = (): void => {
-    void reader.cancel().catch(() => {});
+    cancelCodexWebSearchStream(() => reader.cancel());
   };
   signal?.addEventListener("abort", abortReader, { once: true });
 
@@ -843,11 +845,7 @@ async function readBoundedCodexErrorCode(
   } finally {
     signal?.removeEventListener("abort", abortReader);
     if (!streamFinished) {
-      try {
-        await reader.cancel();
-      } catch {
-        // Preserve the bounded HTTP failure classification.
-      }
+      cancelCodexWebSearchStream(() => reader.cancel());
     }
     try {
       reader.releaseLock();
@@ -1019,6 +1017,22 @@ export async function executeCodexWebSearch(
       Math.min(attemptTimeoutMs, remainingMs),
     );
     const result = outcome.result;
+    if (signal?.aborted) {
+      const cancelledResult = result.ok ? lastResult ?? classifiedFailure("transport") : result;
+      deps.warn?.({
+        classification: cancelledResult.failure?.classification ?? "transport",
+        ...(cancelledResult.failure?.httpStatus === undefined
+          ? {}
+          : { httpStatus: cancelledResult.failure.httpStatus }),
+        detail: "request-failed",
+        attempt,
+        elapsedMs: Math.min(CODEX_WEB_SEARCH_RETRY_WINDOW_MS, Math.round(elapsedMs())),
+      });
+      return cancelledResult;
+    }
+    if (CODEX_WEB_SEARCH_RETRY_WINDOW_MS - elapsedMs() <= 0) {
+      return exhausted(result.ok ? lastResult ?? classifiedFailure("timeout") : result);
+    }
     if (result.ok) return result;
     lastResult = result;
 
