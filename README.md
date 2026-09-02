@@ -276,10 +276,13 @@ reporting surface. Sources retain their own delivery and retry semantics.
 
 The package registers one model-facing `web_search` tool. Its wrapper obtains
 the refreshed OAuth credential and active `openai-codex` model from Pi's model
-registry, then sends one bounded request to the fixed Codex subscription
-Responses endpoint. It does not read `OPENAI_API_KEY`, accept a configurable
-endpoint, switch providers, retry automatically, or apply a package-specific
-search quota.
+registry for each attempt, then sends bounded requests to the fixed Codex
+subscription Responses endpoint. Timeout, rate-limit, transport/5xx, and
+invalid provider-response failures retry with `Retry-After` or jittered
+exponential backoff for at most ten minutes. Caller cancellation stops the
+request or backoff immediately. The tool does not read `OPENAI_API_KEY`, accept
+a configurable endpoint, switch or fall back to another provider, or apply a
+package-specific concurrency limit or search quota.
 
 Interactive sessions, cron runs, package subagents, and ask-agent children each
 load the canonical `dist/extensions/pi/web-tools.js` wrapper once.
@@ -288,8 +291,10 @@ Search-only bundled roles keep `web_search` without receiving Bash.
 
 Search queries pass a bounded content-safety check before leaving the host.
 Responses expose bounded answer text, citations, web-action metadata, response
-identity, and token usage when Codex supplies them; failures return only a fixed
-classification without provider bodies or credentials.
+identity, and token usage when Codex supplies them. Terminal failures and
+ten-minute retry exhaustion return only the last fixed classification without
+provider bodies, raw headers, query text, or credentials; the caller owns any
+alternative after that boundary.
 
 Direct URL reading and browser interaction are deliberately outside the package
 tool. On macOS, install the official `agent-browser` Homebrew formula globally.

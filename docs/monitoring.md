@@ -34,15 +34,22 @@ change production monitoring, deployment, restart, or rollback configuration.
 ## Codex subscription quota and web search
 
 `web_search` uses Pi's existing `openai-codex` subscription OAuth and active
-model through one fixed Codex Responses endpoint. The tool does not own a
-credential file, billing integration, retry loop, durable incident state, or a
-provider-specific Prometheus metric family.
+model through one fixed Codex Responses endpoint. Transient timeout, rate-limit,
+transport/5xx, and invalid provider-response failures retry for at most ten
+minutes, honoring `Retry-After` when present and stopping on caller
+cancellation. Bounded warnings identify retry scheduling and exhaustion with
+attempt, delay, and elapsed values only. They never include query text, URLs,
+provider bodies, raw headers, OAuth data, or credentials.
+
+The tool does not own a credential file, billing integration, durable incident
+state, provider fallback, package concurrency quota, or provider-specific
+Prometheus metric family. After terminal failure or retry exhaustion, the
+calling model receives the last bounded classification and owns any alternative.
 
 The out-of-band `minime-codex-quota-sampler` remains the single quota source for
 interactive work and search. It writes the cached snapshot used by `/status`
 and the `codex_usage_*` node-exporter textfile metrics, including bounded probe
-success and timestamp series. Search failures themselves are returned to the
-calling model as bounded classifications.
+success and timestamp series.
 
 Direct URL reads and browser automation do not go through `web_search`.
 Bash-capable full agents use the host `agent-browser` executable (`read` for

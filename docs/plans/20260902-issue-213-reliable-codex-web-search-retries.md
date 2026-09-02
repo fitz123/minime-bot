@@ -59,10 +59,10 @@ npm pack --dry-run
 - Modify: `src/pi-extensions/README.md`
 - Verify unchanged: `extensions/pi/web-tools.ts`
 
-- [ ] Refactor only the post-validation request path in `src/pi-extensions/codex-web-search.ts` into one private attempt and add the strict ten-minute, cancellation-aware, no-attempt-cap retry loop described above.
-- [ ] Parse numeric and HTTP-date `Retry-After` before response cleanup; otherwise apply simple jittered exponential backoff using only Node/platform primitives.
-- [ ] Preserve existing result classifications and privacy bounds while adding minimum secret-safe retry scheduling/exhaustion details.
-- [ ] Add compact table-driven tests covering first-attempt success; recovery after more than two 429s with both `Retry-After` forms and fallback backoff; timeout, transport/5xx, and provider-schema recovery; refreshed OAuth per attempt; body/reader cleanup; and success after more than forty fast virtual attempts to prove no hidden attempt cap.
-- [ ] Add deterministic deadline/cancellation tests covering strict ten-minute exhaustion without real waiting, `Retry-After` beyond the remaining window, a final timeout clamped to remaining time, abort during request/backoff, and no retry for input/privacy/auth/ordinary-4xx failures.
-- [ ] Update the three existing web-search documentation sections and module comment to describe bounded transient retries, ten-minute exhaustion, caller cancellation, one fixed provider, and absence of fallback/concurrency quota.
-- [ ] Run the focused test, both TypeScript typechecks, build, full suite, and package dry-run; inspect the final diff to confirm only the five listed files changed and all Non-goals remain excluded.
+- [x] Refactor only the post-validation request path in `src/pi-extensions/codex-web-search.ts` into one private attempt and add the strict ten-minute, cancellation-aware, no-attempt-cap retry loop described above.
+- [x] Parse numeric and HTTP-date `Retry-After` before response cleanup; otherwise apply simple jittered exponential backoff using only Node/platform primitives.
+- [x] Preserve existing result classifications and privacy bounds while adding minimum secret-safe retry scheduling/exhaustion details.
+- [x] Add compact table-driven tests covering first-attempt success; recovery after more than two 429s with both `Retry-After` forms and fallback backoff; timeout, transport/5xx, and provider-schema recovery; refreshed OAuth per attempt; body/reader cleanup; and success after more than forty fast virtual attempts to prove no hidden attempt cap.
+- [x] Add deterministic deadline/cancellation tests covering strict ten-minute exhaustion without real waiting, `Retry-After` beyond the remaining window, a final timeout clamped to remaining time, abort during request/backoff, and no retry for input/privacy/auth/ordinary-4xx failures.
+- [x] Update the three existing web-search documentation sections and module comment to describe bounded transient retries, ten-minute exhaustion, caller cancellation, one fixed provider, and absence of fallback/concurrency quota.
+- [x] Run the focused test, both TypeScript typechecks, build, full suite, and package dry-run; inspect the final diff to confirm only the five listed files changed and all Non-goals remain excluded.

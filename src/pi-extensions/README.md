@@ -72,16 +72,20 @@ without package extensions.
 ## Codex web search
 
 The `web-tools` wrapper registers `web_search` once. Its pure helper resolves
-refreshed OAuth and account identity from Pi's `openai-codex` model registry,
-uses the active Codex model, and calls only the fixed subscription Responses
-endpoint. It does not read an API-key environment variable, accept another
-endpoint or provider, retry automatically, or keep provider-specific state.
+refreshed OAuth and account identity from Pi's `openai-codex` model registry on
+each attempt, uses the active Codex model, and calls only the fixed subscription
+Responses endpoint. Timeout, rate-limit, transport/5xx, and invalid
+provider-response failures retry with `Retry-After` or jittered exponential
+backoff inside a strict ten-minute boundary. Caller cancellation stops both an
+active request and a pending backoff.
 
 The helper validates and bounds each query before egress. It parses streamed
 answer text, citations, web actions, response identity, and usage into bounded
-results, while failures expose only fixed classifications. Direct URL reading
-and browser interaction belong to the host `agent-browser` CLI and are available
-only to Bash-capable agents.
+results. Terminal failures and retry exhaustion expose only the last fixed
+classification; the caller owns any alternative. There is no configurable
+endpoint, alternate-provider fallback, package concurrency quota, or retained
+provider state. Direct URL reading and browser interaction belong to the host
+`agent-browser` CLI and are available only to Bash-capable agents.
 
 ## Location lock (Task 0)
 
