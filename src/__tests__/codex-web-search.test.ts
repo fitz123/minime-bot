@@ -8,6 +8,7 @@ import {
   cancelCodexWebSearchResponse,
   CODEX_WEB_SEARCH_ENDPOINT,
   CODEX_WEB_SEARCH_PROVIDER,
+  CODEX_WEB_SEARCH_RETRY_WINDOW_MS,
   CODEX_WEB_SEARCH_TOOL,
   createBoundedCodexSearchSignal,
   executeCodexWebSearch,
@@ -19,6 +20,7 @@ import {
   resolveCodexWebSearchOAuth,
   validateCodexWebSearchQuery,
   type CodexWebSearchExecutionContext,
+  type CodexWebSearchWarn,
 } from "../pi-extensions/codex-web-search.js";
 
 const BOT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -164,6 +166,59 @@ function sseResponse(body: string, chunks?: number[]): Response {
       controller.close();
     },
   }), { status: 200, headers: { "Content-Type": "text/event-stream" } });
+}
+
+function makeVirtualRetryClock(wallStart = Date.UTC(2026, 8, 2, 12)): {
+  now(): number;
+  wallNow(): number;
+  random(): number;
+  sleep(delayMs: number, signal?: AbortSignal): Promise<void>;
+  delays: number[];
+  advance(delayMs: number): void;
+  setElapsed(elapsedMs: number): void;
+} {
+  let elapsed = 0;
+  const delays: number[] = [];
+  return {
+    now: () => elapsed,
+    wallNow: () => wallStart + elapsed,
+    random: () => 0,
+    sleep: async (delayMs, signal) => {
+      if (signal?.aborted) throw signal.reason;
+      delays.push(delayMs);
+      elapsed += delayMs;
+    },
+    delays,
+    advance: (delayMs) => { elapsed += delayMs; },
+    setElapsed: (elapsedMs) => { elapsed = elapsedMs; },
+  };
+}
+
+function expireRetryWindowAfterSleep(): {
+  now(): number;
+  random(): number;
+  sleep(): Promise<void>;
+} {
+  let elapsed = 0;
+  return {
+    now: () => elapsed,
+    random: () => 0,
+    sleep: async () => { elapsed = CODEX_WEB_SEARCH_RETRY_WINDOW_MS; },
+  };
+}
+
+async function settleCodexSearchPromptly<T>(pending: Promise<T>): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      pending,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error("Codex search did not settle promptly")), 250);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
 }
 
 describe("Codex web search auth and request", () => {
@@ -351,6 +406,7 @@ describe("Codex web search auth and request", () => {
     let redirectMode: RequestRedirect | undefined;
     const result = await executeCodexWebSearch({ query: "safe query" }, {
       context,
+      ...expireRetryWindowAfterSleep(),
       fetchImpl: ((_url: string | URL | Request, init?: RequestInit) => {
         redirectMode = init?.redirect;
         return fetch(`http://127.0.0.1:${address.port}/start`, init);
@@ -472,6 +528,7 @@ describe("Codex web search streamed response parsing", () => {
     const { context } = makeContext();
     const result = await executeCodexWebSearch({ query: "safe query" }, {
       context,
+      ...expireRetryWindowAfterSleep(),
       requestTimeoutMs: 20,
       fetchImpl: (async () => response) as typeof fetch,
     });
@@ -578,6 +635,7 @@ describe("Codex web search streamed response parsing", () => {
     for (const entry of cases) {
       const result = await executeCodexWebSearch({ query: "safe query" }, {
         context,
+        ...expireRetryWindowAfterSleep(),
         fetchImpl: (async () => sseResponse(entry.body)) as typeof fetch,
       });
       assert.equal(result.failure?.classification, entry.classification);
@@ -586,7 +644,434 @@ describe("Codex web search streamed response parsing", () => {
   });
 });
 
+describe("Codex web search retries", () => {
+  it("recovers after three 429s using numeric, HTTP-date, and fallback delays while cleaning bodies", async () => {
+    const wallStart = Date.UTC(2026, 8, 2, 12);
+    const clock = makeVirtualRetryClock(wallStart);
+    const { context, calls } = makeContext();
+    const warnings: CodexWebSearchWarn[] = [];
+    const retryHeaders = [
+      "2",
+      new Date(wallStart + 7_000).toUTCString(),
+      "invalid-retry-after",
+    ];
+    let fetchCalls = 0;
+    let cancelledBodies = 0;
+    const result = await executeCodexWebSearch({ query: "safe query" }, {
+      context,
+      ...clock,
+      warn: (event) => warnings.push(event),
+      fetchImpl: (async () => {
+        const retryAfter = retryHeaders[fetchCalls];
+        fetchCalls += 1;
+        if (retryAfter === undefined) return sseResponse(successSse());
+        return new Response(new ReadableStream({
+          cancel() { cancelledBodies += 1; },
+        }), { status: 429, headers: { "Retry-After": retryAfter } });
+      }) as typeof fetch,
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(fetchCalls, 4);
+    assert.deepEqual(clock.delays, [2_000, 5_000, 1_000]);
+    assert.equal(cancelledBodies, 3);
+    assert.deepEqual(calls, { isUsingOAuth: 4, getProviderAuth: 4, getRequestAuth: 4 });
+    assert.deepEqual(warnings.map((event) => event.detail), [
+      "retry-scheduled",
+      "retry-scheduled",
+      "retry-scheduled",
+    ]);
+  });
+
+  it("recovers from timeout, transport, 5xx, and provider-schema failures", async () => {
+    const cases: Array<{
+      name: string;
+      failure(): Response | never;
+      classification: string;
+    }> = [
+      { name: "timeout", failure: () => new Response(null, { status: 408 }), classification: "timeout" },
+      {
+        name: "transport",
+        failure: () => { throw new TypeError("private transport detail"); },
+        classification: "transport",
+      },
+      { name: "5xx", failure: () => new Response(null, { status: 503 }), classification: "transport" },
+      {
+        name: "provider schema",
+        failure: () => sseResponse("data: not-json\n\n"),
+        classification: "schema",
+      },
+    ];
+
+    for (const entry of cases) {
+      const clock = makeVirtualRetryClock();
+      const { context } = makeContext();
+      const warnings: CodexWebSearchWarn[] = [];
+      let fetchCalls = 0;
+      const result = await executeCodexWebSearch({ query: "safe query" }, {
+        context,
+        ...clock,
+        warn: (event) => warnings.push(event),
+        fetchImpl: (async () => {
+          fetchCalls += 1;
+          return fetchCalls === 1 ? entry.failure() : sseResponse(successSse());
+        }) as typeof fetch,
+      });
+      assert.equal(result.ok, true, entry.name);
+      assert.equal(fetchCalls, 2, entry.name);
+      assert.deepEqual(clock.delays, [250], entry.name);
+      assert.equal(warnings[0]?.classification, entry.classification, entry.name);
+    }
+  });
+
+  it("recovers after a local request timeout with a fresh attempt signal", async () => {
+    const clock = makeVirtualRetryClock();
+    const { context } = makeContext();
+    const requestSignals: AbortSignal[] = [];
+    let fetchCalls = 0;
+    const result = await executeCodexWebSearch({ query: "safe query" }, {
+      context,
+      ...clock,
+      createRequestSignal: (_parent, timeoutMs) => {
+        assert.equal(timeoutMs, 60_000);
+        const controller = new AbortController();
+        const requestIndex = requestSignals.length;
+        let timedOut = false;
+        requestSignals.push(controller.signal);
+        if (requestIndex === 0) {
+          setImmediate(() => {
+            timedOut = true;
+            controller.abort(new Error("local request timeout"));
+          });
+        }
+        return {
+          signal: controller.signal,
+          didTimeout: () => timedOut,
+          parentAborted: () => false,
+          cancel: () => {},
+        };
+      },
+      fetchImpl: (async (_url: string | URL | Request, init?: RequestInit) => {
+        fetchCalls += 1;
+        const requestSignal = init?.signal as AbortSignal;
+        if (fetchCalls === 1) {
+          return new Promise<Response>((_resolve, reject) => {
+            requestSignal.addEventListener("abort", () => reject(requestSignal.reason), { once: true });
+          });
+        }
+        return sseResponse(successSse());
+      }) as typeof fetch,
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(fetchCalls, 2);
+    assert.equal(requestSignals.length, 2);
+    assert.equal(requestSignals[0]?.aborted, true);
+    assert.equal(requestSignals[1]?.aborted, false);
+    assert.notEqual(requestSignals[0], requestSignals[1]);
+    assert.deepEqual(clock.delays, [250]);
+  });
+
+  it("resolves refreshed OAuth before every retry attempt", async () => {
+    const clock = makeVirtualRetryClock();
+    let authAttempt = 0;
+    let activeToken = "";
+    const authorizationHeaders: string[] = [];
+    const context: CodexWebSearchExecutionContext = {
+      model: { provider: CODEX_WEB_SEARCH_PROVIDER, id: "gpt-refresh", api: "openai-codex-responses" },
+      modelRegistry: {
+        isUsingOAuth: () => true,
+        getProviderAuth: async () => {
+          authAttempt += 1;
+          activeToken = codexOAuthToken("account-refresh", `attempt-${authAttempt}`);
+          return { auth: { apiKey: activeToken } };
+        },
+        getApiKeyAndHeaders: async () => ({ ok: true, apiKey: activeToken }),
+      },
+    };
+    const result = await executeCodexWebSearch({ query: "safe query" }, {
+      context,
+      ...clock,
+      fetchImpl: (async (_url: string | URL | Request, init?: RequestInit) => {
+        authorizationHeaders.push((init?.headers as Record<string, string>).Authorization);
+        return authorizationHeaders.length < 3
+          ? new Response(null, { status: 503 })
+          : sseResponse(successSse());
+      }) as typeof fetch,
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(authAttempt, 3);
+    assert.equal(new Set(authorizationHeaders).size, 3);
+    assert.deepEqual(clock.delays, [250, 500]);
+  });
+
+  it("has no hidden attempt cap and succeeds after more than forty retries", async () => {
+    const clock = makeVirtualRetryClock();
+    const { context, calls } = makeContext();
+    let fetchCalls = 0;
+    const result = await executeCodexWebSearch({ query: "safe query" }, {
+      context,
+      ...clock,
+      sleep: async (delayMs) => { clock.delays.push(delayMs); clock.advance(1); },
+      fetchImpl: (async () => {
+        fetchCalls += 1;
+        return fetchCalls <= 41
+          ? new Response(null, { status: 503 })
+          : sseResponse(successSse());
+      }) as typeof fetch,
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(fetchCalls, 42);
+    assert.equal(clock.delays.length, 41);
+    assert.equal(calls.getProviderAuth, 42);
+    assert.ok(clock.now() < CODEX_WEB_SEARCH_RETRY_WINDOW_MS);
+  });
+
+  it("exhausts at the strict ten-minute boundary without real waiting", async () => {
+    const { context } = makeContext();
+    let elapsed = 0;
+    let fetchCalls = 0;
+    const warnings: CodexWebSearchWarn[] = [];
+    const result = await executeCodexWebSearch({ query: "safe query" }, {
+      context,
+      now: () => elapsed,
+      random: () => 0,
+      sleep: async () => { elapsed = CODEX_WEB_SEARCH_RETRY_WINDOW_MS; },
+      warn: (event) => warnings.push(event),
+      fetchImpl: (async () => {
+        fetchCalls += 1;
+        return new Response(null, { status: 503 });
+      }) as typeof fetch,
+    });
+
+    assert.equal(result.failure?.classification, "transport");
+    assert.equal(fetchCalls, 1);
+    assert.equal(warnings.at(-1)?.detail, "retry-exhausted");
+    assert.equal(warnings.at(-1)?.elapsedMs, CODEX_WEB_SEARCH_RETRY_WINDOW_MS);
+  });
+
+  it("rejects a successful attempt that completes at the retry deadline", async () => {
+    const { context } = makeContext();
+    const warnings: CodexWebSearchWarn[] = [];
+    let elapsed = 0;
+    const result = await executeCodexWebSearch({ query: "safe query" }, {
+      context,
+      now: () => elapsed,
+      warn: (event) => warnings.push(event),
+      fetchImpl: (async () => {
+        elapsed = CODEX_WEB_SEARCH_RETRY_WINDOW_MS;
+        return sseResponse(successSse());
+      }) as typeof fetch,
+    });
+
+    assert.equal(result.failure?.classification, "timeout");
+    assert.equal(warnings.at(-1)?.detail, "retry-exhausted");
+    assert.equal(warnings.at(-1)?.elapsedMs, CODEX_WEB_SEARCH_RETRY_WINDOW_MS);
+  });
+
+  it("does not wait when Retry-After exceeds the remaining window", async () => {
+    const clock = makeVirtualRetryClock();
+    const { context } = makeContext();
+    let fetchCalls = 0;
+    const result = await executeCodexWebSearch({ query: "safe query" }, {
+      context,
+      ...clock,
+      fetchImpl: (async () => {
+        fetchCalls += 1;
+        clock.advance(CODEX_WEB_SEARCH_RETRY_WINDOW_MS - 1_000);
+        return new Response(null, { status: 429, headers: { "Retry-After": "2" } });
+      }) as typeof fetch,
+    });
+
+    assert.equal(result.failure?.classification, "rate_limit");
+    assert.equal(fetchCalls, 1);
+    assert.deepEqual(clock.delays, []);
+  });
+
+  it("clamps the final request timeout to the remaining retry window", async () => {
+    const clock = makeVirtualRetryClock();
+    const { context } = makeContext();
+    const timeouts: number[] = [];
+    let fetchCalls = 0;
+    const result = await executeCodexWebSearch({ query: "safe query" }, {
+      context,
+      ...clock,
+      sleep: async () => { clock.setElapsed(CODEX_WEB_SEARCH_RETRY_WINDOW_MS - 123); },
+      createRequestSignal: (parent, timeoutMs) => {
+        timeouts.push(timeoutMs);
+        const controller = new AbortController();
+        const abort = (): void => controller.abort(parent?.reason);
+        parent?.addEventListener("abort", abort, { once: true });
+        return {
+          signal: controller.signal,
+          didTimeout: () => false,
+          parentAborted: () => parent?.aborted ?? false,
+          cancel: () => parent?.removeEventListener("abort", abort),
+        };
+      },
+      fetchImpl: (async () => {
+        fetchCalls += 1;
+        return fetchCalls === 1
+          ? new Response(null, { status: 503 })
+          : sseResponse(successSse());
+      }) as typeof fetch,
+    });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(timeouts, [60_000, 123]);
+  });
+
+  it("stops immediately when the caller aborts during a request or backoff", async () => {
+    {
+      const { context } = makeContext();
+      const parent = new AbortController();
+      let fetchCalls = 0;
+      const pending = executeCodexWebSearch({ query: "safe query" }, {
+        context,
+        fetchImpl: ((_url: string | URL | Request, init?: RequestInit) => {
+          fetchCalls += 1;
+          const requestSignal = init?.signal as AbortSignal;
+          return new Promise<Response>((_resolve, reject) => {
+            requestSignal.addEventListener("abort", () => reject(requestSignal.reason), { once: true });
+          });
+        }) as typeof fetch,
+      }, parent.signal);
+      setImmediate(() => parent.abort(new Error("caller cancelled request")));
+      const result = await pending;
+      assert.equal(result.failure?.classification, "transport");
+      assert.equal(fetchCalls, 1);
+    }
+
+    {
+      const clock = makeVirtualRetryClock();
+      const { context } = makeContext();
+      const parent = new AbortController();
+      let backoffSignal: AbortSignal | undefined;
+      let notifySleepStarted: (() => void) | undefined;
+      const sleepStarted = new Promise<void>((resolve) => { notifySleepStarted = resolve; });
+      let fetchCalls = 0;
+      const pending = executeCodexWebSearch({ query: "safe query" }, {
+        context,
+        ...clock,
+        sleep: async (_delayMs, waitSignal) => {
+          backoffSignal = waitSignal;
+          notifySleepStarted?.();
+          await new Promise<void>((_resolve, reject) => {
+            if (!waitSignal) {
+              reject(new Error("backoff signal missing"));
+              return;
+            }
+            if (waitSignal.aborted) {
+              reject(waitSignal.reason);
+              return;
+            }
+            waitSignal.addEventListener("abort", () => reject(waitSignal.reason), { once: true });
+          });
+        },
+        fetchImpl: (async () => {
+          fetchCalls += 1;
+          return new Response(null, { status: 429 });
+        }) as typeof fetch,
+      }, parent.signal);
+      await sleepStarted;
+      parent.abort(new Error("caller cancelled backoff"));
+      const result = await pending;
+      assert.equal(result.failure?.classification, "rate_limit");
+      assert.equal(fetchCalls, 1);
+      assert.equal(backoffSignal, parent.signal);
+    }
+  });
+
+  it("does not retry invalid input, blocked egress, auth, or ordinary 4xx failures", async () => {
+    for (const query of [42, "read /private/project/file.ts"] as const) {
+      const { context, calls } = makeContext();
+      let fetchCalls = 0;
+      await executeCodexWebSearch({ query } as never, {
+        context,
+        fetchImpl: (async () => { fetchCalls += 1; return sseResponse(successSse()); }) as typeof fetch,
+      });
+      assert.equal(calls.getProviderAuth, 0);
+      assert.equal(fetchCalls, 0);
+    }
+
+    const terminalCases = [
+      { status: 401, classification: "auth" },
+      { status: 418, classification: "unknown" },
+    ] as const;
+    for (const entry of terminalCases) {
+      const clock = makeVirtualRetryClock();
+      const { context } = makeContext();
+      let fetchCalls = 0;
+      const result = await executeCodexWebSearch({ query: "safe query" }, {
+        context,
+        ...clock,
+        fetchImpl: (async () => {
+          fetchCalls += 1;
+          return new Response(null, { status: entry.status });
+        }) as typeof fetch,
+      });
+      assert.equal(result.failure?.classification, entry.classification);
+      assert.equal(fetchCalls, 1);
+      assert.deepEqual(clock.delays, []);
+    }
+
+    const { context } = makeContext({ providerAuthOk: false });
+    let fetchCalls = 0;
+    const auth = await executeCodexWebSearch({ query: "safe query" }, {
+      context,
+      fetchImpl: (async () => { fetchCalls += 1; return sseResponse(successSse()); }) as typeof fetch,
+    });
+    assert.equal(auth.failure?.classification, "auth");
+    assert.equal(fetchCalls, 0);
+  });
+});
+
 describe("Codex web search cleanup and bounded failures", () => {
+  it("does not await non-settling response and reader cancellation", async () => {
+    let cancellations = 0;
+    const pendingCancellationResponse = (body: string, status: number): Response => {
+      const encoded = new TextEncoder().encode(body);
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          if (encoded.byteLength > 0) controller.enqueue(encoded);
+        },
+        cancel() {
+          cancellations += 1;
+          return new Promise<void>(() => {});
+        },
+      }), { status, headers: { "Content-Type": "text/event-stream" } });
+    };
+
+    const clock = makeVirtualRetryClock();
+    const { context } = makeContext();
+    let fetchCalls = 0;
+    const recovered = await settleCodexSearchPromptly(executeCodexWebSearch({ query: "safe query" }, {
+      context,
+      ...clock,
+      fetchImpl: (async () => {
+        fetchCalls += 1;
+        return fetchCalls === 1
+          ? pendingCancellationResponse("", 429)
+          : pendingCancellationResponse(successSse(), 200);
+      }) as typeof fetch,
+    }));
+    assert.equal(recovered.ok, true);
+    assert.equal(fetchCalls, 2);
+
+    const classified = await settleCodexSearchPromptly(executeCodexWebSearch({ query: "safe query" }, {
+      context,
+      ...expireRetryWindowAfterSleep(),
+      fetchImpl: (async () => pendingCancellationResponse(
+        JSON.stringify({ error: { code: "rate_limit_exceeded" } }),
+        400,
+      )) as typeof fetch,
+    }));
+    assert.equal(classified.failure?.classification, "rate_limit");
+    assert.equal(cancellations, 3);
+  });
+
   it("classifies HTTP failures and cancels bodies when status is sufficient", async () => {
     const expected = new Map([
       [401, "auth"],
@@ -605,6 +1090,7 @@ describe("Codex web search cleanup and bounded failures", () => {
       const { context } = makeContext();
       const result = await executeCodexWebSearch({ query: "safe query" }, {
         context,
+        ...expireRetryWindowAfterSleep(),
         fetchImpl: (async () => response) as typeof fetch,
       });
       assert.equal(result.failure?.classification, classification, String(status));
@@ -623,6 +1109,7 @@ describe("Codex web search cleanup and bounded failures", () => {
       const { context } = makeContext();
       const result = await executeCodexWebSearch({ query: "safe query" }, {
         context,
+        ...expireRetryWindowAfterSleep(),
         fetchImpl: (async () => new Response(JSON.stringify({
           error: { code, message: "private provider diagnostic" },
         }), { status: 400 })) as typeof fetch,
@@ -647,6 +1134,7 @@ describe("Codex web search cleanup and bounded failures", () => {
     const { context } = makeContext();
     const transport = await executeCodexWebSearch({ query: "safe query" }, {
       context,
+      ...expireRetryWindowAfterSleep(),
       fetchImpl: (async () => { throw new TypeError("private transport details"); }) as typeof fetch,
     });
     assert.equal(transport.failure?.classification, "transport");
@@ -662,6 +1150,7 @@ describe("Codex web search cleanup and bounded failures", () => {
     let requestSignal: AbortSignal | undefined;
     const timeout = await executeCodexWebSearch({ query: "safe query" }, {
       context,
+      ...expireRetryWindowAfterSleep(),
       requestTimeoutMs: 5,
       fetchImpl: ((_url: string | URL | Request, init?: RequestInit) => {
         requestSignal = init?.signal as AbortSignal;
@@ -704,6 +1193,7 @@ describe("Codex web search cleanup and bounded failures", () => {
         let fetchCalls = 0;
         const pending = executeCodexWebSearch({ query: "safe query" }, {
           context,
+          ...expireRetryWindowAfterSleep(),
           requestTimeoutMs: mode === "timeout" ? 5 : 1_000,
           fetchImpl: (async () => {
             fetchCalls += 1;
@@ -730,6 +1220,7 @@ describe("Codex web search cleanup and bounded failures", () => {
       }), { status: 200, headers: { "Content-Type": "text/event-stream" } });
       const pending = executeCodexWebSearch({ query: "safe query" }, {
         context,
+        ...expireRetryWindowAfterSleep(),
         requestTimeoutMs: mode === "timeout" ? 5 : 1_000,
         fetchImpl: (async () => response) as typeof fetch,
       }, parent.signal);
@@ -799,6 +1290,18 @@ describe("Codex web search cleanup and bounded failures", () => {
     assert.equal(
       formatCodexWebSearchWarn({ classification: "rate_limit", httpStatus: 429, detail: "request-failed" }),
       "[web-tools] tool=web_search provider=openai-codex classification=rate_limit httpStatus=429 detail=request-failed",
+    );
+    assert.equal(
+      formatCodexWebSearchWarn({
+        classification: "rate_limit",
+        httpStatus: 429,
+        detail: "retry-scheduled",
+        attempt: 3,
+        delayMs: 1_000,
+        elapsedMs: 7_000,
+      }),
+      "[web-tools] tool=web_search provider=openai-codex classification=rate_limit" +
+        " httpStatus=429 detail=retry-scheduled attempt=3 delayMs=1000 elapsedMs=7000",
     );
   });
 });

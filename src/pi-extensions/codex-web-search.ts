@@ -1,14 +1,19 @@
+import { setTimeout as sleep } from "node:timers/promises";
+
 /**
  * Package-owned Codex subscription web search.
  *
  * Authentication and active-model selection are supplied by Pi's tool
  * execution context. The transport deliberately has one fixed subscription
- * endpoint and no environment-key, alternate-provider, or retry path.
+ * endpoint and no environment-key, alternate-provider, concurrency quota, or
+ * fallback path. Transient failures retry within one caller-cancellable
+ * ten-minute boundary before the last bounded classification is returned.
  */
 
 export const CODEX_WEB_SEARCH_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses";
 export const CODEX_WEB_SEARCH_PROVIDER = "openai-codex";
 export const CODEX_WEB_SEARCH_TIMEOUT_MS = 60_000;
+export const CODEX_WEB_SEARCH_RETRY_WINDOW_MS = 600_000;
 export const MAX_CODEX_WEB_SEARCH_QUERY_CHARS = 300;
 export const MAX_CODEX_WEB_SEARCH_TEXT_CHARS = 50_000;
 export const MAX_CODEX_WEB_SEARCH_RESPONSE_BYTES = 1_000_000;
@@ -17,6 +22,8 @@ const MAX_ACTION_VALUES = 20;
 const MAX_URL_CHARS = 2_048;
 const MAX_METADATA_TEXT_CHARS = 512;
 const MAX_HTTP_ERROR_BODY_CHARS = 4_096;
+const RETRY_BACKOFF_BASE_MS = 500;
+const RETRY_BACKOFF_CAP_MS = 30_000;
 const RATE_LIMIT_ERROR_CODES = new Set([
   "rate_limit",
   "rate_limit_exceeded",
@@ -119,7 +126,10 @@ export interface CodexWebSearchExecutionContext {
 export interface CodexWebSearchWarn {
   classification: CodexWebSearchFailureClassification;
   httpStatus?: number;
-  detail?: "bad-args" | "blocked-egress" | "request-failed";
+  detail?: "bad-args" | "blocked-egress" | "request-failed" | "retry-scheduled" | "retry-exhausted";
+  attempt?: number;
+  delayMs?: number;
+  elapsedMs?: number;
 }
 
 export interface RunCodexWebSearchDeps {
@@ -127,6 +137,12 @@ export interface RunCodexWebSearchDeps {
   fetchImpl?: typeof fetch;
   requestTimeoutMs?: number;
   warn?: (event: CodexWebSearchWarn) => void;
+  /** Private deterministic test seams; runtime callers should use the defaults. */
+  now?: () => number;
+  wallNow?: () => number;
+  random?: () => number;
+  sleep?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
+  createRequestSignal?: (parent: AbortSignal | undefined, timeoutMs: number) => BoundedRequestSignal;
 }
 
 export interface CodexWebSearchHttpRequest {
@@ -707,7 +723,7 @@ export async function parseCodexWebSearchSse(
     return sawTerminal;
   };
   const abortReader = (): void => {
-    void reader.cancel().catch(() => {});
+    cancelCodexWebSearchStream(() => reader.cancel());
   };
   signal?.addEventListener("abort", abortReader, { once: true });
 
@@ -741,11 +757,7 @@ export async function parseCodexWebSearchSse(
   } finally {
     signal?.removeEventListener("abort", abortReader);
     if (!streamFinished) {
-      try {
-        await reader.cancel();
-      } catch {
-        // Preserve the primary failure classification.
-      }
+      cancelCodexWebSearchStream(() => reader.cancel());
     }
     try {
       reader.releaseLock();
@@ -778,16 +790,25 @@ export async function parseCodexWebSearchSse(
   };
 }
 
-/** Release an HTTP error body without reading provider diagnostics. */
-export async function cancelCodexWebSearchResponse(response: Response): Promise<void> {
+function cancelCodexWebSearchStream(cancel: () => Promise<void>): void {
   try {
-    await response.body?.cancel();
+    void cancel().catch(() => {});
   } catch {
-    // Cleanup must not replace the bounded failure classification.
+    // Cleanup must not replace the bounded result or failure classification.
   }
 }
 
-async function readBoundedCodexErrorCode(response: Response): Promise<string | undefined> {
+/** Release an HTTP error body without reading provider diagnostics. */
+export function cancelCodexWebSearchResponse(response: Response): Promise<void> {
+  const body = response.body;
+  if (body) cancelCodexWebSearchStream(() => body.cancel());
+  return Promise.resolve();
+}
+
+async function readBoundedCodexErrorCode(
+  response: Response,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
   if (!response.body) return undefined;
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -800,10 +821,16 @@ async function readBoundedCodexErrorCode(response: Response): Promise<string | u
     }
     return undefined;
   };
+  const abortReader = (): void => {
+    cancelCodexWebSearchStream(() => reader.cancel());
+  };
+  signal?.addEventListener("abort", abortReader, { once: true });
 
   try {
     while (body.length < MAX_HTTP_ERROR_BODY_CHARS) {
+      if (signal?.aborted) throw signal.reason ?? new Error("request aborted");
       const { done, value } = await reader.read();
+      if (signal?.aborted) throw signal.reason ?? new Error("request aborted");
       if (done) {
         streamFinished = true;
         body += decoder.decode().slice(0, MAX_HTTP_ERROR_BODY_CHARS - body.length);
@@ -816,12 +843,9 @@ async function readBoundedCodexErrorCode(response: Response): Promise<string | u
     }
     return undefined;
   } finally {
+    signal?.removeEventListener("abort", abortReader);
     if (!streamFinished) {
-      try {
-        await reader.cancel();
-      } catch {
-        // Preserve the bounded HTTP failure classification.
-      }
+      cancelCodexWebSearchStream(() => reader.cancel());
     }
     try {
       reader.releaseLock();
@@ -839,7 +863,98 @@ function classifyHttpStatus(status: number): CodexWebSearchFailureClassification
   return "unknown";
 }
 
-/** Execute one OAuth-backed Codex Responses request. Never throws. */
+function parseRetryAfterMs(value: string | null, wallNow: number): number | undefined {
+  if (value === null) return undefined;
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) {
+    const milliseconds = Number(trimmed) * 1_000;
+    return Number.isFinite(milliseconds) ? milliseconds : undefined;
+  }
+  const date = Date.parse(trimmed);
+  return Number.isFinite(date) ? Math.max(0, date - wallNow) : undefined;
+}
+
+interface CodexWebSearchAttempt {
+  result: CodexWebSearchResult;
+  retryAfterMs?: number;
+}
+
+async function executeCodexWebSearchAttempt(
+  query: string,
+  controls: NormalizedCodexWebSearchControls,
+  deps: RunCodexWebSearchDeps,
+  signal: AbortSignal | undefined,
+  timeoutMs: number,
+): Promise<CodexWebSearchAttempt> {
+  const bounded = (deps.createRequestSignal ?? createBoundedCodexSearchSignal)(signal, timeoutMs);
+  try {
+    let auth: ResolvedCodexOAuth | undefined;
+    try {
+      auth = await resolveCodexWebSearchOAuth(deps.context, bounded.signal);
+    } catch (error) {
+      if (bounded.signal.aborted) throw error;
+      // Registry/provider diagnostics can contain credential details; keep them private.
+    }
+    if (!auth) {
+      return { result: classifiedFailure("auth") };
+    }
+
+    const request = buildNormalizedCodexWebSearchRequest(auth, query, controls);
+    const response = await (deps.fetchImpl ?? fetch)(request.url, {
+      method: request.method,
+      headers: request.headers,
+      body: request.body,
+      redirect: "error",
+      signal: bounded.signal,
+    });
+    if (!response.ok) {
+      const status = response.status;
+      const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"), (deps.wallNow ?? Date.now)());
+      const statusClassification = classifyHttpStatus(status);
+      const classification = statusClassification === "unknown"
+        ? classifyProviderCode(await readBoundedCodexErrorCode(response, bounded.signal))
+        : statusClassification;
+      if (statusClassification !== "unknown") await cancelCodexWebSearchResponse(response);
+      return {
+        result: classifiedFailure(classification, status),
+        ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
+      };
+    }
+    return { result: await parseCodexWebSearchSse(response, auth, bounded.signal, controls) };
+  } catch (error) {
+    const classification = bounded.didTimeout()
+      ? "timeout"
+      : bounded.parentAborted()
+        ? "transport"
+        : error instanceof CodexSearchSchemaError
+          ? "schema"
+          : error instanceof CodexSearchProviderError
+            ? error.classification
+            : error instanceof TypeError
+              ? "transport"
+              : "unknown";
+    return { result: classifiedFailure(classification) };
+  } finally {
+    bounded.cancel();
+  }
+}
+
+function retryableCodexWebSearchFailure(result: CodexWebSearchResult): boolean {
+  return result.failure !== undefined && (
+    result.failure.classification === "timeout" ||
+    result.failure.classification === "rate_limit" ||
+    result.failure.classification === "transport" ||
+    result.failure.classification === "schema"
+  );
+}
+
+function retryBackoffMs(attempt: number, random: () => number): number {
+  const exponential = RETRY_BACKOFF_BASE_MS * 2 ** Math.min(Math.max(0, attempt - 1), 16);
+  const jitter = 0.5 + Math.min(1, Math.max(0, random()));
+  return Math.min(RETRY_BACKOFF_CAP_MS, Math.round(exponential * jitter));
+}
+
+/** Execute a bounded sequence of OAuth-backed Codex Responses attempts. Never throws. */
 export async function executeCodexWebSearch(
   args: CodexWebSearchArgs,
   deps: RunCodexWebSearchDeps,
@@ -859,57 +974,104 @@ export async function executeCodexWebSearch(
     );
   }
 
-  const bounded = createBoundedCodexSearchSignal(signal, deps.requestTimeoutMs ?? CODEX_WEB_SEARCH_TIMEOUT_MS);
-  try {
-    let auth: ResolvedCodexOAuth | undefined;
-    try {
-      auth = await resolveCodexWebSearchOAuth(deps.context, bounded.signal);
-    } catch (error) {
-      if (bounded.signal.aborted) throw error;
-      // Registry/provider diagnostics can contain credential details; keep them private.
+  const controls = normalizeCodexWebSearchControls(args);
+  const now = deps.now ?? (() => performance.now());
+  const random = deps.random ?? Math.random;
+  const wait = deps.sleep ?? ((delayMs: number, waitSignal?: AbortSignal) =>
+    sleep(delayMs, undefined, waitSignal ? { signal: waitSignal } : undefined));
+  const requestedTimeoutMs = deps.requestTimeoutMs;
+  const attemptTimeoutMs = requestedTimeoutMs !== undefined && Number.isFinite(requestedTimeoutMs) && requestedTimeoutMs > 0
+    ? Math.min(CODEX_WEB_SEARCH_TIMEOUT_MS, requestedTimeoutMs)
+    : CODEX_WEB_SEARCH_TIMEOUT_MS;
+  const startedAt = now();
+  let attempt = 0;
+  let lastResult: CodexWebSearchResult | undefined;
+
+  const elapsedMs = (): number => Math.max(0, now() - startedAt);
+  const exhausted = (result: CodexWebSearchResult): CodexWebSearchResult => {
+    deps.warn?.({
+      classification: result.failure?.classification ?? "unknown",
+      ...(result.failure?.httpStatus === undefined ? {} : { httpStatus: result.failure.httpStatus }),
+      detail: "retry-exhausted",
+      attempt,
+      elapsedMs: Math.min(CODEX_WEB_SEARCH_RETRY_WINDOW_MS, Math.round(elapsedMs())),
+    });
+    return result;
+  };
+
+  while (true) {
+    if (signal?.aborted) {
+      const result = lastResult ?? classifiedFailure("transport");
+      if (!lastResult) deps.warn?.({ classification: "transport", detail: "request-failed", attempt });
+      return result;
     }
-    if (!auth) {
-      const result = classifiedFailure("auth");
-      deps.warn?.({ classification: "auth", detail: "request-failed" });
+    const remainingMs = CODEX_WEB_SEARCH_RETRY_WINDOW_MS - elapsedMs();
+    if (remainingMs <= 0) return exhausted(lastResult ?? classifiedFailure("timeout"));
+
+    attempt += 1;
+    const outcome = await executeCodexWebSearchAttempt(
+      query,
+      controls,
+      deps,
+      signal,
+      Math.min(attemptTimeoutMs, remainingMs),
+    );
+    const result = outcome.result;
+    if (signal?.aborted) {
+      const cancelledResult = result.ok ? lastResult ?? classifiedFailure("transport") : result;
+      deps.warn?.({
+        classification: cancelledResult.failure?.classification ?? "transport",
+        ...(cancelledResult.failure?.httpStatus === undefined
+          ? {}
+          : { httpStatus: cancelledResult.failure.httpStatus }),
+        detail: "request-failed",
+        attempt,
+        elapsedMs: Math.min(CODEX_WEB_SEARCH_RETRY_WINDOW_MS, Math.round(elapsedMs())),
+      });
+      return cancelledResult;
+    }
+    if (CODEX_WEB_SEARCH_RETRY_WINDOW_MS - elapsedMs() <= 0) {
+      return exhausted(result.ok ? lastResult ?? classifiedFailure("timeout") : result);
+    }
+    if (result.ok) return result;
+    lastResult = result;
+
+    if (signal?.aborted || !retryableCodexWebSearchFailure(result)) {
+      deps.warn?.({
+        classification: result.failure?.classification ?? "unknown",
+        ...(result.failure?.httpStatus === undefined ? {} : { httpStatus: result.failure.httpStatus }),
+        detail: "request-failed",
+        attempt,
+        elapsedMs: Math.min(CODEX_WEB_SEARCH_RETRY_WINDOW_MS, Math.round(elapsedMs())),
+      });
       return result;
     }
 
-    const controls = normalizeCodexWebSearchControls(args);
-    const request = buildNormalizedCodexWebSearchRequest(auth, query, controls);
-    const response = await (deps.fetchImpl ?? fetch)(request.url, {
-      method: request.method,
-      headers: request.headers,
-      body: request.body,
-      redirect: "error",
-      signal: bounded.signal,
-    });
-    if (!response.ok) {
-      const status = response.status;
-      const statusClassification = classifyHttpStatus(status);
-      const classification = statusClassification === "unknown"
-        ? classifyProviderCode(await readBoundedCodexErrorCode(response))
-        : statusClassification;
-      if (statusClassification !== "unknown") await cancelCodexWebSearchResponse(response);
-      deps.warn?.({ classification, httpStatus: status, detail: "request-failed" });
-      return classifiedFailure(classification, status);
+    const retryRemainingMs = CODEX_WEB_SEARCH_RETRY_WINDOW_MS - elapsedMs();
+    if (retryRemainingMs <= 0) return exhausted(result);
+    if (outcome.retryAfterMs !== undefined && outcome.retryAfterMs > retryRemainingMs) {
+      return exhausted(result);
     }
-    return await parseCodexWebSearchSse(response, auth, bounded.signal, controls);
-  } catch (error) {
-    const classification = bounded.didTimeout()
-      ? "timeout"
-      : bounded.parentAborted()
-        ? "transport"
-        : error instanceof CodexSearchSchemaError
-          ? "schema"
-          : error instanceof CodexSearchProviderError
-            ? error.classification
-            : error instanceof TypeError
-              ? "transport"
-              : "unknown";
-    deps.warn?.({ classification, detail: "request-failed" });
-    return classifiedFailure(classification);
-  } finally {
-    bounded.cancel();
+    const delayMs = Math.max(outcome.retryAfterMs ?? 0, retryBackoffMs(attempt, random));
+    if (delayMs >= retryRemainingMs) return exhausted(result);
+
+    deps.warn?.({
+      classification: result.failure?.classification ?? "unknown",
+      ...(result.failure?.httpStatus === undefined ? {} : { httpStatus: result.failure.httpStatus }),
+      detail: "retry-scheduled",
+      attempt,
+      delayMs,
+      elapsedMs: Math.min(CODEX_WEB_SEARCH_RETRY_WINDOW_MS, Math.round(elapsedMs())),
+    });
+    if (signal?.aborted) return result;
+    try {
+      await wait(delayMs, signal);
+    } catch {
+      if (signal?.aborted) return result;
+      return exhausted(result);
+    }
+    if (signal?.aborted) return result;
+    if (CODEX_WEB_SEARCH_RETRY_WINDOW_MS - elapsedMs() <= 0) return exhausted(result);
   }
 }
 
@@ -917,7 +1079,10 @@ export function formatCodexWebSearchWarn(event: CodexWebSearchWarn): string {
   return `[web-tools] tool=web_search provider=${CODEX_WEB_SEARCH_PROVIDER}` +
     ` classification=${event.classification}` +
     `${event.httpStatus === undefined ? "" : ` httpStatus=${event.httpStatus}`}` +
-    `${event.detail === undefined ? "" : ` detail=${event.detail}`}`;
+    `${event.detail === undefined ? "" : ` detail=${event.detail}`}` +
+    `${event.attempt === undefined ? "" : ` attempt=${event.attempt}`}` +
+    `${event.delayMs === undefined ? "" : ` delayMs=${event.delayMs}`}` +
+    `${event.elapsedMs === undefined ? "" : ` elapsedMs=${event.elapsedMs}`}`;
 }
 
 /** Compatible with the existing web_search input contract. */
