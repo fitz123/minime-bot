@@ -710,6 +710,54 @@ describe("Codex web search retries", () => {
     }
   });
 
+  it("recovers after a local request timeout with a fresh attempt signal", async () => {
+    const clock = makeVirtualRetryClock();
+    const { context } = makeContext();
+    const requestSignals: AbortSignal[] = [];
+    let fetchCalls = 0;
+    const result = await executeCodexWebSearch({ query: "safe query" }, {
+      context,
+      ...clock,
+      createRequestSignal: (_parent, timeoutMs) => {
+        assert.equal(timeoutMs, 60_000);
+        const controller = new AbortController();
+        const requestIndex = requestSignals.length;
+        let timedOut = false;
+        requestSignals.push(controller.signal);
+        if (requestIndex === 0) {
+          setImmediate(() => {
+            timedOut = true;
+            controller.abort(new Error("local request timeout"));
+          });
+        }
+        return {
+          signal: controller.signal,
+          didTimeout: () => timedOut,
+          parentAborted: () => false,
+          cancel: () => {},
+        };
+      },
+      fetchImpl: (async (_url: string | URL | Request, init?: RequestInit) => {
+        fetchCalls += 1;
+        const requestSignal = init?.signal as AbortSignal;
+        if (fetchCalls === 1) {
+          return new Promise<Response>((_resolve, reject) => {
+            requestSignal.addEventListener("abort", () => reject(requestSignal.reason), { once: true });
+          });
+        }
+        return sseResponse(successSse());
+      }) as typeof fetch,
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(fetchCalls, 2);
+    assert.equal(requestSignals.length, 2);
+    assert.equal(requestSignals[0]?.aborted, true);
+    assert.equal(requestSignals[1]?.aborted, false);
+    assert.notEqual(requestSignals[0], requestSignals[1]);
+    assert.deepEqual(clock.delays, [250]);
+  });
+
   it("resolves refreshed OAuth before every retry attempt", async () => {
     const clock = makeVirtualRetryClock();
     let authAttempt = 0;
@@ -867,21 +915,39 @@ describe("Codex web search retries", () => {
       const clock = makeVirtualRetryClock();
       const { context } = makeContext();
       const parent = new AbortController();
+      let backoffSignal: AbortSignal | undefined;
+      let notifySleepStarted: (() => void) | undefined;
+      const sleepStarted = new Promise<void>((resolve) => { notifySleepStarted = resolve; });
       let fetchCalls = 0;
-      const result = await executeCodexWebSearch({ query: "safe query" }, {
+      const pending = executeCodexWebSearch({ query: "safe query" }, {
         context,
         ...clock,
         sleep: async (_delayMs, waitSignal) => {
-          parent.abort(new Error("caller cancelled backoff"));
-          throw waitSignal?.reason;
+          backoffSignal = waitSignal;
+          notifySleepStarted?.();
+          await new Promise<void>((_resolve, reject) => {
+            if (!waitSignal) {
+              reject(new Error("backoff signal missing"));
+              return;
+            }
+            if (waitSignal.aborted) {
+              reject(waitSignal.reason);
+              return;
+            }
+            waitSignal.addEventListener("abort", () => reject(waitSignal.reason), { once: true });
+          });
         },
         fetchImpl: (async () => {
           fetchCalls += 1;
           return new Response(null, { status: 429 });
         }) as typeof fetch,
       }, parent.signal);
+      await sleepStarted;
+      parent.abort(new Error("caller cancelled backoff"));
+      const result = await pending;
       assert.equal(result.failure?.classification, "rate_limit");
       assert.equal(fetchCalls, 1);
+      assert.equal(backoffSignal, parent.signal);
     }
   });
 
