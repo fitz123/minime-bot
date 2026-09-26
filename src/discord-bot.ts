@@ -145,6 +145,8 @@ export interface DiscordBotResult {
 export interface DiscordBotCreationOptions {
   /** Publish the shutdown handle before login or command registration can block. */
   onCreated?(result: DiscordBotResult): void;
+  /** Notify when the logged-in client is ready to serve conversational traffic. */
+  onReady?(result: DiscordBotResult): void;
 }
 
 interface DiscordCommandInteractionLike {
@@ -486,6 +488,7 @@ export async function createDiscordBot(
   await client.login(discordConfig.token);
   if (!acceptingHandlers) return result;
   log.info("discord-bot", `Discord bot logged in as ${client.user!.tag}`);
+  options.onReady?.(result);
 
   // Register guild-scoped slash commands (instant, no 1-hour propagation delay)
   const commands = [

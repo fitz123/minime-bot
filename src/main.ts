@@ -378,20 +378,24 @@ async function main(): Promise<void> {
 
   // Start Discord bot if configured
   if (config.discord && !shuttingDown) {
+    const discordBindingCount = config.discord.bindings.length;
     try {
       const result = await createDiscordBot(config, config.discord, sessionManager, {
         onCreated: (created) => {
           shutdownDiscord = created.shutdown;
           messageQueues.push(created.messageQueue);
         },
+        onReady: (ready) => {
+          discordClient = ready.client;
+          log.info("main", "Discord bot started");
+          publishRuntimeReadiness(discordBindingCount);
+        },
       });
       if (shuttingDown) {
         finishAgentPlatformStartup();
         return;
       }
-      discordClient = result.client;
-      log.info("main", "Discord bot started");
-      publishRuntimeReadiness(config.discord.bindings.length);
+      discordClient ??= result.client;
     } catch (err) {
       if (!shuttingDown) log.error("main", "Failed to start Discord bot:", err);
     }
