@@ -144,7 +144,9 @@ case "\$cmd" in
       fi
       exit 0
     fi
-    if [ "\$(get bootstrap_fail)" = "1" ]; then
+    incr bot_bootstrap_count
+    bot_bootstrap_count=\$(get bot_bootstrap_count)
+    if [ "\$(get bootstrap_fail)" = "1" ] || { [ "\$(get bootstrap_fail_once)" = "1" ] && [ "\$bot_bootstrap_count" -eq 1 ]; }; then
       echo "Bootstrap failed: 5: Input/output error" >&2
       exit 5
     fi
@@ -158,8 +160,19 @@ case "\$cmd" in
       exit 0
     fi
     np=\$(get next_pid); [ -z "\$np" ] && np=99999
+    retry_np=\$(get retry_next_pid)
+    if [ "\$bot_bootstrap_count" -gt 1 ] && [ -n "\$retry_np" ]; then
+      np="\$retry_np"
+    fi
     set_kv pid "\$np"
     set_kv registered 1
+    ready_on_bootstrap=\$(get ready_on_bootstrap)
+    if [ -n "\$ready_on_bootstrap" ] && [ "\$ready_on_bootstrap" -gt 0 ] && [ "\$bot_bootstrap_count" -ge "\$ready_on_bootstrap" ] && [ -n "\${RESTART_READY_PATH:-}" ]; then
+      mkdir -p "\$(dirname "\$RESTART_READY_PATH")"
+      ready_tmp="\${RESTART_READY_PATH}.mock.\$\$"
+      printf '%s\n' "\$np" > "\$ready_tmp"
+      mv "\$ready_tmp" "\$RESTART_READY_PATH"
+    fi
     ;;
   *)
     echo "mock-launchctl: unknown command: \$cmd" >&2
@@ -283,6 +296,8 @@ function createHarness(): Harness {
     return state;
   };
 
+  setState({ ready_on_bootstrap: 1 });
+
   const readLines = (path: string) => (existsSync(path) ? readFileSync(path, "utf8").split("\n").filter(Boolean) : []);
   const readCommands = () => readLines(join(stateDir, "commands"));
   const readPlutilCommands = () => readLines(join(stateDir, "plutil-commands"));
@@ -308,6 +323,7 @@ function createHarness(): Harness {
         STARTUP_TIMEOUT: "10",
         RESTART_WORKER_NOT_BEFORE_DELAY: "0",
         RESTART_MAX_WORKER_NOT_BEFORE_DELAY: "1",
+        RESTART_READY_PATH: join(dir, "runtime", "bot-ready"),
         ...env,
       },
       encoding: "utf8",
@@ -454,6 +470,7 @@ describe("restart-bot.sh supervisor mode", () => {
           RESTART_REQUEST_ID: plistStringDict(plist, "EnvironmentVariables").RESTART_REQUEST_ID,
           RESTART_STATUS_PATH: plistStringDict(plist, "EnvironmentVariables").RESTART_STATUS_PATH,
           RESTART_LOG_PATH: plistStringDict(plist, "EnvironmentVariables").RESTART_LOG_PATH,
+          RESTART_READY_PATH: plistStringDict(plist, "EnvironmentVariables").RESTART_READY_PATH,
         },
         {
           BOT_PLIST: h.plist,
@@ -469,6 +486,7 @@ describe("restart-bot.sh supervisor mode", () => {
           RESTART_REQUEST_ID: "request-special",
           RESTART_STATUS_PATH: statusPath,
           RESTART_LOG_PATH: logPath,
+          RESTART_READY_PATH: join(h.dir, "runtime", "bot-ready"),
         },
       );
       const env = plistStringDict(plist, "EnvironmentVariables");
@@ -817,6 +835,34 @@ printf 'args=%s\n' "$*" > "$NODE_CAPTURE"
     }
   });
 
+  it("worker retries the validated plist once after bootstrap failure and becomes ready", () => {
+    const h = createHarness();
+    try {
+      const statusPath = join(h.dir, "worker-bootstrap-recovery.status");
+      h.setState({
+        registered: 0,
+        label: "ai.minime.telegram-bot",
+        bootstrap_fail_once: 1,
+        next_pid: 2222,
+        retry_next_pid: 3333,
+        ready_on_bootstrap: 2,
+      });
+
+      const { status, stderr } = h.run(["--worker", "--plist"], {
+        RESTART_STATUS_PATH: statusPath,
+      });
+
+      assert.strictEqual(status, 0, `expected bootstrap recovery success: ${stderr}`);
+      assert.strictEqual(readStatus(statusPath).status, "success");
+      assert.strictEqual(readStatus(statusPath).newPid, "3333");
+      const state = h.readState();
+      assert.strictEqual(state.bot_bootstrap_count, "2");
+      assert.strictEqual(state.bot_bootout_count, undefined);
+    } finally {
+      cleanup(h);
+    }
+  });
+
   it("worker refuses to bootstrap when launchctl state is unknown", () => {
     const h = createHarness();
     try {
@@ -882,7 +928,13 @@ printf 'args=%s\n' "$*" > "$NODE_CAPTURE"
     try {
       const statusPath = join(h.dir, "worker-not-ready.status");
       const readyPath = join(h.dir, "runtime", "bot-ready");
-      h.setState({ registered: 0, label: "ai.minime.telegram-bot", next_pid: 2222 });
+      h.setState({
+        registered: 0,
+        label: "ai.minime.telegram-bot",
+        next_pid: 2222,
+        retry_next_pid: 3333,
+        ready_on_bootstrap: 0,
+      });
 
       const { status } = h.run(["--worker", "--plist"], {
         RESTART_STATUS_PATH: statusPath,
@@ -892,6 +944,97 @@ printf 'args=%s\n' "$*" > "$NODE_CAPTURE"
 
       assert.notStrictEqual(status, 0);
       assert.strictEqual(readStatus(statusPath).status, "failure");
+      assert.strictEqual(readStatus(statusPath).error, "readiness timeout");
+      assert.strictEqual(h.readState().bot_bootstrap_count, "2");
+    } finally {
+      cleanup(h);
+    }
+  });
+
+  it("worker rejects a stale readiness marker whose PID does not match launchd", () => {
+    const h = createHarness();
+    try {
+      const statusPath = join(h.dir, "worker-stale-ready.status");
+      const readyPath = join(h.dir, "runtime", "bot-ready");
+      mkdirSync(dirname(readyPath), { recursive: true });
+      writeFileSync(readyPath, "1111\n");
+      h.setState({
+        registered: 0,
+        label: "ai.minime.telegram-bot",
+        next_pid: 2222,
+        retry_next_pid: 3333,
+        ready_on_bootstrap: 0,
+      });
+
+      const { status } = h.run(["--worker", "--plist"], {
+        RESTART_STATUS_PATH: statusPath,
+        RESTART_READY_PATH: readyPath,
+        STARTUP_TIMEOUT: "1",
+      });
+
+      assert.notStrictEqual(status, 0);
+      assert.strictEqual(readStatus(statusPath).error, "readiness timeout");
+      assert.equal(readFileSync(readyPath, "utf8"), "1111\n");
+      assert.strictEqual(h.readState().bot_bootstrap_count, "2");
+    } finally {
+      cleanup(h);
+    }
+  });
+
+  it("worker makes one clean same-release recovery attempt and accepts its ready PID", () => {
+    const h = createHarness();
+    try {
+      const statusPath = join(h.dir, "worker-recovery-success.status");
+      h.setState({
+        registered: 1,
+        label: "ai.minime.telegram-bot",
+        pid: 1111,
+        next_pid: 2222,
+        retry_next_pid: 3333,
+        ready_on_bootstrap: 2,
+      });
+
+      const { status, stdout, stderr } = h.run(["--worker", "--plist"], {
+        RESTART_STATUS_PATH: statusPath,
+        STARTUP_TIMEOUT: "1",
+      });
+
+      assert.strictEqual(status, 0, `expected recovery success: ${stderr}`);
+      assert.match(stdout, /New PID: 3333 \(application ready\)/);
+      assert.strictEqual(readStatus(statusPath).status, "success");
+      assert.strictEqual(readStatus(statusPath).newPid, "3333");
+      const state = h.readState();
+      assert.strictEqual(state.bot_bootstrap_count, "2");
+      assert.strictEqual(state.bot_bootout_count, "2");
+    } finally {
+      cleanup(h);
+    }
+  });
+
+  it("worker reports terminal failure after exactly one exhausted recovery attempt", () => {
+    const h = createHarness();
+    try {
+      const statusPath = join(h.dir, "worker-recovery-exhausted.status");
+      h.setState({
+        registered: 0,
+        label: "ai.minime.telegram-bot",
+        next_pid: 2222,
+        retry_next_pid: 3333,
+        ready_on_bootstrap: 0,
+      });
+
+      const { status, stderr } = h.run(["--worker", "--plist"], {
+        RESTART_STATUS_PATH: statusPath,
+        STARTUP_TIMEOUT: "1",
+      });
+
+      assert.notStrictEqual(status, 0);
+      assert.match(stderr, /bounded recovery attempt/);
+      assert.strictEqual(readStatus(statusPath).status, "failure");
+      assert.strictEqual(readStatus(statusPath).error, "readiness timeout");
+      const state = h.readState();
+      assert.strictEqual(state.bot_bootstrap_count, "2");
+      assert.strictEqual(state.bot_bootout_count, "1");
     } finally {
       cleanup(h);
     }

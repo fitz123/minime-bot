@@ -46,6 +46,10 @@ import {
 } from "./runtime-guard.js";
 import { shutdownServingRuntime } from "./runtime-shutdown.js";
 import {
+  createRuntimeReadinessMarker,
+  type RuntimeReadinessMarker,
+} from "./runtime-readiness.js";
+import {
   startTriggerInput,
   TriggerInputBindError,
   type TriggerInputServer,
@@ -53,6 +57,8 @@ import {
 
 let activeRuntimeGuard: RuntimeGuard | undefined;
 let removeRuntimeExitHook: (() => void) | undefined;
+let activeRuntimeReadiness: RuntimeReadinessMarker | undefined;
+let removeReadinessExitHook: (() => void) | undefined;
 
 function releaseRuntimeGuard(): boolean {
   removeRuntimeExitHook?.();
@@ -60,6 +66,29 @@ function releaseRuntimeGuard(): boolean {
   const released = activeRuntimeGuard?.release() ?? true;
   activeRuntimeGuard = undefined;
   return released;
+}
+
+function publishRuntimeReadiness(): void {
+  if (!activeRuntimeReadiness) throw new Error("runtime readiness marker is not initialized");
+  activeRuntimeReadiness.publish();
+}
+
+function clearRuntimeReadiness(): boolean {
+  const cleared = activeRuntimeReadiness?.clear() ?? true;
+  removeReadinessExitHook?.();
+  removeReadinessExitHook = undefined;
+  activeRuntimeReadiness = undefined;
+  return cleared;
+}
+
+function clearRuntimeReadinessSafely(): void {
+  try {
+    if (!clearRuntimeReadiness()) {
+      log.warn("main", "Runtime readiness ownership changed; leaving marker untouched");
+    }
+  } catch (error) {
+    log.warn("main", "Failed to clear runtime readiness marker; continuing shutdown", error);
+  }
 }
 
 async function main(): Promise<void> {
@@ -78,6 +107,8 @@ async function main(): Promise<void> {
     resources: runtimeGuardResources(mediaRoot, config.telegramToken),
   });
   removeRuntimeExitHook = activeRuntimeGuard.installProcessExitHook();
+  activeRuntimeReadiness = createRuntimeReadinessMarker();
+  removeReadinessExitHook = activeRuntimeReadiness.installProcessExitHook();
 
   // Start Prometheus metrics server if configured
   if (config.metricsPort !== undefined) {
@@ -122,6 +153,7 @@ async function main(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     log.info("main", `Received ${signal}, shutting down...`);
+    clearRuntimeReadinessSafely();
     if (telegramStartupTimeout) clearTimeout(telegramStartupTimeout);
     telegramPollingRestart?.cancel();
     if (triggerInput) await triggerInput.stop();
@@ -319,6 +351,7 @@ async function main(): Promise<void> {
               }
               setBotUsername(botInfo.username);
               log.info("main", `Telegram bot @${botInfo.username} is running (id: ${botInfo.id})`);
+              publishRuntimeReadiness();
               // No global media wipe on startup: grammY invokes onStart before the
               // first getUpdates, so polling ownership isn't proven yet. A blanket
               // wipe here can clobber files that an overlapping old instance is
@@ -355,6 +388,7 @@ async function main(): Promise<void> {
         finishAgentPlatformStartup();
         return;
       }
+      publishRuntimeReadiness();
       discordClient = result.client;
       log.info("main", "Discord bot started");
     } catch (err) {
@@ -378,6 +412,7 @@ async function main(): Promise<void> {
 
 main().catch(async (err) => {
   await stopMetricsServer();
+  clearRuntimeReadinessSafely();
   releaseRuntimeGuard();
   if (err instanceof TriggerInputBindError) {
     log.error("main", "Trigger input address is in use");

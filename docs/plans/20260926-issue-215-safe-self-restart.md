@@ -39,11 +39,11 @@ npm run workspace:validate -- --workspace test-fixtures/minimal-workspace
 
 **Serves:** The operator requires actual ready-service verification, bounded recovery, and no manual restart or diagnosis for the recoverable startup case.
 
-- [ ] Add one owner-written atomic runtime readiness marker containing the current PID; publish it only after Telegram `onStart` or successful Discord startup, and clear it only when owned by the exiting process.
-- [ ] Make restart worker success require the launchd PID and readiness-marker PID to match; preserve old-PID rejection and bound the readiness wait.
-- [ ] After bootstrap/readiness failure, cleanly unregister and retry the same already-validated plist exactly once; retain an honest terminal failure if the bounded retry cannot become ready.
-- [ ] Preserve request-mode independence, fixed helper ownership, validation-before-bootout, teardown safety, and the existing 60-second runtime drain.
-- [ ] Extend isolated tests for invalid config, PID-without-readiness, readiness success, one-attempt recovery success, exhausted recovery, stale marker, and marker lifecycle; run focused tests.
+- [x] Add one owner-written atomic runtime readiness marker containing the current PID; publish it only after Telegram `onStart` or successful Discord startup, and clear it only when owned by the exiting process.
+- [x] Make restart worker success require the launchd PID and readiness-marker PID to match; preserve old-PID rejection and bound the readiness wait.
+- [x] After bootstrap/readiness failure, cleanly unregister and retry the same already-validated plist exactly once; retain an honest terminal failure if the bounded retry cannot become ready.
+- [x] Preserve request-mode independence, fixed helper ownership, validation-before-bootout, teardown safety, and the existing 60-second runtime drain.
+- [x] Extend isolated tests for invalid config, PID-without-readiness, readiness success, one-attempt recovery success, exhausted recovery, stale marker, and marker lifecycle; run focused tests.
 
 ### Task 2: Document and verify the narrowed contract
 
