@@ -962,13 +962,13 @@ printf 'args=%s\n' "$*" > "$NODE_CAPTURE"
     }
   });
 
-  it("worker rejects a stale readiness marker whose PID does not match launchd", () => {
+  it("worker clears a stale readiness marker before bootstrap even when its PID matches the replacement", () => {
     const h = createHarness();
     try {
       const statusPath = join(h.dir, "worker-stale-ready.status");
       const readyPath = join(h.dir, "runtime", "bot-ready");
       mkdirSync(dirname(readyPath), { recursive: true });
-      writeFileSync(readyPath, "1111\n");
+      writeFileSync(readyPath, "2222\n");
       h.setState({
         registered: 0,
         label: "ai.minime.telegram-bot",
@@ -985,7 +985,7 @@ printf 'args=%s\n' "$*" > "$NODE_CAPTURE"
 
       assert.notStrictEqual(status, 0);
       assert.strictEqual(readStatus(statusPath).error, "readiness timeout");
-      assert.equal(readFileSync(readyPath, "utf8"), "1111\n");
+      assert.equal(existsSync(readyPath), false);
       assert.strictEqual(h.readState().bot_bootstrap_count, "2");
     } finally {
       cleanup(h);

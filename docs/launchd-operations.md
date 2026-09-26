@@ -69,7 +69,9 @@ Operator environment knobs:
 - `RESTART_READY_PATH` overrides the application readiness marker path. By
   default it is isolated under the control workspace's `.tmp` directory when
   `MINIME_CONTROL_WORKSPACE_ROOT` is set, with
-  `~/Library/Logs/minime-bot/restart/bot-ready` as the fallback.
+  `~/Library/Logs/minime-bot/restart/bot-ready` as the fallback. Configure the
+  same absolute override in the bot service environment and the restart
+  invocation; in-bot Pi sessions preserve that value for self-restart.
 - `RESTART_WORKER_NOT_BEFORE_DELAY` controls the worker's bounded delay before
   bot `bootout`; `RESTART_MAX_WORKER_NOT_BEFORE_DELAY` caps that delay.
 

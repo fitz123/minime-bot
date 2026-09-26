@@ -94,6 +94,7 @@ import {
   MINIME_CONTROL_WORKSPACE_ROOT_ENV,
   MINIME_INSTANCE_CONFIG_PATH_ENV,
 } from "../workspace-contract.js";
+import { RUNTIME_READINESS_PATH_ENV } from "../runtime-readiness.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const packageRoot = resolve(__dirname, "..", "..");
@@ -1463,6 +1464,7 @@ describe("buildPiSpawnEnv", () => {
     assert.equal(shouldIncludePiChildEnvKey(MINIME_BOT_PI_SESSION_AGENT_ID_ENV), true);
     assert.equal(shouldIncludePiChildEnvKey(MINIME_BOT_PI_SESSION_ENV), true);
     assert.equal(shouldIncludePiChildEnvKey(MINIME_OUTBOX_ENV), true);
+    assert.equal(shouldIncludePiChildEnvKey(RUNTIME_READINESS_PATH_ENV), true);
     assert.equal(shouldIncludePiChildEnvKey(RETIRED_CONTROL_WORKSPACE_ENV), false);
     assert.equal(shouldIncludePiChildEnvKey(RETIRED_AGENT_WORKSPACE_ENV), false);
   });
@@ -1510,6 +1512,7 @@ describe("buildPiSpawnEnv", () => {
       MINIME_BOT_PI_SESSION_AGENT_ID_ENV,
       MINIME_BOT_PI_SESSION_ENV,
       MINIME_OUTBOX_ENV,
+      RUNTIME_READINESS_PATH_ENV,
       MINIME_CONFIG_PATH_ENV,
       MINIME_CRONS_PATH_ENV,
       MINIME_CONTROL_WORKSPACE_ROOT_ENV,
@@ -1544,6 +1547,7 @@ describe("buildPiSpawnEnv", () => {
       process.env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = "ambient-agent";
       process.env[MINIME_BOT_PI_SESSION_ENV] = "ambient";
       process.env[MINIME_OUTBOX_ENV] = "/tmp/ambient-outbox";
+      process.env[RUNTIME_READINESS_PATH_ENV] = "/tmp/runtime-ready";
       process.env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = "/tmp";
       delete process.env[MINIME_CONFIG_PATH_ENV];
       delete process.env[MINIME_CRONS_PATH_ENV];
@@ -1567,6 +1571,7 @@ describe("buildPiSpawnEnv", () => {
       assert.strictEqual(env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV], undefined);
       assert.strictEqual(env[MINIME_BOT_PI_SESSION_ENV], "1");
       assert.strictEqual(env[MINIME_OUTBOX_ENV], undefined);
+      assert.strictEqual(env[RUNTIME_READINESS_PATH_ENV], "/tmp/runtime-ready");
       assert.strictEqual(env[MINIME_CONTROL_WORKSPACE_ROOT_ENV], "/tmp");
       assert.strictEqual(env[MINIME_CONFIG_PATH_ENV], undefined);
       assert.strictEqual(env[MINIME_CRONS_PATH_ENV], undefined);

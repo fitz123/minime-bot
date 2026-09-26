@@ -229,6 +229,18 @@ read_ready_pid() {
   printf '%s' "$ready_pid"
 }
 
+clear_stale_ready_marker() {
+  if [ ! -e "$RESTART_READY_PATH" ] && [ ! -L "$RESTART_READY_PATH" ]; then
+    return 0
+  fi
+  log "Clearing stale application readiness marker before bootstrap…"
+  if ! rm -f -- "$RESTART_READY_PATH"; then
+    err "failed to clear stale readiness marker: $RESTART_READY_PATH"
+    RESTART_STATUS_ERROR="readiness marker cleanup failed"
+    return 1
+  fi
+}
+
 # PID presence alone is not serving readiness. The application atomically
 # publishes this marker only after a transport has completed startup.
 _pred_running_ready() {
@@ -695,6 +707,8 @@ plist_worker_restart_impl() {
       log "First startup attempt failed (${RESTART_STATUS_ERROR}); making one same-release recovery attempt."
       prepare_recovery_retry || return 1
     fi
+
+    clear_stale_ready_marker || return 1
 
     log "Bootstrapping from ${BOT_PLIST} (attempt ${attempt}/2)…"
     if ! "$LAUNCHCTL_BIN" bootstrap "$DOMAIN" "$BOT_PLIST"; then
