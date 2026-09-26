@@ -302,6 +302,7 @@ function createHarness(): Harness {
         SHUTDOWN_TIMEOUT: "30",
         TEARDOWN_TIMEOUT: "30",
         STARTUP_TIMEOUT: "20",
+        READINESS_STABILITY_SECONDS: "0",
         RESTART_READY_PATH: join(dir, "runtime", "bot-ready"),
         CONFIG_VALIDATE_BIN: "true",
         ...env,
