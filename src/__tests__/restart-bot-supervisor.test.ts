@@ -877,6 +877,26 @@ printf 'args=%s\n' "$*" > "$NODE_CAPTURE"
     }
   });
 
+  it("worker does not report success for a new PID without application readiness", () => {
+    const h = createHarness();
+    try {
+      const statusPath = join(h.dir, "worker-not-ready.status");
+      const readyPath = join(h.dir, "runtime", "bot-ready");
+      h.setState({ registered: 0, label: "ai.minime.telegram-bot", next_pid: 2222 });
+
+      const { status } = h.run(["--worker", "--plist"], {
+        RESTART_STATUS_PATH: statusPath,
+        RESTART_READY_PATH: readyPath,
+        STARTUP_TIMEOUT: "1",
+      });
+
+      assert.notStrictEqual(status, 0);
+      assert.strictEqual(readStatus(statusPath).status, "failure");
+    } finally {
+      cleanup(h);
+    }
+  });
+
   it("worker rejects a stale old PID after bootstrap", () => {
     const h = createHarness();
     try {
