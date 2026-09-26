@@ -51,9 +51,9 @@ npm run workspace:validate -- --workspace test-fixtures/minimal-workspace
 
 **Serves:** The operator requested all necessary tests and an honest distinction between tested package guarantees and untested live activation.
 
-- [ ] Document that `--plist` is a current-release self-restart, what application readiness means, and that failed startup receives one same-release retry rather than version rollback.
-- [ ] Run the full repository validation commands and fix only branch-caused failures.
-- [ ] Perform a final scope/privacy cut pass and leave the branch ready for PR/CI/Copilot review.
+- [x] Document that `--plist` is a current-release self-restart, what application readiness means, and that failed startup receives one same-release retry rather than version rollback.
+- [x] Run the full repository validation commands and fix only branch-caused failures.
+- [x] Perform a final scope/privacy cut pass and leave the branch ready for PR/CI/Copilot review.
 
 ## Post-completion
 
