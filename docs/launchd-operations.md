@@ -7,10 +7,11 @@ this repository.
 
 ## Self-safe bot restart
 
-`scripts/restart-bot.sh --plist` is the canonical launchd restart path. It is
-safe to invoke from a live bot or Pi turn because it schedules an independent
-one-shot launchd supervisor and returns before `ai.minime.telegram-bot` is
-stopped.
+`scripts/restart-bot.sh --plist` is the canonical launchd current-release
+self-restart path. It is safe to invoke from a live bot or Pi turn because it
+schedules an independent one-shot launchd supervisor and returns before
+`ai.minime.telegram-bot` is stopped. It does not change the active release
+slot and is not a deployment, release cutover, or version rollback.
 
 The request path:
 
@@ -31,8 +32,19 @@ The request path:
 
 The worker path then performs the actual launchd unregister/register sequence
 outside the original bot process. It waits a bounded not-before delay, validates
-again before `bootout`, waits for launchd teardown, bootstraps the bot plist,
-waits for a running PID, and writes minimal status/log records.
+again before `bootout`, waits for launchd teardown, and bootstraps the same
+validated bot plist. A running PID alone is not serving readiness. Success
+requires launchd's PID to match the PID in the application-owned readiness
+marker after Telegram `onStart` or successful Discord startup, with that match
+remaining stable for the bounded readiness window. The process writes the
+marker atomically and removes it on shutdown only while it still owns the
+published PID, so a stale or superseded marker cannot establish readiness.
+
+If the first bootstrap fails or the replacement does not reach that readiness
+boundary, the worker cleanly unregisters the failed startup and bootstraps the
+same plist exactly once more. This is one same-release recovery attempt, not
+version rollback: the active release slot never changes. If the second attempt
+does not become ready, the status and log retain an honest terminal failure.
 
 Shell detach is not used for the self-restart contract. A detached shell
 started by a live bot process can still depend on the process tree, session, or
@@ -54,6 +66,12 @@ Operator environment knobs:
   label remains fixed as `ai.minime.telegram-bot.restart-supervisor`.
 - `RESTART_STATUS_PATH` and `RESTART_LOG_PATH` override the request status and
   log paths.
+- `RESTART_READY_PATH` overrides the application readiness marker path. By
+  default it is isolated under the control workspace's `.tmp` directory when
+  `MINIME_CONTROL_WORKSPACE_ROOT` is set, with
+  `~/Library/Logs/minime-bot/restart/bot-ready` as the fallback. Configure the
+  same absolute override in the bot service environment and the restart
+  invocation; in-bot Pi sessions preserve that value for self-restart.
 - `RESTART_WORKER_NOT_BEFORE_DELAY` controls the worker's bounded delay before
   bot `bootout`; `RESTART_MAX_WORKER_NOT_BEFORE_DELAY` caps that delay.
 

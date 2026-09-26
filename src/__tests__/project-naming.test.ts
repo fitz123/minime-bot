@@ -268,6 +268,25 @@ describe("project naming", () => {
     );
   });
 
+  it("documents the current-release readiness-gated restart contract", () => {
+    for (const [label, content] of [
+      ["README.md", normalizeDoc(readme)],
+      ["docs/launchd-operations.md", normalizeDoc(launchdOperations)],
+    ] as const) {
+      for (const expected of [
+        "current-release self-restart",
+        "launchd's PID",
+        "application-owned readiness marker",
+        "Telegram `onStart` or successful Discord startup",
+        "running PID alone is not serving readiness",
+        "one same-release recovery attempt",
+        "not version rollback",
+      ]) {
+        assert.ok(content.includes(expected), `${label} should document ${expected}`);
+      }
+    }
+  });
+
   it("README states that private workspace files are not bundled", () => {
     assert.ok(readme.includes("It does not bundle a private control workspace"));
     for (const privateRootPath of [

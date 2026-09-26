@@ -51,6 +51,12 @@ RESTART_SUPERVISOR_PLIST="${RESTART_SUPERVISOR_PLIST:-}"
 RESTART_REQUEST_ID="${RESTART_REQUEST_ID:-}"
 RESTART_STATUS_PATH="${RESTART_STATUS_PATH:-}"
 RESTART_LOG_PATH="${RESTART_LOG_PATH:-}"
+if [ -n "${MINIME_CONTROL_WORKSPACE_ROOT:-}" ]; then
+  DEFAULT_RESTART_READY_PATH="$MINIME_CONTROL_WORKSPACE_ROOT/.tmp/bot-ready"
+else
+  DEFAULT_RESTART_READY_PATH="$HOME/Library/Logs/minime-bot/restart/bot-ready"
+fi
+RESTART_READY_PATH="${RESTART_READY_PATH:-$DEFAULT_RESTART_READY_PATH}"
 
 # Test-only: override the validator with a single executable (no args, no eval).
 # Tests set this to `true` / `false` to simulate validation pass / fail paths.
@@ -60,6 +66,7 @@ CONFIG_VALIDATE_BIN="${CONFIG_VALIDATE_BIN:-}"
 SHUTDOWN_TIMEOUT="${SHUTDOWN_TIMEOUT:-90}"
 TEARDOWN_TIMEOUT="${TEARDOWN_TIMEOUT:-90}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-60}"
+READINESS_STABILITY_SECONDS="${READINESS_STABILITY_SECONDS:-3}"
 POLL_INTERVAL="${POLL_INTERVAL:-1}"
 RESTART_WORKER_NOT_BEFORE_DELAY="${RESTART_WORKER_NOT_BEFORE_DELAY:-2}"
 RESTART_MAX_WORKER_NOT_BEFORE_DELAY="${RESTART_MAX_WORKER_NOT_BEFORE_DELAY:-30}"
@@ -182,6 +189,7 @@ wait_until() {
 }
 
 _old_pid=""
+_failed_pid=""
 _pred_old_pid_gone() {
   local cur rc=0
   cur=$(get_pid 2>/dev/null) || rc=$?
@@ -200,12 +208,71 @@ _pred_unregistered() {
   [ "$rc" -eq 1 ]
 }
 
-# Requires a successful query AND a non-empty PID that differs from the old PID,
-# so a stale `launchctl list` response can't be mistaken for the new process.
+# Requires a successful query AND a non-empty PID that differs from the old PID
+# and any failed first attempt, so stale launchd state cannot prove startup.
 _pred_running_pid() {
   local pid rc=0
   pid=$(get_pid 2>/dev/null) || rc=$?
-  [ "$rc" -eq 0 ] && [ -n "$pid" ] && [ "$pid" != "$_old_pid" ]
+  [ "$rc" -eq 0 ] \
+    && [ -n "$pid" ] \
+    && [ "$pid" != "$_old_pid" ] \
+    && { [ -z "$_failed_pid" ] || [ "$pid" != "$_failed_pid" ]; }
+}
+
+read_ready_pid() {
+  local ready_pid
+  [ -f "$RESTART_READY_PATH" ] || return 1
+  IFS= read -r ready_pid < "$RESTART_READY_PATH" || return 1
+  case "$ready_pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  printf '%s' "$ready_pid"
+}
+
+clear_stale_ready_marker() {
+  if [ ! -e "$RESTART_READY_PATH" ] && [ ! -L "$RESTART_READY_PATH" ]; then
+    return 0
+  fi
+  log "Clearing stale application readiness marker before bootstrap…"
+  if ! rm -f -- "$RESTART_READY_PATH"; then
+    err "failed to clear stale readiness marker: $RESTART_READY_PATH"
+    RESTART_STATUS_ERROR="readiness marker cleanup failed"
+    return 1
+  fi
+}
+
+# PID presence alone is not serving readiness. The application atomically
+# publishes this marker only after a transport has completed startup.
+_pred_running_ready() {
+  local pid ready_pid rc=0
+  pid=$(get_pid 2>/dev/null) || rc=$?
+  [ "$rc" -eq 0 ] && [ -n "$pid" ] || return 1
+  [ "$pid" != "$_old_pid" ] || return 1
+  [ -z "$_failed_pid" ] || [ "$pid" != "$_failed_pid" ] || return 1
+  ready_pid=$(read_ready_pid 2>/dev/null) || return 1
+  [ "$ready_pid" = "$pid" ]
+}
+
+wait_for_running_ready() {
+  if ! wait_until "$STARTUP_TIMEOUT" _pred_running_ready; then
+    return 1
+  fi
+  case "$READINESS_STABILITY_SECONDS" in
+    ''|*[!0-9]*)
+      err "invalid READINESS_STABILITY_SECONDS"
+      RESTART_STATUS_ERROR="invalid readiness stability window"
+      return 1
+      ;;
+  esac
+  local ready_pid deadline
+  ready_pid=$(get_pid 2>/dev/null) || return 1
+  deadline=$(( $(date +%s) + READINESS_STABILITY_SECONDS ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    _pred_running_ready || return 1
+    [ "$(get_pid 2>/dev/null || true)" = "$ready_pid" ] || return 1
+    sleep "$POLL_INTERVAL"
+  done
+  _pred_running_ready && [ "$(get_pid 2>/dev/null || true)" = "$ready_pid" ]
 }
 
 validate_plist() {
@@ -401,9 +468,11 @@ generate_supervisor_plist() {
     write_env_entry "RESTART_REQUEST_ID" "$request_id"
     write_env_entry "RESTART_STATUS_PATH" "$status_path"
     write_env_entry "RESTART_LOG_PATH" "$log_path"
+    write_env_entry "RESTART_READY_PATH" "$RESTART_READY_PATH"
     write_env_entry "SHUTDOWN_TIMEOUT" "$SHUTDOWN_TIMEOUT"
     write_env_entry "TEARDOWN_TIMEOUT" "$TEARDOWN_TIMEOUT"
     write_env_entry "STARTUP_TIMEOUT" "$STARTUP_TIMEOUT"
+    write_env_entry "READINESS_STABILITY_SECONDS" "$READINESS_STABILITY_SECONDS"
     write_env_entry "POLL_INTERVAL" "$POLL_INTERVAL"
     write_env_entry "RESTART_WORKER_NOT_BEFORE_DELAY" "$RESTART_WORKER_NOT_BEFORE_DELAY"
     write_env_entry "RESTART_MAX_WORKER_NOT_BEFORE_DELAY" "$RESTART_MAX_WORKER_NOT_BEFORE_DELAY"
@@ -532,6 +601,48 @@ plist_worker_guard() {
   fi
 }
 
+prepare_recovery_retry() {
+  local failed_pid registration_rc=0
+  failed_pid=$(get_pid 2>/dev/null) || registration_rc=$?
+  case "$registration_rc" in
+  0)
+    if [ -n "$failed_pid" ]; then
+      _failed_pid="$failed_pid"
+    fi
+    log "Unregistering failed startup before the one recovery attempt…"
+    "$LAUNCHCTL_BIN" bootout "$SERVICE" >/dev/null 2>&1 || true
+    if ! wait_until "$TEARDOWN_TIMEOUT" _pred_unregistered; then
+      err "failed startup did not unregister within ${TEARDOWN_TIMEOUT}s; recovery aborted"
+      RESTART_STATUS_ERROR="recovery teardown timeout"
+      return 1
+    fi
+    ;;
+  1)
+    log "Failed startup is not registered; proceeding with the one recovery attempt."
+    ;;
+  *)
+    err "launchctl list failed while preparing recovery; refusing to bootstrap over unknown service state"
+    RESTART_STATUS_ERROR="unknown recovery launchd state"
+    return 1
+    ;;
+  esac
+}
+
+record_readiness_failure() {
+  local candidate_pid rc=0
+  candidate_pid=$(get_pid 2>/dev/null) || rc=$?
+  if [ "$rc" -eq 0 ] \
+    && [ -n "$candidate_pid" ] \
+    && [ "$candidate_pid" != "$_old_pid" ] \
+    && { [ -z "$_failed_pid" ] || [ "$candidate_pid" != "$_failed_pid" ]; }; then
+    err "running PID $candidate_pid did not publish matching application readiness within ${STARTUP_TIMEOUT}s"
+    RESTART_STATUS_ERROR="readiness timeout"
+  else
+    err "service has no running PID with matching application readiness within ${STARTUP_TIMEOUT}s"
+    RESTART_STATUS_ERROR="startup timeout"
+  fi
+}
+
 plist_worker_restart_impl() {
   if [ ! -f "$BOT_PLIST" ]; then
     err "plist not found: $BOT_PLIST"
@@ -590,25 +701,42 @@ plist_worker_restart_impl() {
     ;;
   esac
 
-  log "Bootstrapping from ${BOT_PLIST}…"
-  if ! "$LAUNCHCTL_BIN" bootstrap "$DOMAIN" "$BOT_PLIST"; then
-    err "launchctl bootstrap failed"
-    RESTART_STATUS_ERROR="bot bootstrap failed"
-    return 1
-  fi
+  local attempt
+  for attempt in 1 2; do
+    if [ "$attempt" -eq 2 ]; then
+      log "First startup attempt failed (${RESTART_STATUS_ERROR}); making one same-release recovery attempt."
+      prepare_recovery_retry || return 1
+    fi
 
-  log "Waiting up to ${STARTUP_TIMEOUT}s for a running PID…"
-  if ! wait_until "$STARTUP_TIMEOUT" _pred_running_pid; then
-    err "service registered but no running PID within ${STARTUP_TIMEOUT}s"
-    RESTART_STATUS_ERROR="startup timeout"
-    return 1
-  fi
+    clear_stale_ready_marker || return 1
 
-  local new_pid
-  new_pid=$(get_pid 2>/dev/null || true)
-  RESTART_STATUS_NEW_PID="$new_pid"
-  log "Restart complete. New PID: ${new_pid:-unknown}"
-  echo "$new_pid"
+    log "Bootstrapping from ${BOT_PLIST} (attempt ${attempt}/2)…"
+    if ! "$LAUNCHCTL_BIN" bootstrap "$DOMAIN" "$BOT_PLIST"; then
+      err "launchctl bootstrap failed on attempt ${attempt}/2"
+      RESTART_STATUS_ERROR="bot bootstrap failed"
+      continue
+    fi
+
+    RESTART_STATUS_ERROR=""
+    log "Waiting up to ${STARTUP_TIMEOUT}s for matching launchd and application-ready PIDs, then a ${READINESS_STABILITY_SECONDS}s stable window…"
+    if ! wait_for_running_ready; then
+      if [ -z "$RESTART_STATUS_ERROR" ]; then
+        record_readiness_failure
+      fi
+      continue
+    fi
+
+    local new_pid
+    new_pid=$(get_pid 2>/dev/null || true)
+    RESTART_STATUS_NEW_PID="$new_pid"
+    RESTART_STATUS_ERROR=""
+    log "Restart complete. New PID: ${new_pid:-unknown} (application ready)"
+    echo "$new_pid"
+    return 0
+  done
+
+  err "service did not become application-ready after the bounded recovery attempt"
+  return 1
 }
 
 plist_worker_restart() {

@@ -760,6 +760,16 @@ launchd `bootout`/`bootstrap` sequence. If that fixed supervisor label is
 already running, the request refuses to replace it instead of interrupting an
 in-progress restart.
 
+This `--plist` flow is a current-release self-restart: it does not change the
+active release slot. A replacement is successful only when launchd's PID
+matches the PID in the application-owned readiness marker after Telegram
+`onStart` or successful Discord startup, and the match remains stable for the
+bounded readiness window. A running PID alone is not serving readiness. If the
+first bootstrap or readiness check fails, the worker cleanly unregisters that
+failed startup and makes exactly one same-release recovery attempt from the
+same validated plist. That retry is not version rollback; a second failure is
+reported as a terminal restart failure.
+
 Explicit foreground mode is for operator debugging only:
 
 ```bash

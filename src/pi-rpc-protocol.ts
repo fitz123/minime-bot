@@ -40,6 +40,7 @@ import {
 } from "./pi-extensions/acknowledged-steer.js";
 import { isReasoningOnlyLengthAgentEnd } from "./pi-extensions/compaction-continuation.js";
 import { MINIME_OUTBOX_ENV } from "./pi-runtime-env.js";
+import { RUNTIME_READINESS_PATH_ENV } from "./runtime-readiness.js";
 import {
   inspectInteractiveSessionBinding,
   type InteractiveSessionBinding,
@@ -212,6 +213,7 @@ const PI_CHILD_ENV_KEY_ALLOWLIST = new Set([
   "PI_SHARE_VIEWER_URL",
   "PI_SKIP_VERSION_CHECK",
   "PI_TELEMETRY",
+  RUNTIME_READINESS_PATH_ENV,
   "SHELL",
   "SSL_CERT_DIR",
   "SSL_CERT_FILE",

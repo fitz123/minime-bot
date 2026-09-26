@@ -117,6 +117,7 @@ case "\$cmd" in
       exit 0
     fi
     if [ "\$(get bootstrap_fail)" = "1" ]; then
+      incr bot_bootstrap_count
       echo "Bootstrap failed: 5: Input/output error" >&2
       exit 5
     fi
@@ -128,9 +129,22 @@ case "\$cmd" in
       sig=\$(node -e "const fs=require('fs'),c=require('crypto');process.stdout.write(c.createHash('sha1').update(fs.readFileSync(process.argv[1])).digest('hex'))" "\$plist_path")
       set_kv bootstrapped_sig "\$sig"
     fi
+    incr bot_bootstrap_count
+    bot_bootstrap_count=\$(get bot_bootstrap_count)
     np=\$(get next_pid); [ -z "\$np" ] && np=99999
+    retry_np=\$(get retry_next_pid)
+    if [ "\$bot_bootstrap_count" -gt 1 ] && [ -n "\$retry_np" ]; then
+      np="\$retry_np"
+    fi
     set_kv pid "\$np"
     set_kv registered 1
+    ready_on_bootstrap=\$(get ready_on_bootstrap)
+    if [ -n "\$ready_on_bootstrap" ] && [ "\$ready_on_bootstrap" -gt 0 ] && [ "\$bot_bootstrap_count" -ge "\$ready_on_bootstrap" ] && [ -n "\${RESTART_READY_PATH:-}" ]; then
+      mkdir -p "\$(dirname "\$RESTART_READY_PATH")"
+      ready_tmp="\${RESTART_READY_PATH}.mock.\$\$"
+      printf '%s\n' "\$np" > "\$ready_tmp"
+      mv "\$ready_tmp" "\$RESTART_READY_PATH"
+    fi
     ;;
   *)
     echo "mock-launchctl: unknown command: \$cmd" >&2
@@ -256,6 +270,8 @@ function createHarness(): Harness {
     return out;
   };
 
+  setState({ ready_on_bootstrap: 1 });
+
   const readLines = (path: string): string[] => {
     if (!existsSync(path)) return [];
     return readFileSync(path, "utf8").split("\n").filter(Boolean);
@@ -286,6 +302,8 @@ function createHarness(): Harness {
         SHUTDOWN_TIMEOUT: "30",
         TEARDOWN_TIMEOUT: "30",
         STARTUP_TIMEOUT: "20",
+        READINESS_STABILITY_SECONDS: "0",
+        RESTART_READY_PATH: join(dir, "runtime", "bot-ready"),
         CONFIG_VALIDATE_BIN: "true",
         ...env,
       },

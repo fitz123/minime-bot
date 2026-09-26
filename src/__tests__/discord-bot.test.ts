@@ -128,6 +128,67 @@ describe("Discord media failure handling", () => {
 });
 
 describe("Discord shutdown", () => {
+  it("notifies readiness before slash-command registration completes", async () => {
+    const originalLogin = Client.prototype.login;
+    const originalPut = REST.prototype.put;
+    let releaseRegistration!: () => void;
+    let markRegistrationStarted!: () => void;
+    const registrationPending = new Promise<void>((resolve) => { releaseRegistration = resolve; });
+    const registrationStarted = new Promise<void>((resolve) => { markRegistrationStarted = resolve; });
+    Client.prototype.login = async function () {
+      this.user = { id: "bot-1", tag: "test-bot" } as never;
+      return "test-token";
+    };
+    REST.prototype.put = async () => {
+      markRegistrationStarted();
+      await registrationPending;
+      return {} as never;
+    };
+
+    const config: BotConfig = {
+      whisperModelPath: "/tmp/minime-test-whisper-model.bin",
+      agents: { main: { id: "main", workspaceCwd: "/tmp/test", model: "gpt-5.5" } },
+      bindings: [],
+      sessionDefaults: {
+        idleTimeoutMs: 60_000,
+        maxConcurrentSessions: 2,
+        maxMessageAgeMs: 300_000,
+        requireMention: false,
+        maxMediaBytes: 10,
+      },
+    };
+    const discordConfig: DiscordConfig = {
+      token: "test-token",
+      bindings: [{ channelId: "channel-1", guildId: "guild-1", agentId: "main", kind: "channel", requireMention: false }],
+    };
+    const sessionManager = {
+      sendSessionMessage: () => { throw new Error("unexpected"); },
+    } as unknown as SessionManager;
+    let ready: DiscordBotResult | undefined;
+    let settled = false;
+
+    try {
+      const starting = createDiscordBot(config, discordConfig, sessionManager, {
+        onReady: (result) => { ready = result; },
+      }).then((result) => {
+        settled = true;
+        return result;
+      });
+
+      await registrationStarted;
+      assert.ok(ready);
+      assert.equal(settled, false);
+
+      releaseRegistration();
+      const result = await starting;
+      assert.equal(result, ready);
+    } finally {
+      Client.prototype.login = originalLogin;
+      REST.prototype.put = originalPut;
+      releaseRegistration();
+    }
+  });
+
   it("publishes a shutdown handle before login completes", async () => {
     const originalLogin = Client.prototype.login;
     const originalDestroy = Client.prototype.destroy;
