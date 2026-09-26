@@ -5,8 +5,11 @@ import { dirname, join } from "node:path";
 export const RUNTIME_READINESS_PATH_ENV = "RESTART_READY_PATH";
 
 export function resolveRuntimeReadinessPath(env: NodeJS.ProcessEnv = process.env): string {
-  return env[RUNTIME_READINESS_PATH_ENV]
-    ?? join(env.HOME || homedir(), "Library", "Logs", "minime-bot", "restart", "bot-ready");
+  if (env[RUNTIME_READINESS_PATH_ENV]) return env[RUNTIME_READINESS_PATH_ENV];
+  if (env.MINIME_CONTROL_WORKSPACE_ROOT) {
+    return join(env.MINIME_CONTROL_WORKSPACE_ROOT, ".tmp", "bot-ready");
+  }
+  return join(env.HOME || homedir(), "Library", "Logs", "minime-bot", "restart", "bot-ready");
 }
 
 export interface RuntimeReadinessMarkerOptions {
