@@ -17,13 +17,24 @@ import {
 } from "../runtime-readiness.js";
 
 describe("runtime readiness marker", () => {
-  it("uses the restart worker's default path and honors an explicit override", () => {
+  it("isolates the default by control workspace and honors an explicit override", () => {
     assert.equal(
       resolveRuntimeReadinessPath({ HOME: "/example/home" }),
       join("/example/home", "Library", "Logs", "minime-bot", "restart", "bot-ready"),
     );
     assert.equal(
-      resolveRuntimeReadinessPath({ HOME: "/ignored", RESTART_READY_PATH: "/runtime/custom-ready" }),
+      resolveRuntimeReadinessPath({
+        HOME: "/example/home",
+        MINIME_CONTROL_WORKSPACE_ROOT: "/control/primary",
+      }),
+      join("/control/primary", ".tmp", "bot-ready"),
+    );
+    assert.equal(
+      resolveRuntimeReadinessPath({
+        HOME: "/ignored",
+        MINIME_CONTROL_WORKSPACE_ROOT: "/control/ignored",
+        RESTART_READY_PATH: "/runtime/custom-ready",
+      }),
       "/runtime/custom-ready",
     );
   });
