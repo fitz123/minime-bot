@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 2026.9.1
+
+- Gate supervised bot restarts on application-owned per-process readiness and
+  bounded stability, with verified incumbent recovery when startup fails (#215).
+
 ## 2026.9.0
 
 - Probe Pi through its correlated RPC control plane before enforcing the fixed
