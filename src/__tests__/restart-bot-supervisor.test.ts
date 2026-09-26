@@ -66,6 +66,11 @@ apply() {
     del_kv pid
     del_kv bootout_at
   fi
+  sat=\$(get startup_crash_at)
+  if [ -n "\$sat" ] && [ "\$(now)" -ge "\$sat" ]; then
+    del_kv pid
+    del_kv startup_crash_at
+  fi
 }
 
 cmd="\${1:-}"; shift || true
@@ -172,6 +177,9 @@ case "\$cmd" in
       ready_tmp="\${RESTART_READY_PATH}.mock.\$\$"
       printf '%s\n' "\$np" > "\$ready_tmp"
       mv "\$ready_tmp" "\$RESTART_READY_PATH"
+    fi
+    if [ "\$(get unstable_ready)" = "1" ]; then
+      set_kv startup_crash_at \$(( \$(now) + 1 ))
     fi
     ;;
   *)
@@ -321,6 +329,7 @@ function createHarness(): Harness {
         SHUTDOWN_TIMEOUT: "10",
         TEARDOWN_TIMEOUT: "10",
         STARTUP_TIMEOUT: "10",
+        READINESS_STABILITY_SECONDS: "0",
         RESTART_WORKER_NOT_BEFORE_DELAY: "0",
         RESTART_MAX_WORKER_NOT_BEFORE_DELAY: "1",
         RESTART_READY_PATH: join(dir, "runtime", "bot-ready"),
@@ -471,6 +480,7 @@ describe("restart-bot.sh supervisor mode", () => {
           RESTART_STATUS_PATH: plistStringDict(plist, "EnvironmentVariables").RESTART_STATUS_PATH,
           RESTART_LOG_PATH: plistStringDict(plist, "EnvironmentVariables").RESTART_LOG_PATH,
           RESTART_READY_PATH: plistStringDict(plist, "EnvironmentVariables").RESTART_READY_PATH,
+          READINESS_STABILITY_SECONDS: plistStringDict(plist, "EnvironmentVariables").READINESS_STABILITY_SECONDS,
         },
         {
           BOT_PLIST: h.plist,
@@ -487,6 +497,7 @@ describe("restart-bot.sh supervisor mode", () => {
           RESTART_STATUS_PATH: statusPath,
           RESTART_LOG_PATH: logPath,
           RESTART_READY_PATH: join(h.dir, "runtime", "bot-ready"),
+          READINESS_STABILITY_SECONDS: "0",
         },
       );
       const env = plistStringDict(plist, "EnvironmentVariables");
@@ -1006,6 +1017,33 @@ printf 'args=%s\n' "$*" > "$NODE_CAPTURE"
       const state = h.readState();
       assert.strictEqual(state.bot_bootstrap_count, "2");
       assert.strictEqual(state.bot_bootout_count, "2");
+    } finally {
+      cleanup(h);
+    }
+  });
+
+  it("worker does not accept a ready marker from a crash-looping PID", () => {
+    const h = createHarness();
+    try {
+      const statusPath = join(h.dir, "worker-crash-loop.status");
+      h.setState({
+        registered: 0,
+        label: "ai.minime.telegram-bot",
+        next_pid: 2222,
+        retry_next_pid: 3333,
+        ready_on_bootstrap: 1,
+        unstable_ready: 1,
+      });
+
+      const { status } = h.run(["--worker", "--plist"], {
+        RESTART_STATUS_PATH: statusPath,
+        STARTUP_TIMEOUT: "2",
+        READINESS_STABILITY_SECONDS: "2",
+      });
+
+      assert.notStrictEqual(status, 0);
+      assert.strictEqual(readStatus(statusPath).status, "failure");
+      assert.strictEqual(h.readState().bot_bootstrap_count, "2");
     } finally {
       cleanup(h);
     }
