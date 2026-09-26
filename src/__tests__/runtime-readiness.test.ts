@@ -54,7 +54,7 @@ describe("runtime readiness marker", () => {
 
       target.emit("exit", 0);
       assert.equal(existsSync(path), false);
-      assert.equal(marker.clear(), false);
+      assert.equal(marker.clear(), true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -72,7 +72,7 @@ describe("runtime readiness marker", () => {
       assert.equal(readFileSync(path, "utf8"), "2222\n");
 
       const neverPublished = createRuntimeReadinessMarker({ path, pid: 2222 });
-      assert.equal(neverPublished.clear(), false);
+      assert.equal(neverPublished.clear(), true);
       assert.equal(readFileSync(path, "utf8"), "2222\n");
     } finally {
       rmSync(root, { recursive: true, force: true });

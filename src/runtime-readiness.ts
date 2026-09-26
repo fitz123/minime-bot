@@ -53,7 +53,7 @@ export function createRuntimeReadinessMarker(
   };
 
   const clear = (): boolean => {
-    if (!ownsPublication) return false;
+    if (!ownsPublication) return true;
 
     let owner: string;
     try {
