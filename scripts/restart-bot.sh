@@ -51,7 +51,12 @@ RESTART_SUPERVISOR_PLIST="${RESTART_SUPERVISOR_PLIST:-}"
 RESTART_REQUEST_ID="${RESTART_REQUEST_ID:-}"
 RESTART_STATUS_PATH="${RESTART_STATUS_PATH:-}"
 RESTART_LOG_PATH="${RESTART_LOG_PATH:-}"
-RESTART_READY_PATH="${RESTART_READY_PATH:-$HOME/Library/Logs/minime-bot/restart/bot-ready}"
+if [ -n "${MINIME_CONTROL_WORKSPACE_ROOT:-}" ]; then
+  DEFAULT_RESTART_READY_PATH="$MINIME_CONTROL_WORKSPACE_ROOT/.tmp/bot-ready"
+else
+  DEFAULT_RESTART_READY_PATH="$HOME/Library/Logs/minime-bot/restart/bot-ready"
+fi
+RESTART_READY_PATH="${RESTART_READY_PATH:-$DEFAULT_RESTART_READY_PATH}"
 
 # Test-only: override the validator with a single executable (no args, no eval).
 # Tests set this to `true` / `false` to simulate validation pass / fail paths.
@@ -61,6 +66,7 @@ CONFIG_VALIDATE_BIN="${CONFIG_VALIDATE_BIN:-}"
 SHUTDOWN_TIMEOUT="${SHUTDOWN_TIMEOUT:-90}"
 TEARDOWN_TIMEOUT="${TEARDOWN_TIMEOUT:-90}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-60}"
+READINESS_STABILITY_SECONDS="${READINESS_STABILITY_SECONDS:-3}"
 POLL_INTERVAL="${POLL_INTERVAL:-1}"
 RESTART_WORKER_NOT_BEFORE_DELAY="${RESTART_WORKER_NOT_BEFORE_DELAY:-2}"
 RESTART_MAX_WORKER_NOT_BEFORE_DELAY="${RESTART_MAX_WORKER_NOT_BEFORE_DELAY:-30}"
@@ -233,6 +239,28 @@ _pred_running_ready() {
   [ -z "$_failed_pid" ] || [ "$pid" != "$_failed_pid" ] || return 1
   ready_pid=$(read_ready_pid 2>/dev/null) || return 1
   [ "$ready_pid" = "$pid" ]
+}
+
+wait_for_running_ready() {
+  if ! wait_until "$STARTUP_TIMEOUT" _pred_running_ready; then
+    return 1
+  fi
+  case "$READINESS_STABILITY_SECONDS" in
+    ''|*[!0-9]*)
+      err "invalid READINESS_STABILITY_SECONDS"
+      RESTART_STATUS_ERROR="invalid readiness stability window"
+      return 1
+      ;;
+  esac
+  local ready_pid deadline
+  ready_pid=$(get_pid 2>/dev/null) || return 1
+  deadline=$(( $(date +%s) + READINESS_STABILITY_SECONDS ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    _pred_running_ready || return 1
+    [ "$(get_pid 2>/dev/null || true)" = "$ready_pid" ] || return 1
+    sleep "$POLL_INTERVAL"
+  done
+  _pred_running_ready && [ "$(get_pid 2>/dev/null || true)" = "$ready_pid" ]
 }
 
 validate_plist() {
@@ -432,6 +460,7 @@ generate_supervisor_plist() {
     write_env_entry "SHUTDOWN_TIMEOUT" "$SHUTDOWN_TIMEOUT"
     write_env_entry "TEARDOWN_TIMEOUT" "$TEARDOWN_TIMEOUT"
     write_env_entry "STARTUP_TIMEOUT" "$STARTUP_TIMEOUT"
+    write_env_entry "READINESS_STABILITY_SECONDS" "$READINESS_STABILITY_SECONDS"
     write_env_entry "POLL_INTERVAL" "$POLL_INTERVAL"
     write_env_entry "RESTART_WORKER_NOT_BEFORE_DELAY" "$RESTART_WORKER_NOT_BEFORE_DELAY"
     write_env_entry "RESTART_MAX_WORKER_NOT_BEFORE_DELAY" "$RESTART_MAX_WORKER_NOT_BEFORE_DELAY"
@@ -674,9 +703,12 @@ plist_worker_restart_impl() {
       continue
     fi
 
-    log "Waiting up to ${STARTUP_TIMEOUT}s for matching launchd and application-ready PIDs…"
-    if ! wait_until "$STARTUP_TIMEOUT" _pred_running_ready; then
-      record_readiness_failure
+    RESTART_STATUS_ERROR=""
+    log "Waiting up to ${STARTUP_TIMEOUT}s for matching launchd and application-ready PIDs, then a ${READINESS_STABILITY_SECONDS}s stable window…"
+    if ! wait_for_running_ready; then
+      if [ -z "$RESTART_STATUS_ERROR" ]; then
+        record_readiness_failure
+      fi
       continue
     fi
 
