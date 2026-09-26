@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createRuntimeReadinessMarker,
+  publishRuntimeReadinessForBoundTransport,
   resolveRuntimeReadinessPath,
 } from "../runtime-readiness.js";
 
@@ -55,6 +56,21 @@ describe("runtime readiness marker", () => {
       target.emit("exit", 0);
       assert.equal(existsSync(path), false);
       assert.equal(marker.clear(), true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("publishes only for a serving transport with conversational bindings", () => {
+    const root = mkdtempSync(join(tmpdir(), "runtime-readiness-binding-test-"));
+    try {
+      const path = join(root, "bot-ready");
+      const marker = createRuntimeReadinessMarker({ path, pid: 12345, nonce: () => "bound" });
+
+      assert.equal(publishRuntimeReadinessForBoundTransport(marker, 0), false);
+      assert.equal(existsSync(path), false);
+      assert.equal(publishRuntimeReadinessForBoundTransport(marker, 1), true);
+      assert.equal(readFileSync(path, "utf8"), "12345\n");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -47,6 +47,7 @@ import {
 import { shutdownServingRuntime } from "./runtime-shutdown.js";
 import {
   createRuntimeReadinessMarker,
+  publishRuntimeReadinessForBoundTransport,
   type RuntimeReadinessMarker,
 } from "./runtime-readiness.js";
 import {
@@ -68,9 +69,9 @@ function releaseRuntimeGuard(): boolean {
   return released;
 }
 
-function publishRuntimeReadiness(): void {
+function publishRuntimeReadiness(bindingCount: number): void {
   if (!activeRuntimeReadiness) throw new Error("runtime readiness marker is not initialized");
-  activeRuntimeReadiness.publish();
+  publishRuntimeReadinessForBoundTransport(activeRuntimeReadiness, bindingCount);
 }
 
 function clearRuntimeReadiness(): boolean {
@@ -351,6 +352,7 @@ async function main(): Promise<void> {
               }
               setBotUsername(botInfo.username);
               log.info("main", `Telegram bot @${botInfo.username} is running (id: ${botInfo.id})`);
+              publishRuntimeReadiness(config.bindings.length);
               // No global media wipe on startup: grammY invokes onStart before the
               // first getUpdates, so polling ownership isn't proven yet. A blanket
               // wipe here can clobber files that an overlapping old instance is
@@ -389,6 +391,7 @@ async function main(): Promise<void> {
       }
       discordClient = result.client;
       log.info("main", "Discord bot started");
+      publishRuntimeReadiness(config.discord.bindings.length);
     } catch (err) {
       if (!shuttingDown) log.error("main", "Failed to start Discord bot:", err);
     }
@@ -405,7 +408,6 @@ async function main(): Promise<void> {
     await shutdown("startup failure", 1);
     return;
   }
-  publishRuntimeReadiness();
   finishAgentPlatformStartup();
 }
 

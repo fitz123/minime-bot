@@ -26,6 +26,15 @@ export interface RuntimeReadinessMarker {
   installProcessExitHook(target?: NodeJS.Process): () => void;
 }
 
+export function publishRuntimeReadinessForBoundTransport(
+  marker: RuntimeReadinessMarker,
+  bindingCount: number,
+): boolean {
+  if (bindingCount <= 0) return false;
+  marker.publish();
+  return true;
+}
+
 /** Publish and clear the serving-ready PID without allowing an older process to remove a replacement's marker. */
 export function createRuntimeReadinessMarker(
   options: RuntimeReadinessMarkerOptions = {},
