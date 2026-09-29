@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 2026.9.2
+
+- Update all four package-owned Pi packages to 0.99.1 and grammY to 1.46.0;
+  support bundled Pi entrypoints and nullable auth-header types while preserving
+  provider/model settings, session history and existing extension behavior (#219).
+- Refresh the remaining compatible stable dependencies. Keep TypeScript at 6.0.3
+  because extension artifact generation requires compiler APIs absent from 7.0.2.
+
 ## 2026.9.1
 
 - Gate supervised bot restarts on application-owned per-process readiness and
