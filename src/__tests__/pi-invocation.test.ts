@@ -33,8 +33,10 @@ const LEGACY_SESSION_FIXTURE = resolve(
   "fixtures",
   "pi-0.80.6-session.jsonl",
 );
-const RPC_ENTRY = "/opt/package/node_modules/@earendil-works/pi-coding-agent/dist/rpc-entry.js";
-const CLI_ENTRY = "/opt/package/node_modules/@earendil-works/pi-coding-agent/dist/cli.js";
+const PI_ROOT = "/opt/package/node_modules/@earendil-works/pi-coding-agent";
+const MANIFEST_PATH = join(PI_ROOT, "package.json");
+const RPC_ENTRY = join(PI_ROOT, "dist", "bundle", "rpc-entry.js");
+const CLI_ENTRY = join(PI_ROOT, "dist", "bundle", "cli.js");
 
 interface RpcResponse {
   id?: string;
@@ -53,12 +55,15 @@ function fixtureOptions(overrides: PiRuntimeResolveOptions = {}): PiRuntimeResol
       assert.equal(specifier, "@earendil-works/pi-coding-agent/rpc-entry");
       return RPC_ENTRY;
     },
-    exists: (path) => path === RPC_ENTRY || path === CLI_ENTRY,
-    readFile: () => JSON.stringify({
-      name: "@earendil-works/pi-coding-agent",
-      version: EXPECTED_PI_PACKAGE_VERSION,
-      bin: { pi: "dist/cli.js" },
-    }),
+    exists: (path) => path === RPC_ENTRY || path === CLI_ENTRY || path === MANIFEST_PATH,
+    readFile: (path) => {
+      assert.equal(path, MANIFEST_PATH);
+      return JSON.stringify({
+        name: "@earendil-works/pi-coding-agent",
+        version: EXPECTED_PI_PACKAGE_VERSION,
+        bin: { pi: "dist/bundle/cli.js" },
+      });
+    },
     realpath: (path) => path,
     ...overrides,
   };
@@ -140,14 +145,14 @@ describe("package-owned Pi invocation", () => {
     assert.equal(invocation.command, "/usr/local/bin/node");
     assert.deepEqual(invocation.args, [RPC_ENTRY, "--model", "gpt-5.5"]);
     assert.deepEqual(invocation.diagnostic, {
-      expectedVersion: "0.82.1",
-      detectedVersion: "0.82.1",
+      expectedVersion: "0.99.1",
+      detectedVersion: "0.99.1",
       entrypointKind: "rpc",
       versionMismatch: false,
     });
   });
 
-  it("resolves the sibling package CLI for print-mode children without PATH fallback", () => {
+  it("resolves the manifest-declared bundled CLI for print-mode children without PATH fallback", () => {
     const invocation = resolvePiInvocation(["--mode", "json"], fixtureOptions());
 
     assert.deepEqual(invocation, {
@@ -157,11 +162,11 @@ describe("package-owned Pi invocation", () => {
     assert.notEqual(invocation.command, "pi");
   });
 
-  it("resolves the real installed 0.82.1 CLI/RPC and preserves upstream GPT-5.6 metadata", () => {
+  it("resolves the real installed 0.99.1 CLI/RPC and preserves upstream GPT-5.6 metadata", () => {
     const rpcEntry = fileURLToPath(
       import.meta.resolve("@earendil-works/pi-coding-agent/rpc-entry"),
     );
-    const packageRoot = resolve(dirname(rpcEntry), "..");
+    const packageRoot = resolve(TEST_ROOT, "node_modules", "@earendil-works", "pi-coding-agent");
     const manifest = JSON.parse(
       readFileSync(join(packageRoot, "package.json"), "utf8"),
     ) as { version?: string; bin?: { pi?: string } };
@@ -195,7 +200,7 @@ describe("package-owned Pi invocation", () => {
   });
 
   it(
-    "resumes a copied Pi 0.80.6 session through the installed 0.82.1 RPC without provider work",
+    "resumes a copied Pi 0.80.6 session through the installed 0.99.1 RPC without provider work",
     { timeout: 20_000 },
     async () => {
       const temp = mkdtempSync(join(tmpdir(), "minime-pi-0806-resume-"));
@@ -327,7 +332,7 @@ describe("package-owned Pi invocation", () => {
     const invocation = resolvePiInvocation(["-p"], {
       ...fixtureOptions(),
       entrypoint: currentEntrypoint,
-      exists: (path) => path === RPC_ENTRY || path === CLI_ENTRY || path === currentEntrypoint,
+      exists: (path) => path === RPC_ENTRY || path === CLI_ENTRY || path === MANIFEST_PATH || path === currentEntrypoint,
       realpath: (path) => path === currentEntrypoint ? CLI_ENTRY : path,
     });
 
@@ -345,13 +350,55 @@ describe("package-owned Pi invocation", () => {
     );
   });
 
+  it("fails when no owning Pi manifest can be found", () => {
+    assert.throws(
+      () => resolvePackageOwnedPiInvocation("rpc", [], fixtureOptions({ exists: () => false })),
+      /Package-owned Pi manifest is unavailable/,
+    );
+    assert.throws(
+      () => resolvePackageOwnedPiInvocation("rpc", [], fixtureOptions({
+        readFile: () => JSON.stringify({ name: "another-package" }),
+      })),
+      /Package-owned Pi manifest is unavailable/,
+    );
+  });
+
+  it("reports unreadable and malformed owning manifests", () => {
+    for (const readFile of [() => { throw new Error("unreadable"); }, () => "{"]) {
+      assert.throws(
+        () => resolvePackageOwnedPiInvocation("cli", [], fixtureOptions({ readFile })),
+        /Package-owned Pi manifest is unavailable/,
+      );
+    }
+  });
+
+  it("fails when the requested bundled entrypoint is missing", () => {
+    for (const kind of ["rpc", "cli"] as const) {
+      assert.throws(
+        () => resolvePackageOwnedPiInvocation(kind, [], fixtureOptions({
+          exists: (path) => path === MANIFEST_PATH,
+        })),
+        new RegExp(`Package-owned Pi ${kind} entrypoint is missing`),
+      );
+    }
+  });
+
+  it("fails when the manifest has no CLI entrypoint", () => {
+    assert.throws(
+      () => resolvePackageOwnedPiInvocation("cli", [], fixtureOptions({
+        readFile: () => JSON.stringify({ name: "@earendil-works/pi-coding-agent" }),
+      })),
+      /Package-owned Pi CLI entrypoint is absent/,
+    );
+  });
+
   it("reports version mismatch without exposing an entrypoint path", () => {
     const invocation = resolvePackageOwnedPiInvocation("cli", [], fixtureOptions({
-      readFile: () => JSON.stringify({ version: "9.9.9", bin: { pi: "dist/cli.js" } }),
+      readFile: () => JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "9.9.9", bin: { pi: "dist/bundle/cli.js" } }),
     }));
     const diagnostic = formatPiRuntimeDiagnostic(invocation.diagnostic);
 
-    assert.match(diagnostic, /expectedVersion=0\.82\.1/);
+    assert.match(diagnostic, /expectedVersion=0\.99\.1/);
     assert.match(diagnostic, /entrypointKind=cli/);
     assert.match(diagnostic, /versionMismatch=true/);
     assert.doesNotMatch(diagnostic, /\/opt\//);
@@ -416,14 +463,14 @@ describe("package-owned Pi invocation", () => {
       packageLock.packages[
         "node_modules/@earendil-works/pi-coding-agent/node_modules/brace-expansion"
       ].version,
-      "5.0.7",
+      "5.0.9",
     );
     assert.equal(
       packageLock.packages[
         "node_modules/@earendil-works/pi-coding-agent/node_modules/protobufjs"
       ].version,
-      "7.6.5",
+      "7.6.6",
     );
-    assert.equal(packageLock.packages["node_modules/protobufjs"].version, "7.6.5");
+    assert.equal(packageLock.packages["node_modules/protobufjs"].version, "7.6.6");
   });
 });

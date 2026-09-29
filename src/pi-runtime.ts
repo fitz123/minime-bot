@@ -3,7 +3,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const PI_CODING_AGENT_PACKAGE = "@earendil-works/pi-coding-agent";
-export const EXPECTED_PI_PACKAGE_VERSION = "0.82.1";
+export const EXPECTED_PI_PACKAGE_VERSION = "0.99.1";
 const PI_RPC_ENTRY_SPECIFIER = `${PI_CODING_AGENT_PACKAGE}/rpc-entry`;
 
 export type PiEntrypointKind = "rpc" | "cli";
@@ -65,11 +65,25 @@ export function resolvePackageOwnedPiInvocation(
     );
   }
 
-  const packageRoot = resolve(dirname(rpcEntrypoint), "..");
-  const manifestPath = resolve(packageRoot, "package.json");
-  let manifest: PiCodingAgentManifest;
+  let packageRoot = dirname(rpcEntrypoint);
+  let manifest: PiCodingAgentManifest | undefined;
   try {
-    manifest = JSON.parse(readFile(manifestPath)) as PiCodingAgentManifest;
+    // The published export may be bundled several directories below its package.
+    // Locate its owning manifest instead of assuming a particular dist layout.
+    while (true) {
+      const manifestPath = resolve(packageRoot, "package.json");
+      if (exists(manifestPath)) {
+        const candidate = JSON.parse(readFile(manifestPath)) as PiCodingAgentManifest;
+        if (candidate.name === PI_CODING_AGENT_PACKAGE) {
+          manifest = candidate;
+          break;
+        }
+      }
+      const parent = dirname(packageRoot);
+      if (parent === packageRoot) break;
+      packageRoot = parent;
+    }
+    if (!manifest) throw new Error(`No ${PI_CODING_AGENT_PACKAGE} manifest found`);
   } catch (error) {
     throw new Error(`Package-owned Pi manifest is unavailable: ${errorMessage(error)}`);
   }

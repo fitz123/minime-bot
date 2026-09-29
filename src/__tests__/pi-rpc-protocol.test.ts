@@ -1908,7 +1908,7 @@ describe("spawnPiRpcSession workspace validation", () => {
       assert.strictEqual(child.spawnfile, process.execPath);
       assert.match(
         child.spawnargs[1],
-        /node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]rpc-entry\.js$/,
+        /node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]bundle[\/\\]rpc-entry\.js$/,
       );
       child.kill();
       await close;

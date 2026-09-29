@@ -234,6 +234,26 @@ describe("Codex web search auth and request", () => {
     assert.deepEqual(calls, { isUsingOAuth: 1, getProviderAuth: 1, getRequestAuth: 1 });
   });
 
+  it("accepts nullable registry auth headers without forwarding them", async () => {
+    const { context } = makeContext();
+    context.modelRegistry.getApiKeyAndHeaders = async () => ({
+      ok: true,
+      apiKey: codexOAuthToken("account-fixture"),
+      headers: { Authorization: null, "X-Registry-Only": "fixture-value" },
+    });
+    const result = await executeCodexWebSearch({ query: "fixture query" }, {
+      context,
+      fetchImpl: (async (_url: unknown, init?: RequestInit) => {
+        const headers = init?.headers as Record<string, string>;
+        assert.equal(headers.Authorization, `Bearer ${codexOAuthToken("account-fixture")}`);
+        assert.equal(headers["ChatGPT-Account-Id"], "account-fixture");
+        assert.equal(headers["X-Registry-Only"], undefined);
+        return sseResponse(successSse());
+      }) as typeof fetch,
+    });
+    assert.equal(result.ok, true);
+  });
+
   it("rejects non-Codex, non-OAuth, unresolved, stale, API-key, and malformed auth", async () => {
     const refreshed = codexOAuthToken("account-current", "refreshed");
     for (const options of [

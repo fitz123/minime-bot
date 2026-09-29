@@ -289,9 +289,11 @@ describe("compaction continuation Pi extension", () => {
     });
     modelRuntime.registerNativeProvider(faux.provider);
 
+    // Pi retries a length stop below the model's output budget as overflow.
+    // Exhaust that budget to exercise threshold compaction and our continuation.
     let continuationRequest: Context | undefined;
     faux.setResponses([
-      fauxAssistantMessage(fauxThinking("unfinished reasoning"), {
+      fauxAssistantMessage(fauxThinking("r".repeat(128 * 4)), {
         stopReason: "length",
       }),
       fauxAssistantMessage("compacted turn prefix"),
@@ -323,7 +325,16 @@ describe("compaction continuation Pi extension", () => {
 
     try {
       assert.deepEqual(extensionsResult.errors, []);
+      const compactions: string[] = [];
+      let settlements = 0;
+      session.subscribe((event) => {
+        if (event.type === "compaction_start") compactions.push(event.reason);
+        if (event.type === "agent_settled") settlements += 1;
+      });
       await session.prompt("long accepted turn ".repeat(300));
+      assert.deepEqual(compactions, ["threshold"]);
+      assert.equal(settlements, 1);
+      assert.equal(session.getLastAssistantText(), "continued final answer");
     } finally {
       session.dispose();
     }

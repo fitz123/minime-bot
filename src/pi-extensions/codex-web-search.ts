@@ -116,7 +116,7 @@ export interface CodexWebSearchExecutionContext {
   modelRegistry: {
     isUsingOAuth(model: ActiveModel): boolean;
     getApiKeyAndHeaders(model: ActiveModel): Promise<
-      | { ok: true; apiKey?: string; headers?: Record<string, string> }
+      | { ok: true; apiKey?: string; headers?: Record<string, string | null> }
       | { ok: false; error: string }
     >;
     getProviderAuth(provider: string): Promise<ProviderAuthResult | undefined>;
