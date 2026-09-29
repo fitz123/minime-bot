@@ -192,7 +192,7 @@ describe("Pi spawn workspace contract", () => {
       assert.equal(spawnCaptures[0].command, process.execPath);
       assert.match(
         spawnCaptures[0].args[0],
-        /node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]rpc-entry\.js$/,
+        /node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]bundle[\/\\]rpc-entry\.js$/,
       );
       assert.equal(spawnCaptures[0].options.cwd, mainWorkspace);
       assert.equal(spawnCaptures[1].command, process.execPath);

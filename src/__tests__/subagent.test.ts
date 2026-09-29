@@ -161,7 +161,7 @@ describe("subagent: wrapper spawn environment", () => {
       assert.equal(invocation.command, process.execPath);
       assert.match(
         invocation.args[0],
-        /node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]cli\.js$/,
+        /node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]bundle[\/\\]cli\.js$/,
       );
       assert.deepEqual(invocation.args.slice(1), ["--mode", "json", "-p"]);
     } finally {

@@ -186,7 +186,7 @@ describe("codex quota sampler command setup", () => {
     assert.equal(config.piArgsPrefix?.length, 1);
     assert.match(
       config.piArgsPrefix?.[0] ?? "",
-      /node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]cli\.js$/,
+      /node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]bundle[\/\\]cli\.js$/,
     );
     assert.equal(config.piRuntimeDiagnostic?.versionMismatch, false);
 
