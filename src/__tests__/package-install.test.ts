@@ -512,13 +512,13 @@ describe("package artifact install", () => {
         (JSON.parse(readFileSync(join(projectDir, "node_modules", "grammy", "package.json"), "utf8")) as {
           version?: string;
         }).version,
-        "1.45.1",
+        "1.46.0",
       );
       assert.equal(
         (JSON.parse(
           readFileSync(join(projectDir, "node_modules", "@grammyjs", "types", "package.json"), "utf8"),
         ) as { version?: string }).version,
-        "4.0.0",
+        "5.0.0",
       );
       for (const helper of [
         "monitoring_native.py",

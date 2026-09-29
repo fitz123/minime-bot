@@ -450,13 +450,13 @@ describe("package-owned Pi invocation", () => {
       readFileSync(resolve(TEST_ROOT, "node_modules", "@grammyjs", "types", "package.json"), "utf8"),
     ) as { version?: string };
 
-    assert.equal(packageJson.dependencies.grammy, "1.45.1");
-    assert.equal(packageLock.packages[""].dependencies?.grammy, "1.45.1");
-    assert.equal(packageLock.packages["node_modules/grammy"].version, "1.45.1");
-    assert.equal(packageLock.packages["node_modules/grammy"].dependencies?.["@grammyjs/types"], "4.0.0");
-    assert.equal(packageLock.packages["node_modules/@grammyjs/types"].version, "4.0.0");
-    assert.equal(installedGrammy.version, "1.45.1");
-    assert.equal(installedGrammyTypes.version, "4.0.0");
+    assert.equal(packageJson.dependencies.grammy, "1.46.0");
+    assert.equal(packageLock.packages[""].dependencies?.grammy, "1.46.0");
+    assert.equal(packageLock.packages["node_modules/grammy"].version, "1.46.0");
+    assert.equal(packageLock.packages["node_modules/grammy"].dependencies?.["@grammyjs/types"], "5.0.0");
+    assert.equal(packageLock.packages["node_modules/@grammyjs/types"].version, "5.0.0");
+    assert.equal(installedGrammy.version, "1.46.0");
+    assert.equal(installedGrammyTypes.version, "5.0.0");
     assert.equal(packageJson.dependencies["@grammyjs/auto-retry"], "^2.0.2");
     assert.equal(packageLock.packages[""].dependencies?.["@grammyjs/auto-retry"], "^2.0.2");
     assert.equal(

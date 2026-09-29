@@ -96,13 +96,13 @@ minime-codex-quota-sampler --workspace /path/to/workspace --textfile-dir /path/t
 ```
 
 Interactive RPC sessions, cron runs, subagents, and ask-agent children resolve
-the package-owned Pi 0.82.1 entrypoints and execute them with Node. They never
+the package-owned Pi 0.99.1 entrypoints and execute them with Node. They never
 fall back to a global `pi` from `PATH`; a missing packaged entrypoint fails
 explicitly. Startup logs report only the expected version, entrypoint kind, and
 mismatch state, without exposing the resolved host path.
 
 The runtime dependency contract pins all four package-owned Pi packages to
-0.82.1 and grammY to 1.45.1 (`@grammyjs/types` 4.0.0). Pi owns the bounded
+0.99.1 and grammY to 1.46.0 (`@grammyjs/types` 5.0.0). Pi owns the bounded
 summarization retry, including transient WebSocket recovery; Minime treats its
 retry records as stream activity and does not add a second compaction retry.
 `agent_settled` remains the accepted-turn terminal boundary. In primary
@@ -111,6 +111,18 @@ visible text continues automatically after successful threshold compaction
 through a hidden follow-up. If compaction produces no meaningful continuation
 outcome, Minime returns a specific length-limit error. Cron, subagent-child, and
 ask-agent-child sessions do not load this continuation wrapper.
+
+Other direct dependency targets are discord.js 14.27.0, p-queue 9.3.3,
+typebox 1.3.34, yaml 2.9.1, tsx 4.23.15, and @types/node 26.6.3. Already-current
+auto-retry 2.0.2, jiti 2.7.0, and prom-client 15.1.3 remain unchanged. The
+manifest retains its exact pins and compatible ranges; the lockfile records
+the installed versions. The Node minimum remains 22.19.0.
+
+TypeScript stays on 6.0.3, the latest compatible stable compiler.
+`scripts/build-package-artifacts.mjs` uses its root compiler API, including
+`transpileModule`, to generate the packaged Pi extension wrappers. TypeScript
+7.0.2 exports only version metadata at the package root and lacks that API;
+adopting its new API would require a separate build-tool migration.
 
 Pi's OpenAI catalog reports a 272K (272,000-token) context window for the
 supported GPT-5.6 models. Earlier compaction at that boundary is expected and
@@ -381,7 +393,7 @@ that point back at the first-party `subagent` or `ask-agent` wrappers.
 Bot-created RPC sessions do not provide an interactive extension UI bridge.
 Blocking `select`, `confirm`, `input`, and `editor` requests are answered as
 cancelled; fire-and-forget UI updates are ignored. External extensions must
-handle cancellation or provide a noninteractive path. Pi 0.82.1 does not bind
+handle cancellation or provide a noninteractive path. Pi 0.99.1 does not bind
 its RPC input reader until startup handlers complete, so a blocking dialog from
 `session_start` instead fails session creation promptly and the child is reaped.
 

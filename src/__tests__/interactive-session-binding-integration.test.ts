@@ -409,10 +409,10 @@ describe("pinned Pi exact interactive session integration", { concurrency: false
       const sessionArgument = child.spawnargs.indexOf("--session");
       const sessionDirectoryArgument = child.spawnargs.indexOf("--session-dir");
 
-      assert.strictEqual(EXPECTED_PI_PACKAGE_VERSION, "0.82.1");
+      assert.strictEqual(EXPECTED_PI_PACKAGE_VERSION, "0.99.1");
       assert.match(
         child.spawnargs[1],
-        /node_modules[\\/]@earendil-works[\\/]pi-coding-agent[\\/]dist[\\/]rpc-entry\.js$/,
+        /node_modules[\\/]@earendil-works[\\/]pi-coding-agent[\\/]dist[\\/]bundle[\\/]rpc-entry\.js$/,
       );
       assert.ok(sessionArgument >= 0);
       assert.ok(sessionDirectoryArgument >= 0);
