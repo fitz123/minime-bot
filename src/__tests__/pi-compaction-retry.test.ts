@@ -84,6 +84,8 @@ function summaryHarness(
     const stream = createAssistantMessageEventStream();
     if (message.stopReason === "error" || message.stopReason === "aborted") {
       stream.push({ type: "error", reason: message.stopReason, error: message });
+    } else if (message.stopReason === "pending") {
+      throw new Error("Summary fixture must return a terminal message");
     } else {
       stream.push({ type: "done", reason: message.stopReason, message });
     }

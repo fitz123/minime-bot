@@ -196,9 +196,12 @@ describe("project naming", () => {
   it("README and monitoring docs preserve the Pi and grammY upgrade contract", () => {
     const normalizedReadme = normalizeDoc(readme);
     for (const expected of [
-      "all four package-owned Pi packages to 0.82.1",
-      "grammY to 1.45.1",
-      "@grammyjs/types` 4.0.0",
+      "all four package-owned Pi packages to 0.99.1",
+      "grammY to 1.46.0",
+      "@grammyjs/types` 5.0.0",
+      "TypeScript stays on 6.0.3",
+      "`scripts/build-package-artifacts.mjs` uses its root compiler API",
+      "7.0.2 exports only version metadata at the package root and lacks that API",
       "Pi owns the bounded summarization retry",
       "does not add a second compaction retry",
       "`agent_settled` remains the accepted-turn terminal boundary",
@@ -211,8 +214,8 @@ describe("project naming", () => {
 
     const normalizedMonitoringDoc = normalizeDoc(monitoringDoc);
     for (const expected of [
-      "Pi runtime to 0.82.1",
-      "grammY to 1.45.1",
+      "Pi runtime to 0.99.1",
+      "grammY to 1.46.0",
       "Pi owns bounded summarization retries",
       "`summarization_retry_scheduled`",
       "`summarization_retry_attempt_start`",

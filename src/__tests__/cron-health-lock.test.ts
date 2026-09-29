@@ -40,7 +40,8 @@ function installCompetingLock(lockPath: string): void {
 }
 
 mock.module("node:fs", {
-  defaultExport: fsDefault,
+  // The CJS mock loader redefines named exports; builtin fs.constants is immutable.
+  defaultExport: { ...fsDefault },
   namedExports: {
     ...fsNamedExports,
     writeFileSync(

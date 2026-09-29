@@ -158,7 +158,7 @@ describe("cron-runner runPi", () => {
     assert.strictEqual(capture.command, process.execPath);
     assert.match(
       capture.args[0],
-      /node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]cli\.js$/,
+      /node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]bundle[\/\\]cli\.js$/,
     );
     assert.deepStrictEqual(capture.args.slice(1, 9), [
       "-p",

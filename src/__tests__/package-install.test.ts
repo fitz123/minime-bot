@@ -473,7 +473,7 @@ describe("package artifact install", () => {
         const manifest = JSON.parse(
           readFileSync(join(projectDir, "node_modules", ...packageName.split("/"), "package.json"), "utf8"),
         ) as { version?: string };
-        assert.equal(manifest.version, "0.82.1", packageName);
+        assert.equal(manifest.version, "0.99.1", packageName);
       }
       const codingAgentRoot = join(
         projectDir,
@@ -494,31 +494,31 @@ describe("package artifact install", () => {
         const nestedManifest = JSON.parse(
           readFileSync(resolvedManifestPath, "utf8"),
         ) as { version?: string };
-        assert.equal(nestedManifest.version, "0.82.1", `Pi nested ${packageName}`);
+        assert.equal(nestedManifest.version, "0.99.1", `Pi nested ${packageName}`);
       }
       assert.equal(
         (JSON.parse(readFileSync(codingAgentRequire.resolve("brace-expansion/package.json"), "utf8")) as {
           version?: string;
         }).version,
-        "5.0.7",
+        "5.0.9",
       );
       assert.equal(
         (JSON.parse(readFileSync(codingAgentRequire.resolve("protobufjs/package.json"), "utf8")) as {
           version?: string;
         }).version,
-        "7.6.5",
+        "7.6.6",
       );
       assert.equal(
         (JSON.parse(readFileSync(join(projectDir, "node_modules", "grammy", "package.json"), "utf8")) as {
           version?: string;
         }).version,
-        "1.45.1",
+        "1.46.0",
       );
       assert.equal(
         (JSON.parse(
           readFileSync(join(projectDir, "node_modules", "@grammyjs", "types", "package.json"), "utf8"),
         ) as { version?: string }).version,
-        "4.0.0",
+        "5.0.0",
       );
       for (const helper of [
         "monitoring_native.py",
@@ -640,7 +640,7 @@ describe("package artifact install", () => {
       assert.equal(samplerDryRunJson.command, process.execPath);
       assert.match(
         samplerDryRunJson.args[0],
-        /node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]cli\.js$/,
+        /node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]bundle[\/\\]cli\.js$/,
       );
       assert.equal(samplerDryRunJson.args[1], "--approve");
 
@@ -1155,8 +1155,8 @@ const { resolvePackageOwnedPiInvocation } = await importPackageFile("dist/pi-run
 const installedRpcInvocation = resolvePackageOwnedPiInvocation("rpc", ["--offline"]);
 const installedCliInvocation = resolvePackageOwnedPiInvocation("cli", ["--offline"]);
 
-assert.equal(installedPiManifest.version, "0.82.1");
-assert.equal(installedRpcEntry, join(installedPiRoot, "dist", "rpc-entry.js"));
+assert.equal(installedPiManifest.version, "0.99.1");
+assert.equal(installedRpcEntry, join(installedPiRoot, "dist", "bundle", "rpc-entry.js"));
 assert.deepEqual(installedRpcInvocation.args, [installedRpcEntry, "--offline"]);
 assert.deepEqual(
   installedCliInvocation.args,
@@ -1555,7 +1555,7 @@ const installedChildInvocation = piInvocation.resolvePiInvocation(["--mode", "js
 assert.equal(installedChildInvocation.command, process.execPath);
 assert.match(
   installedChildInvocation.args[0],
-  /node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]cli\.js$/,
+  /node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]bundle[\/\\]cli\.js$/,
 );
 assert.deepEqual(installedChildInvocation.args.slice(1), ["--mode", "json"]);
 assert.match(readFileSync(join(artifactDir, "subagent", "index.js"), "utf8"), /resolvePiInvocation\(args\)/);

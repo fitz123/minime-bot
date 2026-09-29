@@ -1,8 +1,12 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { pathToFileURL } from "node:url";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { fauxAssistantMessage, fauxProvider, type Context } from "@earendil-works/pi-ai";
 import {
   PI_ACKNOWLEDGED_STEER_COMMAND,
   PI_ACKNOWLEDGED_STEER_CUSTOM_TYPE,
@@ -204,5 +208,75 @@ describe("acknowledged-steer Pi extension", () => {
       id: "idle-race",
       status: "rejected",
     });
+  });
+
+  it("enqueues and consumes steering in an installed Pi run and rejects it after settlement", { timeout: 20_000 }, async (t) => {
+    const cwd = await mkdtemp(join(tmpdir(), "minime-acknowledged-steer-"));
+    t.after(() => rm(cwd, { recursive: true, force: true }));
+    const modelRuntime = await ModelRuntime.create({ modelsPath: null });
+    const faux = fauxProvider({ provider: "acknowledged-steer-test" });
+    modelRuntime.registerNativeProvider(faux.provider);
+    let releaseResponse!: () => void;
+    const responseGate = new Promise<void>((resolveGate) => { releaseResponse = resolveGate; });
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolveStarted) => { markStarted = resolveStarted; });
+    let steeredRequest: Context | undefined;
+    faux.setResponses([
+      async () => {
+        markStarted();
+        await responseGate;
+        return fauxAssistantMessage("initial answer");
+      },
+      (context) => {
+        steeredRequest = context;
+        return fauxAssistantMessage("corrected answer");
+      },
+    ]);
+    const { session, extensionsResult } = await createAgentSession({
+      cwd,
+      agentDir: join(cwd, "agent"),
+      modelRuntime,
+      model: faux.getModel(),
+      settingsManager: SettingsManager.inMemory({
+        extensions: [resolve("extensions/pi/acknowledged-steer.ts")],
+        compaction: { enabled: false },
+        retry: { enabled: false },
+      }),
+      sessionManager: SessionManager.inMemory(cwd),
+      noTools: "all",
+    });
+    const notices: string[] = [];
+    session.extensionRunner.setUIContext({
+      ...session.extensionRunner.getUIContext(),
+      notify: (message) => { notices.push(message); },
+    });
+    let settlements = 0;
+    session.subscribe((event) => {
+      if (event.type === "agent_settled") settlements += 1;
+    });
+    try {
+      assert.deepEqual(extensionsResult.errors, []);
+      await session.prompt(buildPiAcknowledgedSteerInvocation("before", "too early"));
+      const run = session.prompt("initial question");
+      await started;
+      await session.prompt(buildPiAcknowledgedSteerInvocation("during", "apply correction"));
+      releaseResponse();
+      await run;
+      await session.prompt(buildPiAcknowledgedSteerInvocation("after", "too late"));
+      assert.equal(faux.state.callCount, 2);
+      assert.ok(steeredRequest);
+      assert.match(JSON.stringify(steeredRequest.messages), /apply correction/);
+      assert.equal(session.getLastAssistantText(), "corrected answer");
+      assert.equal(settlements, 1);
+      assert.deepEqual(notices.map(parsePiAcknowledgedSteerResultNotice), [
+        { id: "before", status: "rejected" },
+        { id: "during", status: "enqueued" },
+        { id: "during", status: "consumed" },
+        { id: "after", status: "rejected" },
+      ]);
+    } finally {
+      releaseResponse();
+      session.dispose();
+    }
   });
 });
