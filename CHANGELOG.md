@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 2026.9.3
+
+- Bound Telegram transport retries and make typing single-flight, abortable and
+  nonblocking without changing polling or restart behavior (#223).
+- Preserve useful generated cron output across prolonged outages, classify
+  permanent delivery errors, and support `deliveryMaxAgeMs` for stale reminders.
+
 ## 2026.9.2
 
 - Update all four package-owned Pi packages to 0.99.1 and grammY to 1.46.0;
