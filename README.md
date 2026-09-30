@@ -231,7 +231,8 @@ metricsPort: <deployment-metrics-port>
 ```
 
 `topicId` is optional. The overlay may also carry deployment delivery IDs,
-metrics host, and the complete `triggerInput` section described below. It
+metrics host, the complete `triggerInput` section described below, and the
+`collaboration` socket configuration. It
 cannot override agents, models, thinking, prompts, session defaults,
 extensions, logging behavior, raw bindings, or `workspaceCwd`. Exact
 `discord: false` is the sole Discord entry allowed. Add it when the canonical
@@ -369,6 +370,13 @@ assembly includes that exact contained realpath match and keeps bundle headings
 under the satellite `.claude/rules/platform/<file>.md` path. Other
 out-of-workspace rule directories, custom rules, imports, output styles, and
 escaping rule-file symlinks remain skipped.
+
+Opt-in [same-host Pi collaboration](docs/collaboration.md) connects configured
+agents, exact bot sessions, logical threads, and standalone Pi terminals through
+a user-only socket owned by the running bot. Sends/replies return receipts without
+waiting for the peer; internal turns use separate output handling and never enter
+the normal human relays. See the guide for the configuration, package extension,
+address types, continuing conversations, receipt semantics, and trade-offs.
 
 Optional top-level `piExtraExtensions` entries allow operator-approved external
 Pi extension entrypoints in normal bot-created interactive RPC sessions:

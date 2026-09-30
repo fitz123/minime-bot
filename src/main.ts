@@ -1,5 +1,6 @@
 import { loadConfig } from "./config.js";
 import { SessionManager } from "./session-manager.js";
+import { CollaborationRouter } from "./collaboration.js";
 import {
   createTelegramBot,
   BOT_COMMANDS,
@@ -136,6 +137,10 @@ async function main(): Promise<void> {
   const messageQueues: MessageQueue[] = [];
   let echoWatcher: EchoWatcher | undefined;
   let triggerInput: TriggerInputServer | undefined;
+  let collaborationRouter: CollaborationRouter | undefined;
+  sessionManager.setHumanWorkPending(chatId => messageQueues.some(queue =>
+    queue.isBusy(chatId) || queue.getPendingCount(chatId) > 0 || queue.getCollectCount(chatId) > 0,
+  ));
   let discordClient: Client | undefined;
   let shutdownDiscord: (() => Promise<void>) | undefined;
   let watchdog: Watchdog | undefined;
@@ -157,6 +162,7 @@ async function main(): Promise<void> {
     clearRuntimeReadinessSafely();
     if (telegramStartupTimeout) clearTimeout(telegramStartupTimeout);
     telegramPollingRestart?.cancel();
+    if (collaborationRouter) await collaborationRouter.stop();
     if (triggerInput) await triggerInput.stop();
     if (echoWatcher) echoWatcher.stop();
     if (watchdog) watchdog.stop();
@@ -208,6 +214,15 @@ async function main(): Promise<void> {
     log.error("main", "FATAL unhandled rejection:", reason);
     requestShutdown("unhandledRejection", 1);
   });
+
+  if (config.collaboration) {
+    collaborationRouter = new CollaborationRouter({
+      discover: () => sessionManager.collaborationEndpoints(),
+      deliver: (message, consumed) => sessionManager.deliverCollaboration(message, consumed),
+    });
+    await collaborationRouter.start(config.collaboration.socketPath);
+    log.info("main", "Same-host collaboration router started");
+  }
 
   // Telegram starts before Discord has finished connecting. Polling failures
   // wait for that startup decision so an auxiliary alert transport cannot take

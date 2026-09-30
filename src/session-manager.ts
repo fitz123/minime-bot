@@ -1,10 +1,12 @@
 import { type ChildProcess } from "node:child_process";
-import { chmodSync, createWriteStream, existsSync, lstatSync, mkdirSync, rmSync, type Stats, unlinkSync } from "node:fs";
+import { chmodSync, createWriteStream, existsSync, lstatSync, mkdirSync, renameSync, rmSync, type Stats, unlinkSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { on } from "node:events";
 import PQueue from "p-queue";
+import { resolveBinding } from "./telegram-binding.js";
+import { CollaborationDeliveryError, collaborationPrompt, type Delivery, type Endpoint } from "./collaboration.js";
 import type { BoundSessionState, PendingSessionRecoveryNotice, PlatformContext, SessionRecoveryReason, SessionState, StreamLine, BotConfig, AgentConfig } from "./types.js";
 import { spawnPiRpcSession, sendPiPrompt, sendPiSteer, sendPiAcknowledgedSteer, sendPiGetState, readPiStream, parsePiStartupIdentityRecord, assertPiSessionIdentityMatchesBinding, PiStartupBlockingUiError, NewlineOnlyJsonlSplitter, normalizePiModel, PI_EXTENSIONS_DISABLED_ENV, type PiAcknowledgedSteerResult, type PiRpcEvent, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions, type PiStartupDiagnostics } from "./pi-rpc-protocol.js";
 import { SessionStore } from "./session-store.js";
@@ -32,6 +34,8 @@ const RESPONSE_LIVENESS_PROBE_TIMEOUT_MS = 10_000;
 const CRASH_BACKOFF_BASE_MS = 5_000; // Base delay for crash backoff
 const MAX_CRASH_BACKOFF_MS = 60_000; // Maximum backoff delay (1 minute)
 export const MAX_CRASH_RESTARTS = 5; // Block session after this many consecutive crashes
+
+class HumanInputPendingError extends Error {}
 
 class SessionStartupSupersededError extends Error {
   constructor() {
@@ -105,6 +109,8 @@ function prepareOutboxDir(outboxPath: string): void {
   ensurePrivateDir(runtimeDir);
   ensurePrivateDir(outboxBase);
   removeOutboxDirIfPresent(outboxPath);
+  removeOutboxDirIfPresent(`${outboxPath}.human`);
+  removeOutboxDirIfPresent(`${outboxPath}.internal`);
   ensurePrivateDir(outboxPath);
 }
 
@@ -153,6 +159,9 @@ export interface ActiveSession {
   outboxPath: string;
   /** Correlated steer requests still owned by the bot pending Pi response. */
   pendingSteers: Map<string, PendingSteer>;
+  internalTurn?: boolean;
+  internalCleanup?: Promise<void>;
+  outputIsolationFailed?: boolean;
 }
 
 export interface PendingSteer {
@@ -284,6 +293,9 @@ export class SessionManager {
   private loadConfig: () => BotConfig;
   private logDir: string;
   private startupTimeoutMs: number;
+  private collaborationSocket?: string;
+  private humanWorkPending: (chatId: string) => boolean = () => false;
+  private humanInputs = new Map<string, number>();
 
   constructor(
     loadConfig: () => BotConfig,
@@ -294,10 +306,126 @@ export class SessionManager {
     this.loadConfig = loadConfig;
     // Validate config at boot — fail fast if config is broken
     const startupConfig = loadConfig();
+    this.collaborationSocket = startupConfig.collaboration?.socketPath;
     this.store = new SessionStore(storePath);
     this.store.migrateLegacySessions(startupConfig);
     this.logDir = logDir ?? LOG_DIR;
     this.startupTimeoutMs = options?.startupTimeoutMs ?? STARTUP_TIMEOUT_MS;
+  }
+
+  setHumanWorkPending(pending: (chatId: string) => boolean): void {
+    this.humanWorkPending = pending;
+  }
+
+  /** Reserve a lane while an incoming human message is staged (e.g. media download). */
+  holdHumanInput(chatId: string): () => void {
+    this.humanInputs.set(chatId, (this.humanInputs.get(chatId) ?? 0) + 1);
+    this.touchActivity(chatId);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const count = (this.humanInputs.get(chatId) ?? 1) - 1;
+      if (count) this.humanInputs.set(chatId, count);
+      else this.humanInputs.delete(chatId);
+    };
+  }
+
+  private hasHumanWork(chatId: string): boolean {
+    return this.humanInputs.has(chatId) || this.humanWorkPending(chatId);
+  }
+
+  private configuredCollaborationThreads(config: BotConfig): Map<string, string> {
+    const threads = new Map<string, string>();
+    for (const binding of config.bindings) {
+      const topics = [binding.topicId, ...(binding.topics ?? []).map(topic => topic.topicId)];
+      for (const topic of topics) {
+        const resolved = resolveBinding(binding.chatId, config.bindings, topic);
+        if (resolved) threads.set(`${binding.chatId}${topic === undefined ? "" : `:${topic}`}`, resolved.agentId);
+      }
+    }
+    return threads;
+  }
+
+  collaborationEndpoints(): Endpoint[] {
+    const config = this.getFreshConfig();
+    const threads = this.configuredCollaborationThreads(config);
+    const sessions: Endpoint[] = [];
+    for (const [lane, state] of Object.entries(this.store.getAllSessions())) {
+      if (!config.agents[state.agentId]) continue;
+      if (!lane.startsWith("collaboration:")) threads.set(lane, state.agentId);
+      if (state.bindingState === "bound") sessions.push({ address: { kind: "session", id: state.sessionId }, label: state.agentId });
+    }
+    return [
+      ...Object.keys(config.agents).map(id => ({ address: { kind: "agent" as const, id }, label: id })),
+      ...[...threads].map(([id, agentId]) => ({ address: { kind: "thread" as const, id }, label: agentId })),
+      ...sessions,
+    ];
+  }
+
+  async deliverCollaboration(message: Delivery, consumed: () => void): Promise<void> {
+    if (process.env.PI_EXTENSIONS_DISABLED === "1") throw new CollaborationDeliveryError("rejected", "bot collaboration extension is disabled");
+    let lane: string;
+    let agentId: string;
+    let expected: string | undefined;
+    let session: ActiveSession;
+    let generation: number;
+    try {
+      const config = this.getFreshConfig();
+      const states = this.store.getAllSessions();
+      if (message.to.kind === "agent") {
+        agentId = message.to.id;
+        lane = `collaboration:${message.conversation}:${agentId}`;
+      } else if (message.to.kind === "thread") {
+        lane = message.to.id;
+        if (lane.startsWith("collaboration:")) throw new Error("Consultations are not logical threads");
+        const configured = this.configuredCollaborationThreads(config).get(lane);
+        agentId = states[lane]?.agentId ?? configured!;
+        if (configured && configured !== agentId) throw new Error("Thread owner binding changed");
+      } else if (message.to.kind === "session") {
+        const entry = Object.entries(states).find(([, state]) => state.bindingState === "bound" && state.sessionId === message.to.id);
+        if (!entry) throw new Error("Exact target reset or unavailable");
+        lane = entry[0];
+        agentId = entry[1].agentId;
+      } else throw new Error("Terminal delivery belongs to its extension");
+      if (!agentId || !config.agents[agentId]) throw new Error("Target agent unavailable");
+      const stored = states[lane];
+      if (stored && stored.bindingState !== "bound") throw new Error("Target requires owner recovery");
+      expected = stored?.sessionId;
+      generation = this.sessionGenerations.get(lane) ?? 0;
+      await this.waitForHumanWork(lane, message.expires);
+      if ((this.sessionGenerations.get(lane) ?? 0) !== generation) throw new Error("Target reset");
+      session = await this.getOrCreateSession(lane, agentId, expected, true);
+      if ((this.sessionGenerations.get(lane) ?? 0) !== generation || (expected && session.sessionId !== expected)) throw new Error("Target reset");
+    } catch (error) {
+      if (error instanceof CollaborationDeliveryError) throw error;
+      throw new CollaborationDeliveryError("rejected", "target unavailable, reset, or requires owner recovery");
+    }
+    // Replies address the continuing context, never an agent/thread alias.
+    message.to = { kind: "session", id: session.sessionId };
+    for (;;) {
+      await this.waitForHumanWork(lane, message.expires);
+      try {
+        for await (const _line of this.sendSessionMessage(lane, agentId, collaborationPrompt(message), {
+          internal: true, expectedSession: session, expires: message.expires, consumed,
+        })) { /* Internal output has no transport relay. */ }
+        return;
+      } catch (error) {
+        // Human input arrived between the admission check and taking the queue.
+        // This exception is raised strictly before any Pi prompt is sent.
+        if (error instanceof HumanInputPendingError) continue;
+        throw error;
+      }
+    }
+  }
+
+  private async waitForHumanWork(chatId: string, expires: number): Promise<void> {
+    for (;;) {
+      if (!this.acceptingSessionWork) throw new CollaborationDeliveryError("disconnected", "bot is shutting down");
+      if (Date.now() >= expires) throw new CollaborationDeliveryError("expired", "delivery expired before consumption");
+      if (!this.hasHumanWork(chatId)) return;
+      await new Promise(resolve => setTimeout(resolve, Math.min(25, Math.max(1, expires - Date.now()))));
+    }
   }
 
   /**
@@ -348,7 +476,7 @@ export class SessionManager {
   /** Assert Pi's correlated startup identity against the durable exact binding. */
   private async assertPiStartupIdentity(
     child: ChildProcess,
-    binding: InteractiveSessionBinding,
+    binding: Pick<InteractiveSessionBinding, "sessionId" | "sessionFile">,
   ): Promise<void> {
     const stdout = child.stdout;
     if (!stdout || hasExited(child)) {
@@ -369,8 +497,12 @@ export class SessionManager {
     const splitter = new NewlineOnlyJsonlSplitter();
     const responseId = `minime-startup-${randomUUID()}`;
     try {
+      const chunks = on(stdout, "data", { signal: controller.signal, close: ["close"] });
+      // A previous identity check explicitly paused stdout. Adding another data
+      // listener alone does not resume that stream (fresh/inactive targets).
+      stdout.resume();
       sendPiGetState(child, responseId);
-      for await (const [chunk] of on(stdout, "data", { signal: controller.signal, close: ["close"] })) {
+      for await (const [chunk] of chunks) {
         for (const record of splitter.push(chunk as Buffer)) {
           const identity = parsePiStartupIdentityRecord(child, record, responseId);
           if (identity) {
@@ -481,6 +613,8 @@ export class SessionManager {
   ): void {
     try {
       removeOutboxDirIfPresent(outboxPath);
+      removeOutboxDirIfPresent(`${outboxPath}.human`);
+      removeOutboxDirIfPresent(`${outboxPath}.internal`);
     } catch {
       // Ignore cleanup errors
     }
@@ -583,14 +717,17 @@ export class SessionManager {
     agentId: string,
     agent: AgentConfig,
     config: BotConfig,
+    strict = false,
   ): PreparedSessionBinding {
     const location = resolveInteractiveSessionLocation(agent);
     const stored = this.store.getSession(chatId);
 
     if (!stored) {
+      if (strict) throw new Error("Exact target reset");
       return this.publishPreseededBinding(chatId, agentId, agent, undefined, location);
     }
 
+    if (strict && (stored.bindingState !== "bound" || stored.agentId !== agentId)) throw new Error("Exact target changed");
     if (stored.bindingState === "legacy-unresolved") {
       return this.publishPreseededBinding(
         chatId,
@@ -630,6 +767,7 @@ export class SessionManager {
       stored.sessionId,
     );
     if (!inspection.valid) {
+      if (strict) throw new Error("Exact target is not usable");
       if (stored.pendingRecoveryNotice) {
         throw new Error(
           `Replacement Pi session ${stored.sessionId} is not usable: ${inspection.reason}`,
@@ -648,6 +786,7 @@ export class SessionManager {
     try {
       assertInteractiveSessionBindingOpenable(inspection.binding);
     } catch (error) {
+      if (strict) throw new Error("Exact target cannot be opened", { cause: error });
       if (stored.pendingRecoveryNotice) {
         throw new Error(
           `Replacement Pi session ${stored.sessionId} is not usable: exact-open-rejected`,
@@ -667,7 +806,7 @@ export class SessionManager {
     return {
       binding: inspection.binding,
       state: stored,
-      rotationAllowed: stored.pendingRecoveryNotice === undefined,
+      rotationAllowed: !strict && stored.pendingRecoveryNotice === undefined,
     };
   }
 
@@ -685,7 +824,11 @@ export class SessionManager {
    * If no session exists, pre-seed and persist a verified binding before spawn.
    * Enforces maxConcurrentSessions via LRU eviction.
    */
-  async getOrCreateSession(chatId: string, agentId: string): Promise<ActiveSession> {
+  async getOrCreateSession(chatId: string, agentId: string, expectedId?: string, internal = false): Promise<ActiveSession> {
+    if (expectedId) {
+      const state = this.store.getSession(chatId);
+      if (state?.bindingState !== "bound" || state.sessionId !== expectedId) throw new Error("Exact target reset");
+    }
     if (!this.acceptingSessionWork) {
       throw new Error("Session manager is shutting down");
     }
@@ -703,10 +846,10 @@ export class SessionManager {
       if ((this.sessionGenerations.get(chatId) ?? 0) !== generation) {
         throw new SessionStartupSupersededError();
       }
-      return this.getOrCreateSession(chatId, agentId);
+      return this.getOrCreateSession(chatId, agentId, expectedId, internal);
     }
 
-    const promise = this.startSession(chatId, agentId);
+    const promise = this.startSession(chatId, agentId, expectedId, internal);
     const startup: SessionStartup = { generation, agentId, promise };
     this.sessionStartups.set(chatId, startup);
     try {
@@ -718,7 +861,7 @@ export class SessionManager {
     }
   }
 
-  private async startSession(chatId: string, agentId: string): Promise<ActiveSession> {
+  private async startSession(chatId: string, agentId: string, expectedId?: string, internal = false): Promise<ActiveSession> {
     const generation = this.sessionGenerations.get(chatId) ?? 0;
     const isStartupSuperseded = () => (this.sessionGenerations.get(chatId) ?? 0) !== generation;
     const abortSupersededStartup = async (childToTerminate?: ChildProcess): Promise<never> => {
@@ -753,6 +896,7 @@ export class SessionManager {
     let existing = this.active.get(chatId);
     if (existing && !hasExited(existing.child) && !existing.child.killed && !existing.child.stdout?.destroyed) {
       if (existing.agentId === agentId) {
+        if (expectedId && existing.sessionId === expectedId) return existing;
         const activeConfig = tryGetFreshConfigForActiveSession();
         const activeAgent = activeConfig?.agents[agentId];
         if (!activeConfig || (activeAgent && !runtimeSignatureChanged(existing, activeAgent))) {
@@ -798,6 +942,7 @@ export class SessionManager {
       }
       this.active.delete(chatId);
       sessionsActive.dec();
+      if (existing.internalCleanup) await existing.internalCleanup;
     }
     if (isStartupSuperseded()) {
       await abortSupersededStartup();
@@ -811,7 +956,7 @@ export class SessionManager {
     }
 
     // Check if we need to evict
-    await this.evictIfNeeded(freshConfig);
+    await this.evictIfNeeded(freshConfig, internal);
     if (isStartupSuperseded()) {
       await abortSupersededStartup();
     }
@@ -840,11 +985,14 @@ export class SessionManager {
     ensureSessionMediaDir(chatId);
 
     const outboxPath = outboxDir(chatId);
-    const extensionOptions: PiSpawnExtensionOptions | undefined = freshConfig.piExtraExtensions === undefined
-      ? undefined
-      : { extraExtensions: freshConfig.piExtraExtensions };
+    const collaborationEnabled = Boolean(this.collaborationSocket);
+    const extensionOptions: PiSpawnExtensionOptions | undefined = collaborationEnabled
+      ? { extraExtensions: freshConfig.piExtraExtensions, collaboration: true }
+      : freshConfig.piExtraExtensions === undefined
+        ? undefined
+        : { extraExtensions: freshConfig.piExtraExtensions };
     const runtimeEnvOptions: PiSpawnRuntimeEnvOptions = { askCallerAgentId: agentId, outboxPath };
-    let prepared = this.prepareSessionBinding(chatId, agentId, agent, freshConfig);
+    let prepared = this.prepareSessionBinding(chatId, agentId, agent, freshConfig, Boolean(expectedId));
     if (isStartupSuperseded()) {
       await abortSupersededStartup();
     }
@@ -852,7 +1000,9 @@ export class SessionManager {
     let child: ChildProcess | undefined;
     for (;;) {
       try {
-        child = spawnPiRpcSession(agent, prepared.binding, extensionOptions, runtimeEnvOptions);
+        child = spawnPiRpcSession(agent, prepared.binding, extensionOptions, collaborationEnabled
+          ? { ...runtimeEnvOptions, collaborationSession: prepared.binding.sessionId, collaborationSocket: this.collaborationSocket }
+          : runtimeEnvOptions);
         await waitForSpawn(child, this.startupTimeoutMs);
         if (isStartupSuperseded()) {
           throw new SessionStartupSupersededError();
@@ -1019,9 +1169,10 @@ export class SessionManager {
   async *sendSessionMessage(
     chatId: string,
     agentId: string,
-    text: string
+    text: string,
+    options?: { internal?: boolean; expectedSession?: ActiveSession; expires?: number; consumed?: () => void; outputDone?: Promise<void> },
   ): AsyncGenerator<StreamLine> {
-    const session = await this.getOrCreateSession(chatId, agentId);
+    const session = options?.expectedSession ?? await this.getOrCreateSession(chatId, agentId);
 
     // Async channel: queue task pushes lines, generator yields them in real-time
     const buffer: StreamLine[] = [];
@@ -1110,7 +1261,21 @@ export class SessionManager {
           }
         }, RESPONSE_ACTIVITY_TIMEOUT_MS);
       };
+      let internalConsumed = false;
+      let submittedPromptId: string | undefined;
+      let promptRejected = false;
       const observeResponseActivity = (event: PiRpcEvent) => {
+        const incoming = event.message as { role?: unknown; content?: unknown } | undefined;
+        if (options?.internal && event.type === "message_start" && incoming?.role === "user") {
+          const content = incoming.content;
+          const rendered = typeof content === "string" ? content : Array.isArray(content)
+            ? content.map(block => typeof block?.text === "string" ? block.text : "").join("") : "";
+          if (!internalConsumed && rendered.includes(text.split("\n", 1)[0])) {
+            internalConsumed = true;
+            options.consumed?.();
+          }
+        }
+        if (event.type === "response" && event.command === "prompt" && event.id === submittedPromptId && event.success === false) promptRejected = true;
         if (event.type === "response" && event.command === "get_state") {
           if (!responseLivenessProbeId || event.id !== responseLivenessProbeId) return;
           clearProbe();
@@ -1126,7 +1291,33 @@ export class SessionManager {
         clearProbe();
         resetActivityTimer();
       };
+      let savedOutbox: string | undefined;
+      let releaseInternalCleanup: (() => void) | undefined;
+      let promptSent = false;
       try {
+        if (session.outputIsolationFailed) throw new Error("Outbox isolation failed; reconnect the session before delivery");
+        if (options?.internal) {
+          if (this.active.get(chatId) !== session) throw new CollaborationDeliveryError("rejected", "exact target reset or closed");
+          if (hasExited(session.child) || session.child.killed) throw new CollaborationDeliveryError("disconnected", "target process disconnected");
+          if (Date.now() >= (options.expires ?? Infinity)) throw new CollaborationDeliveryError("expired", "delivery expired before consumption");
+          if (this.hasHumanWork(chatId)) throw new HumanInputPendingError();
+          session.internalTurn = true;
+          session.internalCleanup = new Promise(resolve => { releaseInternalCleanup = resolve; });
+          // Same owner, idle queue, same stdout reader boundary. Reject a child
+          // whose Pi context changed without an owner-mediated reopen.
+          await this.assertPiStartupIdentity(session.child, {
+            sessionId: session.sessionId, sessionFile: session.sessionFile!,
+          });
+          if (this.active.get(chatId) !== session) throw new CollaborationDeliveryError("rejected", "exact target reset or closed");
+          if (this.hasHumanWork(chatId)) throw new HumanInputPendingError();
+          if (Date.now() >= (options.expires ?? Infinity)) throw new CollaborationDeliveryError("expired", "delivery expired before consumption");
+          removeOutboxDirIfPresent(`${session.outboxPath}.internal`);
+          ensurePrivateDir(`${session.outboxPath}.internal`);
+          const backup = `${session.outboxPath}.human`;
+          renameSync(session.outboxPath, backup);
+          savedOutbox = backup;
+          mkdirSync(session.outboxPath, { mode: 0o700 });
+        }
         // Always deliver Pi prompts with streamingBehavior:"followUp" (Defect
         // B). Pi ignores the field when the agent is idle (the prompt runs as
         // a fresh turn) and honors it when the agent is still mid-turn — the
@@ -1135,6 +1326,8 @@ export class SessionManager {
         // window would be rejected with "already processing" and the message
         // lost. followUp queues it behind the live turn instead.
         const promptId = sendPiPrompt(session.child, text, "followUp");
+        submittedPromptId = promptId;
+        promptSent = true;
         session.lastActivity = Date.now();
         session.processingStartedAt = Date.now();
         this.resetIdleTimer(chatId);
@@ -1192,16 +1385,42 @@ export class SessionManager {
         session.processingStartedAt = null;
         if (!gotResult) {
           this.settlePendingSteers(session);
-          finish(new Error("Pi stream ended without an agent_settled result"));
+          finish(options?.internal
+            ? new CollaborationDeliveryError("unknown", "Pi stream ended before settlement; do not replay")
+            : new Error("Pi stream ended without an agent_settled result"));
           return;
+        }
+        if (options?.internal && !internalConsumed) {
+          throw new CollaborationDeliveryError(promptRejected ? "rejected" : "unknown", promptRejected ? "Pi rejected internal input" : "Pi settled without confirming internal consumption; do not replay");
         }
         finish();
       } catch (err) {
         clearActivityTimers();
         session.processingStartedAt = null;
         this.settlePendingSteers(session);
-        finish(err instanceof Error ? err : new Error(String(err)));
+        finish(options?.internal && !(err instanceof HumanInputPendingError) && !(err instanceof CollaborationDeliveryError)
+          ? new CollaborationDeliveryError(promptSent ? "unknown" : "rejected", promptSent ? "Pi delivery outcome lost; do not replay" : "exact target or output isolation unavailable")
+          : err instanceof Error ? err : new Error(String(err)));
       } finally {
+        try {
+          if (options?.internal) removeOutboxDirIfPresent(`${session.outboxPath}.internal`);
+          if (savedOutbox) {
+            // Internal outbox files are ephemeral, just like normal delivered
+            // outbox files. Discard them before returning the human directory.
+            removeOutboxDirIfPresent(session.outboxPath);
+            if (this.active.get(chatId) === session) renameSync(savedOutbox, session.outboxPath);
+            else removeOutboxDirIfPresent(savedOutbox);
+          }
+        } catch {
+          // No later human relay may scan a directory whose ownership is unclear.
+          session.outputIsolationFailed = true;
+          finish(new Error("Outbox isolation cleanup failed; reconnect the session"));
+        } finally {
+          session.internalTurn = false;
+          releaseInternalCleanup?.();
+          session.internalCleanup = undefined;
+        }
+        if (options?.outputDone) await options.outputDone;
         // A busy idle deadline is ignored below. Once this queue task reaches
         // its terminal boundary, start a fresh full idle window only if this
         // is still the chat's active incarnation; /clean or /reconnect may
@@ -1210,7 +1429,7 @@ export class SessionManager {
           this.resetIdleTimer(chatId);
         }
       }
-    });
+    }, { priority: options?.internal ? -1 : 0 });
 
     // Yield lines as they arrive from the queue task
     try {
@@ -1224,7 +1443,7 @@ export class SessionManager {
       if (taskError) throw taskError;
     } finally {
       // Ensure queue bookkeeping completes even if consumer stops early
-      await taskPromise;
+      if (!options?.outputDone) await taskPromise;
     }
   }
 
@@ -1243,6 +1462,7 @@ export class SessionManager {
   ): Promise<boolean> {
     const session = this.active.get(chatId);
     if (
+      session?.internalTurn ||
       !session ||
       session.agentId !== agentId ||
       session.processingStartedAt === null ||
@@ -1399,6 +1619,7 @@ export class SessionManager {
 
     // Gracefully terminate (even if SIGTERM was already sent elsewhere)
     await this.waitForSessionChildExit(session, chatId);
+    await session.internalCleanup;
     this.cleanupSessionFiles(chatId, session.outboxPath, "stale");
   }
 
@@ -1613,13 +1834,15 @@ export class SessionManager {
   }
 
   /** LRU eviction: close the session with oldest lastActivity. */
-  private async evictIfNeeded(config: BotConfig): Promise<void> {
+  private async evictIfNeeded(config: BotConfig, internal = false): Promise<void> {
     const maxConcurrentSessions = config.sessionDefaults.maxConcurrentSessions;
     if (this.active.size < maxConcurrentSessions) return;
 
-    // Find session with oldest lastActivity
+    // Internal consultation must never evict a busy human/session owner.
+    // Preserve the existing human admission policy.
     let oldest: { chatId: string; lastActivity: number } | null = null;
     for (const [chatId, session] of this.active) {
+      if (internal && (session.processingStartedAt !== null || session.queue.pending || session.queue.size || this.hasHumanWork(chatId))) continue;
       if (!oldest || session.lastActivity < oldest.lastActivity) {
         oldest = { chatId, lastActivity: session.lastActivity };
       }
@@ -1627,6 +1850,8 @@ export class SessionManager {
 
     if (oldest) {
       await this.closeSession(oldest.chatId);
+    } else if (internal) {
+      throw new CollaborationDeliveryError("rejected", "all bot session slots are busy");
     }
   }
 
@@ -1646,6 +1871,11 @@ export class SessionManager {
       // record buffered before this exit event, then settle unresolved entries.
       this.active.delete(chatId);
       sessionsActive.dec();
+
+      // A new owner must not reuse the shared outbox while the old internal
+      // reader is still draining EOF and discarding its temporary output.
+      const cleanup = session.internalCleanup;
+      if (cleanup) void this.runSessionTeardown(chatId, () => cleanup).catch(() => {});
 
       // Reclaim session-owned media, but preserve bot-owned in-flight files for
       // the ordered fallback that runs after pending steer settlement.

@@ -789,14 +789,20 @@ export function createTelegramBot(
   // Message queue: debounce rapid messages and collect mid-turn messages
   const messageQueue = new MessageQueue(
     async (chatId, agentId, text, platform, onAgentOwnership) => {
-      const stream = sessionManager.sendSessionMessage(chatId, agentId, text);
-      await relayStream(
-        stream,
-        platform,
-        outboxDir(chatId),
-        onAgentOwnership,
-        (suspend) => draftCoordinator.register(chatId, suspend),
-      );
+      let releaseOutput!: () => void;
+      const outputDone = new Promise<void>(resolve => { releaseOutput = resolve; });
+      const stream = sessionManager.sendSessionMessage(chatId, agentId, text, { outputDone });
+      try {
+        await relayStream(
+          stream,
+          platform,
+          outboxDir(chatId),
+          onAgentOwnership,
+          (suspend) => draftCoordinator.register(chatId, suspend),
+        );
+      } finally {
+        releaseOutput();
+      }
     },
     {
       acknowledgedSteerFn: (chatId, agentId, text, onEnqueued) =>
@@ -835,12 +841,14 @@ export function createTelegramBot(
   // cosmetic updates for the active relay before commands, media processing,
   // or message ownership/steering logic runs.
   bot.use(async (ctx, next) => {
-    if (ctx.message) {
-      draftCoordinator.suspend(
-        sessionKey(ctx.message.chat.id, ctx.message.message_thread_id),
-      );
+    const key = ctx.message ? sessionKey(ctx.message.chat.id, ctx.message.message_thread_id) : undefined;
+    const releaseInput = key === undefined ? undefined : sessionManager.holdHumanInput?.(key);
+    try {
+      if (key !== undefined) draftCoordinator.suspend(key);
+      await next();
+    } finally {
+      releaseInput?.();
     }
-    await next();
   });
 
   // /start command

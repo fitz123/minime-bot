@@ -4,6 +4,8 @@ Pure, testable helpers for Pi extension wrappers.
 
 Most helpers here back the live Pi extensions:
 
+- `collaboration` for opt-in same-host internal conversations through the bot
+  router; see [configuration and semantics](../../docs/collaboration.md).
 - `acknowledged-steer` for an atomic active-lifecycle gate around Telegram
   steering ownership transfer.
 - `web-tools` for subscription-backed Codex `web_search`.
