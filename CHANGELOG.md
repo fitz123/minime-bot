@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 2026.9.4
+
+- Refresh stable Telegram drafts every 15 seconds during quiet tool gaps, before
+  the shortest known client expiry (20 seconds on iOS), instead of every 25 seconds
+  (#149, #225). Preserve suspension, rate-limit handling and draft identity.
+
 ## 2026.9.3
 
 - Bound Telegram transport retries and make typing single-flight, abortable and

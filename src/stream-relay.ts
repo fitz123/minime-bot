@@ -148,8 +148,8 @@ export async function sendOutboxFiles(outboxPath: string, platform: PlatformCont
 
 /** Telegram drafts share the per-chat send budget; keep starts at least 1s apart. */
 export const DRAFT_MIN_INTERVAL_MS = 1000;
-/** Refresh visible drafts before Telegram's 30-second expiry. */
-export const DRAFT_REFRESH_INTERVAL_MS = 25_000;
+/** Refresh visible drafts before Telegram's shortest known client expiry (20s on iOS). */
+export const DRAFT_REFRESH_INTERVAL_MS = 15_000;
 const MAX_DRAFT_PAUSE_MS = 60_000;
 
 /** Max time (ms) to wait for in-flight drafts before final delivery. */
