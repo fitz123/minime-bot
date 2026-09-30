@@ -163,11 +163,14 @@ export interface PiExtensionResolveOptions {
 }
 
 export interface PiSpawnExtensionOptions extends PiExtensionResolveOptions {
+  collaboration?: boolean;
   /** Operator-approved external extension entrypoints for interactive bot RPC sessions. */
   extraExtensions?: readonly string[];
 }
 
 export interface PiSpawnRuntimeEnvOptions {
+  collaborationSession?: string;
+  collaborationSocket?: string;
   /** Trusted current agent id supplied by SessionManager for first-party tools. */
   askCallerAgentId?: string;
   /** Deterministic per-chat outbox path supplied for an interactive session. */
@@ -398,6 +401,7 @@ function assertNoAskAgentRecursiveExtraExtensions(
 export function resolvePiSpawnExtensionArgs(options?: PiSpawnExtensionOptions): string[] {
   return [
     ...resolvePiExtensionArgs(options),
+    ...(options?.collaboration ? resolvePiExtensionArgs({ ...options, relpaths: ["collaboration.ts"] }) : []),
     ...resolvePiExtraExtensionArgs(options),
   ];
 }
@@ -755,6 +759,10 @@ function buildAllowedPiChildEnv(
   copyExplicitControlPathEnv(env, contract, MINIME_CONFIG_PATH_ENV, "configPath");
   copyExplicitControlPathEnv(env, contract, MINIME_CRONS_PATH_ENV, "cronsPath");
   env[MINIME_BOT_PI_SESSION_ENV] = "1";
+  if (runtimeEnvOptions?.collaborationSession && runtimeEnvOptions.collaborationSocket) {
+    env.MINIME_COLLABORATION_SOCKET = runtimeEnvOptions.collaborationSocket;
+    env.MINIME_COLLABORATION_SESSION = runtimeEnvOptions.collaborationSession;
+  }
 
   return env;
 }

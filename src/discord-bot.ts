@@ -293,8 +293,14 @@ export async function createDiscordBot(
 
   const messageQueue = new MessageQueue(
     async (chatId, agentId, text, platform, onAgentOwnership) => {
-      const stream = sessionManager.sendSessionMessage(chatId, agentId, text);
-      await relayStream(stream, platform, outboxDir(chatId), onAgentOwnership);
+      let releaseOutput!: () => void;
+      const outputDone = new Promise<void>(resolve => { releaseOutput = resolve; });
+      const stream = sessionManager.sendSessionMessage(chatId, agentId, text, { outputDone });
+      try {
+        await relayStream(stream, platform, outboxDir(chatId), onAgentOwnership);
+      } finally {
+        releaseOutput();
+      }
     },
     {
       prepareSessionFn: async (chatId, agentId) => {
@@ -321,6 +327,7 @@ export async function createDiscordBot(
   // Message handler
   client.on(Events.MessageCreate, (message) => {
     trackHandler(async () => {
+      let releaseInput: (() => void) | undefined;
       try {
       // Ignore messages from bots (including ourselves)
       if (message.author.bot) return;
@@ -349,6 +356,7 @@ export async function createDiscordBot(
       }
 
       const key = discordSessionKey(channelId, threadId);
+      releaseInput = sessionManager.holdHumanInput?.(key);
       const prefix = buildDiscordSourcePrefix(binding, message.author, message.createdTimestamp);
       // Strip bot mention syntax (<@botId>) from message content so the agent
       // doesn't receive raw snowflake IDs in every requireMention message
@@ -446,6 +454,8 @@ export async function createDiscordBot(
       }
       } catch (err) {
         log.error("discord-bot", `Message handler error in ${message.channelId}:`, err);
+      } finally {
+        releaseInput?.();
       }
     });
   });

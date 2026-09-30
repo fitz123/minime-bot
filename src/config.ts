@@ -148,7 +148,7 @@ function validateInstanceOverlay(raw: unknown): Record<string, unknown> {
       }
       continue;
     }
-    if (key === "triggerInput") {
+    if (key === "triggerInput" || key === "collaboration") {
       continue;
     }
     if (key === "discord") {
@@ -339,6 +339,7 @@ interface RawConfig {
   bindings?: unknown[];
   sessionDefaults?: unknown;
   piExtraExtensions?: unknown;
+  collaboration?: unknown;
   logLevel?: string;
   metricsPort?: number;
   metricsHost?: string;
@@ -928,6 +929,16 @@ export function loadTelegramToken(configPath?: string, options: LoadConfigOption
     });
 }
 
+export function validateCollaboration(raw: unknown): BotConfig["collaboration"] {
+  if (raw === undefined || raw === false) return undefined;
+  if (!isConfigRecord(raw) || Object.keys(raw).some(key => key !== "socketPath") ||
+      typeof raw.socketPath !== "string" || !isAbsolute(raw.socketPath) ||
+      raw.socketPath.includes("\0") || Buffer.byteLength(raw.socketPath) > 100) {
+    throw new Error("collaboration must be false or { socketPath: an absolute Unix-socket path of at most 100 bytes }");
+  }
+  return { socketPath: raw.socketPath };
+}
+
 export function loadConfig(configPath?: string, options: LoadConfigOptions = {}): BotConfig {
   const raw: RawConfig = loadRawMergedConfig(configPath, options.instanceConfigPath) as RawConfig;
   const resolveSecrets = options.resolveSecrets !== false;
@@ -948,6 +959,7 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
   }
   const defaultModel = typeof raw.defaultModel === "string" ? raw.defaultModel : undefined;
   const piExtraExtensions = validatePiExtraExtensions(raw.piExtraExtensions);
+  const collaboration = validateCollaboration(raw.collaboration);
   const whisperModelPath = resolveWhisperModelPath(raw.whisperModel);
 
   // Validate agents (needed before validating bindings)
@@ -1077,7 +1089,7 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
     defaultDeliveryThreadId = raw.defaultDeliveryThreadId;
   }
 
-  return { telegramToken, agents, bindings, sessionDefaults, whisperModelPath, piExtraExtensions, logLevel, metricsPort, metricsHost, discord, adminChatId, defaultDeliveryChatId, defaultDeliveryThreadId, triggerInput };
+  return { telegramToken, agents, bindings, sessionDefaults, whisperModelPath, piExtraExtensions, collaboration, logLevel, metricsPort, metricsHost, discord, adminChatId, defaultDeliveryChatId, defaultDeliveryThreadId, triggerInput };
 }
 
 function realpathOrResolve(path: string): string {

@@ -165,6 +165,8 @@ export interface BotConfig {
   sessionDefaults: SessionDefaults;
   whisperModelPath: string;
   piExtraExtensions?: string[];
+  /** Opt-in same-host collaboration; this bot owns the socket. Restart to change. */
+  collaboration?: { socketPath: string };
   logLevel?: LogLevel;
   metricsPort?: number;
   metricsHost?: string;

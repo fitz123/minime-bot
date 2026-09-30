@@ -47,6 +47,7 @@
     "telegram-bot.plist.example",
     "docs/launchd-operations.md",
     "docs/monitoring.md",
+    "docs/collaboration.md",
     "examples/monitoring/*"
   ],
   "keywords": [
