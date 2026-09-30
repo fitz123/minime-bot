@@ -328,7 +328,13 @@ export class SessionManager {
       released = true;
       const count = (this.humanInputs.get(chatId) ?? 1) - 1;
       if (count) this.humanInputs.set(chatId, count);
-      else this.humanInputs.delete(chatId);
+      else {
+        this.humanInputs.delete(chatId);
+        // Resume reclamation if the idle deadline elapsed during staging.
+        // Preserve a live deadline and lastActivity for filtered chatter.
+        const session = this.active.get(chatId);
+        if (session && session.idleTimer === null) this.resetIdleTimer(chatId);
+      }
     };
   }
 
@@ -1580,6 +1586,7 @@ export class SessionManager {
       session.idleTimer = null;
       if (
         this.active.get(chatId) !== session ||
+        this.humanInputs.has(chatId) ||
         session.processingStartedAt !== null ||
         session.queue.pending > 0 ||
         session.queue.size > 0

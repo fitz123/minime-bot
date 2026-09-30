@@ -2,9 +2,10 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, existsSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { SessionManager } from "../session-manager.js";
+import { ensureSessionMediaDir } from "../media-store.js";
 import { resolveBinding } from "../telegram-binding.js";
 import { resolvePackageOwnedPiInvocation } from "../pi-runtime.js";
 import { CollaborationDeliveryError, type Delivery } from "../collaboration.js";
@@ -339,4 +340,33 @@ test("thread owner resolution preserves explicit topics, unchanged fallback, syn
       await manager.closeSession(lane);
     }
   } finally { await manager.closeAll(); restore(); }
+});
+
+
+test("held human staging survives the old idle deadline and final release restores idle cleanup", { timeout: 30000 }, async () => {
+  const { manager, root, restore } = ownerFixture();
+  const releases: Array<() => void> = [];
+  try {
+    const lane = `discord:${basename(root)}`;
+    const session = await manager.getOrCreateSession(lane, "b");
+    const staged = join(ensureSessionMediaDir(lane), "staged.txt");
+    writeFileSync(staged, "fixture media download in progress");
+    const lastActivity = session.lastActivity;
+    session.idleTimeoutMs = 50;
+    releases.push(manager.holdHumanInput(lane), manager.holdHumanInput(lane));
+    manager.resetIdleTimer(lane);
+    await delay(150);
+    assert.equal(manager.getActive(lane), session, "staging must survive the old idle deadline");
+    assert.equal(session.child.exitCode, null);
+    assert.equal(session.child.signalCode, null);
+    assert.equal(existsSync(staged), true);
+    releases[0]();
+    await delay(100);
+    assert.equal(manager.getActive(lane), session, "another input reservation still owns staging");
+    assert.equal(session.lastActivity, lastActivity);
+    releases[1]();
+    await until(() => manager.getActive(lane) === undefined &&
+      (session.child.exitCode !== null || session.child.signalCode !== null) && !existsSync(staged));
+    assert.equal(session.lastActivity, lastActivity, "release must not refresh LRU activity");
+  } finally { for (const release of releases) release(); await manager.closeAll(); restore(); }
 });
