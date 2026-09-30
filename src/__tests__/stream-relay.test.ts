@@ -716,7 +716,7 @@ describe("relayStream bounded draft scheduler", () => {
     assert.deepStrictEqual(sends, [{ text: "replacement" }]);
   });
 
-  it("refreshes the same visible draft during a no-delta gap longer than 30 seconds", async (t) => {
+  it("refreshes the same visible draft before the 20-second client expiry during a no-delta gap", async (t) => {
     t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000 });
     const { platform } = mockPlatform({ typingIndicator: false });
     const calls: Array<{ draftId: number; text: string; at: number }> = [];
@@ -740,7 +740,8 @@ describe("relayStream bounded draft scheduler", () => {
     assert.strictEqual(calls.length, 1);
     t.mock.timers.tick(1);
     await flushMicrotasks();
-    assert.strictEqual(calls.length, 2, "the visible draft refreshes before its 30-second TTL");
+    assert.strictEqual(calls.length, 2);
+    assert.ok(calls[1].at - calls[0].at < 20_000, "the first refresh precedes the iOS client expiry");
     assert.strictEqual(calls[1].draftId, calls[0].draftId);
     assert.strictEqual(calls[1].text, "working");
 
@@ -756,6 +757,7 @@ describe("relayStream bounded draft scheduler", () => {
     );
     assert.strictEqual(calls[2].draftId, calls[0].draftId);
     assert.strictEqual(calls[2].text, "working");
+    assert.ok(calls[2].at - calls[1].at < 20_000, "subsequent refreshes precede the iOS client expiry");
     finish.resolve();
     await relay;
     t.mock.timers.tick(DRAFT_REFRESH_INTERVAL_MS);
