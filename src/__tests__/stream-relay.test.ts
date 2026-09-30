@@ -1243,6 +1243,18 @@ describe("relayStream bounded draft scheduler", () => {
 });
 
 describe("relayStream typingIndicator=false", () => {
+  it("consumes and delivers the stream even while initial typing is hung", { timeout: 1_000 }, async () => {
+    const { platform, sends } = mockPlatform();
+    const typing = deferred<void>();
+    platform.sendTyping = () => typing.promise;
+    try {
+      await relayStream(fakeStream(["answer during outage"]), platform);
+      assert.deepStrictEqual(sends, [{ text: "answer during outage" }]);
+    } finally {
+      typing.resolve();
+    }
+  });
+
   it("sends no typing indicators when disabled", async () => {
     const { platform, typings } = mockPlatform({ typingIndicator: false });
     const stream = fakeStream(["Hello"]);

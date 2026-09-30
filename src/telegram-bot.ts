@@ -1,4 +1,4 @@
-import { Bot, type Transformer } from "grammy";
+import { Bot, HttpError, type Transformer } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
 import { createHash } from "node:crypto";
 import type { BotConfig, TelegramBinding } from "./types.js";
@@ -663,7 +663,7 @@ export interface TelegramBotResult {
 export const AUTO_RETRY_OPTIONS = {
   maxRetryAttempts: 5,
   maxDelaySeconds: 60,
-  rethrowHttpErrors: false,
+  rethrowHttpErrors: true,
 } as const;
 
 /**
@@ -700,16 +700,43 @@ export function makeSteerFn(
  * stream-relay.ts) — a retry that fires after Telegram's 3-10s retry_after is
  * stale by the time it lands (the stream has produced newer text), and 5x
  * amplification turns one rate-limited draft into five log/metric increments.
- * Every other method retains the full AUTO_RETRY_OPTIONS retry behavior.
+ * Typing also bypasses retries: the next periodic tick supplies a fresh action.
+ * Other methods retain bounded 429/5xx retries plus two short transport retries
+ * shared across the entire logical call. Ambiguous transport failures can
+ * duplicate writes; these retries do not provide exactly-once delivery.
  * See issue #117.
  */
 export function createTelegramAutoRetryTransformer(): Transformer {
   const retry = autoRetry(AUTO_RETRY_OPTIONS);
   return async (prev, method, payload, signal) => {
-    if (method === "sendMessageDraft" || method === "getUpdates") {
+    if (method === "sendMessageDraft" || method === "sendChatAction" || method === "getUpdates") {
       return prev(method, payload, signal);
     }
-    return retry(prev, method, payload, signal);
+    let transportRetries = 2;
+    return retry(async (wireMethod, wirePayload, wireSignal) => {
+      for (;;) {
+        if (wireSignal?.aborted) throw new Error("Request aborted before retry");
+        try {
+          return await prev(wireMethod, wirePayload, wireSignal);
+        } catch (err) {
+          if (!(err instanceof HttpError) || wireSignal?.aborted || transportRetries === 0) throw err;
+          transportRetries--;
+          await new Promise<void>((resolve, reject) => {
+            const abort = () => {
+              clearTimeout(timer);
+              wireSignal?.removeEventListener("abort", abort);
+              reject(new Error("Request aborted while waiting between retries"));
+            };
+            const timer = setTimeout(() => {
+              wireSignal?.removeEventListener("abort", abort);
+              resolve();
+            }, 250);
+            wireSignal?.addEventListener("abort", abort);
+            if (wireSignal?.aborted) abort();
+          });
+        }
+      }
+    }, method, payload, signal);
   };
 }
 
@@ -739,9 +766,9 @@ export function createTelegramBot(
   // before autoRetry decides whether to retry)
   bot.api.config.use(createApiErrorLoggingTransformer({ bindings: config.bindings }));
 
-  // Auto-retry on rate limits and network errors (outermost transformer —
+  // Auto-retry on rate limits and server errors (outermost transformer —
   // retries after inner errors). Polling uses grammY's own retry loop, while
-  // cosmetic sendMessageDraft calls remain excluded from retries.
+  // cosmetic drafts and typing remain excluded from retries.
   bot.api.config.use(createTelegramAutoRetryTransformer());
 
   // Outermost transformer: observe completion of each logical getUpdates call,

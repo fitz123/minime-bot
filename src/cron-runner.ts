@@ -77,8 +77,6 @@ const CRON_HEALTH_LOCK_TIMEOUT_MS = CRON_HEALTH_STALE_LOCK_MS + 5_000;
 const PI_ERROR_EXCERPT_CHARS = 1000;
 const FAILURE_FALLBACK_ERROR_CHARS = 400;
 export const CRON_DELIVERY_RETRY_DELAYS_MS = [5_000, 30_000] as const;
-export const CRON_OUTBOX_MAX_ATTEMPTS = 10;
-export const CRON_OUTBOX_EXPIRY_MS = 48 * 60 * 60 * 1000;
 export const MINIME_CRON_UNRESOLVED_MARKER = "[[MINIME_CRON_UNRESOLVED_V1]]";
 export type CronTerminalOutcome = "success" | "failure";
 type PiThinkingLevel = NonNullable<AgentConfig["thinking"]>;
@@ -637,6 +635,11 @@ function loadCronTask(taskName: string, cronsPath?: string, defaults?: DeliveryD
     throw new Error(`Task "${taskName}" has invalid 'timeout' (${c.timeout}): must be a positive number`);
   }
 
+  if (c.deliveryMaxAgeMs !== undefined
+    && (typeof c.deliveryMaxAgeMs !== "number" || !Number.isInteger(c.deliveryMaxAgeMs) || c.deliveryMaxAgeMs <= 0)) {
+    throw new Error(`Task "${taskName}" has invalid 'deliveryMaxAgeMs': must be a positive integer`);
+  }
+
   let engine: CronJob["engine"];
   if (cronType === "llm" && c.engine !== undefined) {
     if (c.engine === "claude") {
@@ -657,6 +660,7 @@ function loadCronTask(taskName: string, cronsPath?: string, defaults?: DeliveryD
     agentId: String(c.agentId ?? "main"),
     deliveryChatId,
     deliveryThreadId,
+    deliveryMaxAgeMs: c.deliveryMaxAgeMs as number | undefined,
     timeout: typeof c.timeout === "number" ? c.timeout : undefined,
     enabled: c.enabled === false ? false : undefined,
     engine,
@@ -846,12 +850,24 @@ export class DeliveryError extends Error {
 }
 
 export function isQueueableDeliveryFailure(err: unknown): boolean {
-  return !(err instanceof DeliveryError
-    && err.status === 1
-    && err.stderrExcerpt !== undefined
-    && /\[deliver\] Error: (invalid chat_id|invalid thread_id|empty message)/.test(
-      err.stderrExcerpt,
-    ));
+  if (!(err instanceof DeliveryError) || err.status !== 1 || !err.stderrExcerpt) return true;
+  if (/\[deliver\] Error: (invalid chat_id|invalid thread_id|empty message)/.test(err.stderrExcerpt)) {
+    return false;
+  }
+  const response = err.stderrExcerpt.match(/\[deliver\] Error: sendMessage failed: (\{[^\n]*\})/);
+  if (response) {
+    try {
+      const body = JSON.parse(response[1]);
+      if (body.ok === false && Number.isInteger(body.error_code)
+        && body.error_code >= 400 && body.error_code < 500
+        && body.error_code !== 408 && body.error_code !== 429) {
+        return false;
+      }
+    } catch {
+      // Truncated, malformed, or non-API responses remain queueable.
+    }
+  }
+  return true;
 }
 
 function deliver(
@@ -1377,7 +1393,7 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
 
   const notifyAdminOfTerminalOutbox = (
     record: CronOutboxRecord,
-    reason: "gave-up" | "deterministic",
+    reason: "deterministic",
   ): void => {
     if (adminChatId === undefined) {
       return;
@@ -1426,6 +1442,19 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     pendingRecord = undefined;
   }
 
+  if (pendingRecord !== undefined && pendingRecord !== "corrupt"
+    && cron.deliveryMaxAgeMs !== undefined
+    && Date.now() - Date.parse(pendingRecord.createdAt) >= cron.deliveryMaxAgeMs) {
+    try {
+      deps.clearCronOutboxRecord(taskName);
+    } catch (err) {
+      deps.log(taskName, `OUTBOX CLEAR-FAILED expired runId=${pendingRecord.runId}: ${errorFromUnknown(err).message}`);
+      deps.exit(1);
+    }
+    deps.log(taskName, `OUTBOX DROPPED expired runId=${pendingRecord.runId}`);
+    pendingRecord = undefined;
+  }
+
   if (pendingRecord === "corrupt") {
     try {
       deps.clearCronOutboxRecord(taskName);
@@ -1435,8 +1464,56 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
       deps.exit(1);
     }
   } else if (pendingRecord !== undefined) {
-    const expired = Date.now() - Date.parse(pendingRecord.createdAt) > CRON_OUTBOX_EXPIRY_MS;
-    if (expired || pendingRecord.attempts >= CRON_OUTBOX_MAX_ATTEMPTS) {
+    // Generated output remains owed across outages. Retry once per scheduled
+    // invocation; deferred pickup blocks generation rather than accumulating runs.
+    const deliveryAttempt: { ok: true } | { ok: false; error: unknown } = (() => {
+      try {
+        deps.deliver(pendingRecord.chatId, pendingRecord.payload, pendingRecord.threadId);
+        return { ok: true };
+      } catch (error) {
+        return { ok: false, error };
+      }
+    })();
+
+    if (!deliveryAttempt.ok) {
+      const err = deliveryAttempt.error;
+      if (isQueueableDeliveryFailure(err)) {
+        const updatedRecord = {
+          ...pendingRecord,
+          attempts: pendingRecord.attempts + 1,
+        };
+        try {
+          deps.writeCronOutboxRecord(updatedRecord);
+        } catch (writeError) {
+          deps.log(
+            taskName,
+            `OUTBOX RETRY-WRITE-FAILED runId=${pendingRecord.runId}: ${errorFromUnknown(writeError).message}`,
+          );
+          deps.exit(1);
+        }
+        deps.log(
+          taskName,
+          `OUTBOX RETRY-DEFERRED runId=${pendingRecord.runId} attempts=${updatedRecord.attempts}`,
+        );
+        // This invocation only retried delivery owed by an earlier logical
+        // run. It exits without generating or counting a new logical run.
+        deps.exit(1);
+      }
+      try {
+        deps.clearCronOutboxRecord(taskName);
+      } catch (clearError) {
+        deps.log(
+          taskName,
+          `OUTBOX CLEAR-FAILED runId=${pendingRecord.runId}: ${errorFromUnknown(clearError).message}`,
+        );
+        deps.exit(1);
+      }
+      deps.log(
+        taskName,
+        `OUTBOX TERMINAL deterministic runId=${pendingRecord.runId} attempts=${pendingRecord.attempts}`,
+      );
+      notifyAdminOfTerminalOutbox(pendingRecord, "deterministic");
+    } else {
       try {
         deps.clearCronOutboxRecord(taskName);
       } catch (err) {
@@ -1448,72 +1525,8 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
       }
       deps.log(
         taskName,
-        `OUTBOX TERMINAL gave-up runId=${pendingRecord.runId} attempts=${pendingRecord.attempts}`,
+        `OUTBOX REDELIVERED runId=${pendingRecord.runId} attempts=${pendingRecord.attempts}`,
       );
-      notifyAdminOfTerminalOutbox(pendingRecord, "gave-up");
-    } else {
-      const deliveryAttempt: { ok: true } | { ok: false; error: unknown } = (() => {
-        try {
-          deps.deliver(pendingRecord.chatId, pendingRecord.payload, pendingRecord.threadId);
-          return { ok: true };
-        } catch (error) {
-          return { ok: false, error };
-        }
-      })();
-
-      if (!deliveryAttempt.ok) {
-        const err = deliveryAttempt.error;
-        if (isQueueableDeliveryFailure(err)) {
-          const updatedRecord = {
-            ...pendingRecord,
-            attempts: pendingRecord.attempts + 1,
-          };
-          try {
-            deps.writeCronOutboxRecord(updatedRecord);
-          } catch (writeError) {
-            deps.log(
-              taskName,
-              `OUTBOX RETRY-WRITE-FAILED runId=${pendingRecord.runId}: ${errorFromUnknown(writeError).message}`,
-            );
-            deps.exit(1);
-          }
-          deps.log(
-            taskName,
-            `OUTBOX RETRY-DEFERRED runId=${pendingRecord.runId} attempts=${updatedRecord.attempts}`,
-          );
-          // This invocation only retried delivery owed by an earlier logical
-          // run. It exits without generating or counting a new logical run.
-          deps.exit(1);
-        }
-        try {
-          deps.clearCronOutboxRecord(taskName);
-        } catch (clearError) {
-          deps.log(
-            taskName,
-            `OUTBOX CLEAR-FAILED runId=${pendingRecord.runId}: ${errorFromUnknown(clearError).message}`,
-          );
-          deps.exit(1);
-        }
-        deps.log(
-          taskName,
-          `OUTBOX TERMINAL deterministic runId=${pendingRecord.runId} attempts=${pendingRecord.attempts}`,
-        );
-        notifyAdminOfTerminalOutbox(pendingRecord, "deterministic");
-      } else {
-        try {
-          deps.clearCronOutboxRecord(taskName);
-        } catch (err) {
-          deps.log(
-            taskName,
-            `OUTBOX CLEAR-FAILED runId=${pendingRecord.runId}: ${errorFromUnknown(err).message}`,
-          );
-          deps.exit(1);
-        }
-        deps.log(
-          taskName,
-          `OUTBOX REDELIVERED runId=${pendingRecord.runId} attempts=${pendingRecord.attempts}`,
-        );
-      }
     }
   }
 

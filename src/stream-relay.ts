@@ -429,8 +429,8 @@ export async function relayStream(
       platform.sendTyping().catch(() => {});
     }, platform.typingIntervalMs);
 
-    // Send initial typing
-    await platform.sendTyping().catch(() => {});
+    // Cosmetic typing must not delay consuming the event stream.
+    void platform.sendTyping().catch(() => {});
   }
 
   /** Queue the latest display snapshot; stale pending snapshots are replaced. */
