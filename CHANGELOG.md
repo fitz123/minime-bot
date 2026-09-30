@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 2026.10.0
+
+- Add opt-in same-host Pi collaboration through a bot-hosted private Unix socket: discover and address configured agents, logical threads, exact sessions and standalone terminals with nonblocking continuing send/reply conversations (#222, #227).
+- Keep internal turns under SessionManager ownership with human-input priority and isolated drafts/text/outbox; preserve exact-context resume and existing ask_agent behavior.
+- Document ephemeral receipt uncertainty, reconnect without replay, bounded conversations and ordinary PTY/Agterm participation.
+
 ## 2026.9.4
 
 - Refresh stable Telegram drafts every 15 seconds during quiet tool gaps, before
