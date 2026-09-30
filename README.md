@@ -132,8 +132,10 @@ topics, media/upload, retry/connectivity, and cancellation contracts; it does
 not opt into new Bot API product features.
 
 In Telegram DMs, streaming text uses one stable nonzero draft ID and refreshes
-the latest visible snapshot every 25 seconds during quiet tool gaps, before
-Telegram's 30-second draft expiry. Unchanged ordinary deltas are deduplicated,
+the latest visible snapshot on a 15-second interval during quiet tool gaps,
+targeting refresh before the shortest known client expiry (20 seconds on iOS).
+Network delays or client quirks can still allow drafts to expire.
+Unchanged ordinary deltas are deduplicated,
 while the configured periodic typing indicator remains active for the whole
 turn as a fallback when drafts fail or are rate-limited. Draft publication is
 held while trimmed output could still be the leading `NO_REPLY` sentinel;
