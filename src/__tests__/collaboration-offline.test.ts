@@ -5,6 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, existsSy
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { SessionManager } from "../session-manager.js";
+import { resolveBinding } from "../telegram-binding.js";
 import { resolvePackageOwnedPiInvocation } from "../pi-runtime.js";
 import { CollaborationDeliveryError, type Delivery } from "../collaboration.js";
 import type { BotConfig } from "../types.js";
@@ -293,5 +294,49 @@ test("an input reservation before Telegram mention filtering does not refresh ac
     release(); // unrelated authorized chatter is filtered without a model turn
     assert.equal(session.lastActivity, lastActivity);
     assert.equal(session.idleTimer, idleTimer);
+  } finally { await manager.closeAll(); restore(); }
+});
+
+
+test("stored fallback Telegram topic rejects a changed chat-wide owner after restart without replacing context", { timeout: 30000 }, async () => {
+  const { manager, config, root, restore } = ownerFixture();
+  let restarted: SessionManager | undefined;
+  try {
+    config.agents.a = { ...config.agents.b, id: "a" };
+    config.bindings = [{ chatId: -101, agentId: "a", kind: "group" }];
+    const lane = "-101:7";
+    const initial = await manager.getOrCreateSession(lane, "a");
+    await manager.closeAll();
+    const transcript = readFileSync(initial.sessionFile!, "utf8");
+    config.bindings[0].agentId = "b";
+    assert.equal(resolveBinding(-101, config.bindings, 7)?.agentId, "b", "normal Telegram routing uses the new fallback owner");
+    const storePath = join(root, "state", "sessions.json");
+    restarted = new SessionManager(() => config, storePath, join(root, "logs"));
+    const stored = readFileSync(storePath, "utf8");
+    await assert.rejects(restarted.deliverCollaboration(message({ kind: "thread", id: lane }, "fallback owner check"), () => assert.fail("changed owner must not consume input")), error => error instanceof CollaborationDeliveryError && error.status === "rejected");
+    assert.equal(restarted.getActive(lane), undefined);
+    assert.equal(readFileSync(storePath, "utf8"), stored);
+    assert.equal(readFileSync(initial.sessionFile!, "utf8"), transcript);
+  } finally { await restarted?.closeAll(); await manager.closeAll(); restore(); }
+});
+
+test("thread owner resolution preserves explicit topics, unchanged fallback, synthetic and Discord lanes", { timeout: 30000 }, async () => {
+  const { manager, config, restore } = ownerFixture();
+  try {
+    config.agents.a = { ...config.agents.b, id: "a" };
+    config.bindings = [
+      { chatId: -101, agentId: "a", kind: "group", topics: [{ topicId: 8, agentId: "b" }] },
+      { chatId: -101, topicId: 9, agentId: "b", kind: "group" },
+    ];
+    for (const [lane, agentId] of [["-101:7", "a"], ["-101:8", "b"], ["-101:9", "b"], ["fixture-thread", "b"], ["discord:101:7", "b"]]) {
+      const initial = await manager.getOrCreateSession(lane, agentId);
+      await manager.closeSession(lane);
+      let consumed = false;
+      await manager.deliverCollaboration(message({ kind: "thread", id: lane }, "unchanged owner check"), () => { consumed = true; });
+      assert.equal(consumed, true, lane);
+      assert.equal(manager.getActive(lane)?.sessionId, initial.sessionId, lane);
+      assert.equal(manager.getActive(lane)?.agentId, agentId, lane);
+      await manager.closeSession(lane);
+    }
   } finally { await manager.closeAll(); restore(); }
 });

@@ -380,7 +380,13 @@ export class SessionManager {
       } else if (message.to.kind === "thread") {
         lane = message.to.id;
         if (lane.startsWith("collaboration:")) throw new Error("Consultations are not logical threads");
-        const configured = this.configuredCollaborationThreads(config).get(lane);
+        // Stored Telegram topics can inherit a chat-wide fallback without
+        // appearing in the explicitly configured topic list.
+        const telegramLane = states[lane] && /^(-?\d+)(?::(\d+))?$/.exec(lane);
+        const configured = telegramLane
+          ? resolveBinding(Number(telegramLane[1]), config.bindings,
+            telegramLane[2] === undefined ? undefined : Number(telegramLane[2]))?.agentId
+          : this.configuredCollaborationThreads(config).get(lane);
         agentId = states[lane]?.agentId ?? configured!;
         if (configured && configured !== agentId) throw new Error("Thread owner binding changed");
       } else if (message.to.kind === "session") {
