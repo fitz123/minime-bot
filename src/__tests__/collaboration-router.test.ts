@@ -1,6 +1,7 @@
 // Protocol/lifecycle tests with socket peers. Real Pi proof lives in collaboration-integration.test.ts.
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { createServer } from "node:net";
 import { spawn } from "node:child_process";
 import { chmodSync, lstatSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -169,4 +170,34 @@ test("absent bot can appear later; discovery pages cover configured and connecte
       assert.equal(total, 152);
     } finally { observer.close(); }
   } finally { a.close(); await router.stop(); rmSync(root, { recursive: true, force: true }); }
+});
+
+
+test("client consumes delivery coalesced in the same write as hello acknowledgement", async () => {
+  const root = mkdtempSync(join(tmpdir(), "collab-hello-"));
+  const path = join(root, "router.sock");
+  const delivery: Delivery = { id: "coalesced", conversation: "fixture", from: { kind: "terminal", id: "peer" }, to: { kind: "terminal", id: "receiver" }, text: "hello", expires: Date.now() + 10000 };
+  const server = createServer(socket => {
+    let input = "";
+    socket.on("data", chunk => {
+      input += chunk.toString();
+      const newline = input.indexOf("\n");
+      if (newline < 0) return;
+      const hello = JSON.parse(input.slice(0, newline));
+      input = "";
+      if (hello.op === "hello") socket.write(JSON.stringify({ request: hello.request, value: { status: "accepted" } }) + "\n" + JSON.stringify({ delivery }) + "\n");
+    });
+  });
+  const received: Delivery[] = [];
+  const client = new CollaborationClient(path, delivery.to, "receiver", d => { received.push(d); });
+  try {
+    await new Promise<void>(resolve => server.listen(path, resolve));
+    assert.equal(await client.connect(), true);
+    await until(() => received.length > 0);
+    assert.deepEqual(received, [delivery]);
+  } finally {
+    client.close();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+  }
 });

@@ -199,7 +199,7 @@ export class CollaborationClient {
   private stopped = false;
   private connecting?: Promise<boolean>;
   private retry?: ReturnType<typeof setTimeout>;
-  private pending = new Map<string, { resolve: (value: any) => void; timer: ReturnType<typeof setTimeout> }>();
+  private pending = new Map<string, { resolve: (value: any) => void; timer: ReturnType<typeof setTimeout>; hello: boolean }>();
   constructor(private path: string, private address: Address, private label: string, private receive: (delivery: Delivery) => void) {}
   connect(): Promise<boolean> {
     if (this.stopped) return Promise.resolve(false);
@@ -230,7 +230,12 @@ export class CollaborationClient {
       if (this.socket !== socket) return;
       if (frame.delivery && this.ready) { this.receive(frame.delivery as Delivery); return; }
       const p = this.pending.get(frame.request);
-      if (p) { clearTimeout(p.timer); this.pending.delete(frame.request); p.resolve(frame.value); }
+      if (p) {
+        // A delivery can follow hello in the same data chunk. frames() handles
+        // it before the awaiting connect continuation gets a microtask.
+        if (p.hello) this.ready = frame.value?.status === "accepted" && !socket.destroyed && !this.stopped;
+        clearTimeout(p.timer); this.pending.delete(frame.request); p.resolve(frame.value);
+      }
     });
     const connected = await new Promise<boolean>(resolve => {
       const timer = setTimeout(() => { socket.destroy(); resolve(false); }, 1000);
@@ -252,7 +257,7 @@ export class CollaborationClient {
     const request = randomUUID();
     return new Promise(resolve => {
       const timer = setTimeout(() => { this.pending.delete(request); resolve({ status: "unknown", reason: "receipt timeout; do not replay" }); }, 3000);
-      this.pending.set(request, { resolve, timer });
+      this.pending.set(request, { resolve, timer, hello: frame.op === "hello" });
       write(this.socket!, { ...frame, request });
     });
   }

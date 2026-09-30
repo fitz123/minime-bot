@@ -91,6 +91,8 @@ test("real standalone Pi session switch retires its exact address without redire
   let child: ChildProcess | undefined;
   const events: any[] = [];
   let buffer = "";
+  let stderr = "";
+  let exit: unknown;
   const request = async (command: Record<string, unknown>) => {
     child!.stdin!.write(JSON.stringify(command) + "\n");
     await until(() => events.some(event => event.type === "response" && event.id === command.id));
@@ -112,10 +114,12 @@ test("real standalone Pi session switch retires its exact address without redire
         try { events.push(JSON.parse(line)); } catch { /* non-RPC diagnostic */ }
       }
     });
-    child.stderr!.resume();
+    child.stderr!.on("data", chunk => { stderr += chunk.toString(); });
+    child.once("exit", (code, signal) => { exit = { code, signal }; });
+    child.once("error", error => { exit = { error: String(error) }; });
     let original: any;
     for (let i = 0; i < 200 && !original; i++) { original = await terminal(); if (!original) await delay(30); }
-    assert.ok(original);
+    assert.ok(original, JSON.stringify({ stderr, exit, events }));
     const originalState = await request({ id: "original-state", type: "get_state" });
     child.stdin!.write(JSON.stringify({ id: "busy", type: "prompt", message: "HUMAN_BUSY_PTY" }) + "\n");
     await until(() => events.some(event => event.type === "agent_start"));
@@ -140,6 +144,10 @@ test("real standalone Pi session switch retires its exact address without redire
     await until(() => events.filter(event => event.type === "agent_settled").length >= 2);
     const state = await request({ id: "state", type: "get_state" });
     assert.doesNotMatch(readFileSync(state.data.sessionFile, "utf8"), /OLD_PENDING_MUST_NOT_APPEAR/);
+  } catch (error) {
+    mkdirSync(resolve(".tmp/222"), { recursive: true });
+    writeFileSync(resolve(".tmp/222/session-switch-diagnostics.json"), JSON.stringify({ stderr, exit, events }, null, 2));
+    throw error;
   } finally {
     observer.close();
     if (child && child.exitCode === null && child.signalCode === null) {

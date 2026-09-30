@@ -320,7 +320,8 @@ export class SessionManager {
   /** Reserve a lane while an incoming human message is staged (e.g. media download). */
   holdHumanInput(chatId: string): () => void {
     this.humanInputs.set(chatId, (this.humanInputs.get(chatId) ?? 0) + 1);
-    this.touchActivity(chatId);
+    // Reservation can precede mention/binding filtering. Only accepted input
+    // handlers should touch activity; unrelated chatter must not extend idle.
     let released = false;
     return () => {
       if (released) return;
@@ -1262,9 +1263,11 @@ export class SessionManager {
         }, RESPONSE_ACTIVITY_TIMEOUT_MS);
       };
       let internalConsumed = false;
+      let internalSettled = false;
       let submittedPromptId: string | undefined;
       let promptRejected = false;
       const observeResponseActivity = (event: PiRpcEvent) => {
+        if (event.type === "agent_settled") internalSettled = true;
         const incoming = event.message as { role?: unknown; content?: unknown } | undefined;
         if (options?.internal && event.type === "message_start" && incoming?.role === "user") {
           const content = incoming.content;
@@ -1292,6 +1295,7 @@ export class SessionManager {
         resetActivityTimer();
       };
       let savedOutbox: string | undefined;
+      let ownsInternalOutbox = false;
       let releaseInternalCleanup: (() => void) | undefined;
       let promptSent = false;
       try {
@@ -1311,6 +1315,7 @@ export class SessionManager {
           if (this.active.get(chatId) !== session) throw new CollaborationDeliveryError("rejected", "exact target reset or closed");
           if (this.hasHumanWork(chatId)) throw new HumanInputPendingError();
           if (Date.now() >= (options.expires ?? Infinity)) throw new CollaborationDeliveryError("expired", "delivery expired before consumption");
+          ownsInternalOutbox = true;
           removeOutboxDirIfPresent(`${session.outboxPath}.internal`);
           ensurePrivateDir(`${session.outboxPath}.internal`);
           const backup = `${session.outboxPath}.human`;
@@ -1325,15 +1330,15 @@ export class SessionManager {
         // from the child's real lifecycle, and a bare prompt sent into that
         // window would be rejected with "already processing" and the message
         // lost. followUp queues it behind the live turn instead.
-        const promptId = sendPiPrompt(session.child, text, "followUp");
-        submittedPromptId = promptId;
-        promptSent = true;
         session.lastActivity = Date.now();
         session.processingStartedAt = Date.now();
         this.resetIdleTimer(chatId);
-
-        // Update store with new activity time
-        this.store.setSession(chatId, this.toSessionState(chatId, session));
+        // An internal persistence failure must happen before Pi receives input.
+        if (options?.internal) this.store.setSession(chatId, this.toSessionState(chatId, session));
+        promptSent = true; // A failed write may still have dispatched input.
+        const promptId = sendPiPrompt(session.child, text, "followUp");
+        submittedPromptId = promptId;
+        if (!options?.internal) this.store.setSession(chatId, this.toSessionState(chatId, session));
 
         // Read response lines through agent_settled, when readPiStream emits the
         // accepted prompt's single terminal result.
@@ -1403,7 +1408,14 @@ export class SessionManager {
           : err instanceof Error ? err : new Error(String(err)));
       } finally {
         try {
-          if (options?.internal) removeOutboxDirIfPresent(`${session.outboxPath}.internal`);
+          if (options?.internal && promptSent && !internalSettled) {
+            // A failed reader cannot leave private events buffered for the next
+            // human reader. Keep isolation until this child has stopped.
+            session.outputIsolationFailed = true;
+            await this.waitForSessionChildExit(session, chatId);
+            if (!hasExited(session.child)) throw new Error("Internal child has not exited");
+          }
+          if (ownsInternalOutbox) removeOutboxDirIfPresent(`${session.outboxPath}.internal`);
           if (savedOutbox) {
             // Internal outbox files are ephemeral, just like normal delivered
             // outbox files. Discard them before returning the human directory.

@@ -229,3 +229,69 @@ test("actual Bash background output stays private after the internal turn settle
     assert.equal(existsSync(`${session.outboxPath}.internal`), false);
   } finally { await manager.closeAll(); restore(); }
 });
+
+test("internal persistence failure rejects before dispatch and cannot leak into the next human stream", { timeout: 30000 }, async () => {
+  const { manager, restore } = ownerFixture();
+  const store = (manager as any).store;
+  const original = store.setSession.bind(store);
+  try {
+    const session = await manager.getOrCreateSession("fixture-thread", "b");
+    store.setSession = (...args: any[]) => {
+      if (session.internalTurn && session.processingStartedAt !== null) throw new Error("fixture persistence failure");
+      return original(...args);
+    };
+    await assert.rejects(manager.deliverCollaboration(message({ kind: "session", id: session.sessionId }, "INTERNAL_BUSY"), () => assert.fail("not dispatched")), error => error instanceof CollaborationDeliveryError && error.status === "rejected");
+    store.setSession = original;
+    const lines = [];
+    for await (const line of manager.sendSessionMessage("fixture-thread", "b", "Human after persistence failure")) lines.push(line);
+    assert.doesNotMatch(JSON.stringify(lines), /INTERNAL_DONE/);
+    assert.doesNotMatch(readFileSync(session.sessionFile!, "utf8"), /INTERNAL_BUSY/);
+  } finally { store.setSession = original; await manager.closeAll(); restore(); }
+});
+
+test("fatal internal reader failure terminates the dispatched child before releasing isolation", { timeout: 30000 }, async () => {
+  const { manager, restore } = ownerFixture();
+  try {
+    const session = await manager.getOrCreateSession("fixture-thread", "b");
+    let exitedWhileIsolated = false;
+    session.child.once("exit", () => { exitedWhileIsolated = session.internalTurn === true; });
+    await assert.rejects(manager.deliverCollaboration(message({ kind: "session", id: session.sessionId }, "INTERNAL_BUSY"), () => { throw new Error("fixture reader failure"); }), error => error instanceof CollaborationDeliveryError && error.status === "unknown");
+    assert.ok(session.child.exitCode !== null || session.child.signalCode !== null, "must stop dispatched child before restoring output ownership");
+    assert.equal(exitedWhileIsolated, true);
+    const lines = [];
+    for await (const line of manager.sendSessionMessage("fixture-thread", "b", "Human after reader failure")) lines.push(line);
+    assert.notEqual(manager.getActive("fixture-thread")?.child, session.child);
+    assert.doesNotMatch(JSON.stringify(lines), /INTERNAL_DONE/);
+  } finally { await manager.closeAll(); restore(); }
+});
+
+test("rejected stale attempt cannot remove the replacement turn's internal outbox", { timeout: 30000 }, async () => {
+  const { manager, restore } = ownerFixture();
+  try {
+    const old = await manager.getOrCreateSession("fixture-thread", "b");
+    await manager.destroySession("fixture-thread");
+    const replacement = await manager.getOrCreateSession("fixture-thread", "b");
+    const active = manager.deliverCollaboration(message({ kind: "session", id: replacement.sessionId }, "INTERNAL_BUSY"), () => {});
+    const privateFile = join(`${replacement.outboxPath}.internal`, "internal.txt");
+    await until(() => existsSync(privateFile));
+    await assert.rejects(async () => {
+      for await (const _ of manager.sendSessionMessage("fixture-thread", "b", "stale", { internal: true, expectedSession: old })) {}
+    }, error => error instanceof CollaborationDeliveryError && error.status === "rejected");
+    assert.equal(readFileSync(privateFile, "utf8"), "INTERNAL_FILE");
+    await active;
+  } finally { await manager.closeAll(); restore(); }
+});
+
+test("an input reservation before Telegram mention filtering does not refresh activity or idle deadline", { timeout: 30000 }, async () => {
+  const { manager, restore } = ownerFixture();
+  try {
+    const session = await manager.getOrCreateSession("fixture-thread", "b");
+    const lastActivity = session.lastActivity;
+    const idleTimer = session.idleTimer;
+    await delay(20);
+    const release = manager.holdHumanInput("fixture-thread");
+    release(); // unrelated authorized chatter is filtered without a model turn
+    assert.equal(session.lastActivity, lastActivity);
+    assert.equal(session.idleTimer, idleTimer);
+  } finally { await manager.closeAll(); restore(); }
+});

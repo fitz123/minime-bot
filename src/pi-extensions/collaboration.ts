@@ -16,16 +16,27 @@ export function registerCollaboration(pi: ExtensionAPI): void {
   let client: CollaborationClient | undefined;
   let context: ExtensionContext | undefined;
   const inbox: Array<{ delivery: Delivery; client: CollaborationClient; timer: ReturnType<typeof setTimeout>; injected: boolean }> = [];
+  let wakeup: ReturnType<typeof setTimeout> | undefined;
   const clearInbox = () => {
+    clearTimeout(wakeup);
+    wakeup = undefined;
     for (const item of inbox.splice(0)) {
       clearTimeout(item.timer);
       if (!item.injected) item.client.report(item.delivery.id, "rejected");
     }
   };
   const drain = () => {
-    if (!context?.isIdle()) return;
+    clearTimeout(wakeup);
+    wakeup = undefined;
     const item = inbox.find(item => !item.injected);
     if (!item) return;
+    if (!context?.isIdle()) {
+      // Pi 0.99.1 manual compaction has no extension idle event on every
+      // success/cancel/failure path. Poll only while uninjected input waits.
+      wakeup = setTimeout(drain, 100);
+      wakeup.unref();
+      return;
+    }
     if (item.delivery.expires <= Date.now()) return;
     item.injected = true;
     pi.sendMessage({
@@ -37,7 +48,7 @@ export function registerCollaboration(pi: ExtensionAPI): void {
     clearInbox();
     client?.close();
     context = ctx;
-    const bot = process.env.MINIME_COLLABORATION_SESSION;
+    const bot = process.env.MINIME_COLLABORATION_SESSION || undefined;
     // An owner-opened bot child must never advertise a replacement Pi context.
     if (bot && bot !== ctx.sessionManager.getSessionId()) { client = undefined; return; }
     const current = new CollaborationClient(path, {
