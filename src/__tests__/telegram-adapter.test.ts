@@ -589,3 +589,74 @@ describe("createTelegramAdapter", () => {
     });
   });
 });
+
+describe("bounded Telegram typing", () => {
+  it("shares one wire call across adapters/ticks, aborts it at the deadline, and recovers", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+    const { Api } = await import("grammy");
+    const { createTelegramAutoRetryTransformer } = await import("../telegram-bot.js");
+    let active = 0;
+    let peak = 0;
+    let calls = 0;
+    let aborted = 0;
+    let offline = true;
+    // Exercise grammY's actual signal forwarding into a fully isolated transport.
+    const api = new Api("test-token", {
+      fetch: ((_url: unknown, options: { signal: AbortSignal }) => {
+        calls++;
+        active++;
+        peak = Math.max(peak, active);
+        if (!offline) {
+          active--;
+          return Promise.resolve({ json: async () => ({ ok: true, result: true }) });
+        }
+        return new Promise((_resolve, reject) => {
+          options.signal.addEventListener("abort", () => {
+            active--;
+            aborted++;
+            reject(new Error("wire aborted"));
+          }, { once: true });
+        });
+      }) as never,
+    });
+    api.config.use(createTelegramAutoRetryTransformer());
+    const first = createTelegramApiAdapter({ api, chatId: 1, threadId: 2 });
+    const second = createTelegramAdapter({ chat: { id: 1 }, api, message: { message_thread_id: 2 } } as never);
+    const pending = first.sendTyping();
+    const rejected = assert.rejects(pending, /sendChatAction/);
+    const tick = setInterval(() => { void second.sendTyping().catch(() => {}); }, 10);
+    try {
+      t.mock.timers.tick(4_990);
+      assert.equal(calls, 1);
+      assert.equal(active, 1);
+      assert.equal(peak, 1);
+      t.mock.timers.tick(10);
+      await rejected;
+      assert.equal(aborted, 1);
+      assert.equal(active, 0, "abort must end wire work");
+      offline = false;
+      await second.sendTyping();
+      assert.equal(calls, 2);
+      assert.equal(active, 0);
+      assert.equal(peak, 1);
+    } finally {
+      clearInterval(tick);
+    }
+  });
+
+  it("allows different threads to type independently and releases slots after failure", async () => {
+    const ctx = mockContext({ chatId: 1 });
+    const pending: Array<() => void> = [];
+    ctx.api.sendChatAction = () => new Promise<void>((resolve) => pending.push(resolve));
+    const first = createTelegramApiAdapter({ api: ctx.api, chatId: 1, threadId: 3 });
+    const second = createTelegramApiAdapter({ api: ctx.api, chatId: 1, threadId: 4 });
+    const work = [first.sendTyping(), second.sendTyping()];
+    assert.equal(pending.length, 2);
+    pending.forEach((resolve) => resolve());
+    await Promise.all(work);
+    ctx.api.sendChatAction = async () => { throw new Error("offline"); };
+    await assert.rejects(first.sendTyping(), /offline/);
+    ctx.api.sendChatAction = async () => true;
+    await first.sendTyping();
+  });
+});

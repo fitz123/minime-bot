@@ -17,8 +17,6 @@ import {
   classifyLlmCronTerminalResult,
   classifyPiResult,
   CRON_DELIVERY_RETRY_DELAYS_MS,
-  CRON_OUTBOX_EXPIRY_MS,
-  CRON_OUTBOX_MAX_ATTEMPTS,
   deliver,
   DeliveryError,
   getAgentWorkspace,
@@ -233,7 +231,7 @@ describe("cron-runner", () => {
       assert.strictEqual(subprocessCalls, 1);
     });
 
-    it("queues every failure except proven deliver.sh pre-send validation errors", () => {
+    it("queues failures except proven validation and permanent Telegram errors", () => {
       const cases: Array<{ name: string; error: unknown; expected: boolean }> = [
         {
           name: "invalid chat id",
@@ -293,6 +291,17 @@ describe("cron-runner", () => {
         { name: "ordinary error", error: new Error("unknown"), expected: true },
         { name: "unknown thrown value", error: "network down", expected: true },
       ];
+
+      for (const code of [400, 401, 403, 404, 409, 429, 500, 503]) {
+        cases.push({ name: `API ${code}`, expected: code === 429 || code >= 500,
+          error: new DeliveryError("API failed", { status: 1,
+            stderrExcerpt: `[deliver] Error: sendMessage failed: ${JSON.stringify({ ok: false, error_code: code, description: "Bad Request: message thread not found" })}` }) });
+      }
+      for (const body of ['<html>Bad Gateway</html>', '{"ok":false,"error_code":400', '{"ok":true,"error_code":400}', '{"ok":false,"error_code":"400"}']) {
+        cases.push({ name: body, expected: true, error: new DeliveryError("unknown", {
+          status: 1, stderrExcerpt: `[deliver] Error: sendMessage failed: ${body}`,
+        }) });
+      }
 
       for (const testCase of cases) {
         assert.strictEqual(
@@ -392,6 +401,21 @@ describe("cron-runner", () => {
     afterEach(() => {
       rmSync(CRONS_DIR, { recursive: true, force: true });
     });
+
+    for (const value of [undefined, 60000, 0, -1, 1.5, '"60000"', '.inf', 'null']) {
+      it(`validates deliveryMaxAgeMs ${value}`, () => {
+        writeFileSync(CRONS_FILE, `crons:
+  - name: test-task
+    prompt: test
+    deliveryChatId: 111111111
+${value === undefined ? "" : `    deliveryMaxAgeMs: ${value}\n`}`);
+        if (value === undefined || value === 60000) {
+          assert.equal(loadCronTask("test-task", CRONS_FILE).deliveryMaxAgeMs, value);
+        } else {
+          assert.throws(() => loadCronTask("test-task", CRONS_FILE), /invalid 'deliveryMaxAgeMs'/);
+        }
+      });
+    }
 
     it("parses deliveryThreadId when present", () => {
       writeFileSync(CRONS_FILE, `crons:
@@ -2579,49 +2603,36 @@ bindings: []
       assert.doesNotMatch(calls.logs.map((entry) => entry.message).join("\n"), /OUTBOX QUEUED/);
     });
 
-    it("clears an attempts-exhausted pending record, notifies admin, and counts only the new logical run", async () => {
+    it("preserves output across a virtual month of outages with one pickup per scheduled invocation", async (t) => {
+      t.mock.timers.enable({ apis: ["Date"], now: Date.UTC(2026, 0, 1) });
       const cron = makeMainCron();
       const { calls, deps, state } = makeMainHarness(cron);
-      const pending = makePendingRecord(cron, { attempts: CRON_OUTBOX_MAX_ATTEMPTS });
+      const pending = makePendingRecord(cron);
       state.pending = pending;
-
+      const deliver = deps.deliver;
+      deps.deliver = (chatId, message, threadId) => {
+        deliver(chatId, message, threadId);
+        throw new Error("temporary transport failure");
+      };
+      for (let day = 1; day <= 30; day++) {
+        t.mock.timers.tick(24 * 60 * 60 * 1000);
+        await assertMainExits(deps, 1);
+        assert.deepStrictEqual(state.pending, { ...pending, attempts: day });
+        assert.strictEqual(calls.deliveries.length, day);
+        assert.deepStrictEqual(calls.oneShots, []);
+        assert.deepStrictEqual(calls.metrics, []);
+        assert.deepStrictEqual(calls.sleeps, []);
+        assert.deepStrictEqual(calls.outboxClears, []);
+      }
+      deps.deliver = deliver;
+      calls.events.length = 0;
       await main(deps);
-
-      assert.strictEqual(state.pending, undefined);
-      assert.deepStrictEqual(calls.outboxClears, [cron.name]);
-      assert.strictEqual(
-        calls.logs.find((entry) => entry.message.startsWith("OUTBOX TERMINAL"))?.message,
-        `OUTBOX TERMINAL gave-up runId=${pending.runId} attempts=${CRON_OUTBOX_MAX_ATTEMPTS}`,
-      );
-      assert.strictEqual(calls.deliveries[0].chatId, 999999999);
-      assert.match(calls.deliveries[0].message, /Cron outbox gave-up/);
-      assert.deepStrictEqual(calls.oneShots.map((call) => call.cronName), [cron.name]);
-      assert.deepStrictEqual(calls.metrics, [
-        { cronName: cron.name, exitCode: 0, success: true },
+      assert.deepStrictEqual(calls.events, [
+        "deliver:owed output", `generate:${cron.name}`, "deliver:llm output",
       ]);
-    });
-
-    it("clears an expired pending record, notifies admin, and counts only the new logical run", async () => {
-      const cron = makeMainCron();
-      const { calls, deps, state } = makeMainHarness(cron);
-      const pending = makePendingRecord(cron, {
-        createdAt: new Date(Date.now() - CRON_OUTBOX_EXPIRY_MS - 1_000).toISOString(),
-        attempts: 4,
-      });
-      state.pending = pending;
-
-      await main(deps);
-
       assert.strictEqual(state.pending, undefined);
-      assert.deepStrictEqual(calls.outboxClears, [cron.name]);
-      assert.ok(calls.logs.some((entry) =>
-        entry.message === `OUTBOX TERMINAL gave-up runId=${pending.runId} attempts=4`));
-      assert.strictEqual(calls.deliveries[0].chatId, 999999999);
-      assert.match(calls.deliveries[0].message, /Cron outbox gave-up/);
-      assert.deepStrictEqual(calls.oneShots.map((call) => call.cronName), [cron.name]);
-      assert.deepStrictEqual(calls.metrics, [
-        { cronName: cron.name, exitCode: 0, success: true },
-      ]);
+      assert.strictEqual(calls.oneShots.length, 1, "no replay of missed ticks");
+      assert.strictEqual(calls.metrics.length, 1);
     });
 
     it("clears corrupt pending state and counts only the new logical run", async () => {
@@ -2692,17 +2703,44 @@ bindings: []
         === `OUTBOX CLEAR-FAILED legacy-failure-notice runId=${pending.runId}: clear unavailable`));
     });
 
-    it("clears a deterministically undeliverable pending record, notifies admin, and counts only the new logical run", async () => {
+    for (const age of [500, 1000, 2000]) {
+      it(`picks up output with explicit freshness at age ${age}`, async (t) => {
+        t.mock.timers.enable({ apis: ["Date"], now: Date.UTC(2026, 0, 1) });
+        const cron = { ...makeMainCron(), deliveryMaxAgeMs: 1000 };
+        const { calls, deps, state } = makeMainHarness(cron);
+        state.pending = makePendingRecord(cron, { createdAt: new Date(Date.now() - age).toISOString() });
+        await main(deps);
+        assert.equal(state.pending, undefined);
+        assert.deepEqual(calls.events, age < 1000
+          ? ["deliver:owed output", `generate:${cron.name}`, "deliver:llm output"]
+          : [`generate:${cron.name}`, "deliver:llm output"]);
+        assert.equal(calls.outboxClears.length, 1);
+      });
+    }
+
+    it("stops before generation if expired output cannot be cleared", async () => {
+      const cron = { ...makeMainCron(), deliveryMaxAgeMs: 1 };
+      const { calls, deps, state } = makeMainHarness(cron);
+      const pending = makePendingRecord(cron, { createdAt: new Date(0).toISOString() });
+      state.pending = pending;
+      deps.clearCronOutboxRecord = () => { throw new Error("disk unavailable"); };
+      await assertMainExits(deps, 1);
+      assert.equal(state.pending, pending);
+      assert.deepEqual(calls.events, []);
+      assert.deepEqual(calls.metrics, []);
+    });
+
+    it("clears deleted-topic output and delivers the new run to the corrected config", async () => {
       const cron = makeMainCron();
       const { calls, deps, state } = makeMainHarness(cron);
-      const pending = makePendingRecord(cron);
+      const pending = makePendingRecord(cron, { threadId: 99 });
       state.pending = pending;
       deps.deliver = (chatId: number, message: string, threadId?: number) => {
         calls.deliveries.push({ chatId, message, threadId });
         if (message === pending.payload) {
           throw new DeliveryError("Delivery failed: invalid thread", {
             status: 1,
-            stderrExcerpt: "[deliver] Error: invalid thread_id",
+            stderrExcerpt: '[deliver] Error: sendMessage failed: {"ok":false,"error_code":400,"description":"Bad Request: message thread not found"}',
           });
         }
       };
@@ -2718,6 +2756,8 @@ bindings: []
         999999999,
         cron.deliveryChatId,
       ]);
+      assert.equal(calls.deliveries[0].threadId, 99);
+      assert.equal(calls.deliveries[2].threadId, cron.deliveryThreadId);
       assert.match(calls.deliveries[1].message, /Cron outbox deterministic/);
       assert.deepStrictEqual(calls.oneShots.map((call) => call.cronName), [cron.name]);
       assert.deepStrictEqual(calls.metrics, [
@@ -2766,10 +2806,10 @@ bindings: []
         entry.message === "OUTBOX CLEAR-FAILED corrupt: clear unavailable"));
     });
 
-    it("fails closed when an attempts-exhausted record cannot be cleared", async () => {
+    it("fails closed when a redelivered old record cannot be cleared", async () => {
       const cron = makeMainCron();
       const { calls, deps, state } = makeMainHarness(cron);
-      const pending = makePendingRecord(cron, { attempts: CRON_OUTBOX_MAX_ATTEMPTS });
+      const pending = makePendingRecord(cron, { attempts: 30 });
       state.pending = pending;
       deps.clearCronOutboxRecord = (cronName: string) => {
         calls.outboxClears.push(cronName);

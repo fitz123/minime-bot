@@ -911,9 +911,20 @@ runner tries to deliver any result owed by that cron before generating new
 output. After bounded in-process delivery retries fail, it stores the exact
 generated output in one atomic, durable outbox slot per cron. A queueable
 pickup failure stops the invocation before generation, so a newer result
-cannot overwrite the pending one. Redelivery is limited to 10 later attempts
-and a 48-hour lifetime. Queue, redelivery, deferral, and terminal decisions are
-recorded as `OUTBOX` lines in `cron-<name>.log`.
+cannot overwrite the pending one. Transient failures retain output indefinitely,
+with one pickup attempt per scheduled invocation and no missed-run replay.
+For time-sensitive reminders, set optional `deliveryMaxAgeMs` to a positive
+integer in milliseconds (for example, `deliveryMaxAgeMs: 3600000` for one hour).
+At pickup, the current cron setting discards output whose age since creation
+has reached that limit before generating a new result. Leave it absent for
+valuable reports that must survive prolonged outages.
+
+Proven Telegram API 4xx rejections except 429 (such as a deleted topic or blocked
+bot), and local destination validation errors, take the terminal clear/admin
+notice path so corrected configuration can run. Rate limits, 5xx, network errors,
+and unknown responses remain queueable. Legacy failure notices are dropped.
+Queue, redelivery, expiry, deferral, and terminal decisions are recorded as
+`OUTBOX` lines in `cron-<name>.log`.
 
 Pickup-only outbox preflight failures and deferred redelivery attempts do not
 start a new logical cron run, so they do not change terminal metrics or
@@ -922,8 +933,11 @@ diagnostic evidence.
 
 Delivery has at-least-once, not exactly-once, semantics: a process crash after
 the chat accepts a message but before the outbox record is cleared can produce
-a duplicate, including for multi-chunk messages. Recovery occurs only on the
-same cron's next scheduled invocation; there is no background sweeper or
+a duplicate, including for multi-chunk messages. Ordinary bot API calls also
+allow two short, abort-aware transport retries shared across their bounded
+429/5xx retry loop; an ambiguous transport failure can duplicate a write.
+Typing and drafts skip retries, and polling uses its own retry loop.
+Recovery occurs only on the same cron's next scheduled invocation; there is no background sweeper or
 receipt-based deduplication. Pending records for crons that are disabled or
 removed remain inert, inspectable files until an operator handles them.
 

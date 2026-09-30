@@ -25,6 +25,8 @@ export interface TelegramApiAdapterOptions {
 /** Telegram platform constants. */
 const TELEGRAM_MAX_MSG_LENGTH = 4096;
 const TELEGRAM_TYPING_INTERVAL_MS = 5000;
+// Shared across context/API adapters, including queue-to-relay handoffs.
+const typingInFlight = new Set<string>();
 const MAX_DRAFT_RETRY_AFTER_MS = 60_000;
 
 function shouldFallbackToPlainText(err: unknown): boolean {
@@ -121,11 +123,23 @@ export function createTelegramApiAdapter({
 
     async sendTyping(): Promise<void> {
       if (!chatId) return;
-      await api.sendChatAction(
-        chatId,
-        "typing",
-        threadId != null ? { message_thread_id: threadId } : undefined,
-      );
+      const key = `${chatId}:${threadId ?? ""}`;
+      if (typingInFlight.has(key)) return;
+      typingInFlight.add(key);
+      const controller = new AbortController();
+      const deadline = setTimeout(() => controller.abort(), TELEGRAM_TYPING_INTERVAL_MS);
+      try {
+        await api.sendChatAction(
+          chatId,
+          "typing",
+          threadId != null ? { message_thread_id: threadId } : undefined,
+          controller.signal as Parameters<TelegramAdapterApi["sendChatAction"]>[3],
+        );
+      } finally {
+        clearTimeout(deadline);
+        // Keep the slot until the aborted transport actually settles.
+        typingInFlight.delete(key);
+      }
     },
 
     async sendFile(filePath: string, isImage: boolean): Promise<void> {

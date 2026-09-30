@@ -343,7 +343,27 @@ When delivery retries are exhausted, the cron runner stores the exact owed
 message under `<control-workspace>/data/cron-outbox/`. The directory and its
 hashed per-cron JSON records are owner-only. An enabled cron normally consumes
 only its own record at the start of its next invocation; no background process
-redelivers or garbage-collects records.
+redelivers or garbage-collects records. Transient failures retain useful output
+indefinitely, retrying once per scheduled invocation before any new generation.
+Missed invocations are not replayed.
+
+Set optional cron `deliveryMaxAgeMs` to a positive integer in milliseconds for
+time-sensitive reminders, for example `deliveryMaxAgeMs: 3600000` (one hour).
+At pickup, the current setting drops output at or beyond that age since creation
+before generating new output. An absent setting keeps valuable reports through
+long outages. A failed record removal stops generation; legacy failure-notice
+records are still dropped.
+
+Proven Telegram API 4xx rejections except 429, including deleted topics and
+blocked bots, clear the pending record through the terminal/admin-notice path,
+allowing corrected cron configuration to proceed. Local destination validation
+errors are also terminal. Rate limits, 5xx, transport failures, and unknown or
+non-JSON gateway responses remain queueable. Inspect `OUTBOX` log lines for
+pickup, deferral, expiry, and terminal decisions. Delivery is not exactly-once:
+ambiguous transport failures, partial multi-chunk delivery, or a crash before
+record removal can cause duplicates. Ordinary bot API calls retain two short
+abort-aware transport retries shared across their bounded 429/5xx retries;
+typing and draft calls bypass retries, and polling has its own retry loop.
 
 Records for disabled or removed crons remain inert. Inspect a record before
 manually removing it so the owed payload, target, run identity, age, and attempt

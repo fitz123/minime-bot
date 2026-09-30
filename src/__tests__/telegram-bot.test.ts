@@ -3,6 +3,7 @@ import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { resolveBinding, isAuthorized, sessionKey, isImageMimeType, imageExtensionForMime, buildSourcePrefix, shouldRespondInGroup, shouldRespondToReaction, BOT_COMMANDS, TELEGRAM_ALLOWED_UPDATES, buildReplyContext, buildForwardContext, extensionForDocument, formatFileSize, formatDocumentMeta, buildReactionContext, AUTO_RETRY_OPTIONS, createTelegramAutoRetryTransformer, extractMediaInfo, extensionForMedia, formatMediaMeta, createTelegramBot, extractChatContext, formatChatContextForLog, describeTelegramUpdateForLog, createApiErrorLoggingTransformer, resolveBindingLabel, BINDING_LABEL_NONE, BINDING_LABEL_UNBOUND, makeSteerFn, parseTelegramEchoId, routeTelegramEchoToActiveTurn } from "../telegram-bot.js";
 import client from "prom-client";
+import { HttpError } from "grammy";
 import { mediaPipelineErrors, telegramApiCalls, telegramApiErrors } from "../metrics.js";
 import type { TelegramBinding, BotConfig } from "../types.js";
 import type { SessionManager } from "../session-manager.js";
@@ -1106,8 +1107,8 @@ describe("buildReactionContext", () => {
 });
 
 describe("AUTO_RETRY_OPTIONS", () => {
-  it("has rethrowHttpErrors set to false so network errors retry infinitely", () => {
-    assert.strictEqual(AUTO_RETRY_OPTIONS.rethrowHttpErrors, false);
+  it("rethrows transport errors so individual calls terminate", () => {
+    assert.strictEqual(AUTO_RETRY_OPTIONS.rethrowHttpErrors, true);
   });
 
   it("has maxRetryAttempts and maxDelaySeconds configured", () => {
@@ -1117,6 +1118,91 @@ describe("AUTO_RETRY_OPTIONS", () => {
 });
 
 describe("createTelegramAutoRetryTransformer", () => {
+  for (const sequence of [
+    ["http", "ok"],
+    ["http", "http", "http"],
+    ["http", 429, "http", 503, "http"],
+  ]) {
+    it(`shares bounded transport retries across ${sequence.join(", ")}`, async (t) => {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const transformer = createTelegramAutoRetryTransformer();
+      const failure = new HttpError("transport unavailable", new Error("offline"));
+      let calls = 0;
+      const result = transformer((async () => {
+        const step = sequence[calls++];
+        if (step === "http") throw failure;
+        if (typeof step === "number") return { ok: false, error_code: step, ...(step === 429 ? { parameters: { retry_after: 1 } } : {}) };
+        return { ok: true, result: true };
+      }) as never, "sendMessage", { chat_id: 1, text: "test" });
+      const check = sequence.at(-1) === "http"
+        ? assert.rejects(result, (err) => err === failure)
+        : result.then((value) => assert.equal(value.ok, true));
+      for (let i = 0; i < 30; i++) {
+        for (let j = 0; j < 10; j++) await Promise.resolve();
+        t.mock.timers.tick(100_000);
+      }
+      await check;
+      assert.equal(calls, sequence.length);
+      assert.equal((await transformer((async () => ({ ok: true, result: true })) as never,
+        "sendMessage", { chat_id: 1, text: "recovered" })).ok, true);
+    });
+  }
+
+  for (const alreadyAborted of [false, true]) {
+    it(`cancels transport retries (already aborted: ${alreadyAborted})`, async (t) => {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const transformer = createTelegramAutoRetryTransformer();
+      const controller = new AbortController();
+      if (alreadyAborted) controller.abort();
+      let calls = 0;
+      const result = transformer((async () => {
+        calls++;
+        throw new HttpError("offline", new Error("offline"));
+      }) as never, "sendMessage", { chat_id: 1, text: "test" }, controller.signal as Parameters<typeof transformer>[3]);
+      const check = assert.rejects(result, /aborted/);
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      controller.abort();
+      await check;
+      t.mock.timers.tick(10_000);
+      assert.equal(calls, alreadyAborted ? 0 : 1);
+    });
+  }
+
+  for (const code of [429, 503]) {
+    it(`bounds ordinary ${code} retries`, async (t) => {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const transformer = createTelegramAutoRetryTransformer();
+      let calls = 0;
+      const prev = async () => {
+        calls++;
+        return { ok: false, error_code: code, ...(code === 429 ? { parameters: { retry_after: 1 } } : {}) } as const;
+      };
+      const result = transformer(prev as never, "sendMessage", { chat_id: 1, text: "test" });
+      for (let i = 0; i < 30; i++) {
+        for (let j = 0; j < 10; j++) await Promise.resolve();
+        t.mock.timers.tick(100_000);
+      }
+      assert.equal((await result).ok, false);
+      assert.equal(calls, AUTO_RETRY_OPTIONS.maxRetryAttempts + 1);
+    });
+  }
+
+  it("preserves cancellation during retry backoff", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const controller = new AbortController();
+    const transformer = createTelegramAutoRetryTransformer();
+    let calls = 0;
+    const result = transformer((async () => {
+      calls++;
+      return { ok: false, error_code: 503 };
+    }) as never, "sendMessage", { chat_id: 1, text: "test" }, controller.signal as Parameters<typeof transformer>[3]);
+    const rejected = assert.rejects(result, /aborted/);
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    controller.abort();
+    await rejected;
+    assert.equal(calls, 1);
+  });
+
   it("bypasses autoRetry for sendMessageDraft — calls prev exactly once on 429", async () => {
     const transformer = createTelegramAutoRetryTransformer();
     let callCount = 0;
@@ -1156,7 +1242,7 @@ describe("createTelegramAutoRetryTransformer", () => {
     assert.strictEqual((result as { ok: boolean }).ok, true);
   });
 
-  it("retries sendChatAction on 429 via autoRetry", async () => {
+  it("bypasses retry for sendChatAction on 429", async () => {
     const transformer = createTelegramAutoRetryTransformer();
     let callCount = 0;
     const prev = async () => {
@@ -1167,8 +1253,8 @@ describe("createTelegramAutoRetryTransformer", () => {
       return { ok: true, result: true } as const;
     };
     const result = await transformer(prev as never, "sendChatAction", { chat_id: 555000111, action: "typing" } as never);
-    assert.strictEqual(callCount, 2, "sendChatAction must retry once after 429");
-    assert.strictEqual((result as { ok: boolean }).ok, true);
+    assert.strictEqual(callCount, 1, "typing must not retry");
+    assert.strictEqual((result as { ok: boolean }).ok, false);
   });
 });
 

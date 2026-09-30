@@ -86,6 +86,7 @@ export interface CronJob {
   agentId: string;
   deliveryChatId: number;
   deliveryThreadId?: number;
+  deliveryMaxAgeMs?: number;
   timeout?: number;
   enabled?: boolean;
   engine?: "pi";
