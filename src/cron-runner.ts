@@ -859,7 +859,8 @@ export function isQueueableDeliveryFailure(err: unknown): boolean {
     try {
       const body = JSON.parse(response[1]);
       if (body.ok === false && Number.isInteger(body.error_code)
-        && body.error_code >= 400 && body.error_code < 500 && body.error_code !== 429) {
+        && body.error_code >= 400 && body.error_code < 500
+        && body.error_code !== 408 && body.error_code !== 429) {
         return false;
       }
     } catch {

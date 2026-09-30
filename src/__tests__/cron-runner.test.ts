@@ -292,8 +292,8 @@ describe("cron-runner", () => {
         { name: "unknown thrown value", error: "network down", expected: true },
       ];
 
-      for (const code of [400, 401, 403, 404, 409, 429, 500, 503]) {
-        cases.push({ name: `API ${code}`, expected: code === 429 || code >= 500,
+      for (const code of [400, 401, 403, 404, 408, 409, 429, 500, 503]) {
+        cases.push({ name: `API ${code}`, expected: code === 408 || code === 429 || code >= 500,
           error: new DeliveryError("API failed", { status: 1,
             stderrExcerpt: `[deliver] Error: sendMessage failed: ${JSON.stringify({ ok: false, error_code: code, description: "Bad Request: message thread not found" })}` }) });
       }
