@@ -870,7 +870,8 @@ export function buildPiPromptCommand(
   imagePaths?: string[],
 ): PiPromptCommand {
   const command: PiPromptCommand = { type: "prompt", message: text };
-  const images = readVisionImages(imagePaths);
+  const { images, omissionNote } = readVisionImages(imagePaths);
+  command.message += omissionNote;
   if (images) command.images = images;
   if (id) {
     command.id = id;
@@ -893,9 +894,10 @@ export function buildPiAcknowledgedSteerCommand(
   id: string,
   imagePaths?: string[],
 ): PiPromptCommand {
+  const { images, omissionNote } = readVisionImages(imagePaths);
   return {
     type: "prompt",
-    message: buildPiAcknowledgedSteerInvocation(id, text, readVisionImages(imagePaths)),
+    message: buildPiAcknowledgedSteerInvocation(id, text + omissionNote, images),
     id,
   };
 }

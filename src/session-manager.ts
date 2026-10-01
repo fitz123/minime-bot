@@ -120,6 +120,16 @@ function prepareOutboxDir(outboxPath: string): void {
   removeOutboxDirIfPresent(`${outboxPath}.human`, true);
   removeOutboxDirIfPresent(`${outboxPath}.internal`);
   ensurePrivateDir(outboxPath);
+  // An interrupted internal turn may have left human reservations in its backup.
+  // Relocate the excluded subtree, freeing the fixed backup name for the next turn.
+  const backup = `${outboxPath}.human`;
+  const held = join(backup, RICH_RESERVED_DIR);
+  if (existsSync(held)) {
+    const destination = join(outboxPath, RICH_RESERVED_DIR);
+    ensurePrivateDir(destination);
+    renameSync(held, join(destination, randomUUID()));
+    removeOutboxDirIfPresent(backup);
+  }
 }
 
 /** Check whether a child process has exited (by exit code or signal). */
@@ -1444,7 +1454,7 @@ export class SessionManager {
             // outbox files. Discard them before returning the human directory.
             removeOutboxDirIfPresent(session.outboxPath);
             if (this.active.get(chatId) === session) renameSync(savedOutbox, session.outboxPath);
-            else removeOutboxDirIfPresent(savedOutbox);
+            else removeOutboxDirIfPresent(savedOutbox, true);
           }
         } catch {
           // No later human relay may scan a directory whose ownership is unclear.

@@ -97,16 +97,30 @@ function needsLiteralEncoding(text: string): boolean {
 export function literalRichText(text: string, depth = 0): RichText {
   if (depth >= 6) return text;
   const parts: RichText[] = [];
-  const tokens = /(`+)([\s\S]*?)\1|<(b|strong|i|em|u|s|strike|del|sup|sub|mark|tg-spoiler)>([\s\S]*?)<\/\3>|(\*\*|__|~~|==|\|\||\*|_)([^\n]+?)\5|\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g;
+  const tokens = /\\[\\`*_[\]{}()#+.!<>~-]|(`+)([\s\S]*?)\1|<(b|strong|i|em|u|s|strike|del|sup|sub|mark|tg-spoiler)>([\s\S]*?)<\/\3>|(\*\*|__|~~|==|\|\||\*|_)([^\n]+?)\5|\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|https?:\/\/[^\s<>]+/g;
   let end = 0;
-  for (const match of text.matchAll(tokens)) {
+  for (let match; (match = tokens.exec(text));) {
+    if (match[5]) {
+      const before = text[match.index! - 1] ?? "";
+      const after = text[match.index! + match[0].length] ?? "";
+      const inner = match[6];
+      // Emphasis cannot open/close against whitespace. Underscores within
+      // identifiers are literal (CommonMark's intraword underscore rule).
+      if (/^\s|\s$/.test(inner) || (match[5].includes("_")
+        && (/[\p{L}\p{N}_]/u.test(before) || /[\p{L}\p{N}_]/u.test(after)))) {
+        tokens.lastIndex = match.index + match[5].length;
+        continue;
+      }
+    }
     if (match.index! > end) parts.push(text.slice(end, match.index));
-    if (match[1]) parts.push({ type: "code", text: match[2] });
+    if (match[0].startsWith("\\")) parts.push(match[0].slice(1));
+    else if (match[1]) parts.push({ type: "code", text: match[2] });
     else if (match[3]) parts.push({ type: INLINE_HTML_TYPES[match[3] as keyof typeof INLINE_HTML_TYPES], text: literalRichText(match[4], depth + 1) });
     else if (match[5]) {
       const types = { "**": "bold", "__": "bold", "~~": "strikethrough", "==": "marked", "||": "spoiler", "*": "italic", "_": "italic" } as const;
       parts.push({ type: types[match[5] as keyof typeof types], text: literalRichText(match[6], depth + 1) });
-    } else parts.push({ type: "url", text: literalRichText(match[7], depth + 1), url: match[8] });
+    } else if (match[7]) parts.push({ type: "url", text: literalRichText(match[7], depth + 1), url: match[8] });
+    else parts.push(match[0]); // A bare URL is opaque to emphasis scanning.
     end = match.index! + match[0].length;
   }
   if (end < text.length) parts.push(text.slice(end));
@@ -135,15 +149,97 @@ function isFence(block: string): boolean { return /^ {0,3}(`{3,}|~{3,})/.test(bl
 
 /** Text-only bounded projection; full authoritative source never undergoes tail slicing. */
 export function richDraft(source: string): string {
-  const parts = sourceBlocks(source).slice(0, 80).map(block => isFence(block) || isIndentedCode(block) ? block : mapImages(block,
-    (caption) => `[Image${caption ? `: ${caption}` : ""}]`));
-  let text = byteSlices(parts.join("\n\n"), 3500)[0] ?? "";
-  const fences = text.match(/^ {0,3}(`{3,}|~{3,}).*$/gm);
-  if (fences && fences.length % 2) {
-    const marker = fences[fences.length - 1].match(/(`{3,}|~{3,})/)![1];
-    if (marker.length <= 128) text += `\n${marker}`;
+  const blocks = sourceBlocks(source);
+  const parts: string[] = [];
+  let bytes = 0;
+  for (const block of blocks.slice(-80).reverse()) {
+    let part = isFence(block) || isIndentedCode(block) ? block : mapImages(block,
+      (caption) => `[Image${caption ? `: ${caption}` : ""}]`);
+    if (isFence(part)) {
+      const lines = part.split("\n");
+      const opener = lines.shift()!;
+      const marker = opener.match(/(`{3,}|~{3,})/)![1];
+      if (new RegExp(`^ {0,3}${marker[0]}{${marker.length},}\\s*$`).test(lines.at(-1) ?? "")) lines.pop();
+      // Select within the source block, then restore its fence context. Never
+      // interpret a window beginning inside code as ordinary Markdown.
+      const contextBytes = Buffer.byteLength(opener + marker) + 2;
+      if (contextBytes > 3500) continue; // No safe preview window for this fence.
+      const content = byteTail(lines.join("\n"), 3500 - contextBytes);
+      part = `${opener}\n${content}\n${marker}`;
+    } else if (Buffer.byteLength(part) > 3500) {
+      part = byteTail(part, 3500);
+      if (isIndentedCode(block)) part = "    " + byteTail(part, 3496);
+    }
+    const size = Buffer.byteLength(part) + (parts.length ? 2 : 0);
+    if (bytes + size > 3500) break;
+    parts.unshift(part); bytes += size;
   }
-  return text;
+  return parts.join("\n\n");
+}
+
+function byteTail(text: string, limit: number): string {
+  const chars = Array.from(text);
+  let bytes = 0, start = chars.length;
+  while (start > 0 && bytes + Buffer.byteLength(chars[start - 1]) <= limit) bytes += Buffer.byteLength(chars[--start]);
+  return chars.slice(start).join("");
+}
+
+/** Native equivalents only for the simple blocks we already handle. Complex
+ * Markdown remains on its server-parsed path; this is not a document parser. */
+function compatibleNativeBlocks(text: string): InputRichMessageWithoutUpload["blocks"] | undefined {
+  const result: NonNullable<InputRichMessageWithoutUpload["blocks"]> = [];
+  for (const block of sourceBlocks(text)) {
+    const photo = block.match(/^!\[([^\]]*)\]\(tg:\/\/photo\?id=([^)]+)\)$/);
+    if (photo) {
+      result.push({ type: "photo", photo: { type: "photo", media: photo[2] }, caption: { text: literalRichText(photo[1]) } });
+      continue;
+    }
+    const rows = block.split("\n");
+    if (rows.length >= 2 && /^\s*\|?\s*:?-{3,}/.test(rows[1])) {
+      result.push({ type: "table", cells: [rows[0], ...rows.slice(2)].map((row, i) => tableCells(row).map((cell, j) => ({
+        text: literalRichText(cell), ...(i === 0 ? { is_header: true as const } : {}),
+        align: tableCells(rows[1])[j]?.endsWith(":") ? tableCells(rows[1])[j]?.startsWith(":") ? "center" : "right" : "left", valign: "top",
+      }))) });
+      continue;
+    }
+    // Leave lists, quotations, reference links, math and block HTML to native Markdown.
+    const syntax = block.replace(/(`+)[\s\S]*?\1/g, "");
+    if (/^\s*(?:[-*+] |\d+[.)] |> ?|(?:[-*_]{3,}|=+)\s*$|\[.+\]:|\$\$)/m.test(syntax)
+      || /\[\^|\]\((?!https?:\/\/)|\$[^$]+\$|\]\[[^\]]*\]|<\/?(?:div|details|summary|table|ul|ol|li|p|h[1-6])\b/i.test(syntax)) return undefined;
+    let paragraph: string[] = [];
+    const flushParagraph = () => {
+      if (paragraph.length) result.push({ type: "paragraph", text: literalRichText(paragraph.join("\n")) });
+      paragraph = [];
+    };
+    for (const line of rows) {
+      const heading = line.match(/^(#{1,6}) (.+)$/);
+      if (heading) {
+        flushParagraph();
+        result.push({ type: "heading", size: heading[1].length as 1 | 2 | 3 | 4 | 5 | 6, text: literalRichText(heading[2]) });
+      } else paragraph.push(line);
+    }
+    flushParagraph();
+  }
+  return result;
+}
+
+function packCompatibleChunks(chunks: RichAnswerChunk[]): void {
+  for (let i = 1; i < chunks.length;) {
+    const left = chunks[i - 1], right = chunks[i];
+    const text = `${left.text}\n\n${right.text}`;
+    if ((left.options.nativeBlocks || right.options.nativeBlocks) && Buffer.byteLength(text) <= RICH_TEXT_BYTES
+      && blockCost(text) <= 400 && (text.match(/tg:\/\/photo\?id=/g)?.length ?? 0) <= MAX_PHOTOS) {
+      const a = left.options.nativeBlocks ?? compatibleNativeBlocks(left.text);
+      const b = right.options.nativeBlocks ?? compatibleNativeBlocks(right.text);
+      if (a && b && a.length + b.length <= 400) {
+        left.text = text;
+        left.options.nativeBlocks = [...a, ...b];
+        chunks.splice(i, 1);
+        continue;
+      }
+    }
+    i++;
+  }
 }
 
 /** JPEG/PNG only: Telegram photo dimensions and bytes, inspected independently of suffix. */
@@ -288,6 +384,7 @@ export function prepareRichAnswer(source: string, outboxPath?: string): {
     append(text);
   }
   flush();
+  packCompatibleChunks(chunks);
   // Only references actually retained as media need custody (literal examples do not).
   for (const [name, id] of names) {
     if (!chunks.some(chunk => (!chunk.options.nativeBlocks || chunk.options.nativeBlocks.some(block => block.type === "photo")) && chunk.text.includes(`tg://photo?id=${id})`))) names.delete(name);

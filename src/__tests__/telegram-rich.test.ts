@@ -60,12 +60,11 @@ describe("rich preparation and custody", () => {
   it("preserves literal fence blank lines, placeholders and intentional formatting", () => {
     const source = '# Heading\n\nUse <widget> and <path/to/file> placeholders, with <u>intentional underline</u> and **bold**.\n\n```xml\n<widget>\n\n\nvalue\n</widget>\n```';
     const { chunks } = prepareRichAnswer(source);
-    assert.match(chunks[1].text, /<widget>/);
-    assert.deepEqual((chunks[1].options.nativeBlocks![0] as { text: unknown }).text, ["Use <widget> and <path/to/file> placeholders, with ", { type: "underline", text: "intentional underline" }, " and ", { type: "bold", text: "bold" }, "."]);
-    assert.match(chunks[1].text, /<u>intentional underline<\/u>/);
-    assert.match(chunks[1].text, /\*\*bold\*\*/);
-    assert.equal(chunks[2].text, '<widget>\n\n\nvalue\n</widget>');
-    assert.equal(chunks[2].options.nativeBlocks![0].type, "pre");
+    assert.equal(chunks.length, 1);
+    const blocks = chunks[0].options.nativeBlocks!;
+    assert.equal(blocks[0].type, "heading");
+    assert.deepEqual((blocks[1] as { text: unknown }).text, ["Use <widget> and <path/to/file> placeholders, with ", { type: "underline", text: "intentional underline" }, " and ", { type: "bold", text: "bold" }, "."]);
+    assert.deepEqual(blocks[2], { type: "pre", text: '<widget>\n\n\nvalue\n</widget>', language: "xml" });
   });
 
   it("splits Unicode, large paragraphs and repeated table headers within native budgets", () => {
@@ -91,7 +90,12 @@ describe("rich preparation and custody", () => {
 
   it("external images remain ordinary links, code examples do not reserve", () => {
     const chunks = prepareRichAnswer('![Remote](https://example.test/photo.png)\n\n`![Example](outbox:missing.png)`\n\n```\n![Example](outbox:missing.png)\n```').chunks;
-    assert.equal(chunks[0].text, '[Remote](https://example.test/photo.png)\n\n`![Example](outbox:missing.png)`');
+    assert.equal(chunks.length, 1);
+    assert.deepEqual(chunks[0].options.nativeBlocks, [
+      { type: 'paragraph', text: { type: 'url', text: 'Remote', url: 'https://example.test/photo.png' } },
+      { type: 'paragraph', text: { type: 'code', text: '![Example](outbox:missing.png)' } },
+      { type: 'pre', text: '![Example](outbox:missing.png)' },
+    ]);
     assert.ok(chunks.every(c => !c.options.media?.length));
   });
 
@@ -198,7 +202,9 @@ describe('native draft transport and scheduler', () => {
     const source = '```xml\n<widget>\n\n\n' + '😀'.repeat(3000);
     const draft = richDraft(source);
     assert.ok(Buffer.byteLength(draft) < 4096); assert.ok(draft.endsWith('\n```'));
-    assert.match(draft, /<widget>\n\n\n/);
+    assert.ok(draft.startsWith('```xml\n'));
+    assert.ok(draft.includes('😀'));
+    assert.ok(!draft.includes('<widget>'), 'preview shows the latest code, not the head');
     assert.equal(prepareRichAnswer(source).chunks.map(c => c.text).join(''), source.slice(7));
     assert.doesNotMatch(richDraft('![photo](outbox:missing.png)\n\n![remote](https://example.test/a.png)'), /!\[|outbox:|https:/);
   });
@@ -335,4 +341,137 @@ it('short agent answers are rich while service/error sends stay ordinary and ind
   await adapter.sendMessage('Session recovery notice'); await adapter.replyError('Error notice');
   assert.deepEqual(methods, ['rich', 'ordinary', 'ordinary']);
   assert.equal(getThread(1, 218), 7); assert.match(JSON.stringify(lookupMessage(1, 218)), /Okay\./);
+});
+
+it('packs mixed heading/prose/code/placeholder/photo/prose into one actual final request', async () => {
+  for (const context of [false, true]) {
+    const outbox = mkdtempSync(join(tmpdir(), 'rich-mixed-'));
+    writeFileSync(join(outbox, 'one.png'), png);
+    const finals: any[] = [];
+    const api: any = {
+      async sendRichMessage(_chat: number, rich: any) { finals.push(rich); return { message_id: 1 }; },
+      async sendPhoto() { assert.fail('duplicate standalone photo'); },
+    };
+    const binding = { kind: 'group' as const, chatId: 1, agentId: 'test', typingIndicator: false };
+    const adapter = context ? createTelegramAdapter({ api, chat: { id: 1 } } as any, binding)
+      : createTelegramApiAdapter({ api, chatId: 1, binding });
+    await relayStream(answer('# Report\n\nBefore **bold**\n\n```xml\n<widget>\n\n\nvalue\n```\n\nUse OPENAI_API_KEY <your-key>.\n\n![Chart](outbox:one.png)\n\nAfter _italic_.'), adapter, outbox);
+    assert.equal(finals.length, 1);
+    assert.deepEqual(finals[0].blocks.map((b: any) => b.type), ['heading', 'paragraph', 'pre', 'paragraph', 'photo', 'paragraph']);
+    assert.deepEqual(finals[0].blocks[1].text, ['Before ', { type: 'bold', text: 'bold' }]);
+    assert.equal(finals[0].blocks[2].text, '<widget>\n\n\nvalue');
+    assert.equal(finals[0].blocks[3].text, 'Use OPENAI_API_KEY <your-key>.');
+    assert.equal(typeof finals[0].blocks[4].photo.media.toRaw, 'function');
+    assert.deepEqual(finals[0].blocks[5].text, ['After ', { type: 'italic', text: 'italic' }, '.']);
+    assert.deepEqual(readdirSync(outbox), []);
+  }
+});
+
+it('retains literal identifiers, comparisons and URLs while recognizing flanked formatting', async () => {
+  const { literalRichText } = await import('../telegram-rich.js');
+  const source = 'OPENAI_API_KEY <your-key>; a < b > c; https://example.test/my_file_name; 2 * 3 * 4; foo__bar__baz';
+  const rich = literalRichText(source);
+  const flatten = (value: any): string => typeof value === 'string' ? value : Array.isArray(value) ? value.map(flatten).join('') : flatten(value.text);
+  assert.equal(flatten(rich), source);
+  assert.ok(!JSON.stringify(rich).includes('"type"'), 'literal fixture contains no formatting');
+  assert.deepEqual(literalRichText('_italic_ and __bold__ and **strong** and *em*'), [
+    { type: 'italic', text: 'italic' }, ' and ', { type: 'bold', text: 'bold' }, ' and ',
+    { type: 'bold', text: 'strong' }, ' and ', { type: 'italic', text: 'em' },
+  ]);
+  const blocks = prepareRichAnswer(source).chunks[0].options.nativeBlocks!;
+  assert.equal(flatten((blocks[0] as any).text), source);
+});
+
+it('packed native finals still split at text and media limits', () => {
+  const outbox = mkdtempSync(join(tmpdir(), 'rich-packed-limits-'));
+  writeFileSync(join(outbox, 'one.png'), png);
+  const prepared = prepareRichAnswer('# Heading\n\n<placeholder>\n\n' + Array(85).fill('![Image](outbox:one.png)').join('\n\n') + '\n\n```\n' + '😀'.repeat(9000) + '\n```', outbox);
+  assert.ok(prepared.chunks.length > 2);
+  for (const chunk of prepared.chunks) {
+    assert.ok(Buffer.byteLength(chunk.text) <= 24000);
+    assert.ok((chunk.text.match(/tg:\/\/photo/g) ?? []).length <= 40);
+    assert.ok(!chunk.text.includes('\uFFFD'));
+  }
+  const path = prepared.chunks[0].options.media![0].path;
+  const references = prepared.chunks.map((c, i) => c.options.media?.length ? i : -1).filter(i => i >= 0);
+  for (const i of references) { assert.ok(existsSync(path)); prepared.confirm(i); }
+  assert.ok(!existsSync(path));
+});
+
+it('terminal Pi failures go through the ordinary relay transport', async () => {
+  const methods: string[] = [];
+  const api: any = {
+    async sendRichMessage() { assert.fail('terminal error became rich agent answer'); },
+    async sendMessage(_chat: number, text: string) { methods.push(text); return { message_id: 1 }; },
+  };
+  async function* error(): AsyncGenerator<StreamLine> {
+    yield { type: 'stream_event', event: { delta: { type: 'text_delta', text: 'Partial answer' } } } as StreamLine;
+    yield { type: 'result', session_id: 'fixture', is_error: true, result: 'Provider failed <retry>' } as StreamLine;
+  }
+  await relayStream(error(), createTelegramApiAdapter({ api, chatId: 1, binding: { chatId: 1, kind: 'group', agentId: 'test', typingIndicator: false } }));
+  assert.equal(methods.length, 1); assert.match(methods[0], /Provider failed/); assert.doesNotMatch(methods[0], /Partial answer/);
+});
+
+it('drafts show latest complete blocks and code tail with source fence context', async () => {
+  const { richDraft, richDraftPayload } = await import('../telegram-rich.js');
+  const source = Array.from({ length: 100 }, (_, i) => `Paragraph ${i}: ${'text '.repeat(15)}`).join('\n\n');
+  const draft = richDraft(source);
+  assert.ok(draft.endsWith('Paragraph 99: ' + 'text '.repeat(15)));
+  assert.ok(!draft.includes('Paragraph 0:'));
+  assert.match(draft, /^Paragraph \d+:/);
+  const code = richDraft(source + '\n\n```xml\n' + '<old>\n'.repeat(1000) + '<latest>');
+  assert.ok(code.startsWith('```xml\n')); assert.ok(code.endsWith('<latest>\n```'));
+  assert.ok(Buffer.byteLength(code) <= 3500);
+  assert.equal(richDraft(code), code, 'projection is stable when the adapter receives it');
+  assert.ok(JSON.stringify(richDraftPayload(code)).includes('<latest>'));
+});
+
+it('deduplicates projected rich drafts while preserving periodic refresh', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] });
+  let advance!: () => void, finish!: () => void;
+  const next = new Promise<void>(r => { advance = r; });
+  const done = new Promise<void>(r => { finish = r; });
+  let drafts = 0;
+  const api: any = {
+    async sendRichMessageDraft() { drafts++; return true; },
+    async sendRichMessage() { return { message_id: 1 }; },
+  };
+  async function* stream(): AsyncGenerator<StreamLine> {
+    yield { type: 'stream_event', event: { delta: { type: 'text_delta', text: 'Visible paragraph' } } } as StreamLine;
+    await next;
+    yield { type: 'stream_event', event: { delta: { type: 'text_delta', text: '\n\n' } } } as StreamLine;
+    await done; yield { type: 'result' } as StreamLine;
+  }
+  const task = relayStream(stream(), createTelegramApiAdapter({ api, chatId: 1, binding: { chatId: 1, kind: 'dm', agentId: 'test', typingIndicator: false } }));
+  await tick(); assert.equal(drafts, 1);
+  advance(); await tick(); t.mock.timers.tick(1000); await tick(); assert.equal(drafts, 1);
+  t.mock.timers.tick(14000); await tick(); assert.equal(drafts, 2);
+  finish(); await task;
+});
+
+it('incomplete local image syntax cannot abort the authoritative streamed answer', async () => {
+  const outbox = mkdtempSync(join(tmpdir(), 'rich-partial-'));
+  writeFileSync(join(outbox, 'one.png'), png);
+  let finals = 0;
+  const api: any = {
+    async sendRichMessageDraft() { return true; },
+    async sendRichMessage(_chat: number, rich: any) { finals++; assert.equal(rich.media.length, 1); return { message_id: 1 }; },
+  };
+  async function* stream(): AsyncGenerator<StreamLine> {
+    for (const text of ['Before\n\n![Chart](outbox:', 'one.png)\n\nAfter']) {
+      yield { type: 'stream_event', event: { delta: { type: 'text_delta', text } } } as StreamLine;
+      await tick();
+    }
+    yield { type: 'result' } as StreamLine;
+  }
+  await relayStream(stream(), createTelegramApiAdapter({ api, chatId: 1, binding: { chatId: 1, kind: 'dm', agentId: 'test', typingIndicator: false } }), outbox);
+  assert.equal(finals, 1); assert.deepEqual(readdirSync(outbox), []);
+});
+
+it('keeps escaped delimiters literal and still formats emphasis after an identifier', async () => {
+  const { literalRichText } = await import('../telegram-rich.js');
+  assert.deepEqual(literalRichText('a_b and _emphasis_ <placeholder>'), ['a_b and ', { type: 'italic', text: 'emphasis' }, ' <placeholder>']);
+  const literal = literalRichText('Use \\*literal\\* and \\_literal\\_ <placeholder>');
+  assert.equal((literal as string[]).join(''), 'Use *literal* and _literal_ <placeholder>');
+  assert.ok((literal as unknown[]).every(p => typeof p === 'string'));
 });
