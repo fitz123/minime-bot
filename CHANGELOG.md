@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 2026.10.1
+
+- Deliver Telegram agent answers as native rich messages with headings, formatted paragraphs and interleaved JPEG/PNG outbox photos (#218, #229). Keep commands, errors, service notices and Discord on their existing paths.
+- Reuse text-only rich drafts with the 15-second refresh and existing scheduler; preserve literal content and bound native payloads without ordinary-text fallback.
+- Retain unconfirmed inline-photo reservations through cleanup and internal turns; receive bounded rich and immediate-reply photos as actual Pi vision input.
+
 ## 2026.10.0
 
 - Add opt-in same-host Pi collaboration through a bot-hosted private Unix socket: discover and address configured agents, logical threads, exact sessions and standalone terminals with nonblocking continuing send/reply conversations (#222, #227).
