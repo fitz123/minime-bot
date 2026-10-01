@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import type { RichText, InputRichMessageWithoutUpload } from "grammy/types";
 import type { AgentAnswerOptions } from "./types.js";
 import { log } from "./logger.js";
+import { linkDestinationEnd } from "./markdown-html.js";
 
 /** Deliberately below native 32768-character / 500-block / 50-media limits. */
 export const RICH_TEXT_BYTES = 24_000;
@@ -64,7 +65,7 @@ function mapImages(source: string, replace: (caption: string, target: string) =>
       if (caption !== undefined && target !== undefined) return replace(caption, target.replace(/\s+"[^"\n]*"$/, ""));
       if (source.slice(offset).split("\n")[0].includes("(outbox:")) throw new Error("Malformed inline photo reference; use ![caption](outbox:basename.png)");
       // Reference-style or incomplete external image syntax must not ask the server to fetch media.
-      return "[";
+      return "\\![";
     });
 }
 
@@ -100,6 +101,14 @@ export function literalRichText(text: string, depth = 0): RichText {
   const tokens = /\\[\\`*_[\]{}()#+.!<>~-]|(`+)([\s\S]*?)\1|<(b|strong|i|em|u|s|strike|del|sup|sub|mark|tg-spoiler)>([\s\S]*?)<\/\3>|(\*\*|__|~~|==|\|\||\*|_)([^\n]+?)\5|\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|https?:\/\/[^\s<>]+/g;
   let end = 0;
   for (let match; (match = tokens.exec(text));) {
+    if (match[7]) {
+      const urlStart = match.index + match[0].indexOf("](") + 2;
+      const pos = linkDestinationEnd(text, urlStart);
+      if (pos === undefined || !/^https?:\/\/\S+$/.test(text.slice(urlStart, pos - 1))) continue;
+      match[8] = text.slice(urlStart, pos - 1);
+      match[0] = text.slice(match.index, pos);
+      tokens.lastIndex = pos;
+    }
     if (match[5]) {
       const before = text[match.index! - 1] ?? "";
       const after = text[match.index! + match[0].length] ?? "";
@@ -301,22 +310,8 @@ export function prepareRichAnswer(source: string, outboxPath?: string): {
     const photoCaption = text.match(/^!\[([^\]]*)\]\(tg:\/\/photo\?id=[^)]+\)$/)?.[1];
     if (needsLiteralEncoding(text) || (photoCaption !== undefined && /["\\]/.test(photoCaption))) {
       flush();
-      const photo = text.match(/^!\[([^\]]*)\]\(tg:\/\/photo\?id=([^)]+)\)$/);
-      if (photo) {
-        chunks.push({ text, options: { purpose: "agent-answer", nativeBlocks: [{ type: "photo", photo: { type: "photo", media: photo[2] }, caption: { text: literalRichText(photo[1]) } }] } });
-        return;
-      }
-      const rows = text.split("\n");
-      const table = rows.length >= 2 && /^\s*\|?\s*:?-{3,}/.test(rows[1]);
-      const heading = !table && text.match(/^(#{1,6}) ([^\n]+)$/);
-      const nativeBlocks: InputRichMessageWithoutUpload["blocks"] = table ? [{
-        type: "table", cells: [rows[0], ...rows.slice(2)].map((row, i) => tableCells(row).map((cell, j) => ({
-          text: literalRichText(cell), ...(i === 0 ? { is_header: true as const } : {}),
-          align: tableCells(rows[1])[j]?.endsWith(":") ? tableCells(rows[1])[j]?.startsWith(":") ? "center" : "right" : "left", valign: "top",
-        }))),
-      }] : heading ? [{ type: "heading", size: heading[1].length as 1 | 2 | 3 | 4 | 5 | 6, text: literalRichText(heading[2]) }]
-        : [{ type: "paragraph", text: literalRichText(text) }];
-      chunks.push({ text, options: { purpose: "agent-answer", nativeBlocks } });
+      chunks.push({ text, options: { purpose: "agent-answer", nativeBlocks: compatibleNativeBlocks(text)
+        ?? [{ type: "paragraph", text: literalRichText(text) }] } });
       return;
     }
     const candidate = pending ? `${pending}\n\n${text}` : text;
@@ -349,11 +344,9 @@ export function prepareRichAnswer(source: string, outboxPath?: string): {
       log.warn("telegram-rich", "Rich formatting normalized to literal text: nesting/table limit");
       literal(block, undefined, true); continue;
     }
-    if (table && /!\[[^\]]*\]\(outbox:/.test(block)) {
-      throw new Error("Inline photos must be outside table cells; place the photo between paragraphs");
-    }
     const text = mapImages(block, (caption, target) => {
       if (!target.startsWith("outbox:")) return `[${caption || "Image"}](${target})`;
+      if (table) throw new Error("Inline photos must be outside table cells; place the photo between paragraphs");
       const name = target.slice(7);
       if (!name || name !== basename(name) || /[\\/\s\x00-\x1f]/.test(name) || name === "." || name === "..") throw new Error("Inline photo requires an outbox basename");
       if (!names.has(name)) names.set(name, `photo_${names.size}`);

@@ -13,6 +13,17 @@ export function escapeHtml(text: string): string {
     .replace(/"/g, "&quot;");
 }
 
+/** Index after the balanced closing parenthesis of a Markdown link destination. */
+export function linkDestinationEnd(text: string, urlStart: number): number | undefined {
+  let depth = 1, pos = urlStart;
+  while (pos < text.length && depth > 0) {
+    if (text[pos] === "(") depth++;
+    else if (text[pos] === ")") depth--;
+    pos++;
+  }
+  return depth === 0 ? pos : undefined;
+}
+
 /** Convert markdown links [text](url) to HTML, handling nested parentheses. */
 function convertLinks(text: string): string {
   const linkStart = /\[([^\]]+)\]\(/g;
@@ -24,16 +35,8 @@ function convertLinks(text: string): string {
     const linkText = match[1];
     const urlStart = match.index + match[0].length;
 
-    // Find the balanced closing parenthesis
-    let depth = 1;
-    let pos = urlStart;
-    while (pos < text.length && depth > 0) {
-      if (text[pos] === "(") depth++;
-      else if (text[pos] === ")") depth--;
-      pos++;
-    }
-
-    if (depth !== 0) continue; // unbalanced — skip
+    const pos = linkDestinationEnd(text, urlStart);
+    if (pos === undefined) continue; // unbalanced — skip
 
     const url = text.slice(urlStart, pos - 1);
 

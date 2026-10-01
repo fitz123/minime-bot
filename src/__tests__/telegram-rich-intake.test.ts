@@ -118,3 +118,70 @@ describe('actual rich handler to queue to Pi vision', () => {
     assert.equal(apiCalls.length, 0); assert.equal(messageQueue.getPendingCount('32'), 0); messageQueue.clearAll();
   });
 });
+
+for (const ordinaryParent of [false, true]) for (const failure of ['metadata', 'download', 'format'] as const) {
+  if (ordinaryParent && failure === 'format') continue; // Ordinary photos keep their existing format handling.
+  it(`keeps primary text when optional ${ordinaryParent ? 'ordinary' : 'rich'} parent photo fails at ${failure}`, async t => {
+    const { readdirSync } = await import('node:fs');
+    const { ensureSessionMediaDir } = await import('../media-store.js');
+    t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.now() });
+    const { bot, messageQueue, commands, apiCalls } = setup();
+    bot.api.config.use(async (prev, method, payload, signal) => {
+      if (method !== 'getFile') return prev(method, payload, signal);
+      if (failure === 'metadata') throw new Error('fixture metadata failure');
+      return { ok: true, result: { file_id: 'parent', file_unique_id: 'parent', file_path: 'parent.png' } } as any;
+    });
+    t.mock.method(globalThis, 'fetch', async () => {
+      if (failure === 'download') return new Response('unavailable', { status: 404 });
+      return new Response('invalid photo fixture');
+    });
+    try {
+      await bot.handleUpdate(update({ text: 'Keep my primary text', reply_to_message: update(ordinaryParent
+        ? { photo: photo('parent').photo, caption: 'Parent caption' }
+        : { rich_message: rich(photo('parent')) }).message }));
+      t.mock.timers.tick(3000); await tick();
+      assert.equal(commands.length, 1); assert.match(commands[0].message, /Keep my primary text/);
+      assert.match(commands[0].message, /Photo omitted: parent unavailable/); assert.equal(commands[0].images, undefined);
+      assert.equal(apiCalls.filter(c => c.method === 'sendMessage').length, 0, 'optional context does not send a turn-failure notice');
+      assert.deepEqual(readdirSync(ensureSessionMediaDir('31')), [], 'failed optional download leaves no file');
+    } finally { messageQueue.clearAll(); cleanupSessionMediaDir('31'); }
+  });
+}
+
+it('keeps successful direct and later parent photos after an optional failure and reclaims them on drop', async t => {
+  const { readdirSync } = await import('node:fs');
+  const { ensureSessionMediaDir } = await import('../media-store.js');
+  const { bot, messageQueue } = setup();
+  bot.api.config.use(async (prev, method, payload, signal) => {
+    if (method !== 'getFile') return prev(method, payload, signal);
+    const id = (payload as { file_id: string }).file_id;
+    return { ok: true, result: { file_id: id, file_unique_id: id, file_path: `${id}.png` } } as any;
+  });
+  t.mock.method(globalThis, 'fetch', async (url: any) => new Response(String(url).includes('bad.png') ? 'invalid photo' : png));
+  const captured: Parameters<typeof messageQueue.enqueue>[] = [];
+  const enqueue = messageQueue.enqueue.bind(messageQueue);
+  t.mock.method(messageQueue, 'enqueue', (...args: Parameters<typeof messageQueue.enqueue>) => { captured.push(args); return enqueue(...args); });
+  try {
+    await bot.handleUpdate(update({ rich_message: rich({ type: 'paragraph', text: 'Primary' }, photo('direct')),
+      reply_to_message: update({ rich_message: rich(photo('direct'), photo('bad'), photo('good')) }).message }));
+    assert.equal(captured.length, 1); assert.match(captured[0][2], /Primary/); assert.match(captured[0][2], /parent unavailable/);
+    assert.equal(captured[0][6]?.length, 2); assert.equal(readdirSync(ensureSessionMediaDir('31')).length, 2);
+    messageQueue.clearAll(); assert.deepEqual(readdirSync(ensureSessionMediaDir('31')), []);
+  } finally { messageQueue.clearAll(); cleanupSessionMediaDir('31'); }
+});
+
+it('still aborts on a failed primary photo even when the parent repeats that photo', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.now() });
+  const { bot, messageQueue, commands, apiCalls } = setup();
+  bot.api.config.use(async (prev, method, payload, signal) => {
+    if (method === 'getFile') throw new Error('primary unavailable');
+    return prev(method, payload, signal);
+  });
+  try {
+    await bot.handleUpdate(update({ rich_message: rich({ type: 'paragraph', text: 'Primary' }, photo('same')),
+      reply_to_message: update({ rich_message: rich(photo('same')) }).message }));
+    t.mock.timers.tick(3000); await tick();
+    assert.equal(commands.length, 0);
+    assert.equal(apiCalls.filter(c => c.method === 'sendMessage').length, 1);
+  } finally { messageQueue.clearAll(); cleanupSessionMediaDir('31'); }
+});

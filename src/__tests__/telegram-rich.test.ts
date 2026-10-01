@@ -264,7 +264,7 @@ it('preserves indented code and its literal outbox examples before media scannin
 
 it('never requests server-side media for reference-style external images', () => {
   const { chunks } = prepareRichAnswer('![External][ref]\n\n[ref]: https://example.test/photo.png');
-  assert.equal(chunks[0].text, '[External][ref]\n\n[ref]: https://example.test/photo.png');
+  assert.equal(chunks[0].text, '\\![External][ref]\n\n[ref]: https://example.test/photo.png');
   assert.throws(() => prepareRichAnswer('![bad [nested]](outbox:missing.png)'), /Malformed inline photo/);
 });
 
@@ -474,4 +474,61 @@ it('keeps escaped delimiters literal and still formats emphasis after an identif
   const literal = literalRichText('Use \\*literal\\* and \\_literal\\_ <placeholder>');
   assert.equal((literal as string[]).join(''), 'Use *literal* and _literal_ <placeholder>');
   assert.ok((literal as unknown[]).every(p => typeof p === 'string'));
+});
+
+it('table photo checks preserve inline code and escaped examples while rejecting actual uploads', async () => {
+  const source = '| Example |\n| --- |\n| `![preview](outbox:example.png)` |\n| \\![escaped](outbox:example.png) |';
+  const sent: any[] = [];
+  const adapter = createTelegramApiAdapter({ api: { async sendRichMessage(_chat: number, rich: any) { sent.push(rich); return { message_id: 1 }; } } as any,
+    chatId: 1, binding: { chatId: 1, kind: 'group', agentId: 'test', typingIndicator: false } });
+  await relayStream(answer(source), adapter);
+  assert.equal(sent.length, 1); assert.equal(sent[0].markdown, source); assert.deepEqual(sent[0].media, []);
+  const native = prepareRichAnswer(source + '\n\n<placeholder>').chunks[0].options.nativeBlocks!;
+  const table = native[0]; assert.equal(table.type, 'table');
+  if (table.type !== 'table') assert.fail('expected table');
+  assert.deepEqual(table.cells[1][0].text, { type: 'code', text: '![preview](outbox:example.png)' });
+  assert.throws(() => prepareRichAnswer('| Example |\n| --- |\n| ![upload](outbox:example.png) |'), /outside table cells/);
+});
+
+it('native links preserve balanced URL parentheses when packed with code or literal placeholders', () => {
+  for (const url of ['https://en.wikipedia.org/wiki/Foo_(bar)', 'https://example.test/a_(b_(c))']) {
+    for (const tail of ['\n\n```\nexample\n```', ' <placeholder>']) {
+      const { chunks } = prepareRichAnswer(`[wiki](${url})${tail}`);
+      assert.equal(chunks.length, 1);
+      const paragraph = chunks[0].options.nativeBlocks![0]; assert.equal(paragraph.type, 'paragraph');
+      if (paragraph.type !== 'paragraph') assert.fail('expected paragraph');
+      assert.deepEqual(paragraph.text, tail.startsWith('\n') ? { type: 'url', text: 'wiki', url }
+        : [{ type: 'url', text: 'wiki', url }, ' <placeholder>']);
+    }
+  }
+});
+
+it('preserves literal image-like punctuation in Markdown wire fixtures and explicit native text', async () => {
+  const { literalRichText, richDraftPayload } = await import('../telegram-rich.js');
+  for (const source of ['Use vec![1, 2] here', 'Done![1]', '![External][ref]\n\n[ref]: https://example.test/photo.png']) {
+    const escaped = source.replace('![', '\\![');
+    const prepared = prepareRichAnswer(source);
+    assert.equal(prepared.chunks[0].text, escaped);
+    assert.deepEqual(prepared.chunks[0].options.media, []);
+    assert.equal(richDraftPayload(source).markdown, escaped);
+    // Deterministic native text fixture verifies that the encoding escape is
+    // removed once, without removing the literal exclamation mark.
+    const parsed = literalRichText(escaped);
+    assert.equal(Array.isArray(parsed) ? parsed.join('') : parsed, source);
+  }
+  const sent: any[] = [];
+  const adapter = createTelegramApiAdapter({ api: { async sendRichMessage(_chat: number, rich: any) { sent.push(rich); return { message_id: 1 }; } } as any,
+    chatId: 1, binding: { chatId: 1, kind: 'group', agentId: 'test', typingIndicator: false } });
+  await relayStream(answer('Use vec![1, 2] here'), adapter);
+  assert.equal(sent[0].markdown, 'Use vec\\![1, 2] here');
+  await relayStream(answer('Use vec![1, 2] with <placeholder>'), adapter);
+  assert.equal(sent[1].blocks[0].text.join(''), 'Use vec![1, 2] with <placeholder>');
+});
+
+it('uses the shared native builder for a heading immediately followed by literal prose', () => {
+  const { chunks } = prepareRichAnswer('## Setup\nSet <token> in env');
+  assert.equal(chunks.length, 1);
+  assert.deepEqual(chunks[0].options.nativeBlocks, [
+    { type: 'heading', size: 2, text: 'Setup' }, { type: 'paragraph', text: 'Set <token> in env' },
+  ]);
 });

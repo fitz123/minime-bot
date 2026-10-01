@@ -886,7 +886,12 @@ describe("assemblePiContext", () => {
     const rich = assemblePiContext(agent, { includeFileDelivery: true, telegramRichAnswers: true })!;
     assert.notEqual(plain.appendSystemPromptPath, rich.appendSystemPromptPath);
     assert.doesNotMatch(readFileSync(plain.appendSystemPromptPath, "utf8"), /outbox:filename/);
-    assert.match(readFileSync(rich.appendSystemPromptPath, "utf8"), /!\[caption\]\(outbox:filename.png\)/);
+    const richGuidance = readFileSync(rich.appendSystemPromptPath, "utf8");
+    assert.match(richGuidance, /!\[caption\]\(outbox:filename.png\)/);
+    for (const constraint of [/between paragraphs, outside table cells/, /basenames without whitespace or directory separators/,
+      /captions without closing brackets/, /invalid inline reference prevents final answer delivery/]) {
+      assert.match(richGuidance, constraint);
+    }
     const plainAgain = assemblePiContext(agent, { includeFileDelivery: true })!;
     assert.doesNotMatch(readFileSync(plainAgain.appendSystemPromptPath, "utf8"), /outbox:filename/);
   });

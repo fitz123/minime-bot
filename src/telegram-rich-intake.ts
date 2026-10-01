@@ -7,7 +7,7 @@ const MAX_TEXT = 32768;
 
 /** One budget for the message and its immediate parent; never follow reply chains. */
 export function extractRichIntake(direct?: RichMessage, parent?: RichMessage): {
-  text: string; parentText: string; photos: PhotoSize[];
+  text: string; parentText: string; photos: PhotoSize[]; parentPhotoIds: Set<string>;
 } {
   let remaining = MAX_TEXT, nodes = MAX_NODES, blockBudget = 500;
   const photos: PhotoSize[] = [];
@@ -88,5 +88,8 @@ export function extractRichIntake(direct?: RichMessage, parent?: RichMessage): {
     }
     return result.join("\n\n");
   };
-  return { text: direct ? blocks(direct.blocks, 0) : "", parentText: parent ? blocks(parent.blocks, 0) : "", photos };
+  const text = direct ? blocks(direct.blocks, 0) : "";
+  const directPhotoCount = photos.length;
+  const parentText = parent ? blocks(parent.blocks, 0) : "";
+  return { text, parentText, photos, parentPhotoIds: new Set(photos.slice(directPhotoCount).map(photo => photo.file_id)) };
 }

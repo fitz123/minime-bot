@@ -203,7 +203,7 @@ const FILE_DELIVERY_DIRECTIVE = [
 /** Complete static section, also usable as Pi's inline artifact-write fallback. */
 export const FILE_DELIVERY_CONTEXT = `## File delivery\n\n${FILE_DELIVERY_DIRECTIVE}`;
 
-export const TELEGRAM_RICH_FILE_DIRECTIVE = "For Telegram answers, interleave local photos with prose using ![caption](outbox:filename.png). Use a basename only, and write the JPEG or PNG into the outbox first. Photos must be at most 10 MB, width + height at most 10000, and aspect ratio at most 20. Referenced photos are consumed inline; other files are sent separately. External images remain caption links.";
+export const TELEGRAM_RICH_FILE_DIRECTIVE = "For Telegram answers, interleave local photos with prose using ![caption](outbox:filename.png). Place photos between paragraphs, outside table cells. Use basenames without whitespace or directory separators, and captions without closing brackets (]). Write the JPEG or PNG into the outbox first. An invalid inline reference prevents final answer delivery. Photos must be at most 10 MB, width + height at most 10000, and aspect ratio at most 20. Referenced photos are consumed inline; other files are sent separately. External images remain caption links.";
 export function fileDeliveryContext(telegramRichAnswers = false): string {
   return FILE_DELIVERY_CONTEXT + (telegramRichAnswers ? `\n\n${TELEGRAM_RICH_FILE_DIRECTIVE}` : "");
 }

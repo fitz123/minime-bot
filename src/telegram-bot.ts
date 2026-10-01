@@ -936,28 +936,42 @@ export function createTelegramBot(
     const fwdCtx = buildForwardContext(ctx.message.forward_origin);
     const parentOrigin = parent?.rich_message ? buildForwardContext(parent.forward_origin) : "";
     let messageText = prefix + replyCtx + (parentOrigin ? `[Reply source] ${parentOrigin}` : "") + fwdCtx + body;
-    const photos = [...(ctx.message.photo?.slice(-1) ?? []), ...intake.photos, ...(parent?.photo?.slice(-1) ?? [])];
+    const photos = [
+      ...(ctx.message.photo?.slice(-1) ?? []).map(photo => ({ photo, fromParent: false })),
+      ...intake.photos.map(photo => ({ photo, fromParent: intake.parentPhotoIds.has(photo.file_id) })),
+      ...(parent?.photo?.slice(-1) ?? []).map(photo => ({ photo, fromParent: true })),
+    ];
     const seen = new Set<string>();
     const paths: string[] = [];
     let remaining = Math.min(config.sessionDefaults.maxMediaBytes, TELEGRAM_FILE_SIZE_LIMIT);
     if (photos.length) sessionManager.touchActivity(key);
     try {
-      for (const photo of photos) {
+      for (const { photo, fromParent } of photos) {
         if (seen.has(photo.file_id)) continue;
         seen.add(photo.file_id);
         if (paths.length >= 50 || remaining <= 0 || (photo.file_size ?? 0) > remaining) {
           messageText += "\n[Photo omitted: shared media limit]";
           continue;
         }
-        const file = await ctx.api.getFile(photo.file_id).catch(error => { throw toMediaPipelineError(error, "metadata"); });
-        if (!file.file_path) throw new MediaPipelineError("metadata");
-        if ((file.file_size ?? 0) > remaining) { messageText += "\n[Photo omitted: shared media limit]"; continue; }
-        const path = allocateMediaPath(key, "photo", ".jpg");
-        paths.push(path);
-        await downloadFile(`https://api.telegram.org/file/bot${token}/${file.file_path}`, path, { maxBytes: remaining });
-        if (ctx.message.rich_message || parent?.rich_message) validateRichPhoto(path);
-        remaining -= statSync(path).size;
-        messageText = messageText.trimEnd() + `\n\n${path}`;
+        let path: string | undefined;
+        try {
+          const file = await ctx.api.getFile(photo.file_id).catch(error => { throw toMediaPipelineError(error, "metadata"); });
+          if (!file.file_path) throw new MediaPipelineError("metadata");
+          if ((file.file_size ?? 0) > remaining) { messageText += "\n[Photo omitted: shared media limit]"; continue; }
+          path = allocateMediaPath(key, "photo", ".jpg");
+          await downloadFile(`https://api.telegram.org/file/bot${token}/${file.file_path}`, path, { maxBytes: remaining });
+          if (ctx.message.rich_message || parent?.rich_message) validateRichPhoto(path);
+          remaining -= statSync(path).size;
+          paths.push(path);
+          messageText = messageText.trimEnd() + `\n\n${path}`;
+        } catch (err) {
+          if (path) discardMediaPath(path);
+          if (!fromParent) throw err;
+          const stage = mediaPipelineStage(err, "download");
+          recordMediaPipelineError({ transport: "telegram", mediaType: "photo", stage });
+          log.warn("telegram-bot", `Optional parent photo unavailable stage=${stage}`);
+          messageText += "\n[Photo omitted: parent unavailable]";
+        }
       }
       if (paths.length) enforceMediaCap(config.sessionDefaults.maxMediaBytes);
       messageQueue.enqueue(key, binding.agentId, messageText, createTelegramAdapter(ctx, binding, undefined, config.sessionDefaults),
