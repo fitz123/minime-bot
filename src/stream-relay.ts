@@ -7,6 +7,7 @@ import {
   recordDraftSchedulerEvent,
   recordFinalDeliveryFailure,
 } from "./metrics.js";
+import { prepareRichAnswer } from "./telegram-rich.js";
 import { shouldSuppressNoReply } from "./no-reply.js";
 
 /**
@@ -436,7 +437,7 @@ export async function relayStream(
   /** Queue the latest display snapshot; stale pending snapshots are replaced. */
   const scheduleDraft = () => {
     if (!accumulated || shouldHoldDraft(accumulated)) return;
-    const displayText = boundedDraftSnapshot(accumulated, platform.maxMessageLength);
+    const displayText = platform.richAnswers ? accumulated : boundedDraftSnapshot(accumulated, platform.maxMessageLength);
     if (displayText !== null) draftScheduler.enqueue(displayText);
   };
 
@@ -523,11 +524,19 @@ export async function relayStream(
 
     // Final delivery: always sendMessage (completes draft in DMs, sends fresh in groups)
     if (accumulated) {
-      const chunks = splitMessage(collapseNewlines(accumulated), platform.maxMessageLength);
+      let rich: ReturnType<typeof prepareRichAnswer> | undefined;
+      try {
+        if (platform.richAnswers) rich = prepareRichAnswer(accumulated, outboxPath);
+      } catch (err) {
+        recordFinalDeliveryFailure();
+        throw new Error(`Failed to prepare rich response: ${err instanceof Error ? err.message : err}`);
+      }
+      const chunks = rich?.chunks ?? splitMessage(collapseNewlines(accumulated), platform.maxMessageLength).map(text => ({ text, options: undefined }));
 
       for (let i = 0; i < chunks.length; i++) {
         try {
-          await platform.sendMessage(chunks[i]);
+          await platform.sendMessage(chunks[i].text, chunks[i].options);
+          rich?.confirm(i);
           messagesSent.inc();
         } catch (err) {
           recordFinalDeliveryFailure();

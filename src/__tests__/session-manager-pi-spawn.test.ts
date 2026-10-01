@@ -547,6 +547,26 @@ describe("SessionManager exact Pi binding startup", () => {
     onGetState = null;
   });
 
+  it("preserves inline reservations across actual session preparation and cleanup", async () => {
+    const config = makeConfig({ bindings: [{ chatId: 218, agentId: "pi", kind: "dm" }] });
+    const manager = new SessionManager(() => config, TEST_STORE_PATH);
+    const path = outboxDir("218");
+    const reserved = `${path}/.rich-reserved/fixture/photo.png`;
+    mkdirSync(dirname(reserved), { recursive: true, mode: 0o700 });
+    writeFileSync(reserved, "reserved photo fixture");
+    writeFileSync(`${path}/stale.txt`, "stale standalone");
+    try {
+      await manager.getOrCreateSession("218", "pi");
+      assert.ok(existsSync(reserved));
+      assert.ok(!existsSync(`${path}/stale.txt`));
+      assert.equal(piSpawnCaptures[0].runtimeEnvOptions?.telegramRichAnswers, true);
+      await manager.closeSession("218");
+      assert.ok(existsSync(reserved));
+      await manager.getOrCreateSession("218", "pi");
+      assert.ok(existsSync(reserved));
+    } finally { await manager.closeAll(); }
+  });
+
   it("pre-seeds, persists, and asserts one exact Pi binding before spawn", async () => {
     const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
 

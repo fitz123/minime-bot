@@ -53,7 +53,7 @@ function mockContext(opts: {
         return { message_id: id };
       },
       async deleteMessage() {},
-      async sendMessageDraft() { return true; },
+      async sendRichMessageDraft() { return true; },
       async editMessageText(cId: number, msgId: number, text: string, editOpts?: any) {
         if (failOnHtml && editOpts?.parse_mode === "HTML") {
           throw new Error("Bad Request: can't parse entities");
@@ -153,10 +153,10 @@ describe("createTelegramAdapter", () => {
   });
 
   describe("sendDraft", () => {
-    it("calls api.sendMessageDraft for DM bindings", async () => {
+    it("calls api.sendRichMessageDraft for DM bindings", async () => {
       const ctx = mockContext();
       const draftCalls: Array<{ chatId: number; draftId: number; text: string; opts: any }> = [];
-      ctx.api.sendMessageDraft = async (cId: number, dId: number, text: string, opts?: any) => {
+      ctx.api.sendRichMessageDraft = async (cId: number, dId: number, text: string, opts?: any) => {
         draftCalls.push({ chatId: cId, draftId: dId, text, opts });
         return true;
       };
@@ -167,13 +167,14 @@ describe("createTelegramAdapter", () => {
       assert.strictEqual(draftCalls.length, 1);
       assert.strictEqual(draftCalls[0].chatId, 12345);
       assert.strictEqual(draftCalls[0].draftId, 42);
-      assert.strictEqual(draftCalls[0].opts?.parse_mode, "HTML");
+      assert.strictEqual(draftCalls[0].opts?.parse_mode, undefined);
+      assert.deepStrictEqual(draftCalls[0].text, { markdown: "streaming text" });
     });
 
     it("forwards cancellation to the Telegram request", async () => {
       const ctx = mockContext();
       let receivedSignal: AbortSignal | undefined;
-      ctx.api.sendMessageDraft = async (
+      ctx.api.sendRichMessageDraft = async (
         _cId: number,
         _dId: number,
         _text: string,
@@ -190,88 +191,23 @@ describe("createTelegramAdapter", () => {
       assert.strictEqual(receivedSignal, controller.signal);
     });
 
-    for (const message of [
-      "Bad Request: can't parse entities",
-      "Bad Request: message is too long",
-    ]) {
-      it(`falls back to bounded plain text for ${message}`, async () => {
+    for (const message of ["Bad Request: can't parse entities", "Bad Request: message is too long"]) {
+      it(`contains rich rejection without ordinary fallback: ${message}`, async () => {
         const ctx = mockContext({ threadId: 77 });
-        const calls: Array<{
-          chatId: number;
-          draftId: number;
-          text: string;
-          opts: any;
-          signal?: AbortSignal;
-        }> = [];
-        ctx.api.sendMessageDraft = async (
-          chatId: number,
-          draftId: number,
-          text: string,
-          opts?: any,
-          signal?: AbortSignal,
-        ) => {
-          calls.push({ chatId, draftId, text, opts, signal });
-          if (calls.length === 1) throw new Error(message);
-          return true;
-        };
-        const adapter = createTelegramAdapter(ctx, { ...defaultBinding, kind: "dm" });
+        const calls: any[] = [];
+        ctx.api.sendRichMessageDraft = async (...args: any[]) => { calls.push(args); throw new Error(message); };
+        ctx.api.sendMessageDraft = async () => { assert.fail("no ordinary draft fallback"); };
+        const adapter = createTelegramAdapter(ctx, defaultBinding);
         const controller = new AbortController();
-
-        assert.deepStrictEqual(
-          await adapter.sendDraft(42, "**bold**", controller.signal),
-          { status: "sent" },
-        );
-        assert.strictEqual(calls.length, 2);
-        assert.deepStrictEqual(
-          calls.map(({ chatId, draftId }) => ({ chatId, draftId })),
-          [{ chatId: 12345, draftId: 42 }, { chatId: 12345, draftId: 42 }],
-        );
-        assert.strictEqual(calls[0].text, "<b>bold</b>");
-        assert.strictEqual(calls[0].opts.parse_mode, "HTML");
-        assert.strictEqual(calls[1].text, "**bold**");
-        assert.strictEqual(calls[1].opts.parse_mode, undefined);
-        assert.strictEqual(calls[0].opts.message_thread_id, 77);
-        assert.strictEqual(calls[1].opts.message_thread_id, 77);
-        assert.strictEqual(calls[0].signal, controller.signal);
-        assert.strictEqual(calls[1].signal, controller.signal);
+        assert.deepEqual(await adapter.sendDraft(42, "**bold**", controller.signal), { status: "failed" });
+        assert.deepEqual(calls, [[12345, 42, { markdown: "**bold**" }, { message_thread_id: 77 }, controller.signal]]);
       });
     }
-
-    it("classifies a 429 from the plain-text fallback without retry amplification", async () => {
-      const ctx = mockContext();
-      let calls = 0;
-      ctx.api.sendMessageDraft = async () => {
-        calls++;
-        if (calls === 1) throw new Error("Bad Request: can't parse entities");
-        throw { error_code: 429, parameters: { retry_after: 3 } };
-      };
-      const adapter = createTelegramAdapter(ctx, { ...defaultBinding, kind: "dm" });
-
-      assert.deepStrictEqual(
-        await adapter.sendDraft(42, "**bold**"),
-        { status: "rate_limited", retryAfterMs: 3000 },
-      );
-      assert.strictEqual(calls, 2);
-    });
-
-    it("contains an ordinary failure from the plain-text fallback", async () => {
-      const ctx = mockContext();
-      let calls = 0;
-      ctx.api.sendMessageDraft = async () => {
-        calls++;
-        if (calls === 1) throw new Error("Bad Request: can't parse entities");
-        throw new Error("network failure");
-      };
-      const adapter = createTelegramAdapter(ctx, { ...defaultBinding, kind: "dm" });
-
-      assert.deepStrictEqual(await adapter.sendDraft(42, "**bold**"), { status: "failed" });
-      assert.strictEqual(calls, 2);
-    });
 
     it("is a no-op for group bindings", async () => {
       const ctx = mockContext();
       const draftCalls: unknown[] = [];
-      ctx.api.sendMessageDraft = async () => { draftCalls.push(1); return true; };
+      ctx.api.sendRichMessageDraft = async () => { draftCalls.push(1); return true; };
       const binding: TelegramBinding = { ...defaultBinding, kind: "group" };
       const adapter = createTelegramAdapter(ctx, binding);
       const result = await adapter.sendDraft(42, "streaming text");
@@ -281,7 +217,7 @@ describe("createTelegramAdapter", () => {
 
     it("returns a bounded cosmetic failure without exposing error contents", async () => {
       const ctx = mockContext();
-      ctx.api.sendMessageDraft = async () => { throw new Error("rate limited"); };
+      ctx.api.sendRichMessageDraft = async () => { throw new Error("rate limited"); };
       const binding: TelegramBinding = { ...defaultBinding, kind: "dm" };
       const adapter = createTelegramAdapter(ctx, binding);
       assert.deepStrictEqual(await adapter.sendDraft(42, "text"), { status: "failed" });
@@ -289,7 +225,7 @@ describe("createTelegramAdapter", () => {
 
     it("returns structured and bounded 429 retry-after feedback", async () => {
       const ctx = mockContext();
-      ctx.api.sendMessageDraft = async () => {
+      ctx.api.sendRichMessageDraft = async () => {
         throw { error_code: 429, parameters: { retry_after: 3 } };
       };
       const adapter = createTelegramAdapter(ctx, { ...defaultBinding, kind: "dm" });
@@ -298,7 +234,7 @@ describe("createTelegramAdapter", () => {
         { status: "rate_limited", retryAfterMs: 3000 },
       );
 
-      ctx.api.sendMessageDraft = async () => {
+      ctx.api.sendRichMessageDraft = async () => {
         throw { error_code: 429, parameters: { retry_after: 999 } };
       };
       assert.deepStrictEqual(
@@ -311,7 +247,7 @@ describe("createTelegramAdapter", () => {
       const ctx = mockContext();
       ctx.chat = undefined;
       const draftCalls: unknown[] = [];
-      ctx.api.sendMessageDraft = async () => { draftCalls.push(1); return true; };
+      ctx.api.sendRichMessageDraft = async () => { draftCalls.push(1); return true; };
       const binding: TelegramBinding = { ...defaultBinding, kind: "dm" };
       const adapter = createTelegramAdapter(ctx, binding);
       const result = await adapter.sendDraft(42, "text");
@@ -322,7 +258,7 @@ describe("createTelegramAdapter", () => {
     it("includes message_thread_id when thread is set", async () => {
       const ctx = mockContext({ threadId: 77 });
       const draftCalls: Array<{ opts: any }> = [];
-      ctx.api.sendMessageDraft = async (_cId: number, _dId: number, _text: string, opts?: any) => {
+      ctx.api.sendRichMessageDraft = async (_cId: number, _dId: number, _text: string, opts?: any) => {
         draftCalls.push({ opts });
         return true;
       };

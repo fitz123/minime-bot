@@ -1,3 +1,5 @@
+import type { InputRichMessageWithoutUpload } from "grammy/types";
+
 // Core types for the Minime bot
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
@@ -184,14 +186,20 @@ export type DraftSendResult =
   | { status: "rate_limited"; retryAfterMs: number }
   | { status: "failed" };
 
-/**
- * Platform-agnostic message I/O interface.
- * Each platform (Telegram, Discord) provides an adapter implementing this interface.
- * stream-relay and message-queue depend only on this — no platform-specific imports.
- */
+/** Relay-owned final answer metadata; native blocks preserve Telegram literals. */
+export interface AgentAnswerOptions {
+  purpose: "agent-answer";
+  media?: Array<{ id: string; path: string }>;
+  nativeBlocks?: InputRichMessageWithoutUpload["blocks"];
+  indexText?: string;
+}
+
+/** Platform message I/O. Discord ignores optional Telegram answer metadata. */
 export interface PlatformContext {
+  /** Native Telegram answers consume authoritative Markdown before legacy transforms. */
+  readonly richAnswers?: boolean;
   /** Send a new message, returns a platform-specific message ID for later editing. */
-  sendMessage(text: string): Promise<string>;
+  sendMessage(text: string, options?: AgentAnswerOptions): Promise<string>;
 
   /** Delete a previously sent message by its ID. Best-effort — failures are silently ignored by callers. */
   deleteMessage(messageId: string): Promise<void>;

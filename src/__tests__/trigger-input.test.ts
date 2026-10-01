@@ -46,6 +46,8 @@ function mockApi(): TelegramAdapterApi {
   return {
     async sendMessage() { return { message_id: 1 } as never; },
     async sendMessageDraft() { return true; },
+    async sendRichMessage() { return { message_id: 4 } as never; },
+    async sendRichMessageDraft() { return true; },
     async deleteMessage() { return true; },
     async sendChatAction() { return true; },
     async sendPhoto() { return { message_id: 2 } as never; },

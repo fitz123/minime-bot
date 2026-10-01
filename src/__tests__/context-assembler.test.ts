@@ -879,6 +879,18 @@ describe("assemblePiContext", () => {
     }
   });
 
+  it("adds inline-photo guidance only to the Telegram rich variant", () => {
+    const ws = makeWorkspace({ claudeMd: "# Fixture" });
+    const agent = agentFor(ws, { id: "rich-guidance" });
+    const plain = assemblePiContext(agent, { includeFileDelivery: true })!;
+    const rich = assemblePiContext(agent, { includeFileDelivery: true, telegramRichAnswers: true })!;
+    assert.notEqual(plain.appendSystemPromptPath, rich.appendSystemPromptPath);
+    assert.doesNotMatch(readFileSync(plain.appendSystemPromptPath, "utf8"), /outbox:filename/);
+    assert.match(readFileSync(rich.appendSystemPromptPath, "utf8"), /!\[caption\]\(outbox:filename.png\)/);
+    const plainAgain = assemblePiContext(agent, { includeFileDelivery: true })!;
+    assert.doesNotMatch(readFileSync(plainAgain.appendSystemPromptPath, "utf8"), /outbox:filename/);
+  });
+
   it("keeps file-delivery capability isolated across cache entries", () => {
     const ws = makeWorkspace({ claudeMd: "# Context\n\nBODY" });
     const agent = agentFor(ws, { id: "file-delivery-cache" });

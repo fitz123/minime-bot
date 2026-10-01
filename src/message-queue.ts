@@ -27,6 +27,7 @@ export type ProcessFn = (
   text: string,
   platform: PlatformContext,
   onAgentOwnership: () => void,
+  imagePaths?: string[],
 ) => Promise<void>;
 
 /**
@@ -39,6 +40,7 @@ export type AcknowledgedSteerFn = (
   agentId: string,
   text: string,
   onEnqueued?: () => void,
+  imagePaths?: string[],
 ) => Promise<boolean>;
 
 /** Deliver any durable non-model recovery notice after lane preparation. */
@@ -59,6 +61,7 @@ export type CleanupFn = () => void;
 
 interface CollectEntry {
   text: string;
+  imagePaths?: string[];
   cleanup?: CleanupFn;
   dropCleanup?: CleanupFn;
 }
@@ -66,6 +69,7 @@ interface CollectEntry {
 interface ChatQueueState {
   /** Messages pending debounce timer (pre-send) */
   pendingTexts: string[];
+  pendingImagePaths: string[];
   /** Cleanup callbacks for pending messages (fire on successful delivery) */
   pendingCleanups: CleanupFn[];
   /**
@@ -177,6 +181,7 @@ export class MessageQueue {
     if (!state) {
       state = {
         pendingTexts: [],
+        pendingImagePaths: [],
         pendingCleanups: [],
         pendingDropCleanups: [],
         debounceTimer: null,
@@ -221,6 +226,7 @@ export class MessageQueue {
     platform: PlatformContext,
     cleanup?: CleanupFn,
     dropCleanup?: CleanupFn,
+    imagePaths?: string[],
   ): boolean {
     if (!this.acceptingMessages) {
       this.runCleanups([cleanup, dropCleanup]);
@@ -233,6 +239,7 @@ export class MessageQueue {
       if (state.collectEntries.length < this.queueCap) {
         state.collectEntries.push({
           text,
+          imagePaths,
           cleanup,
           dropCleanup,
         });
@@ -255,6 +262,7 @@ export class MessageQueue {
       return false;
     }
     state.pendingTexts.push(text);
+    state.pendingImagePaths.push(...(imagePaths ?? []));
     state.pendingCleanups.push(cleanup ?? (() => {}));
     state.pendingDropCleanups.push(dropCleanup ?? (() => {}));
 
@@ -285,6 +293,7 @@ export class MessageQueue {
     if (!state || state.pendingTexts.length === 0) return;
 
     const texts = state.pendingTexts.splice(0);
+    const imagePaths = state.pendingImagePaths.splice(0);
     const cleanups = state.pendingCleanups.splice(0);
     // Hold drop cleanups locally during processing. If processFn throws, or
     // the queue is cleared mid-process, we must run them so persistent media
@@ -322,7 +331,7 @@ export class MessageQueue {
             await this.deliverRecoveryNotice(chatId, state.agentId, platform);
           }
           if (this.queues.get(chatId) === state) {
-            await this.processFn(chatId, state.agentId, combinedText, platform, transferOwnership);
+            await this.processFn(chatId, state.agentId, combinedText, platform, transferOwnership, imagePaths.length ? imagePaths : undefined);
           }
         } finally {
           this.settleBusyGeneration(state);
@@ -370,6 +379,7 @@ export class MessageQueue {
     while (state.collectEntries.length > 0) {
       const entries = state.collectEntries.splice(0);
       const collected = entries.map(({ text }) => text);
+      const imagePaths = entries.flatMap(entry => entry.imagePaths ?? []);
       const cleanups = entries.map(({ cleanup }) => cleanup);
       // Hold drop cleanups locally for exactly this batch. If processFn
       // throws or the queue is cleared mid-drain, we must run them. Any
@@ -402,7 +412,7 @@ export class MessageQueue {
               await this.deliverRecoveryNotice(chatId, state.agentId, platform);
             }
             if (this.queues.get(chatId) === state) {
-              await this.processFn(chatId, state.agentId, prompt, platform, transferOwnership);
+              await this.processFn(chatId, state.agentId, prompt, platform, transferOwnership, imagePaths.length ? imagePaths : undefined);
             }
           } finally {
             this.settleBusyGeneration(state);
@@ -471,6 +481,7 @@ export class MessageQueue {
         state.agentId,
         entry.text,
         () => this.finishSteerEnqueue(chatId, state, entry),
+        entry.imagePaths,
       );
     } catch {
       this.finishAcknowledgedSteer(chatId, state, entry, false);

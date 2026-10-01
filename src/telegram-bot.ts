@@ -1,3 +1,7 @@
+import { statSync } from "node:fs";
+import type { RichMessage } from "grammy/types";
+import { validateRichPhoto } from "./telegram-rich.js";
+import { extractRichIntake } from "./telegram-rich-intake.js";
 import { Bot, HttpError, type Transformer } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
 import { createHash } from "node:crypto";
@@ -329,6 +333,7 @@ export function buildReplyContext(
     from?: { first_name: string; username?: string };
     text?: string;
     caption?: string;
+    rich_message?: RichMessage;
     forum_topic_created?: unknown;
     forum_topic_edited?: unknown;
     forum_topic_closed?: unknown;
@@ -356,7 +361,7 @@ export function buildReplyContext(
     header = "[Reply, quoting]";
   }
 
-  const replyText = hasQuote ? quote!.text : (replyTo.text ?? replyTo.caption ?? "");
+  const replyText = hasQuote ? quote!.text : (replyTo.text ?? replyTo.caption ?? (replyTo.rich_message ? extractRichIntake(replyTo.rich_message).text : ""));
   if (!replyText) return header + "\n";
 
   const cleaned = replyText.replace(/[\n\r]/g, " ").trim();
@@ -601,6 +606,7 @@ export function shouldRespondInGroup(
     };
     text?: string;
     caption?: string;
+    rich_message?: RichMessage;
     entities?: Array<{ type: string; offset: number; length: number }>;
     caption_entities?: Array<{ type: string; offset: number; length: number }>;
   },
@@ -618,7 +624,7 @@ export function shouldRespondInGroup(
     return true;
   }
 
-  const text = message.text ?? message.caption ?? "";
+  const text = message.text ?? message.caption ?? (message.rich_message ? extractRichIntake(message.rich_message).text : "");
   const entities = message.entities ?? message.caption_entities ?? [];
   const mention = `@${botUsername}`;
   const mentionPattern = new RegExp(`(?<!\\w)@${botUsername}(?![a-zA-Z0-9_])`);
@@ -709,7 +715,7 @@ export function makeSteerFn(
 export function createTelegramAutoRetryTransformer(): Transformer {
   const retry = autoRetry(AUTO_RETRY_OPTIONS);
   return async (prev, method, payload, signal) => {
-    if (method === "sendMessageDraft" || method === "sendChatAction" || method === "getUpdates") {
+    if (method === "sendMessageDraft" || method === "sendRichMessageDraft" || method === "sendChatAction" || method === "getUpdates") {
       return prev(method, payload, signal);
     }
     let transportRetries = 2;
@@ -788,10 +794,10 @@ export function createTelegramBot(
 
   // Message queue: debounce rapid messages and collect mid-turn messages
   const messageQueue = new MessageQueue(
-    async (chatId, agentId, text, platform, onAgentOwnership) => {
+    async (chatId, agentId, text, platform, onAgentOwnership, imagePaths) => {
       let releaseOutput!: () => void;
       const outputDone = new Promise<void>(resolve => { releaseOutput = resolve; });
-      const stream = sessionManager.sendSessionMessage(chatId, agentId, text, { outputDone });
+      const stream = sessionManager.sendSessionMessage(chatId, agentId, text, { outputDone, imagePaths });
       try {
         await relayStream(
           stream,
@@ -805,8 +811,8 @@ export function createTelegramBot(
       }
     },
     {
-      acknowledgedSteerFn: (chatId, agentId, text, onEnqueued) =>
-        sessionManager.steerSessionMessage(chatId, agentId, text, onEnqueued),
+      acknowledgedSteerFn: (chatId, agentId, text, onEnqueued, imagePaths) =>
+        sessionManager.steerSessionMessage(chatId, agentId, text, onEnqueued, imagePaths),
       prepareSessionFn: async (chatId, agentId) => {
         await sessionManager.getOrCreateSession(chatId, agentId);
       },
@@ -911,28 +917,60 @@ export function createTelegramBot(
     }));
   });
 
-  // Handle text messages
-  bot.on("message:text", async (ctx) => {
+  // Text, native rich posts, and photos share routing and bounded media custody.
+  bot.on(["message:text", "message:rich_message", "message:photo"], async (ctx) => {
     const chatId = ctx.chat.id;
-    const topicId = ctx.message?.message_thread_id;
+    const topicId = ctx.message.message_thread_id;
     setThread(chatId, ctx.message.message_id, topicId);
-    recordMessage(chatId, ctx.message.message_id, senderLabel(ctx.from), ctx.message.text, "in");
+    const intake = extractRichIntake(ctx.message.rich_message, ctx.message.reply_to_message?.rich_message);
+    const body = ctx.message.text ?? ctx.message.caption ?? intake.text;
+    recordMessage(chatId, ctx.message.message_id, senderLabel(ctx.from), body || "[photo]", "in");
     const binding = resolveBinding(chatId, config.bindings, topicId);
     if (!binding) return;
-
     if (!shouldRespondInGroup(binding, bot.botInfo.id, bot.botInfo.username, ctx.message, config.sessionDefaults)) return;
-
-    messagesReceived.inc({ type: "text" });
-
+    messagesReceived.inc({ type: ctx.message.photo ? "photo" : "text" });
     const key = sessionKey(chatId, topicId);
     const prefix = buildSourcePrefix(binding, ctx.from, ctx.message.date);
-    const replyCtx = buildReplyContext(ctx.message.reply_to_message, ctx.message.quote);
+    const parent = ctx.message.reply_to_message;
+    const replyCtx = buildReplyContext(parent?.rich_message ? { ...parent, text: intake.parentText } : parent, ctx.message.quote);
     const fwdCtx = buildForwardContext(ctx.message.forward_origin);
-    const messageText = prefix + replyCtx + fwdCtx + ctx.message.text;
-
-    // Enqueue: debounce rapid messages, collect mid-turn messages.
-    // Processing happens in the background after debounce timer expires.
-    messageQueue.enqueue(key, binding.agentId, messageText, createTelegramAdapter(ctx, binding, undefined, config.sessionDefaults));
+    const parentOrigin = parent?.rich_message ? buildForwardContext(parent.forward_origin) : "";
+    let messageText = prefix + replyCtx + (parentOrigin ? `[Reply source] ${parentOrigin}` : "") + fwdCtx + body;
+    const photos = [...(ctx.message.photo?.slice(-1) ?? []), ...intake.photos, ...(parent?.photo?.slice(-1) ?? [])];
+    const seen = new Set<string>();
+    const paths: string[] = [];
+    let remaining = Math.min(config.sessionDefaults.maxMediaBytes, TELEGRAM_FILE_SIZE_LIMIT);
+    if (photos.length) sessionManager.touchActivity(key);
+    try {
+      for (const photo of photos) {
+        if (seen.has(photo.file_id)) continue;
+        seen.add(photo.file_id);
+        if (paths.length >= 50 || remaining <= 0 || (photo.file_size ?? 0) > remaining) {
+          messageText += "\n[Photo omitted: shared media limit]";
+          continue;
+        }
+        const file = await ctx.api.getFile(photo.file_id).catch(error => { throw toMediaPipelineError(error, "metadata"); });
+        if (!file.file_path) throw new MediaPipelineError("metadata");
+        if ((file.file_size ?? 0) > remaining) { messageText += "\n[Photo omitted: shared media limit]"; continue; }
+        const path = allocateMediaPath(key, "photo", ".jpg");
+        paths.push(path);
+        await downloadFile(`https://api.telegram.org/file/bot${token}/${file.file_path}`, path, { maxBytes: remaining });
+        if (ctx.message.rich_message || parent?.rich_message) validateRichPhoto(path);
+        remaining -= statSync(path).size;
+        messageText = messageText.trimEnd() + `\n\n${path}`;
+      }
+      if (paths.length) enforceMediaCap(config.sessionDefaults.maxMediaBytes);
+      messageQueue.enqueue(key, binding.agentId, messageText, createTelegramAdapter(ctx, binding, undefined, config.sessionDefaults),
+        paths.length ? () => { for (const path of paths) releaseMediaPath(path); } : undefined,
+        paths.length ? () => { for (const path of paths) discardMediaPath(path); } : undefined,
+        paths.length ? paths : undefined);
+    } catch (err) {
+      for (const path of paths) discardMediaPath(path);
+      const stage = mediaPipelineStage(err, "download");
+      recordMediaPipelineError({ transport: "telegram", mediaType: "photo", stage });
+      log.error("telegram-bot", `Photo media pipeline failed stage=${stage}`);
+      await ctx.reply(mediaPipelineFailureMessage(err, "download")).catch(() => {});
+    }
   });
 
   // Handle voice messages — transcribe with whisper-cli and send to the agent
@@ -983,74 +1021,6 @@ export function createTelegramBot(
       const detail = mediaPipelineFailureDetail(err, "transcription", config.whisperModelPath);
       log.error("telegram-bot", `Voice media pipeline failed stage=${stage}${detail ? ` ${detail}` : ""}`);
       await ctx.reply(mediaPipelineFailureMessage(err, "transcription")).catch(() => {});
-    }
-  });
-
-  // Handle photo messages — download image and pass file path to the agent for vision
-  bot.on("message:photo", async (ctx) => {
-    const chatId = ctx.chat.id;
-    const topicId = ctx.message?.message_thread_id;
-    setThread(chatId, ctx.message.message_id, topicId);
-    recordMessage(chatId, ctx.message.message_id, senderLabel(ctx.from), ctx.message.caption ?? "[photo]", "in");
-    const binding = resolveBinding(chatId, config.bindings, topicId);
-    if (!binding) return;
-
-    if (!shouldRespondInGroup(binding, bot.botInfo.id, bot.botInfo.username, ctx.message, config.sessionDefaults)) return;
-
-    messagesReceived.inc({ type: "photo" });
-
-    const key = sessionKey(chatId, topicId);
-    let tempPath: string | null = null;
-
-    // Keep any active session alive across the download+debounce window so the
-    // idle timer cannot fire and wipe the media dir before the agent reads it.
-    sessionManager.touchActivity(key);
-
-    try {
-      // Get largest photo size (last element in array)
-      const photos = ctx.msg.photo;
-      const largest = photos[photos.length - 1];
-      const file = await ctx.api.getFile(largest.file_id).catch((error) => {
-        throw toMediaPipelineError(error, "metadata");
-      });
-      if (!file.file_path) throw new MediaPipelineError("metadata");
-      const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
-      tempPath = allocateMediaPath(key, "photo", ".jpg");
-      await downloadFile(url, tempPath, { maxBytes: config.sessionDefaults.maxMediaBytes });
-      enforceMediaCap(config.sessionDefaults.maxMediaBytes);
-
-      // Build message: caption (if any) + image file path
-      const prefix = buildSourcePrefix(binding, ctx.from, ctx.message.date);
-      const replyCtx = buildReplyContext(ctx.message.reply_to_message, ctx.message.quote);
-      const fwdCtx = buildForwardContext(ctx.message.forward_origin);
-      const context = prefix + replyCtx + fwdCtx;
-      const caption = ctx.msg.caption ?? "";
-      const messageText = caption.trimEnd()
-        ? `${context}${caption.trimEnd()}\n\n${tempPath}`
-        : `${context}${tempPath}`;
-
-      // File persists for the session lifetime so follow-up turns can reference it.
-      // `cleanup` releases in-flight tracking when the message is delivered; the
-      // active session then owns the file. `dropCleanup` reclaims the file if
-      // the message never reaches an agent (cap exceeded, /reconnect, /clean).
-      const trackedPath = tempPath;
-      tempPath = null;
-      messageQueue.enqueue(
-        key,
-        binding.agentId,
-        messageText,
-        createTelegramAdapter(ctx, binding, undefined, config.sessionDefaults),
-        () => { releaseMediaPath(trackedPath); },
-        () => { discardMediaPath(trackedPath); },
-      );
-    } catch (err) {
-      const stage = mediaPipelineStage(err, "download");
-      recordMediaPipelineError({ transport: "telegram", mediaType: "photo", stage });
-      log.error("telegram-bot", `Photo media pipeline failed stage=${stage}`);
-      await ctx.reply(mediaPipelineFailureMessage(err, "download")).catch(() => {});
-      if (tempPath) {
-        discardMediaPath(tempPath);
-      }
     }
   });
 

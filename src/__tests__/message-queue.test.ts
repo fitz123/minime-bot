@@ -1752,3 +1752,34 @@ describe("MessageQueue pre-stream typing", () => {
     queue.clearAll();
   });
 });
+
+it('carries explicit vision paths through debounce, acknowledged steering and fallback custody', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  const processed: Array<{ text: string; paths?: string[] }> = [];
+  const steered: Array<{ text: string; paths?: string[] }> = [];
+  const released: string[] = [], dropped: string[] = [];
+  let finish!: () => void;
+  const gate = new Promise<void>(resolve => { finish = resolve; });
+  const queue = new MessageQueue(async (_chat, _agent, text, _platform, own, paths) => {
+    processed.push({ text, paths }); own();
+    if (processed.length === 1) await gate;
+  }, {
+    acknowledgedSteerFn: async (_chat, _agent, text, enqueued, paths) => {
+      steered.push({ text, paths }); enqueued?.(); return text === 'accepted';
+    },
+  });
+  const platform = mockPlatform(undefined, false);
+  queue.enqueue('vision', 'test', 'first', platform, undefined, undefined, ['first.png']);
+  queue.enqueue('vision', 'test', 'second', platform, undefined, undefined, ['second.png']);
+  t.mock.timers.tick(3000); await flushMicrotasks();
+  assert.deepEqual(processed, [{ text: 'first\n\nsecond', paths: ['first.png', 'second.png'] }]);
+  queue.enqueue('vision', 'test', 'accepted', platform, () => released.push('accepted'), () => dropped.push('accepted'), ['accepted.png']);
+  await flushMicrotasks();
+  queue.enqueue('vision', 'test', 'fallback', platform, () => released.push('fallback'), () => dropped.push('fallback'), ['fallback.png']);
+  await flushMicrotasks();
+  assert.deepEqual(steered, [{ text: 'accepted', paths: ['accepted.png'] }, { text: 'fallback', paths: ['fallback.png'] }]);
+  finish(); for (let i = 0; i < 5; i++) await flushMicrotasks();
+  assert.deepEqual(processed[1], { text: 'fallback', paths: ['fallback.png'] });
+  assert.deepEqual(released, ['accepted', 'fallback']); assert.deepEqual(dropped, []);
+  queue.clearAll();
+});
