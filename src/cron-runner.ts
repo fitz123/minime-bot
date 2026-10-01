@@ -33,6 +33,9 @@ import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { setTimeout as sleep } from "node:timers/promises";
+import { Api } from "grammy";
+import { deliverCronResult } from "./cron-rich-delivery.js";
+import type { TelegramAdapterApi } from "./telegram-adapter.js";
 import type { CronJob, AgentConfig } from "./types.js";
 import { shouldSuppressNoReply } from "./no-reply.js";
 import {
@@ -806,6 +809,8 @@ function buildDeliverArgs(
 }
 
 export interface CronDeliveryDeps {
+  purpose?: "result" | "service";
+  createTelegramApi: (token: string) => TelegramAdapterApi;
   loadTelegramToken: () => string;
   execFileSync: (
     file: string,
@@ -815,6 +820,7 @@ export interface CronDeliveryDeps {
 }
 
 const defaultCronDeliveryDeps: CronDeliveryDeps = {
+  createTelegramApi: (token) => new Api(token, { timeoutSeconds: 30 }),
   loadTelegramToken,
   execFileSync,
 };
@@ -850,6 +856,8 @@ export class DeliveryError extends Error {
 }
 
 export function isQueueableDeliveryFailure(err: unknown): boolean {
+  // Only legacy service-script evidence is terminal here. Native result
+  // rejections retain the generated output, including after partial delivery.
   if (!(err instanceof DeliveryError) || err.status !== 1 || !err.stderrExcerpt) return true;
   if (/\[deliver\] Error: (invalid chat_id|invalid thread_id|empty message)/.test(err.stderrExcerpt)) {
     return false;
@@ -875,10 +883,13 @@ function deliver(
   message: string,
   threadId?: number,
   overrides: Partial<CronDeliveryDeps> = {},
-): void {
+): void | Promise<void> {
   const deps = { ...defaultCronDeliveryDeps, ...overrides };
   try {
     const telegramToken = loadDeliveryTelegramToken(deps.loadTelegramToken);
+    if (deps.purpose === "result") {
+      return deliverCronResult(deps.createTelegramApi(telegramToken), chatId, message, threadId);
+    }
     deps.execFileSync(DELIVER_SCRIPT, buildDeliverArgs(chatId, threadId), {
       input: message,
       encoding: "utf8",
@@ -1235,7 +1246,8 @@ export interface CronRunnerMainDeps {
   resolveCronAgentData: (agentId: string, configPath?: string) => CronAgentData;
   runScript: (cron: CronJob) => string;
   runPi: (cron: CronJob, workspaceCwd: string, agentData?: CronAgentData) => string;
-  deliver: (chatId: number, message: string, threadId?: number) => void;
+  deliver: (chatId: number, message: string, threadId?: number,
+    options?: Pick<CronDeliveryDeps, "purpose">) => void | Promise<void>;
   sleep: (ms: number) => Promise<void>;
   readCronOutboxRecord: (
     cronName: string,
@@ -1311,14 +1323,14 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     threadId?: number,
   ): Promise<void> => {
     try {
-      deps.deliver(chatId, payload, threadId);
+      await deps.deliver(chatId, payload, threadId, { purpose: "result" });
       return;
     } catch (initialError) {
       let lastError: unknown = initialError;
       for (const delayMs of CRON_DELIVERY_RETRY_DELAYS_MS) {
         await deps.sleep(delayMs);
         try {
-          deps.deliver(chatId, payload, threadId);
+          await deps.deliver(chatId, payload, threadId, { purpose: "result" });
           return;
         } catch (retryError) {
           lastError = retryError;
@@ -1391,17 +1403,19 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
 
   deps.log(taskName, `Loaded: type=${cron.type}, agent=${cron.agentId}, deliver=${cron.deliveryChatId}${cron.deliveryThreadId ? `, thread=${cron.deliveryThreadId}` : ""}`);
 
-  const notifyAdminOfTerminalOutbox = (
+  const notifyAdminOfTerminalOutbox = async (
     record: CronOutboxRecord,
     reason: "deterministic",
-  ): void => {
+  ): Promise<void> => {
     if (adminChatId === undefined) {
       return;
     }
     try {
-      deps.deliver(
+      await deps.deliver(
         adminChatId,
         `⚠️ Cron outbox ${reason}\nTask: ${taskName}\nRun: ${record.runId}\nAttempts: ${record.attempts}`,
+        undefined,
+        { purpose: "service" },
       );
     } catch (err) {
       deps.log(
@@ -1466,9 +1480,9 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
   } else if (pendingRecord !== undefined) {
     // Generated output remains owed across outages. Retry once per scheduled
     // invocation; deferred pickup blocks generation rather than accumulating runs.
-    const deliveryAttempt: { ok: true } | { ok: false; error: unknown } = (() => {
+    const deliveryAttempt: { ok: true } | { ok: false; error: unknown } = await (async () => {
       try {
-        deps.deliver(pendingRecord.chatId, pendingRecord.payload, pendingRecord.threadId);
+        await deps.deliver(pendingRecord.chatId, pendingRecord.payload, pendingRecord.threadId, { purpose: "result" });
         return { ok: true };
       } catch (error) {
         return { ok: false, error };
@@ -1512,7 +1526,7 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
         taskName,
         `OUTBOX TERMINAL deterministic runId=${pendingRecord.runId} attempts=${pendingRecord.attempts}`,
       );
-      notifyAdminOfTerminalOutbox(pendingRecord, "deterministic");
+      await notifyAdminOfTerminalOutbox(pendingRecord, "deterministic");
     } else {
       try {
         deps.clearCronOutboxRecord(taskName);
