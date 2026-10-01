@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 
 import { join } from "node:path";
 import { Api } from "grammy";
 import { deliver, main, CRON_DELIVERY_RETRY_DELAYS_MS,
-  type CronRunnerMainDeps } from "../cron-runner.js";
+  isQueueableDeliveryFailure, type CronRunnerMainDeps } from "../cron-runner.js";
 import { readCronOutboxRecord, writeCronOutboxRecord } from "../cron-outbox.js";
 import { RICH_TEXT_BYTES } from "../telegram-rich.js";
 import { EchoWatcher } from "../echo-watcher.js";
@@ -34,15 +34,17 @@ function harness(output = "# Result\n\nA short report.", type: "llm" | "script" 
   let generated = 0;
   let failure: number | "network" | undefined;
   let failChunk: number | undefined;
+  let failureThread: number | undefined;
+  let description = "Bad Request: can't parse entities";
   const api = new Api("test:fixture", {
     fetch: async (url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
       assert.ok(String(url).includes("/bottest:fixture/"), "uses the configured sender token");
       const method = String(url).split("/").at(-1)!;
       const body = JSON.parse(init!.body as string);
       calls.push({ method, body });
-      if (failure !== undefined && (failChunk === undefined || calls.length % 2 === failChunk)) {
-        if (failure === "network") throw new Error("synthetic transport failure");
-        return Response.json({ ok: false, error_code: failure, description: "Bad Request: can't parse entities" });
+      if (failure !== undefined && (failureThread === undefined || body.message_thread_id === failureThread) && (failChunk === undefined || calls.length % 2 === failChunk)) {
+        if (failure === "network") throw new Error(`synthetic transport failure at ${url}`);
+        return Response.json({ ok: false, error_code: failure, description });
       }
       return Response.json({ ok: true, result: { message_id: calls.length } });
     },
@@ -76,6 +78,7 @@ function harness(output = "# Result\n\nA short report.", type: "llm" | "script" 
   return { name, echoDir, calls, ordinary, sleeps, errors, metrics, deps, transport,
     generated: () => generated,
     fail: (code: typeof failure, chunk?: number) => { failure = code; failChunk = chunk; },
+    failThread: (thread: number, detail: string) => { failureThread = thread; description = detail; },
     seed: (payload = output) => writeCronOutboxRecord({ version: 1, cron: name, runId: "fixture-run",
       kind: "output", payload, chatId: 456, threadId: 73, createdAt: new Date().toISOString(), attempts: 2 }),
     run: () => main(deps),
@@ -129,7 +132,7 @@ describe("cron native result routing", () => {
     assert.deepEqual(h.ordinary, []);
   });
 
-  for (const code of [400, 403, 429, 500, "network"] as const) {
+  for (const code of [408, 429, 500, "network"] as const) {
     it(`retains native ${code} failures through bounded retries and blocks regeneration on replay`, async () => {
       const h = harness();
       h.fail(code);
@@ -157,10 +160,49 @@ describe("cron native result routing", () => {
     });
   }
 
+  for (const code of [400, 401, 403, 404, 409, 499]) {
+    it(`treats native ${code} as terminal and preserves sanitized API diagnostics`, async () => {
+      const h = harness();
+      h.fail(code);
+      h.failThread(42, "Bad Request: message thread not found\n\x1b[31mhttps://api.telegram.org/bottest:fixture/sendRichMessage\x00");
+      await assert.rejects(async () => deliver(123, "report", 42, { ...h.transport, purpose: "result" }), error => {
+        const failure = error as Error & { error_code: number; description: string };
+        assert.equal(failure.error_code, code);
+        assert.match(failure.description, /Bad Request: message thread not found/);
+        assert.match(failure.message, /Bad Request: message thread not found/);
+        assert.doesNotMatch(failure.message, /test:fixture|https:|[\x00-\x1f]/);
+        assert.equal(isQueueableDeliveryFailure(error), false);
+        return true;
+      });
+      await assert.rejects(h.run(), Exit);
+      assert.equal(readCronOutboxRecord(h.name), undefined);
+      assert.deepEqual(h.sleeps, [...CRON_DELIVERY_RETRY_DELAYS_MS]);
+      assert.match(h.errors[0], /message thread not found/);
+      assert.deepEqual(h.ordinary, []);
+    });
+  }
+
+  it("clears a pending deleted topic and delivers fresh output to the corrected current destination", async () => {
+    const h = harness("Fresh corrected report");
+    h.seed("Old topic report");
+    h.fail(400);
+    h.failThread(73, "Bad Request: message thread not found");
+    await h.run();
+    assert.deepEqual(h.calls.map(c => [c.method, c.body.chat_id, c.body.message_thread_id, c.body.rich_message.markdown]), [
+      ["sendRichMessage", 456, 73, "Old topic report"],
+      ["sendRichMessage", 123, 42, "Fresh corrected report"],
+    ]);
+    assert.equal(h.generated(), 1);
+    assert.equal(readCronOutboxRecord(h.name), undefined);
+    assert.deepEqual(h.sleeps, []);
+    assert.deepEqual(h.ordinary, []);
+    assert.deepEqual(h.metrics, ["success"]);
+  });
+
   it("retains the full result after later-chunk rejection and echoes only confirmed chunks", async () => {
     const source = "x".repeat(RICH_TEXT_BYTES + 1);
     const h = harness(source);
-    h.fail(400, 0);
+    h.fail(500, 0);
     await assert.rejects(h.run(), Exit);
     assert.equal(h.calls.length, 6);
     assert.ok(h.calls.every(c => c.method === "sendRichMessage"));
@@ -202,9 +244,11 @@ describe("cron native result routing", () => {
     assert.deepEqual(h.ordinary, []);
     assert.deepEqual(readdirSync(outbox), ["photo.png"]);
     assert.equal(readFileSync(join(outbox, "photo.png"), "utf8"), "untouched");
+    assert.equal(readCronOutboxRecord(h.name), undefined);
+    h.seed();
     await assert.rejects(h.run(), Exit);
-    assert.equal(h.generated(), 1);
-    assert.ok(readCronOutboxRecord(h.name));
+    assert.equal(h.generated(), 2, "terminal preparation replay allows a new run");
+    assert.equal(readCronOutboxRecord(h.name), undefined);
   });
 
   it("echo spool failure does not retry a confirmed result", async () => {

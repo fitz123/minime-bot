@@ -34,7 +34,7 @@ import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { setTimeout as sleep } from "node:timers/promises";
 import { Api } from "grammy";
-import { deliverCronResult } from "./cron-rich-delivery.js";
+import { CronResultPreparationError, deliverCronResult } from "./cron-rich-delivery.js";
 import type { TelegramAdapterApi } from "./telegram-adapter.js";
 import type { CronJob, AgentConfig } from "./types.js";
 import { shouldSuppressNoReply } from "./no-reply.js";
@@ -856,8 +856,11 @@ export class DeliveryError extends Error {
 }
 
 export function isQueueableDeliveryFailure(err: unknown): boolean {
-  // Only legacy service-script evidence is terminal here. Native result
-  // rejections retain the generated output, including after partial delivery.
+  if (err instanceof CronResultPreparationError) return false;
+  const nativeCode = (err as { error_code?: unknown } | null)?.error_code;
+  if (typeof nativeCode === "number" && Number.isInteger(nativeCode)
+    && nativeCode >= 400 && nativeCode < 500
+    && nativeCode !== 408 && nativeCode !== 429) return false;
   if (!(err instanceof DeliveryError) || err.status !== 1 || !err.stderrExcerpt) return true;
   if (/\[deliver\] Error: (invalid chat_id|invalid thread_id|empty message)/.test(err.stderrExcerpt)) {
     return false;
