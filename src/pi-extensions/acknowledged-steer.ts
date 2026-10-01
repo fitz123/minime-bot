@@ -1,3 +1,4 @@
+import type { ImageContent } from "@earendil-works/pi-ai";
 export const PI_ACKNOWLEDGED_STEER_COMMAND = "minime-acknowledged-steer";
 export const PI_ACKNOWLEDGED_STEER_CUSTOM_TYPE = "minime-acknowledged-steer";
 export const PI_ACKNOWLEDGED_STEER_RESULT_EVENT = "minime_acknowledged_steer_result";
@@ -7,6 +8,7 @@ export const PI_ACKNOWLEDGED_STEER_RESULT_PREFIX =
 export interface PiAcknowledgedSteerEnvelope {
   id: string;
   text: string;
+  images?: ImageContent[];
 }
 
 export type PiAcknowledgedSteerResultStatus =
@@ -19,8 +21,8 @@ export interface PiAcknowledgedSteerResultEnvelope {
   status: PiAcknowledgedSteerResultStatus;
 }
 
-export function buildPiAcknowledgedSteerInvocation(id: string, text: string): string {
-  const encoded = Buffer.from(JSON.stringify({ id, text }), "utf8").toString("base64url");
+export function buildPiAcknowledgedSteerInvocation(id: string, text: string, images?: ImageContent[]): string {
+  const encoded = Buffer.from(JSON.stringify({ id, text, ...(images ? { images } : {}) }), "utf8").toString("base64url");
   return `/${PI_ACKNOWLEDGED_STEER_COMMAND} ${encoded}`;
 }
 
@@ -38,7 +40,7 @@ export function parsePiAcknowledgedSteerEnvelope(
     ) {
       return null;
     }
-    return { id: parsed.id, text: parsed.text };
+    return { id: parsed.id, text: parsed.text, ...(parsed.images ? { images: parsed.images } : {}) };
   } catch {
     return null;
   }

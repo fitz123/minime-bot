@@ -370,3 +370,45 @@ test("held human staging survives the old idle deadline and final release restor
     assert.equal(session.lastActivity, lastActivity, "release must not refresh LRU activity");
   } finally { for (const release of releases) release(); await manager.closeAll(); restore(); }
 });
+
+for (const ending of ['reset', 'crash'] as const) test(`unconfirmed rich photos survive internal ${ending}, resume and another consultation`, { timeout: 30000 }, async () => {
+  const { manager, restore } = ownerFixture();
+  try {
+    const initial = await manager.getOrCreateSession('fixture-thread', 'b');
+    const reservation = join(initial.outboxPath, '.rich-reserved', 'fixture');
+    mkdirSync(reservation, { recursive: true, mode: 0o700 });
+    writeFileSync(join(reservation, 'photo.png'), 'unconfirmed fixture');
+    const outcome = manager.deliverCollaboration(message({ kind: 'session', id: initial.sessionId }, 'INTERNAL_BUSY'), () => {}).catch(e => e);
+    await until(() => initial.internalTurn === true && initial.processingStartedAt !== null);
+    assert.ok(existsSync(join(`${initial.outboxPath}.human`, '.rich-reserved', 'fixture', 'photo.png')));
+    if (ending === 'reset') await manager.destroySession('fixture-thread');
+    else initial.child.kill('SIGKILL');
+    const resumed = await manager.getOrCreateSession('fixture-thread', 'b', ending === 'crash' ? initial.sessionId : undefined);
+    await outcome;
+    const held = () => readdirSync(join(resumed.outboxPath, '.rich-reserved'), { recursive: true }).filter(p => String(p).endsWith('photo.png'));
+    assert.equal(held().length, 1);
+    assert.equal(existsSync(`${resumed.outboxPath}.human`), false);
+    await manager.deliverCollaboration(message({ kind: 'session', id: resumed.sessionId }, 'INTERNAL_TASK'), () => {});
+    assert.equal(held().length, 1);
+    assert.equal(existsSync(`${resumed.outboxPath}.human`), false);
+  } finally { await manager.closeAll(); restore(); }
+});
+
+test('startup relocates stale human reservations and frees the internal backup name', { timeout: 30000 }, async () => {
+  const { manager, restore } = ownerFixture();
+  try {
+    const initial = await manager.getOrCreateSession('fixture-thread', 'b');
+    await manager.closeSession('fixture-thread');
+    for (const path of [initial.outboxPath, `${initial.outboxPath}.human`]) {
+      mkdirSync(join(path, '.rich-reserved', 'fixture'), { recursive: true, mode: 0o700 });
+      writeFileSync(join(path, '.rich-reserved', 'fixture', 'photo.png'), 'held fixture');
+    }
+    const resumed = await manager.getOrCreateSession('fixture-thread', 'b');
+    assert.equal(existsSync(`${resumed.outboxPath}.human`), false);
+    const held = () => readdirSync(join(resumed.outboxPath, '.rich-reserved'), { recursive: true }).filter(p => String(p).endsWith('photo.png'));
+    assert.equal(held().length, 2, 'both normal and stale backup reservations survive even with equal batch names');
+    await manager.deliverCollaboration(message({ kind: 'session', id: resumed.sessionId }, 'INTERNAL_TASK'), () => {});
+    assert.equal(held().length, 2);
+    assert.equal(existsSync(`${resumed.outboxPath}.human`), false);
+  } finally { await manager.closeAll(); restore(); }
+});

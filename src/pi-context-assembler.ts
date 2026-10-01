@@ -97,6 +97,7 @@ export interface PiContextAssemblyOptions {
   artifactWorkspaceCwd?: string;
   /** Include the package directive for sessions whose child environment has an outbox. */
   includeFileDelivery?: boolean;
+  telegramRichAnswers?: boolean;
   /** Reject unsafe, missing, or unreadable declared sources instead of skipping them. */
   strict?: boolean;
 }
@@ -201,6 +202,11 @@ const FILE_DELIVERY_DIRECTIVE = [
 
 /** Complete static section, also usable as Pi's inline artifact-write fallback. */
 export const FILE_DELIVERY_CONTEXT = `## File delivery\n\n${FILE_DELIVERY_DIRECTIVE}`;
+
+export const TELEGRAM_RICH_FILE_DIRECTIVE = "For Telegram answers, interleave local photos with prose using ![caption](outbox:filename.png). Place photos between paragraphs, outside table cells. Use basenames without whitespace or directory separators, and captions without closing brackets (]). Write the JPEG or PNG into the outbox first. An invalid inline reference prevents final answer delivery. Photos must be at most 10 MB, width + height at most 10000, and aspect ratio at most 20. Referenced photos are consumed inline; other files are sent separately. External images remain caption links.";
+export function fileDeliveryContext(telegramRichAnswers = false): string {
+  return FILE_DELIVERY_CONTEXT + (telegramRichAnswers ? `\n\n${TELEGRAM_RICH_FILE_DIRECTIVE}` : "");
+}
 
 /**
  * Read one already-resolved regular file through a stable descriptor. The
@@ -597,6 +603,7 @@ function assembleBundle(
   workspaceCwd: string,
   strict = false,
   includeFileDelivery = false,
+  telegramRichAnswers = false,
 ): BundleResult {
   const claudeMdPath = join(workspaceCwd, "CLAUDE.md");
   if (strict) rejectDirectSymlink(claudeMdPath, "CLAUDE.md");
@@ -651,11 +658,11 @@ function assembleBundle(
     KNOWLEDGE_ACCESS_DIRECTIVE,
   ));
   if (includeFileDelivery) {
-    parts.push(FILE_DELIVERY_CONTEXT);
+    parts.push(fileDeliveryContext(telegramRichAnswers));
     sources.push(contextSource(
       "package-directive",
       "package:file-delivery-v1",
-      FILE_DELIVERY_DIRECTIVE,
+      telegramRichAnswers ? `${FILE_DELIVERY_DIRECTIVE}\n\n${TELEGRAM_RICH_FILE_DIRECTIVE}` : FILE_DELIVERY_DIRECTIVE,
     ));
   }
 
@@ -840,7 +847,7 @@ export function writeTempArtifact(
   agentId: string,
   kind: PiArtifactKind,
   content: string,
-  opts?: { stagingSuffix?: string; variant?: "file-delivery" },
+  opts?: { stagingSuffix?: string; variant?: "file-delivery" | "telegram-rich" },
 ): string {
   const tmpDir = join(workspaceCwd, ".tmp");
   ensurePrivateArtifactDir(tmpDir);
@@ -965,8 +972,9 @@ export function assemblePiContext(
 ): PiContextArtifacts | null {
   const strict = options.strict === true;
   const includeFileDelivery = options.includeFileDelivery === true;
+  const telegramRichAnswers = includeFileDelivery && options.telegramRichAnswers === true;
   const signature = strict ? null : computeManifestSignature(agent);
-  const cacheKey = `${agent.id}\0${resolve(agent.workspaceCwd)}\0${strict}\0${includeFileDelivery}`;
+  const cacheKey = `${agent.id}\0${resolve(agent.workspaceCwd)}\0${strict}\0${includeFileDelivery}\0${telegramRichAnswers}`;
   const cached = strict ? undefined : cache.get(cacheKey);
 
   let bundle: string;
@@ -983,7 +991,7 @@ export function assemblePiContext(
     suppressContextFiles = cached.suppressContextFiles;
     manifest = cached.manifest;
   } else {
-    const assembled = assembleBundle(agent.workspaceCwd, strict, includeFileDelivery);
+    const assembled = assembleBundle(agent.workspaceCwd, strict, includeFileDelivery, telegramRichAnswers);
     const resolvedPersona = resolvePersonaWithSources(agent, strict);
     if (!assembled.hasContent && resolvedPersona.persona === null) {
       // Empty workspace — let Pi fall back to its own (flat) context loading
@@ -1013,7 +1021,7 @@ export function assemblePiContext(
       agent.id,
       "bundle",
       bundle,
-      includeFileDelivery ? { variant: "file-delivery" } : undefined,
+      includeFileDelivery ? { variant: telegramRichAnswers ? "telegram-rich" : "file-delivery" } : undefined,
     );
     if (persona !== null) {
       systemPromptPath = writeTempArtifact(artifactWorkspaceCwd, agent.id, "persona", persona);

@@ -2814,7 +2814,10 @@ describe("SessionManager Pi dispatch", () => {
     const { child, stdout, stdinWrites } = makeCapturingChild();
     injectSession(manager, "pi-chat", "pi", child);
 
-    const gen = manager.sendSessionMessage("pi-chat", "pi", "hello pi");
+    const imagePath = `${TEST_DIR}/vision.png`;
+    const imageData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=";
+    writeFileSync(imagePath, Buffer.from(imageData, "base64"));
+    const gen = manager.sendSessionMessage("pi-chat", "pi", "hello pi", { imagePaths: [imagePath] });
 
     // Drive a multi-turn-shaped Pi run: per-turn and low-level run boundaries,
     // followed by the session-level settlement emitted by the helper.
@@ -2834,6 +2837,7 @@ describe("SessionManager Pi dispatch", () => {
     assert.strictEqual(sent.type, "prompt", "pi path must write a Pi prompt command");
     assert.match(sent.id, /^minime-prompt-\d+$/, "pi prompt must carry a correlation id");
     assert.strictEqual(sent.message, "hello pi", "Pi must receive the accepted user text unchanged");
+    assert.deepEqual(sent.images, [{ type: "image", mimeType: "image/png", data: imageData }]);
     assert.ok(
       !sent.message.includes("outbox"),
       "prompt must not include per-message outbox boilerplate",

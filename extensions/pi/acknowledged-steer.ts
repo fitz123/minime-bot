@@ -64,7 +64,7 @@ export default function acknowledgedSteerExtension(pi: ExtensionAPI): void {
       pi.sendMessage(
         {
           customType: PI_ACKNOWLEDGED_STEER_CUSTOM_TYPE,
-          content: envelope.text,
+          content: envelope.images?.length ? [{ type: "text", text: envelope.text }, ...envelope.images] : envelope.text,
           display: false,
           details: { requestId: envelope.id },
         },

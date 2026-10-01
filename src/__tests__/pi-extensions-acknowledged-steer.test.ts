@@ -213,7 +213,7 @@ describe("acknowledged-steer Pi extension", () => {
   it("enqueues and consumes steering in an installed Pi run and rejects it after settlement", { timeout: 20_000 }, async (t) => {
     const cwd = await mkdtemp(join(tmpdir(), "minime-acknowledged-steer-"));
     t.after(() => rm(cwd, { recursive: true, force: true }));
-    const modelRuntime = await ModelRuntime.create({ modelsPath: null });
+    const modelRuntime = await ModelRuntime.create({ modelsPath: null, authPath: join(cwd, "auth.json") });
     const faux = fauxProvider({ provider: "acknowledged-steer-test" });
     modelRuntime.registerNativeProvider(faux.provider);
     let releaseResponse!: () => void;
@@ -259,13 +259,16 @@ describe("acknowledged-steer Pi extension", () => {
       await session.prompt(buildPiAcknowledgedSteerInvocation("before", "too early"));
       const run = session.prompt("initial question");
       await started;
-      await session.prompt(buildPiAcknowledgedSteerInvocation("during", "apply correction"));
+      const image = { type: "image" as const, mimeType: "image/png", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=" };
+      await session.prompt(buildPiAcknowledgedSteerInvocation("during", "apply correction", [image]));
       releaseResponse();
       await run;
       await session.prompt(buildPiAcknowledgedSteerInvocation("after", "too late"));
       assert.equal(faux.state.callCount, 2);
       assert.ok(steeredRequest);
       assert.match(JSON.stringify(steeredRequest.messages), /apply correction/);
+      const imageParts = steeredRequest.messages.flatMap(message => Array.isArray(message.content) ? message.content.filter(part => part.type === "image") : []);
+      assert.deepEqual(imageParts, [image], "installed Pi delivers steering photos to model vision");
       assert.equal(session.getLastAssistantText(), "corrected answer");
       assert.equal(settlements, 1);
       assert.deepEqual(notices.map(parsePiAcknowledgedSteerResultNotice), [

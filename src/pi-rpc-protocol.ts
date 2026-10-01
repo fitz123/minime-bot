@@ -1,3 +1,5 @@
+import { readVisionImages } from "./vision-input.js";
+import type { ImageContent } from "@earendil-works/pi-ai";
 import { spawn, type ChildProcess } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { existsSync, realpathSync, statSync } from "node:fs";
@@ -15,7 +17,7 @@ import type {
 import { log } from "./logger.js";
 import {
   assemblePiContext,
-  FILE_DELIVERY_CONTEXT,
+  fileDeliveryContext,
   PiContextArtifactWriteError,
   type PiContextAssemblyOptions,
 } from "./pi-context-assembler.js";
@@ -175,6 +177,7 @@ export interface PiSpawnRuntimeEnvOptions {
   askCallerAgentId?: string;
   /** Deterministic per-chat outbox path supplied for an interactive session. */
   outboxPath?: string;
+  telegramRichAnswers?: boolean;
   /** Create a process group rooted at the Pi child so fence loss can kill its tool descendants. */
   startNewProcessGroup?: boolean;
 }
@@ -430,6 +433,7 @@ export function piExtensionRelpathForDir(baseDir: string, relpath: string): stri
 }
 
 export interface PiPromptCommand {
+  images?: ImageContent[];
   type: "prompt";
   message: string;
   /** Correlates prompt acceptance/rejection with the active bot request. */
@@ -620,6 +624,7 @@ export function buildPiSpawnArgs(
   try {
     const context = assemblePiContextForCurrentDeployment(agent, {
       includeFileDelivery,
+      telegramRichAnswers: runtimeEnvOptions?.telegramRichAnswers,
     });
     if (context) {
       if (context.systemPromptPath) {
@@ -641,7 +646,7 @@ export function buildPiSpawnArgs(
       `Pi context assembly threw for agent "${agent.id}", ${contextLoadingOutcome}: ${(err as Error).message}`,
     );
     if (includeFileDelivery) {
-      args.push("--append-system-prompt", FILE_DELIVERY_CONTEXT);
+      args.push("--append-system-prompt", fileDeliveryContext(runtimeEnvOptions?.telegramRichAnswers));
     }
     if (suppressContextFiles) {
       args.push("--no-context-files");
@@ -862,8 +867,12 @@ export function buildPiPromptCommand(
   text: string,
   streamingBehavior?: "steer" | "followUp",
   id?: string,
+  imagePaths?: string[],
 ): PiPromptCommand {
   const command: PiPromptCommand = { type: "prompt", message: text };
+  const { images, omissionNote } = readVisionImages(imagePaths);
+  command.message += omissionNote;
+  if (images) command.images = images;
   if (id) {
     command.id = id;
   }
@@ -883,10 +892,12 @@ export function buildPiSteerCommand(text: string): PiSteerCommand {
 export function buildPiAcknowledgedSteerCommand(
   text: string,
   id: string,
+  imagePaths?: string[],
 ): PiPromptCommand {
+  const { images, omissionNote } = readVisionImages(imagePaths);
   return {
     type: "prompt",
-    message: buildPiAcknowledgedSteerInvocation(id, text),
+    message: buildPiAcknowledgedSteerInvocation(id, text + omissionNote, images),
     id,
   };
 }
@@ -938,9 +949,10 @@ export function sendPiPrompt(
   child: ChildProcess,
   text: string,
   streamingBehavior?: "steer" | "followUp",
+  imagePaths?: string[],
 ): string {
   const id = `minime-prompt-${++piPromptCommandSequence}`;
-  writePiCommand(child, buildPiPromptCommand(text, streamingBehavior, id));
+  writePiCommand(child, buildPiPromptCommand(text, streamingBehavior, id, imagePaths));
   return id;
 }
 
@@ -953,8 +965,9 @@ export function sendPiAcknowledgedSteer(
   text: string,
   id: string,
   onWriteError?: (error: Error) => void,
+  imagePaths?: string[],
 ): void {
-  writePiCommand(child, buildPiAcknowledgedSteerCommand(text, id), onWriteError);
+  writePiCommand(child, buildPiAcknowledgedSteerCommand(text, id, imagePaths), onWriteError);
 }
 
 /**

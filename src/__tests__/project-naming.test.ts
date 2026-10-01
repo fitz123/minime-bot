@@ -207,7 +207,8 @@ describe("project naming", () => {
       "`agent_settled` remains the accepted-turn terminal boundary",
       "272K (272,000-token) context window",
       "does not override the model metadata",
-      "does not opt into new Bot API product features",
+      "Telegram textual agent answers use native `sendRichMessage`, including short paragraphs",
+      "In Telegram DMs, text-only native `sendRichMessageDraft` previews use one stable nonzero draft ID",
     ]) {
       assert.ok(normalizedReadme.includes(expected), `README.md should document ${expected}`);
     }

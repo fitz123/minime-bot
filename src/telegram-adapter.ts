@@ -1,5 +1,6 @@
 import { type Context, InputFile } from "grammy";
-import type { DraftSendResult, PlatformContext, SessionDefaults, TelegramBinding } from "./types.js";
+import type { AgentAnswerOptions, DraftSendResult, PlatformContext, SessionDefaults, TelegramBinding } from "./types.js";
+import { richDraftPayload } from "./telegram-rich.js";
 import { markdownToHtml } from "./markdown-html.js";
 import { setThread } from "./message-thread-cache.js";
 import { recordMessage } from "./message-content-index.js";
@@ -8,6 +9,8 @@ export type TelegramAdapterApi = Pick<
   Context["api"],
   | "sendMessage"
   | "sendMessageDraft"
+  | "sendRichMessage"
+  | "sendRichMessageDraft"
   | "deleteMessage"
   | "sendChatAction"
   | "sendPhoto"
@@ -68,12 +71,27 @@ export function createTelegramApiAdapter({
   const isDm = binding?.kind === "dm";
 
   return {
+    richAnswers: true,
     maxMessageLength: TELEGRAM_MAX_MSG_LENGTH,
     typingIntervalMs: TELEGRAM_TYPING_INTERVAL_MS,
     typingIndicator: binding?.typingIndicator !== false,
 
-    async sendMessage(text: string): Promise<string> {
+    async sendMessage(text: string, options?: AgentAnswerOptions): Promise<string> {
       if (chatId == null) return "";
+      if (options?.purpose === "agent-answer") {
+        const rich = options.nativeBlocks
+          ? { blocks: options.nativeBlocks.map(block => {
+              if (block.type !== "photo") return block;
+              const photo = options.media?.find(media => media.id === block.photo.media);
+              if (!photo) throw new Error("Missing reserved inline photo");
+              return { ...block, photo: { ...block.photo, media: new InputFile(photo.path) } };
+            }) }
+          : { markdown: text, media: options.media?.map(({ id, path }) => ({ id, media: { type: "photo" as const, media: new InputFile(path) } })) };
+        const sent = await api.sendRichMessage(chatId, rich, threadOpts);
+        if (threadId != null) setThread(chatId, sent.message_id, threadId);
+        recordMessage(chatId, sent.message_id, `@${_botUsername}`, options.indexText ?? text, "out");
+        return String(sent.message_id);
+      }
       const html = markdownToHtml(text);
       try {
         const sent = await api.sendMessage(chatId, html, { ...threadOpts, parse_mode: "HTML" });
@@ -94,24 +112,11 @@ export function createTelegramApiAdapter({
 
     async sendDraft(draftId: number, text: string, signal?: AbortSignal): Promise<DraftSendResult> {
       if (!chatId || !isDm) return { status: "unsupported" };
-      const html = markdownToHtml(text);
       try {
-        await api.sendMessageDraft(chatId, draftId, html, {
-          parse_mode: "HTML",
-          ...threadOpts,
-        }, signal as Parameters<TelegramAdapterApi["sendMessageDraft"]>[4]);
+        await api.sendRichMessageDraft(chatId, draftId, richDraftPayload(text), threadOpts,
+          signal as Parameters<TelegramAdapterApi["sendRichMessageDraft"]>[4]);
         return { status: "sent" };
       } catch (err) {
-        if (shouldFallbackToPlainText(err)) {
-          try {
-            await api.sendMessageDraft(chatId, draftId, text, {
-              ...threadOpts,
-            }, signal as Parameters<TelegramAdapterApi["sendMessageDraft"]>[4]);
-            return { status: "sent" };
-          } catch (fallbackErr) {
-            return draftFailureResult(fallbackErr);
-          }
-        }
         return draftFailureResult(err);
       }
     },
@@ -172,6 +177,8 @@ export function createTelegramAdapter(
   sessionDefaults?: SessionDefaults,
 ): PlatformContext {
   const contextApi: TelegramAdapterApi = {
+    sendRichMessage: (chatId, rich, other, signal) => ctx.api.sendRichMessage(chatId, rich, other, signal),
+    sendRichMessageDraft: (chatId, draftId, rich, other, signal) => ctx.api.sendRichMessageDraft(chatId, draftId, rich, other, signal),
     sendMessage: (_chatId, text, other, signal) => ctx.reply(text, other, signal),
     sendMessageDraft: (chatId, draftId, text, other, signal) => (
       ctx.api.sendMessageDraft(chatId, draftId, text, other, signal)

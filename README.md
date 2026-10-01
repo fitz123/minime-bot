@@ -126,31 +126,34 @@ adopting its new API would require a separate build-tool migration.
 
 Pi's OpenAI catalog reports a 272K (272,000-token) context window for the
 supported GPT-5.6 models. Earlier compaction at that boundary is expected and
-Minime does not override the model metadata. The grammY upgrade preserves the
-existing polling, authoritative final delivery, cosmetic draft fallback,
-topics, media/upload, retry/connectivity, and cancellation contracts; it does
-not opt into new Bot API product features.
+Minime does not override the model metadata.
 
-In Telegram DMs, streaming text uses one stable nonzero draft ID and refreshes
-the latest visible snapshot on a 15-second interval during quiet tool gaps,
-targeting refresh before the shortest known client expiry (20 seconds on iOS).
-Network delays or client quirks can still allow drafts to expire.
-Unchanged ordinary deltas are deduplicated,
-while the configured periodic typing indicator remains active for the whole
-turn as a fallback when drafts fail or are rate-limited. Draft publication is
-held while trimmed output could still be the leading `NO_REPLY` sentinel;
-disambiguated text such as `NO_REPLY_EXTRA` streams normally, and completed
-leading or trailing sentinel responses remain suppressed.
+Telegram textual agent answers use native `sendRichMessage`, including short
+paragraphs. Headings, prose, literal code, placeholders and inline outbox photos
+share one message where their encodings and limits permit; larger answers split
+into bounded native messages. Commands, terminal errors, service notices,
+Discord output and unconsumed standalone attachments retain ordinary delivery.
+See [Telegram rich agent answers](docs/telegram-rich-messages.md) for the inline
+photo contract, literal handling, incoming vision inputs and limits.
 
-Long draft snapshots retain the current response tail, stay within Telegram's
-message bound, and do not split UTF-16 surrogate pairs. HTML entity or length
-rejections use the same narrow bounded plain-text fallback as final messages.
-At settlement, future cosmetic draft work stops and the one in-flight draft is
-allowed up to three seconds to finish naturally before a hung request is
-aborted. The authoritative final `sendMessage` still runs exactly once after
-that bounded wait. Groups and other non-DM delivery are unchanged, and this
-contract does not adopt Bot API 10.2 empty-text “Thinking…” drafts or rich
-message drafts.
+In Telegram DMs, text-only native `sendRichMessageDraft` previews use one stable
+nonzero draft ID. They show the latest bounded source blocks, retaining source
+fence context when displaying a code tail. Identical projected previews are
+deduplicated; quiet tool gaps refresh the visible draft every 15 seconds.
+Network delays or client quirks can still allow drafts to expire. The configured
+periodic typing indicator remains active when drafts fail or are rate-limited.
+Native draft requests bypass automatic transport retries; the existing scheduler
+handles rate-limit feedback. Rich draft or final errors do not trigger an
+ordinary-message fallback.
+
+Draft publication is held while trimmed output could still be the leading
+`NO_REPLY` sentinel; disambiguated text such as `NO_REPLY_EXTRA` streams normally.
+Completed leading or trailing sentinel responses suppress final text and outbox
+dispatch. At settlement, future cosmetic draft work stops and the in-flight
+request gets up to three seconds to finish before a hung request is aborted.
+Final delivery follows that bounded wait. Final requests retain existing bounded
+transport retries and their delivery ambiguity; later-chunk failures can leave
+partial delivery. This is not an exactly-once transport guarantee.
 
 The sampler uses the same packaged Pi CLI by default; override it explicitly
 with `--pi-bin` or `CODEX_QUOTA_PI_BIN`. Its probe passes `--approve` for the

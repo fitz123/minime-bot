@@ -7,6 +7,7 @@ import {
   recordDraftSchedulerEvent,
   recordFinalDeliveryFailure,
 } from "./metrics.js";
+import { prepareRichAnswer, richDraft, richDraftPayload } from "./telegram-rich.js";
 import { shouldSuppressNoReply } from "./no-reply.js";
 
 /**
@@ -182,9 +183,12 @@ class DraftScheduler {
     private readonly draftId: number,
   ) {}
 
-  enqueue(text: string): void {
+  private latestKey: string | null = null;
+
+  enqueue(text: string, key = text): void {
     if (this.cancelled || this.suspended || this.unsupported || !text) return;
-    if (text === this.latestText) return;
+    if (key === this.latestKey) return;
+    this.latestKey = key;
     this.latestText = text;
     if (this.pendingText !== null) recordDraftSchedulerEvent("coalesced");
     this.pendingText = text;
@@ -192,6 +196,7 @@ class DraftScheduler {
   }
 
   reset(): void {
+    this.latestKey = null;
     this.latestText = null;
     this.visibleText = null;
     this.nextRefreshAt = 0;
@@ -401,6 +406,7 @@ export async function relayStream(
   registerDraftSuspension?: RegisterDraftSuspension,
 ): Promise<void> {
   let accumulated = "";
+  let terminalError = false;
   let typingTimer: ReturnType<typeof setInterval> | null = null;
   let sawNonTextBlock = false;
 
@@ -436,8 +442,14 @@ export async function relayStream(
   /** Queue the latest display snapshot; stale pending snapshots are replaced. */
   const scheduleDraft = () => {
     if (!accumulated || shouldHoldDraft(accumulated)) return;
-    const displayText = boundedDraftSnapshot(accumulated, platform.maxMessageLength);
-    if (displayText !== null) draftScheduler.enqueue(displayText);
+    try {
+      const displayText = platform.richAnswers ? richDraft(accumulated) : boundedDraftSnapshot(accumulated, platform.maxMessageLength);
+      if (displayText !== null) draftScheduler.enqueue(displayText, platform.richAnswers ? JSON.stringify(richDraftPayload(displayText)) : displayText);
+    } catch {
+      // Incomplete streamed syntax can be unsuitable for a preview. Preparation
+      // remains cosmetic; only the complete final source owns delivery errors.
+      recordDraftSchedulerEvent("failed");
+    }
   };
 
   try {
@@ -456,6 +468,7 @@ export async function relayStream(
       if (shouldResetAccumulatedText(msg)) {
         accumulated = "";
         resultText = null;
+        terminalError = false;
         sawNonTextBlock = false;
         draftScheduler.reset();
         continue;
@@ -491,6 +504,8 @@ export async function relayStream(
         }
       }
 
+      if (msg.type === "result") terminalError = msg.is_error === true;
+
       // Track result text as fallback when no streaming deltas arrive
       if (msg.type === "result" && msg.result) {
         resultText = msg.result;
@@ -523,11 +538,19 @@ export async function relayStream(
 
     // Final delivery: always sendMessage (completes draft in DMs, sends fresh in groups)
     if (accumulated) {
-      const chunks = splitMessage(collapseNewlines(accumulated), platform.maxMessageLength);
+      let rich: ReturnType<typeof prepareRichAnswer> | undefined;
+      try {
+        if (platform.richAnswers && !terminalError) rich = prepareRichAnswer(accumulated, outboxPath);
+      } catch (err) {
+        recordFinalDeliveryFailure();
+        throw new Error(`Failed to prepare rich response: ${err instanceof Error ? err.message : err}`);
+      }
+      const chunks = rich?.chunks ?? splitMessage(collapseNewlines(accumulated), platform.maxMessageLength).map(text => ({ text, options: undefined }));
 
       for (let i = 0; i < chunks.length; i++) {
         try {
-          await platform.sendMessage(chunks[i]);
+          await platform.sendMessage(chunks[i].text, chunks[i].options);
+          rich?.confirm(i);
           messagesSent.inc();
         } catch (err) {
           recordFinalDeliveryFailure();

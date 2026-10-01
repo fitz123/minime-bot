@@ -4557,3 +4557,38 @@ describe("readPiStream", () => {
     await second.return(undefined);
   });
 });
+
+describe('coalesced vision budgets', () => {
+  it('keeps prompt text and fitting images when combined photos exceed count or byte budgets', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vision-budgets-'));
+    const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+    const paths = Array.from({ length: 60 }, (_, i) => {
+      const path = join(dir, `${i}.png`); writeFileSync(path, signature); return path;
+    });
+    const count = buildPiPromptCommand('First message\n\nSecond message', 'followUp', 'fixture', [...paths, paths[0]]);
+    assert.equal(count.images?.length, 50);
+    assert.match(count.message, /^First message\n\nSecond message/);
+    assert.match(count.message, /10 photo\(s\) omitted/);
+    const largePaths = [9, 9, 3, 1].map((mb, i) => {
+      const data = Buffer.alloc(mb * 1024 * 1024); signature.copy(data);
+      const path = join(dir, `large-${i}.png`); writeFileSync(path, data); return path;
+    });
+    const bytes = buildPiPromptCommand('Preserve this text', undefined, undefined, largePaths);
+    assert.match(bytes.message, /^Preserve this text/);
+    assert.match(bytes.message, /1 photo\(s\) omitted/);
+    assert.deepEqual(bytes.images?.map(i => Buffer.from(i.data, 'base64').length), [9, 9, 1].map(mb => mb * 1024 * 1024));
+  });
+
+  it('includes the same bounded images and omission note in acknowledged steering', async () => {
+    const { parsePiAcknowledgedSteerEnvelope, PI_ACKNOWLEDGED_STEER_COMMAND } = await import('../pi-extensions/acknowledged-steer.js');
+    const dir = mkdtempSync(join(tmpdir(), 'vision-steer-'));
+    const paths = Array.from({ length: 52 }, (_, i) => {
+      const path = join(dir, `${i}.jpg`); writeFileSync(path, Buffer.from([255, 216, 255, 217])); return path;
+    });
+    const command = buildPiAcknowledgedSteerCommand('Steer text', 'fixture', paths);
+    const envelope = parsePiAcknowledgedSteerEnvelope(command.message.slice(`/${PI_ACKNOWLEDGED_STEER_COMMAND} `.length));
+    assert.equal(envelope?.images?.length, 50);
+    assert.match(envelope!.text, /^Steer text/);
+    assert.match(envelope!.text, /2 photo\(s\) omitted/);
+  });
+});

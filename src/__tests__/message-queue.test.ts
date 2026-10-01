@@ -1752,3 +1752,68 @@ describe("MessageQueue pre-stream typing", () => {
     queue.clearAll();
   });
 });
+
+it('carries explicit vision paths through debounce, acknowledged steering and fallback custody', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  const processed: Array<{ text: string; paths?: string[] }> = [];
+  const steered: Array<{ text: string; paths?: string[] }> = [];
+  const released: string[] = [], dropped: string[] = [];
+  let finish!: () => void;
+  const gate = new Promise<void>(resolve => { finish = resolve; });
+  const queue = new MessageQueue(async (_chat, _agent, text, _platform, own, paths) => {
+    processed.push({ text, paths }); own();
+    if (processed.length === 1) await gate;
+  }, {
+    acknowledgedSteerFn: async (_chat, _agent, text, enqueued, paths) => {
+      steered.push({ text, paths }); enqueued?.(); return text === 'accepted';
+    },
+  });
+  const platform = mockPlatform(undefined, false);
+  queue.enqueue('vision', 'test', 'first', platform, undefined, undefined, ['first.png']);
+  queue.enqueue('vision', 'test', 'second', platform, undefined, undefined, ['second.png']);
+  t.mock.timers.tick(3000); await flushMicrotasks();
+  assert.deepEqual(processed, [{ text: 'first\n\nsecond', paths: ['first.png', 'second.png'] }]);
+  queue.enqueue('vision', 'test', 'accepted', platform, () => released.push('accepted'), () => dropped.push('accepted'), ['accepted.png']);
+  await flushMicrotasks();
+  queue.enqueue('vision', 'test', 'fallback', platform, () => released.push('fallback'), () => dropped.push('fallback'), ['fallback.png']);
+  await flushMicrotasks();
+  assert.deepEqual(steered, [{ text: 'accepted', paths: ['accepted.png'] }, { text: 'fallback', paths: ['fallback.png'] }]);
+  finish(); for (let i = 0; i < 5; i++) await flushMicrotasks();
+  assert.deepEqual(processed[1], { text: 'fallback', paths: ['fallback.png'] });
+  assert.deepEqual(released, ['accepted', 'fallback']); assert.deepEqual(dropped, []);
+  queue.clearAll();
+});
+
+it('delivers coalesced photo overflow with text and fitting vision inputs, preserving queue custody', async t => {
+  const { mkdtempSync, writeFileSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const { buildPiPromptCommand } = await import('../pi-rpc-protocol.js');
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  const dir = mkdtempSync(join(tmpdir(), 'queue-vision-'));
+  const paths = Array.from({ length: 60 }, (_, i) => {
+    const path = join(dir, `${i}.jpg`); writeFileSync(path, Buffer.from([255, 216, 255, 217])); return path;
+  });
+  const commands: ReturnType<typeof buildPiPromptCommand>[] = [];
+  const released: string[] = [], dropped: string[] = [];
+  let finish!: () => void;
+  const gate = new Promise<void>(resolve => { finish = resolve; });
+  const queue = new MessageQueue(async (_chat, _agent, text, _platform, own, images) => {
+    commands.push(buildPiPromptCommand(text, 'followUp', undefined, images)); own();
+    if (commands.length === 1) await gate;
+  });
+  const platform = mockPlatform(undefined, false);
+  const enqueue = (name: string, images: string[]) => queue.enqueue('vision', 'test', name, platform,
+    () => released.push(name), () => dropped.push(name), images);
+  enqueue('first', paths.slice(0, 30)); enqueue('second', paths.slice(30));
+  t.mock.timers.tick(3000); await flushMicrotasks();
+  assert.equal(commands[0].images?.length, 50);
+  assert.match(commands[0].message, /^first\n\nsecond/); assert.match(commands[0].message, /10 photo\(s\) omitted/);
+  enqueue('third', paths.slice(0, 30)); enqueue('fourth', paths.slice(30));
+  finish(); for (let i = 0; i < 6; i++) await flushMicrotasks();
+  assert.equal(commands[1].images?.length, 50);
+  assert.match(commands[1].message, /third/); assert.match(commands[1].message, /fourth/);
+  assert.match(commands[1].message, /10 photo\(s\) omitted/);
+  assert.deepEqual(released, ['first', 'second', 'third', 'fourth']); assert.deepEqual(dropped, []);
+  queue.clearAll();
+});

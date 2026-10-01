@@ -1,5 +1,6 @@
+import { RICH_RESERVED_DIR } from "./telegram-rich.js";
 import { type ChildProcess } from "node:child_process";
-import { chmodSync, createWriteStream, existsSync, lstatSync, mkdirSync, renameSync, rmSync, type Stats, unlinkSync } from "node:fs";
+import { chmodSync, createWriteStream, existsSync, lstatSync, mkdirSync, readdirSync, renameSync, rmSync, type Stats, unlinkSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -88,7 +89,7 @@ function ensurePrivateDir(path: string): void {
   verifyPrivateDir(path);
 }
 
-function removeOutboxDirIfPresent(path: string): void {
+export function removeOutboxDirIfPresent(path: string, preserveReservations = false): void {
   if (!existsSync(path)) return;
   try {
     const stat = lstatSync(path);
@@ -100,6 +101,13 @@ function removeOutboxDirIfPresent(path: string): void {
     if (isMissingErr(err)) return;
     throw err;
   }
+  if (preserveReservations && existsSync(join(path, RICH_RESERVED_DIR))) {
+    for (const name of readdirSync(path)) {
+      if (name !== RICH_RESERVED_DIR) rmSync(join(path, name), { recursive: true, force: true });
+    }
+    log.warn("session-manager", `Retained inline photo reservations under outbox/${RICH_RESERVED_DIR}; no automatic replay`);
+    return;
+  }
   rmSync(path, { recursive: true, force: true });
 }
 
@@ -108,10 +116,20 @@ function prepareOutboxDir(outboxPath: string): void {
   const outboxBase = join(runtimeDir, OUTBOX_DIR_NAME);
   ensurePrivateDir(runtimeDir);
   ensurePrivateDir(outboxBase);
-  removeOutboxDirIfPresent(outboxPath);
-  removeOutboxDirIfPresent(`${outboxPath}.human`);
+  removeOutboxDirIfPresent(outboxPath, true);
+  removeOutboxDirIfPresent(`${outboxPath}.human`, true);
   removeOutboxDirIfPresent(`${outboxPath}.internal`);
   ensurePrivateDir(outboxPath);
+  // An interrupted internal turn may have left human reservations in its backup.
+  // Relocate the excluded subtree, freeing the fixed backup name for the next turn.
+  const backup = `${outboxPath}.human`;
+  const held = join(backup, RICH_RESERVED_DIR);
+  if (existsSync(held)) {
+    const destination = join(outboxPath, RICH_RESERVED_DIR);
+    ensurePrivateDir(destination);
+    renameSync(held, join(destination, randomUUID()));
+    removeOutboxDirIfPresent(backup);
+  }
 }
 
 /** Check whether a child process has exited (by exit code or signal). */
@@ -625,8 +643,8 @@ export class SessionManager {
     mediaCleanup: "all" | "stale",
   ): void {
     try {
-      removeOutboxDirIfPresent(outboxPath);
-      removeOutboxDirIfPresent(`${outboxPath}.human`);
+      removeOutboxDirIfPresent(outboxPath, true);
+      removeOutboxDirIfPresent(`${outboxPath}.human`, true);
       removeOutboxDirIfPresent(`${outboxPath}.internal`);
     } catch {
       // Ignore cleanup errors
@@ -1004,7 +1022,10 @@ export class SessionManager {
       : freshConfig.piExtraExtensions === undefined
         ? undefined
         : { extraExtensions: freshConfig.piExtraExtensions };
-    const runtimeEnvOptions: PiSpawnRuntimeEnvOptions = { askCallerAgentId: agentId, outboxPath };
+    const telegramLane = /^(-?\d+)(?::(\d+))?$/.exec(chatId);
+    const telegramRichAnswers = !!telegramLane && !!resolveBinding(Number(telegramLane[1]), freshConfig.bindings,
+      telegramLane[2] === undefined ? undefined : Number(telegramLane[2]));
+    const runtimeEnvOptions: PiSpawnRuntimeEnvOptions = { askCallerAgentId: agentId, outboxPath, ...(telegramRichAnswers ? { telegramRichAnswers: true } : {}) };
     let prepared = this.prepareSessionBinding(chatId, agentId, agent, freshConfig, Boolean(expectedId));
     if (isStartupSuperseded()) {
       await abortSupersededStartup();
@@ -1183,7 +1204,7 @@ export class SessionManager {
     chatId: string,
     agentId: string,
     text: string,
-    options?: { internal?: boolean; expectedSession?: ActiveSession; expires?: number; consumed?: () => void; outputDone?: Promise<void> },
+    options?: { internal?: boolean; expectedSession?: ActiveSession; expires?: number; consumed?: () => void; outputDone?: Promise<void>; imagePaths?: string[] },
   ): AsyncGenerator<StreamLine> {
     const session = options?.expectedSession ?? await this.getOrCreateSession(chatId, agentId);
 
@@ -1348,7 +1369,7 @@ export class SessionManager {
         // An internal persistence failure must happen before Pi receives input.
         if (options?.internal) this.store.setSession(chatId, this.toSessionState(chatId, session));
         promptSent = true; // A failed write may still have dispatched input.
-        const promptId = sendPiPrompt(session.child, text, "followUp");
+        const promptId = sendPiPrompt(session.child, text, "followUp", options?.imagePaths);
         submittedPromptId = promptId;
         if (!options?.internal) this.store.setSession(chatId, this.toSessionState(chatId, session));
 
@@ -1433,7 +1454,7 @@ export class SessionManager {
             // outbox files. Discard them before returning the human directory.
             removeOutboxDirIfPresent(session.outboxPath);
             if (this.active.get(chatId) === session) renameSync(savedOutbox, session.outboxPath);
-            else removeOutboxDirIfPresent(savedOutbox);
+            else removeOutboxDirIfPresent(savedOutbox, true);
           }
         } catch {
           // No later human relay may scan a directory whose ownership is unclear.
@@ -1483,6 +1504,7 @@ export class SessionManager {
     agentId: string,
     text: string,
     onEnqueued?: () => void,
+    imagePaths?: string[],
   ): Promise<boolean> {
     const session = this.active.get(chatId);
     if (
@@ -1513,7 +1535,7 @@ export class SessionManager {
             `Pi steer write failed for chat ${chatId}: ${error.message}`,
           );
           this.settlePendingSteer(session, id, false);
-        });
+        }, imagePaths);
       } catch (err) {
         log.warn(
           "session-manager",
