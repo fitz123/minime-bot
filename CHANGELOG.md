@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 2026.10.2
+
+- Send fresh and retained Telegram cron results through native Rich Messages using the existing renderer and adapter (#218, #231).
+- Preserve result suppression, sender/topic routing, bounded delivery retries and deterministic failure recovery; retain ordinary service notices and 15-second interactive drafts.
+- Add cron-path transport/retention regressions and document the substantive delivery-path audit.
+
 ## 2026.10.1
 
 - Deliver Telegram agent answers as native rich messages with headings, formatted paragraphs and interleaved JPEG/PNG outbox photos (#218, #229). Keep commands, errors, service notices and Discord on their existing paths.
