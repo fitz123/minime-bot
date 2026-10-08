@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 2026.10.3
+
+- Use correlated native Pi prompt dispositions instead of post-prompt completion probes (#233, #235).
+- Complete handled prompts without a lifecycle while preserving independently observed work, partial/batched frames, acknowledged-steer consumption, and identity/liveness probes.
+- Leave compaction behavior and the pinned Pi version unchanged.
+
 ## 2026.10.2
 
 - Send fresh and retained Telegram cron results through native Rich Messages using the existing renderer and adapter (#218, #231).
