@@ -3285,9 +3285,12 @@ describe("readPiStream", () => {
       const collect = (async () => {
         for await (const line of readPiStream(child, undefined, "current")) lines.push(line);
       })();
-      // Bound a broken implementation without waiting for the test-runner timeout.
-      const timeout = setTimeout(() => stdout.push(null), 500);
-      try { await collect; } finally { clearTimeout(timeout); }
+      // Fail a broken implementation without allowing EOF fallback to complete it.
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      const deadline = new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error("Handled prompt did not complete before the deadline")), 500);
+      });
+      try { await Promise.race([collect, deadline]); } finally { clearTimeout(timeout); }
       assert.deepEqual(writes, []);
       assert.deepEqual(lines, [{ type: "result", result: "", session_id: "" }]);
     } finally {
