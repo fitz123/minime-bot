@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 2026.10.4
+
+- Improve fresh-Markdown Knowledge retrieval with ranked partial whole-word matches and exact identity priority (#237, #238).
+- Accept bounded caller-provided query variants in native tools and CLI; share corpus reads, merge results with coverage-weighted fusion, and isolate catalog entries.
+- Preserve source/get contracts, document lexical and score limitations, and add same-call reformulation guidance without an index, cache, embedding service, or extra LLM call.
+
 ## 2026.10.3
 
 - Use correlated native Pi prompt dispositions instead of post-prompt completion probes (#233, #235).
