@@ -76,6 +76,9 @@ function assertBlocked(
 describe("Knowledge Pi extension helpers", () => {
   it("defines model-callable knowledge tools with scope, authority, write-path, and protection guidance", () => {
     assert.equal(KNOWLEDGE_SEARCH_TOOL.name, "knowledge_search");
+    assert.equal(KNOWLEDGE_SEARCH_TOOL.parameters.properties.variants.maxItems, 5);
+    assert.equal(KNOWLEDGE_SEARCH_TOOL.parameters.properties.variants.items.maxLength, 500);
+    assert.match(KNOWLEDGE_SEARCH_TOOL.promptGuidelines.join(" "), /SAME call/);
     assert.match(KNOWLEDGE_SEARCH_TOOL.description, /Scope auto\/default/);
     assert.match(KNOWLEDGE_SEARCH_TOOL.description, /authority/);
     assert.equal(KNOWLEDGE_GET_TOOL.name, "knowledge_get");

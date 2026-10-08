@@ -22,6 +22,8 @@ import {
   generateLaunchdCronPlists,
   type LaunchdCommandRunner,
 } from "../launchd-cron-plists.js";
+import { executeKnowledgeSearch } from "../knowledge/tools.js";
+import { executePiKnowledgeSearch } from "../pi-extensions/knowledge-tools.js";
 import { generateKnowledgeV2Schema } from "../knowledge/layout.js";
 import { KNOWLEDGE_MAINTENANCE_HIGH_WATERMARK_BYTES } from "../knowledge/maintenance.js";
 import { generateKnowledgeIndex } from "../knowledge/update.js";
@@ -249,6 +251,7 @@ describe("minime-bot CLI", () => {
     assert.match(result.stdout, /minime-bot config validate --workspace <path>/);
     assert.match(result.stdout, /minime-bot workspace validate --workspace <path>/);
     assert.match(result.stdout, /minime-bot knowledge search --workspace <agent-workspace>/);
+    assert.match(result.stdout, /--variant <q>.*repeat up to 5 times/);
     assert.match(result.stdout, /minime-bot knowledge sync --workspace <agent-workspace> \[--json\]/);
     assert.match(result.stdout, /--op archive\|restore --path <wiki\/pages\/type\/page\.md>/);
     assert.match(result.stdout, /minime-bot knowledge maintain --workspace <agent-workspace>/);
@@ -592,6 +595,52 @@ describe("minime-bot CLI", () => {
       rmSync(workspace, { recursive: true, force: true });
     }
   });
+
+  it("passes repeatable variants through CLI and native Pi with helper parity", () => {
+    const workspace = createKnowledgeWorkspace();
+    try {
+      const args = { query: "несуществующий", variants: ["runtime", "durable"] };
+      const expected = executeKnowledgeSearch(args, { agentWorkspaceRoot: workspace });
+      const cli = runWithCapture(["knowledge", "search", "--workspace", workspace,
+        "--query", args.query, "--variant", "runtime", "--variant=durable", "--json"], BOT_ROOT);
+      assert.equal(cli.code, 0, cli.stderr);
+      assert.deepEqual(JSON.parse(cli.stdout), expected);
+      const native = executePiKnowledgeSearch(args, { env: { [MINIME_AGENT_WORKSPACE_ROOT_ENV]: workspace } });
+      assert.equal(native.ok, true);
+      assert.deepEqual(JSON.parse(native.text), expected);
+      const invalid = runWithCapture(["knowledge", "search", "--workspace", workspace,
+        "--query", "runtime", "--variant=", "--json"], BOT_ROOT);
+      assert.notEqual(invalid.code, 0);
+      assert.equal(JSON.parse(invalid.stdout).reason, "invalid-variants");
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  for (const [args, command] of [
+    [["update", "--op", "archive", "--path", "wiki/pages/project/runtime.md", "--variant", "thermal"], "update --op archive|restore"],
+    [["sync", "--variant=thermal"], "sync"],
+    [["get", "--path", "wiki/pages/project/runtime.md", "--variant=thermal"], "get"],
+    [["maintain", "--variant=thermal"], "maintain"],
+    [["migrate", "--dry-run", "--variant=thermal"], "migrate"],
+  ] as const) {
+    it(`rejects variants before ${command} action`, () => {
+      const workspace = createKnowledgeWorkspace();
+      const relPath = "wiki/pages/project/runtime.md";
+      const original = readFileSync(join(workspace, relPath), "utf8");
+      try {
+        const result = runWithCapture(["knowledge", ...args, "--workspace", workspace, "--json"], BOT_ROOT);
+        assert.equal(result.code, 2);
+        assert.equal(result.stdout, "");
+        assert.ok(result.stderr.includes(`knowledge ${command} does not accept --variant`), result.stderr);
+        assert.equal(readFileSync(join(workspace, relPath), "utf8"), original);
+        assert.equal(existsSync(join(workspace, "artifacts/knowledge-archive", relPath)), false);
+        assert.equal(existsSync(join(workspace, ".tmp")), false);
+      } finally {
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    });
+  }
 
   it("searches knowledge with JSON output using --workspace as the agent workspace", () => {
     const controlWorkspace = createWorkspace();
