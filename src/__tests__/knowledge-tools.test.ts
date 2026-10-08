@@ -126,6 +126,66 @@ describe("knowledge tools", () => {
     assert.equal(response.results.some((hit) => hit.path.endsWith("/tail.md")), false);
   });
 
+  it("weights each uniform fusion vote by matched-token coverage", () => {
+    const deps = { agentWorkspaceRoot: createV2Workspace({
+      "wiki/index.md": "# Catalog\n",
+      "wiki/pages/a.md": "# Loop tuning\nThermal control parameters.\n",
+      "wiki/pages/b.md": "# Access\nAccess control and heat map.\n",
+    }) };
+    for (const args of [
+      { query: "thermal control", variants: ["heat management"] },
+      { query: "heat management", variants: ["thermal control"] },
+    ]) {
+      const response = executeKnowledgeSearch(args, deps);
+      assertSearchOk(response);
+      assert.deepEqual(response.results.map((hit) => hit.path), ["wiki/pages/a.md", "wiki/pages/b.md"]);
+      assert.equal(response.results[0].score, 1 / 61);
+      assert.equal(response.results[1].score, 0.5 / 62 + 0.5 / 61);
+      assert.deepEqual(Object.keys(response.results[0]).sort(),
+        ["path", "title", "heading", "startLine", "endLine", "snippet", "sourceKind", "authority", "score", "rank"].sort());
+    }
+  });
+
+  it("keeps exact-ID priority attached to its actual catalog representative", () => {
+    const deps = { agentWorkspaceRoot: createV2Workspace({
+      "wiki/index.md": "- [Thermal](pages/project/thermal.md) - Record ZX-4317\n- [Cooling](pages/project/cooling.md) - Coolant pump notes\n",
+      "wiki/pages/project/thermal.md": "# Thermal\nRecord ZX-4317.\n",
+    }) };
+    const response = executeKnowledgeSearch({ query: "ZX-4317", variants: ["coolant pump"] }, deps);
+    assertSearchOk(response);
+    const catalog = response.results.find((hit) => hit.sourceKind === "index")!;
+    assert.equal(catalog.startLine, 2);
+    assert.match(catalog.snippet, /Coolant pump/);
+    assert.equal(catalog.score, 1 / 61);
+    assert.equal(response.results[0].path, "wiki/pages/project/thermal.md");
+    const limited = executeKnowledgeSearch({ query: "ZX-4317", variants: ["coolant pump"], maxResults: 1 }, deps);
+    assertSearchOk(limited);
+    assert.equal(limited.results[0].path, "wiki/pages/project/thermal.md");
+  });
+
+  for (const identity of ["title", "name", "path", "ID"] as const) {
+    it(`prioritizes exact ${identity} before the bounded candidate cutoff and for a single query`, () => {
+      const query = identity === "path" ? "wiki/pages/record.md" : identity === "ID" ? "ZX-4317" : "Thermal Control";
+      const files: Record<string, string> = {
+        "wiki/index.md": "# Catalog\n",
+        "wiki/pages/record.md": identity === "name" ? "---\nname: Thermal Control\n---\n# Record\n" :
+          identity === "title" ? "# Thermal Control\n" : identity === "ID" ? "# Record\nRecord ZX-4317.\n" : "# Record\n",
+      };
+      for (let i = 0; i < 50; i++) {
+        const stem = identity === "path" ? "wiki-pages-record-md" : identity === "ID" ? "ZX-4317" : "thermal-control";
+        const mention = identity === "ID" ? "ZX note 4317" : query;
+        files[`wiki/pages/${stem}-note-${i}.md`] = `# ${mention} Note ${i}\n${mention} note details.\n`;
+      }
+      const deps = { agentWorkspaceRoot: createV2Workspace(files) };
+      for (const variants of [[], ["cooling"]]) {
+        const response = executeKnowledgeSearch({ query, variants, maxResults: 50 }, deps);
+        assertSearchOk(response);
+        assert.equal(response.results[0].path, "wiki/pages/record.md");
+        assert.equal(response.results.length, 50);
+      }
+    });
+  }
+
   it("keeps source preference proportional to relevance for scope all", () => {
     const files: Record<string, string> = {
       "wiki/index.md": "# Catalog\n",

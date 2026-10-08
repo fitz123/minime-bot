@@ -511,6 +511,12 @@ interface SearchUnit {
   path: SearchText;
 }
 
+interface RankedSearchResult {
+  result: KnowledgeSearchResult;
+  coverage: number;
+  exactOriginal: boolean;
+}
+
 function prepareEntry(entry: CorpusEntry): SearchUnit[] {
   let markdown: string;
   try {
@@ -538,8 +544,8 @@ function snippetForLine(line: string): string {
   return trimmed.length <= 240 ? trimmed : `${trimmed.slice(0, 237)}...`;
 }
 
-function rankUnits(units: SearchUnit[], query: PreparedQuery, idf: Map<string, number>, averageLength: number): KnowledgeSearchResult[] {
-  const results = new Map<string, KnowledgeSearchResult>();
+function rankUnits(units: SearchUnit[], query: PreparedQuery, original: PreparedQuery, idf: Map<string, number>, averageLength: number): RankedSearchResult[] {
+  const results = new Map<string, RankedSearchResult>();
   for (const unit of units) {
     let matched = 0;
     let score = 0;
@@ -577,10 +583,22 @@ function rankUnits(units: SearchUnit[], query: PreparedQuery, idf: Map<string, n
       snippet: snippetForLine(best.line.text), sourceKind: unit.entry.sourceKind,
       authority: unit.entry.authority, score, rank: 0,
     };
+    const candidate: RankedSearchResult = {
+      result,
+      coverage: matched / query.tokens.length,
+      exactOriginal: !!original.normalized &&
+        (unit.title.normalized === original.normalized || unit.path.normalized === original.normalized ||
+          (original.tokens.some((token) => /\p{N}/u.test(token)) && containsPhrase(unit.body, original))),
+    };
     const previous = results.get(result.path);
-    if (!previous || result.score > previous.score) results.set(result.path, result);
+    if (!previous || compareRankedResults(candidate, previous) < 0) results.set(result.path, candidate);
   }
-  return [...results.values()].sort(compareResults);
+  // Protect the actual unit's original identity before selecting bounded lists.
+  return [...results.values()].sort(compareRankedResults);
+}
+
+function compareRankedResults(a: RankedSearchResult, b: RankedSearchResult): number {
+  return Number(b.exactOriginal) - Number(a.exactOriginal) || compareResults(a.result, b.result);
 }
 
 function compareResults(a: KnowledgeSearchResult, b: KnowledgeSearchResult): number {
@@ -672,33 +690,27 @@ export function executeKnowledgeSearch(args: KnowledgeSearchArgs = {}, deps: Kno
     }
     const idf = new Map([...documentFrequency].map(([token, count]) =>
       [token, Math.log(1 + (units.length - count + 0.5) / (count + 0.5))]));
-    const ranked = queries.map((prepared) => rankUnits(units, prepared, idf, averageLength));
-    const fused = new Map<string, KnowledgeSearchResult>();
+    const ranked = queries.map((prepared) => rankUnits(units, prepared, queries[0], idf, averageLength));
+    const fused = new Map<string, RankedSearchResult>();
     for (const list of ranked) {
-      for (const [index, result] of list.slice(0, FUSION_LIST_DEPTH).entries()) {
-        // Each reformulation gets an equal vote; weak tail matches do not accumulate.
-        const contribution = 1 / (60 + index + 1);
+      for (const [index, candidate] of list.slice(0, FUSION_LIST_DEPTH).entries()) {
+        const { result, coverage } = candidate;
+        // Uniform coverage-weighted votes; matches beyond the bounded depth cannot vote.
+        const contribution = coverage / (60 + index + 1);
         const existing = fused.get(result.path);
         if (existing && result.sourceKind === "index") {
           // Different catalog entries must not reinforce one another through variants.
-          if (contribution > existing.score) fused.set(result.path, { ...result, score: contribution });
-        } else if (existing) existing.score += contribution;
-        else fused.set(result.path, { ...result, score: contribution });
+          if (contribution > existing.result.score) fused.set(result.path, { ...candidate, result: { ...result, score: contribution } });
+        } else if (existing) existing.result.score += contribution;
+        else fused.set(result.path, { ...candidate, result: { ...result, score: contribution } });
       }
     }
     // Preserve exact original names/paths/identifiers even when several broad variants agree elsewhere.
-    const original = queries[0];
-    const boostedPaths = new Set<string>();
-    for (const unit of units) {
-      const hit = fused.get(unit.entry.relPath);
-      if (hit && !boostedPaths.has(unit.entry.relPath) && original.normalized &&
-        (unit.title.normalized === original.normalized || unit.path.normalized === original.normalized ||
-          (original.tokens.some((token) => /\p{N}/u.test(token)) && containsPhrase(unit.body, original)))) {
-        hit.score += 1;
-        boostedPaths.add(unit.entry.relPath);
-      }
+    for (const candidate of fused.values()) {
+      if (candidate.exactOriginal) candidate.result.score += 1;
     }
-    const results = (queries.length === 1 ? ranked[0] : [...fused.values()].sort(compareResults))
+    const results = (queries.length === 1 ? ranked[0].map((candidate) => candidate.result) :
+      [...fused.values()].map((candidate) => candidate.result).sort(compareResults))
       .slice(0, coerceMaxResults(args.maxResults))
       .map((result, index) => ({ ...result, rank: index + 1 }));
 
