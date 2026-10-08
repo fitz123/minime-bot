@@ -512,6 +512,10 @@ export class NewlineOnlyJsonlSplitter {
     return [finalRecord];
   }
 
+  hasPendingRecord(): boolean {
+    return this.buffer.length > 0;
+  }
+
   private takeCompleteRecords(): string[] {
     const records: string[] = [];
 
@@ -1120,9 +1124,9 @@ export interface PiRpcParseState {
   pendingOverflowSessionId?: string;
   /** Prompt response id owned by this stream reader. */
   expectedPromptId?: string;
-  /** Correlated get_state request used to detect a prompt handled without a run. */
-  promptStateProbeId?: string;
-  /** Guards an idle state probe from racing a real agent lifecycle. */
+  /** Correlated prompt was handled without starting its own run. */
+  promptHandled?: boolean;
+  /** Independent extension work still owns completion through agent_settled. */
   agentLifecycleObserved?: boolean;
 }
 
@@ -1549,7 +1553,8 @@ export function parsePiEvent(
 
     case "response": {
       // Command responses are side-channel replies, NOT prompt-turn stream
-      // content. The terminal event of an accepted prompt is `agent_settled`.
+      // content. Started/queued prompts finish at `agent_settled`; handled
+      // input may finish without a lifecycle.
       // A `response` shares the same stdout the active turn
       // is reading, so it must be correlated by `command` before being treated
       // as terminal:
@@ -1599,6 +1604,17 @@ export function parsePiEvent(
           "pi-rpc",
           `Pi RPC command failed (ignored in stream): command=${rawEvent.command ?? "unknown"} error=${nonEmptyText(rawEvent.error) ?? "(none)"}`,
         );
+        return null;
+      }
+      if (
+        rawEvent.command === "prompt" &&
+        rawEvent.success === true &&
+        state?.expectedPromptId &&
+        rawEvent.id === state.expectedPromptId
+      ) {
+        state.promptHandled = rawEvent.data?.disposition === "handled";
+        // started/queued acceptance must await agent_settled. A handled
+        // response can complete only after the reader drains lifecycle records.
         return null;
       }
       const sessionId = rawEvent.data?.sessionId;
@@ -1840,78 +1856,29 @@ function handlePiStreamRecord(
   if (handlePiExtensionUiRequest(child, event) !== "not_ui") {
     return null;
   }
-  const promptCompletionProbe = handlePiPromptCompletionProbe(child, event, state);
-  if (promptCompletionProbe.handled) {
-    return promptCompletionProbe.line;
-  }
   return parsePiEvent(event, state);
 }
 
-interface PiPromptCompletionProbeResult {
-  handled: boolean;
-  line: StreamLine | null;
-}
-
-/**
- * Pi 0.82.1 accepts extension commands and `input` handlers that finish without
- * starting an agent run. Those paths emit a successful prompt response but no
- * agent lifecycle events. Probe the correlated session state after acceptance:
- * an active/queued model turn remains authoritative through agent_settled,
- * while an idle prompt completes successfully with no fabricated reply text.
+/** Complete handled input only after draining available records: an extension
+ * may independently start a lifecycle before or alongside its prompt response.
+ * Disposition describes acceptance, never completion of that independent run.
  */
-function handlePiPromptCompletionProbe(
-  child: ChildProcess,
-  event: PiRpcEvent,
-  state: PiRpcParseState,
-): PiPromptCompletionProbeResult {
-  if (
-    event.type === "response" &&
-    event.command === "prompt" &&
-    event.success === true &&
-    state.expectedPromptId &&
-    event.id === state.expectedPromptId
-  ) {
-    if (!state.promptStateProbeId) {
-      state.promptStateProbeId = `${state.expectedPromptId}-state`;
-      sendPiGetState(child, state.promptStateProbeId);
-    }
-    return { handled: true, line: null };
+function consumeHandledPromptOutcome(state: PiRpcParseState): ResultMessage | null {
+  if (!state.promptHandled || state.agentLifecycleObserved) {
+    return null;
   }
-
-  if (
-    event.type !== "response" ||
-    event.command !== "get_state" ||
-    !state.promptStateProbeId ||
-    event.id !== state.promptStateProbeId
-  ) {
-    return { handled: false, line: null };
-  }
-
-  const sessionId = nonEmptyText(event.data?.sessionId);
-  if (sessionId) {
-    state.observedSessionId = sessionId;
-  }
-  if (
-    event.success === true &&
-    event.data?.isStreaming === false &&
-    !state.agentLifecycleObserved
-  ) {
-    return {
-      handled: true,
-      line: emitPiRpcResult(
-        { type: "result", result: "", session_id: sessionId ?? state.observedSessionId ?? "" },
-        state,
-      ),
-    };
-  }
-  return { handled: true, line: null };
+  return emitPiRpcResult(
+    { type: "result", result: "", session_id: state.observedSessionId ?? "" },
+    state,
+  );
 }
 
 /**
  * Async generator yielding translated `StreamLine`s from a Pi RPC child's
  * stdout: newline-only splitter → `JSON.parse` → `parsePiEvent`. The reader
  * remains active through low-level run boundaries and ends only on the settled
- * result, prompt preflight rejection, or an EOF/close fallback. Blocking
+ * result, a correlated handled prompt without lifecycle, prompt preflight
+ * rejection, or an EOF/close fallback. Blocking
  * extension UI requests are cancelled through the child's shared JSONL stdin
  * writer before stream delivery. `onActivity` receives every decoded valid JSON
  * record, including lifecycle and UI records that do not become user-facing
@@ -1956,6 +1923,14 @@ export async function* readPiStream(
       }
     }
 
+    const handledResult = splitter.hasPendingRecord()
+      ? null
+      : consumeHandledPromptOutcome(parseState);
+    if (handledResult) {
+      yield handledResult;
+      return;
+    }
+
     const waitResult = await waitForPiStdout(stdout);
     if (waitResult === "end" || waitResult === "close") {
       break;
@@ -1978,7 +1953,7 @@ export async function* readPiStream(
     }
   }
 
-  const eofResult = consumeEofOutcome(parseState);
+  const eofResult = consumeHandledPromptOutcome(parseState) ?? consumeEofOutcome(parseState);
   if (eofResult) {
     yield eofResult;
   }

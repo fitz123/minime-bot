@@ -2887,19 +2887,7 @@ describe("SessionManager Pi dispatch", () => {
           command: "prompt",
           success: true,
           id: prompt.id,
-        })}\n`);
-
-        while (stdinWrites.length < 2) {
-          await new Promise<void>((resolve) => setImmediate(resolve));
-        }
-        const stateProbe = JSON.parse(stdinWrites[1]) as { id: string; type: string };
-        assert.deepStrictEqual(stateProbe, { type: "get_state", id: `${prompt.id}-state` });
-        stdout.push(`${JSON.stringify({
-          type: "response",
-          command: "get_state",
-          success: true,
-          id: stateProbe.id,
-          data: { sessionId: "handled-session", isStreaming: false },
+          data: { disposition: "handled" },
         })}\n`);
 
         const lines = await Promise.race([
@@ -2908,6 +2896,7 @@ describe("SessionManager Pi dispatch", () => {
             setTimeout(() => reject(new Error(`timed out waiting for ${handledBy} completion`)), 2_500);
           }),
         ]);
+        assert.strictEqual(stdinWrites.length, 1, "handled completion writes no get_state probe");
         assert.strictEqual(lines.length, 1);
         assert.strictEqual(lines[0].type, "result");
         assert.strictEqual((lines[0] as { result: string }).result, "");

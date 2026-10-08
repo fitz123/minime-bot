@@ -3269,124 +3269,137 @@ describe("readPiStream", () => {
     assert.strictEqual((lines[0] as { result: string }).result, "turn result");
   });
 
-  for (const handledBy of ["extension command", "input handler"]) {
-    it(`completes a prompt handled immediately by an ${handledBy} without waiting for agent_settled`, async () => {
-      const stdout = new Readable({ read() {} });
-      const writes: Array<Record<string, unknown>> = [];
-      const stdin = new Writable({
-        write(chunk, _enc, callback) {
-          const command = JSON.parse(chunk.toString().trim()) as Record<string, unknown>;
-          writes.push(command);
-          callback();
-          queueMicrotask(() => {
-            stdout.push(`${JSON.stringify({
-              type: "response",
-              command: "get_state",
-              success: true,
-              id: command.id,
-              data: { sessionId: "handled-session", isStreaming: false },
-            })}\n`);
-          });
-        },
-      });
-      const child = new EventEmitter() as unknown as ChildProcess;
-      Object.assign(child, { stdout, stdin, exitCode: null, killed: false });
-      const promptId = `prompt-handled-by-${handledBy.replaceAll(" ", "-")}`;
-
-      try {
-        const collect = (async () => {
-          const lines: StreamLine[] = [];
-          for await (const line of readPiStream(child, undefined, promptId)) lines.push(line);
-          return lines;
-        })();
-        stdout.push(`${JSON.stringify({
-          type: "response",
-          command: "prompt",
-          success: true,
-          id: promptId,
-        })}\n`);
-
-        const lines = await Promise.race([
-          collect,
-          new Promise<never>((_resolve, reject) => {
-            setTimeout(() => reject(new Error(`timed out waiting for ${handledBy} completion`)), 2_500);
-          }),
-        ]);
-
-        assert.deepStrictEqual(writes, [{ type: "get_state", id: `${promptId}-state` }]);
-        assert.strictEqual(lines.length, 1);
-        assert.strictEqual(lines[0].type, "result");
-        assert.strictEqual((lines[0] as { result: string }).result, "");
-        assert.strictEqual((lines[0] as { session_id: string }).session_id, "handled-session");
-        assert.notStrictEqual((lines[0] as { is_error?: boolean }).is_error, true);
-      } finally {
-        stdout.destroy();
-        stdin.destroy();
-      }
-    });
-  }
-
-  it("keeps a real agent run open when the correlated prompt state probe reports streaming", async () => {
+  it("completes a correlated handled prompt without lifecycle or completion probes", { timeout: 2_000 }, async () => {
     const stdout = new Readable({ read() {} });
-    const writes: Array<Record<string, unknown>> = [];
-    const stdin = new Writable({
-      write(chunk, _enc, callback) {
-        const command = JSON.parse(chunk.toString().trim()) as Record<string, unknown>;
-        writes.push(command);
-        callback();
-        queueMicrotask(() => {
-          stdout.push(`${JSON.stringify({
-            type: "response",
-            command: "get_state",
-            success: true,
-            id: command.id,
-            data: { sessionId: "running-session", isStreaming: true },
-          })}\n`);
-          stdout.push(`${JSON.stringify({ type: "agent_start" })}\n`);
-          stdout.push(`${JSON.stringify({
-            type: "agent_end",
-            messages: [{ role: "assistant", content: [{ type: "text", text: "model answer" }] }],
-          })}\n`);
-          stdout.push(`${JSON.stringify({ type: "agent_settled" })}\n`);
-        });
-      },
-    });
+    const writes: string[] = [];
+    const stdin = new Writable({ write(chunk, _enc, callback) {
+      writes.push(chunk.toString());
+      callback();
+    } });
     const child = new EventEmitter() as unknown as ChildProcess;
     Object.assign(child, { stdout, stdin, exitCode: null, killed: false });
-    const promptId = "prompt-with-agent-run";
-    const activityEvents: Array<{ type?: string; command?: string; id?: string }> = [];
-
     try {
+      stdout.push(`${JSON.stringify({ type: "response", command: "prompt", id: "current",
+        success: true, data: { disposition: "handled" } })}\n`);
+      const lines: StreamLine[] = [];
       const collect = (async () => {
-        const lines: StreamLine[] = [];
-        for await (const line of readPiStream(child, (event) => {
-          activityEvents.push({ type: event.type, command: event.command, id: event.id });
-        }, promptId)) lines.push(line);
-        return lines;
+        for await (const line of readPiStream(child, undefined, "current")) lines.push(line);
       })();
-      stdout.push(`${JSON.stringify({
-        type: "response",
-        command: "prompt",
-        success: true,
-        id: promptId,
-      })}\n`);
-      const lines = await collect;
-
-      assert.deepStrictEqual(writes, [{ type: "get_state", id: `${promptId}-state` }]);
-      assert.strictEqual(lines.length, 1, "the internal state probe is not user-facing");
-      assert.strictEqual(lines[0].type, "result");
-      assert.strictEqual((lines[0] as { result: string }).result, "model answer");
-      assert.deepStrictEqual(activityEvents, [
-        { type: "response", command: "prompt", id: promptId },
-        { type: "response", command: "get_state", id: `${promptId}-state` },
-        { type: "agent_start", command: undefined, id: undefined },
-        { type: "agent_end", command: undefined, id: undefined },
-        { type: "agent_settled", command: undefined, id: undefined },
-      ], "activity observation preserves the internal probe and terminal settlement order");
+      // Bound a broken implementation without waiting for the test-runner timeout.
+      const timeout = setTimeout(() => stdout.push(null), 500);
+      try { await collect; } finally { clearTimeout(timeout); }
+      assert.deepEqual(writes, []);
+      assert.deepEqual(lines, [{ type: "result", result: "", session_id: "" }]);
     } finally {
       stdout.destroy();
       stdin.destroy();
     }
+  });
+
+  for (const disposition of ["started", "queued", "handled"]) {
+    for (const order of ["before-response", "after-response"]) {
+      it(`waits for settlement with ${disposition} and independent lifecycle ${order}`, async () => {
+        const response = { type: "response", command: "prompt", id: "current",
+          success: true, data: { disposition } };
+        const start = { type: "agent_start" };
+        const events = order === "before-response" ? [start, response] : [response, start];
+        const child = childWithStdout([
+          ...events,
+          { type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "real answer" }] }] },
+          { type: "agent_settled" },
+        ].map(event => JSON.stringify(event)));
+        const writes: string[] = [];
+        Object.assign(child, { exitCode: null, killed: false, stdin: new Writable({ write(chunk, _enc, callback) {
+          writes.push(chunk.toString()); callback();
+        } }) });
+        const observed: string[] = [];
+        const lines: StreamLine[] = [];
+        for await (const line of readPiStream(child, event => observed.push(event.type!), "current")) lines.push(line);
+        assert.deepEqual(writes, []);
+        assert.equal(observed.at(-1), "agent_settled");
+        assert.deepEqual(lines, [{ type: "result", result: "real answer", session_id: "" }]);
+      });
+    }
+  }
+
+  for (const disposition of ["started", "queued"]) {
+    it(`does not finish ${disposition} acceptance before delayed lifecycle`, async () => {
+      const stdout = new Readable({ read() {} });
+      const child = new EventEmitter() as unknown as ChildProcess;
+      Object.assign(child, { stdout, exitCode: null, killed: false,
+        stdin: new Writable({ write(_chunk, _enc, callback) { callback(); } }) });
+      const lines: StreamLine[] = [];
+      const collect = (async () => {
+        for await (const line of readPiStream(child, undefined, "current")) lines.push(line);
+      })();
+      stdout.push(`${JSON.stringify({ type: "response", command: "prompt", id: "current",
+        success: true, data: { disposition } })}\n`);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepEqual(lines, []);
+      stdout.push([
+        { type: "agent_start" },
+        { type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "answer" }] }] },
+        { type: "agent_settled" },
+      ].map(event => JSON.stringify(event)).join("\n") + "\n");
+      try { await collect; } finally { stdout.destroy(); }
+      assert.equal(lines.length, 1);
+      assert.equal((lines[0] as { result: string }).result, "answer");
+    });
+  }
+
+  it("drains separate available chunks after handled acceptance before completing", async () => {
+    const frames = [
+      { type: "response", command: "prompt", id: "current", success: true, data: { disposition: "handled" } },
+      { type: "agent_start" },
+      { type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "independent answer" }] }] },
+      { type: "agent_settled" },
+    ].map(event => JSON.stringify(event) + "\n");
+    const child = new EventEmitter() as unknown as ChildProcess;
+    Object.assign(child, { stdout: Readable.from(frames) });
+    const lines: StreamLine[] = [];
+    for await (const line of readPiStream(child, undefined, "current")) lines.push(line);
+    assert.deepEqual(lines, [{ type: "result", result: "independent answer", session_id: "" }]);
+  });
+
+  it("finishes an already buffered partial lifecycle record before handled completion", async () => {
+    const stdout = new Readable({ read() {} });
+    const child = new EventEmitter() as unknown as ChildProcess;
+    Object.assign(child, { stdout });
+    stdout.push(JSON.stringify({ type: "response", command: "prompt", id: "current",
+      success: true, data: { disposition: "handled" } }) + '\n{"type":"agent_');
+    const lines: StreamLine[] = [];
+    const collect = (async () => {
+      for await (const line of readPiStream(child, undefined, "current")) lines.push(line);
+    })();
+    await new Promise(resolve => setImmediate(resolve));
+    const earlyLines = [...lines];
+    stdout.push('start"}\n' + [
+      { type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "answer" }] }] },
+      { type: "agent_settled" },
+    ].map(event => JSON.stringify(event)).join("\n") + "\n");
+    try { await collect; } finally { stdout.destroy(); }
+    assert.deepEqual(earlyLines, []);
+    assert.deepEqual(lines, [{ type: "result", result: "answer", session_id: "" }]);
+  });
+
+  it("does not confuse handled acknowledged-steer acceptance with consumption", async () => {
+    const child = childWithStdout([
+      { type: "agent_start" },
+      { type: "extension_ui_request", method: "notify", notifyType: "info",
+        message: buildPiAcknowledgedSteerResultNotice("steer", "enqueued") },
+      { type: "response", command: "prompt", id: "steer-command", success: true, data: { disposition: "handled" } },
+      { type: "response", command: "prompt", success: true, data: { disposition: "handled" } },
+      { type: "response", command: "steer", id: "current", success: true, data: { disposition: "handled" } },
+      { type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "answer" }] }] },
+      { type: "agent_settled" },
+    ].map(event => JSON.stringify(event)));
+    const notices: Array<{ id: string; status: string }> = [];
+    const lines: StreamLine[] = [];
+    for await (const line of readPiStream(child, undefined, "current", notice => {
+      notices.push({ id: notice.id, status: notice.status });
+    })) lines.push(line);
+    assert.deepEqual(notices, [{ id: "steer", status: "enqueued" }]);
+    assert.deepEqual(lines, [{ type: "result", result: "answer", session_id: "" }]);
   });
 
   it("ignores a stale successful prompt response from an earlier stream reader", async () => {
@@ -3396,6 +3409,7 @@ describe("readPiStream", () => {
         command: "prompt",
         success: true,
         id: "previous-prompt",
+        data: { disposition: "handled" },
       }),
       JSON.stringify({
         type: "agent_end",
