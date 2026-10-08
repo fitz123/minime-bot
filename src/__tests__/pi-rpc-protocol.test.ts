@@ -3306,21 +3306,43 @@ describe("readPiStream", () => {
           success: true, data: { disposition } };
         const start = { type: "agent_start" };
         const events = order === "before-response" ? [start, response] : [response, start];
-        const child = childWithStdout([
-          ...events,
-          { type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "real answer" }] }] },
-          { type: "agent_settled" },
-        ].map(event => JSON.stringify(event)));
+        const stdout = new Readable({ read() {} });
+        const child = new EventEmitter() as unknown as ChildProcess;
         const writes: string[] = [];
-        Object.assign(child, { exitCode: null, killed: false, stdin: new Writable({ write(chunk, _enc, callback) {
+        const stdin = new Writable({ write(chunk, _enc, callback) {
           writes.push(chunk.toString()); callback();
-        } }) });
+        } });
+        Object.assign(child, { stdout, stdin, exitCode: null, killed: false });
         const observed: string[] = [];
         const lines: StreamLine[] = [];
-        for await (const line of readPiStream(child, event => observed.push(event.type!), "current")) lines.push(line);
-        assert.deepEqual(writes, []);
-        assert.equal(observed.at(-1), "agent_settled");
-        assert.deepEqual(lines, [{ type: "result", result: "real answer", session_id: "" }]);
+        let completed = false;
+        const collect = (async () => {
+          for await (const line of readPiStream(child, event => observed.push(event.type!), "current")) lines.push(line);
+          completed = true;
+        })();
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        try {
+          stdout.push(events.map(event => JSON.stringify(event)).join("\n") + "\n");
+          await new Promise(resolve => setImmediate(resolve));
+          assert.deepEqual(observed, events.map(event => event.type));
+          assert.deepEqual(lines, []);
+          assert.equal(completed, false);
+          stdout.push([
+            { type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "real answer" }] }] },
+            { type: "agent_settled" },
+          ].map(event => JSON.stringify(event)).join("\n") + "\n");
+          const deadline = new Promise<never>((_resolve, reject) => {
+            timeout = setTimeout(() => reject(new Error("Lifecycle did not settle before the deadline")), 500);
+          });
+          await Promise.race([collect, deadline]);
+          assert.deepEqual(writes, []);
+          assert.equal(observed.at(-1), "agent_settled");
+          assert.deepEqual(lines, [{ type: "result", result: "real answer", session_id: "" }]);
+        } finally {
+          clearTimeout(timeout);
+          stdout.destroy();
+          stdin.destroy();
+        }
       });
     }
   }
@@ -3405,28 +3427,42 @@ describe("readPiStream", () => {
     assert.deepEqual(lines, [{ type: "result", result: "answer", session_id: "" }]);
   });
 
-  it("ignores a stale successful prompt response from an earlier stream reader", async () => {
-    const child = childWithStdout([
-      JSON.stringify({
-        type: "response",
-        command: "prompt",
-        success: true,
-        id: "previous-prompt",
-        data: { disposition: "handled" },
-      }),
-      JSON.stringify({
-        type: "agent_end",
-        messages: [{ role: "assistant", content: [{ type: "text", text: "current answer" }] }],
-      }),
-      JSON.stringify({ type: "agent_settled" }),
-    ]);
-    const lines: StreamLine[] = [];
-    for await (const line of readPiStream(child, undefined, "current-prompt")) lines.push(line);
-
-    assert.strictEqual(lines.length, 1);
-    assert.strictEqual(lines[0].type, "result");
-    assert.strictEqual((lines[0] as { result: string }).result, "current answer");
-  });
+  for (const id of ["previous-prompt", undefined]) {
+    it(`ignores a ${id ? "stale mismatched" : "id-less"} handled prompt response before lifecycle`, async () => {
+      const stdout = new Readable({ read() {} });
+      const child = new EventEmitter() as unknown as ChildProcess;
+      Object.assign(child, { stdout });
+      const observed: string[] = [];
+      const lines: StreamLine[] = [];
+      let completed = false;
+      const collect = (async () => {
+        for await (const line of readPiStream(child, event => observed.push(event.type!), "current-prompt")) lines.push(line);
+        completed = true;
+      })();
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        stdout.push(JSON.stringify({ type: "response", command: "prompt", success: true,
+          id, data: { disposition: "handled" } }) + "\n");
+        await new Promise(resolve => setImmediate(resolve));
+        assert.deepEqual(observed, ["response"]);
+        assert.deepEqual(lines, []);
+        assert.equal(completed, false);
+        stdout.push([
+          { type: "agent_start" },
+          { type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "current answer" }] }] },
+          { type: "agent_settled" },
+        ].map(event => JSON.stringify(event)).join("\n") + "\n");
+        const deadline = new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(() => reject(new Error("Current lifecycle did not settle before the deadline")), 500);
+        });
+        await Promise.race([collect, deadline]);
+        assert.deepEqual(lines, [{ type: "result", result: "current answer", session_id: "" }]);
+      } finally {
+        clearTimeout(timeout);
+        stdout.destroy();
+      }
+    });
+  }
 
   it("cancels all blocking extension UI methods through captured child stdin and still settles once", async () => {
     const stdout = new Readable({ read() {} });
