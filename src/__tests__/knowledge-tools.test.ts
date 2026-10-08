@@ -112,6 +112,37 @@ describe("knowledge tools", () => {
     assert.equal(forward.results[0].score, forward.results[1].score);
   });
 
+  it("preserves the original ranked list and scores with zero-hit variants", () => {
+    const deps = { agentWorkspaceRoot: createV2Workspace({
+      "wiki/index.md": "# Catalog\n",
+      "wiki/pages/r.md": "# Radiator coolant guide\nRadiator coolant radiator coolant.\n",
+      "wiki/pages/n.md": `# Garage log\nRadiator notes coolant records replacement ${"garage ".repeat(200)}\n`,
+    }) };
+    const query = "radiator coolant replacement";
+    const original = executeKnowledgeSearch({ query }, deps);
+    assertSearchOk(original);
+    assert.deepEqual(original.results.map((hit) => hit.path), ["wiki/pages/r.md", "wiki/pages/n.md"]);
+    for (const variants of [["замена охлаждающей жидкости"], ["!!!"], ["!!!", "замена охлаждающей жидкости"]]) {
+      const response = executeKnowledgeSearch({ query, variants }, deps);
+      assertSearchOk(response);
+      assert.deepEqual(response.results, original.results);
+    }
+  });
+
+  it("preserves the sole variant ranked list and scores when the original has zero hits", () => {
+    const deps = { agentWorkspaceRoot: createV2Workspace({
+      "wiki/index.md": "# Catalog\n",
+      "wiki/pages/r.md": "# Radiator coolant guide\nRadiator coolant radiator coolant.\n",
+      "wiki/pages/n.md": `# Garage log\nRadiator notes coolant records replacement ${"garage ".repeat(200)}\n`,
+    }) };
+    const variant = "radiator coolant replacement";
+    const expected = executeKnowledgeSearch({ query: variant }, deps);
+    assertSearchOk(expected);
+    const response = executeKnowledgeSearch({ query: "несуществующий", variants: [variant, "!!!"] }, deps);
+    assertSearchOk(response);
+    assert.deepEqual(response.results, expected.results);
+  });
+
   it("bounds each fused list so repeated tail matches cannot vote", () => {
     const files: Record<string, string> = { "wiki/index.md": "# Catalog\n" };
     for (const term of ["radiator", "coolant"]) {
@@ -271,14 +302,11 @@ describe("knowledge tools", () => {
     assertSearchOk(response);
     assert.equal(response.results[0].path, "wiki/pages/combined.md");
     const withVariants = executeKnowledgeSearch({ query: "amber reservoirs", variants: ["violet", "turbines"] }, deps);
-    const singleListScores = ["amber reservoirs", "violet", "turbines"].map((query) => {
-      const singleList = executeKnowledgeSearch({ query, variants: ["missing"] }, deps);
-      assertSearchOk(singleList);
-      return singleList.results.find((hit) => hit.sourceKind === "index")!.score;
-    });
     assertSearchOk(withVariants);
+    // Each one-word variant ranks its matching catalog entry first with full coverage.
+    // Catalog fusion keeps the strongest vote instead of summing across entries.
     assert.equal(withVariants.results.find((hit) => hit.sourceKind === "index")?.score,
-      Math.max(...singleListScores));
+      1 / 61);
     const catalog = response.results.find((hit) => hit.sourceKind === "index")!;
     assert.equal(catalog.authority, "catalog/discovery");
     assert.equal(catalog.startLine, catalog.endLine);

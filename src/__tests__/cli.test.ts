@@ -617,6 +617,31 @@ describe("minime-bot CLI", () => {
     }
   });
 
+  for (const [args, command] of [
+    [["update", "--op", "archive", "--path", "wiki/pages/project/runtime.md", "--variant", "thermal"], "update --op archive|restore"],
+    [["sync", "--variant=thermal"], "sync"],
+    [["get", "--path", "wiki/pages/project/runtime.md", "--variant=thermal"], "get"],
+    [["maintain", "--variant=thermal"], "maintain"],
+    [["migrate", "--dry-run", "--variant=thermal"], "migrate"],
+  ] as const) {
+    it(`rejects variants before ${command} action`, () => {
+      const workspace = createKnowledgeWorkspace();
+      const relPath = "wiki/pages/project/runtime.md";
+      const original = readFileSync(join(workspace, relPath), "utf8");
+      try {
+        const result = runWithCapture(["knowledge", ...args, "--workspace", workspace, "--json"], BOT_ROOT);
+        assert.equal(result.code, 2);
+        assert.equal(result.stdout, "");
+        assert.ok(result.stderr.includes(`knowledge ${command} does not accept --variant`), result.stderr);
+        assert.equal(readFileSync(join(workspace, relPath), "utf8"), original);
+        assert.equal(existsSync(join(workspace, "artifacts/knowledge-archive", relPath)), false);
+        assert.equal(existsSync(join(workspace, ".tmp")), false);
+      } finally {
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    });
+  }
+
   it("searches knowledge with JSON output using --workspace as the agent workspace", () => {
     const controlWorkspace = createWorkspace();
     const agentWorkspace = createKnowledgeWorkspace();

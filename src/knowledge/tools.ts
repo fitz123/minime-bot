@@ -690,7 +690,8 @@ export function executeKnowledgeSearch(args: KnowledgeSearchArgs = {}, deps: Kno
     }
     const idf = new Map([...documentFrequency].map(([token, count]) =>
       [token, Math.log(1 + (units.length - count + 0.5) / (count + 0.5))]));
-    const ranked = queries.map((prepared) => rankUnits(units, prepared, queries[0], idf, averageLength));
+    const ranked = queries.map((prepared) => rankUnits(units, prepared, queries[0], idf, averageLength))
+      .filter((list) => list.length > 0);
     const fused = new Map<string, RankedSearchResult>();
     for (const list of ranked) {
       for (const [index, candidate] of list.slice(0, FUSION_LIST_DEPTH).entries()) {
@@ -709,7 +710,8 @@ export function executeKnowledgeSearch(args: KnowledgeSearchArgs = {}, deps: Kno
     for (const candidate of fused.values()) {
       if (candidate.exactOriginal) candidate.result.score += 1;
     }
-    const results = (queries.length === 1 ? ranked[0].map((candidate) => candidate.result) :
+    // With only one contributing list, preserve its ordering and original scores.
+    const results = (ranked.length <= 1 ? (ranked[0] ?? []).map((candidate) => candidate.result) :
       [...fused.values()].map((candidate) => candidate.result).sort(compareResults))
       .slice(0, coerceMaxResults(args.maxResults))
       .map((result, index) => ({ ...result, rank: index + 1 }));

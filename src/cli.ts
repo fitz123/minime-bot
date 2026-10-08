@@ -365,7 +365,8 @@ function rejectUnexpectedKnowledgeOptions(
   allowedFlags: ReadonlySet<string>,
   command: string,
 ): void {
-  for (const name of options.values.keys()) {
+  const valueNames = [...options.values.keys(), ...(options.variants.length ? ["variant"] : [])];
+  for (const name of valueNames) {
     if (!allowedValues.has(name)) {
       throw new CliUsageError(`knowledge ${command} does not accept --${name}`);
     }
@@ -459,6 +460,12 @@ function runKnowledgeGet(
   stderr: WriteFn,
 ): number {
   const commandOptions = parseKnowledgeCommandOptions(args);
+  rejectUnexpectedKnowledgeOptions(
+    commandOptions,
+    new Set(["path", "from", "lines"]),
+    new Set(["json"]),
+    "get",
+  );
   const json = commandOptions.flags.has("json");
   const from = parsePositiveIntegerOption(commandOptions, "from");
   const lineCount = parsePositiveIntegerOption(commandOptions, "lines");
@@ -611,6 +618,12 @@ function runKnowledgeMigrate(
   stderr: WriteFn,
 ): number {
   const commandOptions = parseKnowledgeCommandOptions(args);
+  rejectUnexpectedKnowledgeOptions(
+    commandOptions,
+    new Set(["report"]),
+    new Set(["json", "dry-run", "apply", "allow-dirty"]),
+    "migrate",
+  );
   const json = commandOptions.flags.has("json");
   const dryRun = commandOptions.flags.has("dry-run");
   const apply = commandOptions.flags.has("apply");
