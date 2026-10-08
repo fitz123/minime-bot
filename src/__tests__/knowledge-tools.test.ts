@@ -77,6 +77,94 @@ describe("knowledge tools", () => {
     }
   });
 
+  it("keeps translated meaningful matches ahead of bilingual function-word distractors", () => {
+    const files: Record<string, string> = {
+      "wiki/index.md": "# Catalog\n",
+      "wiki/pages/relevant.md": "# Maintenance\nRadiator coolant replacement procedure.\n",
+    };
+    for (let i = 0; i < 12; i++) {
+      files[`wiki/pages/noise-${i}.md`] = "# Notes\nкак и где это мы для the and where is it for\n";
+    }
+    const deps = { agentWorkspaceRoot: createV2Workspace(files) };
+    const translated = "where is the radiator coolant replacement procedure";
+    for (const args of [
+      { query: "как и где замена охлаждающей жидкости", variants: [translated] },
+      { query: translated },
+    ]) {
+      const response = executeKnowledgeSearch(args, deps);
+      assertSearchOk(response);
+      assert.equal(response.results[0]?.path, "wiki/pages/relevant.md");
+      assert.equal(response.results.some((hit) => hit.path.includes("noise-")), false);
+    }
+  });
+
+  it("uses uniform votes for original and reformulated candidate lists", () => {
+    const deps = { agentWorkspaceRoot: createV2Workspace({
+      "wiki/index.md": "# Catalog\n",
+      "wiki/pages/a.md": "# Record A\nRadiator coolant replacement.\n",
+      "wiki/pages/z.md": "# Record Z\nАрхив.\n",
+    }) };
+    const forward = executeKnowledgeSearch({ query: "архив", variants: ["radiator coolant replacement"] }, deps);
+    const reverse = executeKnowledgeSearch({ query: "radiator coolant replacement", variants: ["архив"] }, deps);
+    assertSearchOk(forward);
+    assertSearchOk(reverse);
+    assert.deepEqual(forward.results, reverse.results);
+    assert.equal(forward.results[0].score, forward.results[1].score);
+  });
+
+  it("bounds each fused list so repeated tail matches cannot vote", () => {
+    const files: Record<string, string> = { "wiki/index.md": "# Catalog\n" };
+    for (const term of ["radiator", "coolant"]) {
+      for (let i = 0; i < 50; i++) {
+        files[`wiki/pages/${term}-${i}.md`] = `# ${term}\n${term} maintenance procedure\n`;
+      }
+    }
+    files["wiki/pages/tail.md"] = `# Notes\nRadiator coolant ${"unrelated ".repeat(300)}\n`;
+    const deps = { agentWorkspaceRoot: createV2Workspace(files) };
+    const response = executeKnowledgeSearch({ query: "radiator instructions", variants: ["coolant instructions"], maxResults: 50 }, deps);
+    assertSearchOk(response);
+    assert.equal(response.results.some((hit) => hit.path.endsWith("/tail.md")), false);
+  });
+
+  it("keeps source preference proportional to relevance for scope all", () => {
+    const files: Record<string, string> = {
+      "wiki/index.md": "# Catalog\n",
+      "diary/day.md": "# Travel\nTbilisi.\n",
+    };
+    for (let i = 0; i < 10; i++) files[`wiki/pages/noise-${i}.md`] = "# Notes\nTravel plans.\n";
+    const deps = { agentWorkspaceRoot: createV2Workspace(files) };
+    for (const variants of [[], ["tbilisi journey"]]) {
+      const response = executeKnowledgeSearch({ query: "travel tbilisi journey details", variants, scope: "all" }, deps);
+      assertSearchOk(response);
+      assert.equal(response.results[0]?.path, "diary/day.md");
+    }
+  });
+
+  it("preserves complete phrases, names containing function words, and function-word-only queries", () => {
+    const deps = { agentWorkspaceRoot: createV2Workspace({
+      "wiki/index.md": "# Catalog\n",
+      "wiki/pages/named.md": "# The Who\nTo be or not to be.\n",
+      "wiki/pages/other.md": "# Other\nWho knows. Broad synonyms.\n",
+      "wiki/pages/ru.md": "# Words\nи в на\n",
+      "wiki/pages/mixed-name.md": "# The Radiator\nDesign notes.\n",
+      "wiki/pages/phrase.md": "# Example\nState of the art.\n",
+      "wiki/pages/words.md": "# Example\nArt of the state.\n",
+    }) };
+    for (const query of ["The Who", "The Radiator", "to be or not to be", "the"]) {
+      const response = executeKnowledgeSearch({ query, variants: ["broad synonyms"] }, deps);
+      assertSearchOk(response);
+      const expected = query === "The Radiator" ? "wiki/pages/mixed-name.md" : "wiki/pages/named.md";
+      assert.ok(response.results.some((hit) => hit.path === expected));
+      if (query.startsWith("The ")) assert.equal(response.results[0].path, expected);
+    }
+    const phrase = executeKnowledgeSearch({ query: "state of the art" }, deps);
+    assertSearchOk(phrase);
+    assert.equal(phrase.results[0]?.path, "wiki/pages/phrase.md");
+    const russian = executeKnowledgeSearch({ query: "и в на" }, deps);
+    assertSearchOk(russian);
+    assert.equal(russian.results[0]?.path, "wiki/pages/ru.md");
+  });
+
   it("bounds variants, deduplicates normalized queries, and requires the original", () => {
     const workspace = createV2Workspace({ "wiki/pages/topic.md": "# Café\nRadiator details.\n" });
     const deps = { agentWorkspaceRoot: workspace };
@@ -123,11 +211,14 @@ describe("knowledge tools", () => {
     assertSearchOk(response);
     assert.equal(response.results[0].path, "wiki/pages/combined.md");
     const withVariants = executeKnowledgeSearch({ query: "amber reservoirs", variants: ["violet", "turbines"] }, deps);
-    const unrelatedVariants = executeKnowledgeSearch({ query: "amber reservoirs", variants: ["missing"] }, deps);
+    const singleListScores = ["amber reservoirs", "violet", "turbines"].map((query) => {
+      const singleList = executeKnowledgeSearch({ query, variants: ["missing"] }, deps);
+      assertSearchOk(singleList);
+      return singleList.results.find((hit) => hit.sourceKind === "index")!.score;
+    });
     assertSearchOk(withVariants);
-    assertSearchOk(unrelatedVariants);
     assert.equal(withVariants.results.find((hit) => hit.sourceKind === "index")?.score,
-      unrelatedVariants.results.find((hit) => hit.sourceKind === "index")?.score);
+      Math.max(...singleListScores));
     const catalog = response.results.find((hit) => hit.sourceKind === "index")!;
     assert.equal(catalog.authority, "catalog/discovery");
     assert.equal(catalog.startLine, catalog.endLine);
@@ -139,7 +230,9 @@ describe("knowledge tools", () => {
     const isolated = executeKnowledgeSearch({ query: "amber reservoirs" }, deps);
     assertSearchOk(isolated);
     // Removing the other entry's matching term cannot remove support from this entry.
-    assert.ok(isolated.results.some((hit) => hit.path === "wiki/index.md" && hit.snippet === "- Amber turbines"));
+    const isolatedCatalog = isolated.results.find((hit) => hit.path === "wiki/index.md")!;
+    assert.equal(isolatedCatalog.snippet, "- Amber turbines");
+    assert.equal(isolatedCatalog.score, catalog.score);
   });
 
   it("reads each corpus file once across variants and sees edits on the next call", (t) => {

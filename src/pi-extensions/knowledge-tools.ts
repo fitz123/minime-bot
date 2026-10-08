@@ -15,7 +15,7 @@ export const KNOWLEDGE_SEARCH_TOOL = {
     "knowledge can still be stale and diary entries are history, not current truth.",
   promptSnippet: "Search workspace knowledge before answering from prior decisions, preferences, projects, or history.",
   promptGuidelines: [
-    "For synonym/paraphrase or Russian/English-sensitive questions, supply the original query plus a few useful variants in the SAME call. Preserve exact IDs/names; do not invent facts or answers. Verify relevant sources with knowledge_get and check freshness/authority before claiming; unrelated or empty hits are not evidence.",
+    "For synonym/paraphrase or Russian/English-sensitive questions, supply the original query plus a few useful variants in the SAME call. Matching uses whole words, without stemming or prefix matching; include plural or inflected forms as same-call variants when needed. Preserve exact IDs/names; do not invent facts or answers. Verify relevant sources with knowledge_get and check freshness/authority before claiming; unrelated or empty hits are not evidence.",
     "Use knowledge_search before answering about prior work, decisions, people, preferences, projects, health, dates, or what happened with something.",
     "Use default scope for curated durable facts, diary/all for chronology, and knowledge_get for exact source lines before important assertions.",
   ] as string[],

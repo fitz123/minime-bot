@@ -111,6 +111,7 @@ interface MarkdownDocument {
 
 const DEFAULT_MAX_RESULTS = 10;
 const MAX_RESULTS = 50;
+const FUSION_LIST_DEPTH = 50;
 export const MAX_QUERY_VARIANTS = 5;
 export const MAX_QUERY_VARIANT_LENGTH = 500;
 const MARKDOWN_EXTENSIONS = new Set([".md", ".markdown"]);
@@ -462,13 +463,25 @@ function normalizeSearchText(text: string): string {
     .replace(/\s+/g, " ");
 }
 
+// Ignore common grammatical words for candidate support, but retain the complete
+// normalized query for phrase/identity matching. All-function-word queries fall back
+// to their original tokens so names and literal lookups remain searchable.
+const FUNCTION_WORDS = new Set(normalizeSearchText(
+  "a an the and or but not no of to in on at by for from with as is are was were be been being " +
+  "do does did have has had it its this that these those i me my we us our you your he him his she her they them their " +
+  "what which who whom whose where when why how " +
+  "и а но или в во на к ко с со у о об от до из за по для при " +
+  "я мы ты вы он она оно они мне нам тебе вам ему ей им мой наш твой ваш его ее их " +
+  "это этот эта эти то тот та те как где когда кто что какой какая какие " +
+  "не ни бы же ли есть был была было были быть"
+).split(" "));
+
 function prepareQuery(query: string): PreparedQuery {
   const raw = query.trim();
   const normalized = normalizeSearchText(raw);
-  return {
-    normalized,
-    tokens: normalized ? [...new Set(normalized.split(" "))] : [],
-  };
+  const tokens = normalized ? [...new Set(normalized.split(" "))] : [];
+  const meaningful = tokens.filter((token) => !FUNCTION_WORDS.has(token));
+  return { normalized, tokens: meaningful.length ? meaningful : tokens };
 }
 
 interface SearchText {
@@ -546,7 +559,8 @@ function rankUnits(units: SearchUnit[], query: PreparedQuery, idf: Map<string, n
     if (containsPhrase(unit.body, query)) score += 4;
     if (containsPhrase(unit.title, query)) score += 8;
     if (containsPhrase(unit.path, query)) score += 8;
-    if (unit.entry.sourceKind === "wiki" || unit.entry.sourceKind === "auto") score += 2;
+    // Prefer curated sources without overwhelming low-coverage relevance.
+    if (unit.entry.sourceKind === "wiki" || unit.entry.sourceKind === "auto") score *= 1.2;
     let best = unit.lines[0];
     let bestScore = -1;
     for (const candidate of unit.lines) {
@@ -660,10 +674,10 @@ export function executeKnowledgeSearch(args: KnowledgeSearchArgs = {}, deps: Kno
       [token, Math.log(1 + (units.length - count + 0.5) / (count + 0.5))]));
     const ranked = queries.map((prepared) => rankUnits(units, prepared, idf, averageLength));
     const fused = new Map<string, KnowledgeSearchResult>();
-    for (const [queryIndex, list] of ranked.entries()) {
-      for (const [index, result] of list.entries()) {
-        // Give the required original query twice the weight of a reformulation.
-        const contribution = (queryIndex === 0 ? 2 : 1) / (60 + index + 1);
+    for (const list of ranked) {
+      for (const [index, result] of list.slice(0, FUSION_LIST_DEPTH).entries()) {
+        // Each reformulation gets an equal vote; weak tail matches do not accumulate.
+        const contribution = 1 / (60 + index + 1);
         const existing = fused.get(result.path);
         if (existing && result.sourceKind === "index") {
           // Different catalog entries must not reinforce one another through variants.

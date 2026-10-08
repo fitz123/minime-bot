@@ -181,7 +181,7 @@ const NO_FOLLOW = constants.O_NOFOLLOW ?? 0;
 const KNOWLEDGE_ACCESS_DIRECTIVE = [
   "Use `knowledge_search` before answering about prior work, decisions, people, preferences, projects, health, dates, or \"what happened with X?\"",
   "",
-  "- For synonym/paraphrase or Russian/English-sensitive questions, supply the original query plus a few useful variants in the SAME call. Preserve exact IDs/names; do not invent facts or answers. Verify relevant sources with knowledge_get and check freshness/authority before claiming; unrelated or empty hits are not evidence.",
+  "- For synonym/paraphrase or Russian/English-sensitive questions, supply the original query plus a few useful variants in the SAME call. Matching uses whole words, without stemming or prefix matching; include plural or inflected forms as same-call variants when needed. Preserve exact IDs/names; do not invent facts or answers. Verify relevant sources with knowledge_get and check freshness/authority before claiming; unrelated or empty hits are not evidence.",
   "- Use default scope for curated/current facts.",
   "- Use `diary` or `all` scope for chronology and history.",
   "- Use `knowledge_get` for exact source lines before important assertions.",
