@@ -32,6 +32,7 @@ export interface KnowledgeSearchResult {
 
 export interface KnowledgeSearchArgs {
   query?: unknown;
+  variants?: unknown;
   scope?: unknown;
   maxResults?: unknown;
 }
@@ -90,8 +91,6 @@ interface CorpusEntry {
 }
 
 interface PreparedQuery {
-  raw: string;
-  rawLower: string;
   normalized: string;
   tokens: string[];
 }
@@ -112,6 +111,8 @@ interface MarkdownDocument {
 
 const DEFAULT_MAX_RESULTS = 10;
 const MAX_RESULTS = 50;
+export const MAX_QUERY_VARIANTS = 5;
+export const MAX_QUERY_VARIANT_LENGTH = 500;
 const MARKDOWN_EXTENSIONS = new Set([".md", ".markdown"]);
 
 const INDEX_AUTHORITY: KnowledgeAuthority = "catalog/discovery";
@@ -465,131 +466,111 @@ function prepareQuery(query: string): PreparedQuery {
   const raw = query.trim();
   const normalized = normalizeSearchText(raw);
   return {
-    raw,
-    rawLower: raw.toLowerCase(),
     normalized,
-    tokens: normalized ? normalized.split(" ").filter(Boolean) : [],
+    tokens: normalized ? [...new Set(normalized.split(" "))] : [],
   };
 }
 
-function scoreText(text: string, query: PreparedQuery): number {
-  const rawLower = text.toLowerCase();
+interface SearchText {
+  normalized: string;
+  frequencies: Map<string, number>;
+  length: number;
+}
+
+function prepareText(text: string): SearchText {
   const normalized = normalizeSearchText(text);
-  let score = 0;
-
-  if (query.rawLower && rawLower.includes(query.rawLower)) {
-    score += 50;
-  }
-  if (query.normalized && normalized.includes(query.normalized)) {
-    score += 40;
-  }
-  if (query.tokens.length > 0) {
-    let matched = 0;
-    for (const token of query.tokens) {
-      if (normalized.includes(token) || rawLower.includes(token)) {
-        matched += 1;
-      }
-    }
-    if (matched === query.tokens.length) {
-      score += 20 + matched * 4;
-    } else {
-      score += matched;
-    }
-  }
-
-  return score;
+  const tokens = normalized ? normalized.split(" ") : [];
+  const frequencies = new Map<string, number>();
+  for (const token of tokens) frequencies.set(token, (frequencies.get(token) ?? 0) + 1);
+  return { normalized, frequencies, length: tokens.length };
 }
 
-function sectionScoreBonus(sectionKind: MarkdownLine["sectionKind"]): number {
-  switch (sectionKind) {
-    case "frontmatter":
-      return 8;
-    case "heading":
-      return 6;
-    case "index-entry":
-      return 5;
-    case "body":
-      return 0;
-  }
+function containsPhrase(text: SearchText, query: PreparedQuery): boolean {
+  return !!query.normalized && ` ${text.normalized} `.includes(` ${query.normalized} `);
 }
 
-function snippetForLine(line: string): string {
-  const trimmed = line.trim().replace(/\s+/g, " ");
-  if (trimmed.length <= 240) {
-    return trimmed;
-  }
-  return `${trimmed.slice(0, 237)}...`;
+interface SearchUnit {
+  entry: CorpusEntry;
+  document: MarkdownDocument;
+  lines: { line: MarkdownLine; text: SearchText }[];
+  body: SearchText;
+  title: SearchText;
+  path: SearchText;
 }
 
-function bestLineForDocument(document: MarkdownDocument, query: PreparedQuery): { line: MarkdownLine; score: number } | undefined {
-  let best: { line: MarkdownLine; score: number } | undefined;
-
-  for (const line of document.annotatedLines) {
-    const score = scoreText(line.text, query) + sectionScoreBonus(line.sectionKind);
-    if (score <= sectionScoreBonus(line.sectionKind)) {
-      continue;
-    }
-    if (
-      !best ||
-      score > best.score ||
-      (score === best.score && line.lineNumber < best.line.lineNumber)
-    ) {
-      best = { line, score };
-    }
-  }
-
-  if (best) {
-    return best;
-  }
-
-  const documentScore = scoreText(document.searchableText, query);
-  if (documentScore <= 0) {
-    return undefined;
-  }
-
-  const firstToken = query.tokens[0];
-  const fallback =
-    document.annotatedLines.find((line) => {
-      const normalized = normalizeSearchText(line.text);
-      return firstToken ? normalized.includes(firstToken) : line.text.toLowerCase().includes(query.rawLower);
-    }) ?? document.annotatedLines.find((line) => line.text.trim()) ?? document.annotatedLines[0];
-
-  return fallback ? { line: fallback, score: documentScore } : undefined;
-}
-
-function searchEntry(entry: CorpusEntry, query: PreparedQuery): KnowledgeSearchResult | undefined {
+function prepareEntry(entry: CorpusEntry): SearchUnit[] {
   let markdown: string;
   try {
     markdown = readFileSync(entry.absPath, "utf8");
   } catch {
-    return undefined;
+    return [];
   }
-
   const document = parseMarkdownDocument(markdown, entry.relPath, entry.sourceKind);
-  const normalizedDocument = normalizeSearchText(document.searchableText);
-  if (query.tokens.some((token) => !normalizedDocument.includes(token))) {
-    return undefined;
+  const lines = document.annotatedLines.filter((line) => line.text.trim())
+    .map((line) => ({ line, text: prepareText(line.text) }));
+  const title = prepareText(document.title);
+  const path = prepareText(entry.relPath);
+  // Catalog discovery is atomic: never pool terms or frequency across entries.
+  if (entry.sourceKind === "index") {
+    const emptyTitle = prepareText("");
+    return lines.map((line) => ({
+      entry, document, lines: [line], body: line.text, title: emptyTitle, path,
+    }));
   }
-  const best = bestLineForDocument(document, query);
-  if (!best) {
-    return undefined;
+  return [{ entry, document, lines, body: prepareText(document.searchableText), title, path }];
+}
+
+function snippetForLine(line: string): string {
+  const trimmed = line.trim().replace(/\s+/g, " ");
+  return trimmed.length <= 240 ? trimmed : `${trimmed.slice(0, 237)}...`;
+}
+
+function rankUnits(units: SearchUnit[], query: PreparedQuery, idf: Map<string, number>, averageLength: number): KnowledgeSearchResult[] {
+  const results = new Map<string, KnowledgeSearchResult>();
+  for (const unit of units) {
+    let matched = 0;
+    let score = 0;
+    for (const token of query.tokens) {
+      const frequency = unit.body.frequencies.get(token) ?? 0;
+      const titleMatch = unit.title.frequencies.has(token);
+      const pathMatch = unit.path.frequencies.has(token);
+      if (!frequency && !titleMatch && !pathMatch) continue;
+      matched += 1;
+      // Saturated term frequency and length normalization, with explicit field weights.
+      score += (idf.get(token) ?? 1) * (
+        frequency * 2.2 / (frequency + 1.2 * (0.25 + 0.75 * unit.body.length / averageLength)) +
+        (titleMatch ? 3 : 0) + (pathMatch ? 2 : 0));
+    }
+    if (!matched) continue;
+    score *= matched / query.tokens.length;
+    if (containsPhrase(unit.body, query)) score += 4;
+    if (containsPhrase(unit.title, query)) score += 8;
+    if (containsPhrase(unit.path, query)) score += 8;
+    if (unit.entry.sourceKind === "wiki" || unit.entry.sourceKind === "auto") score += 2;
+    let best = unit.lines[0];
+    let bestScore = -1;
+    for (const candidate of unit.lines) {
+      const matches = query.tokens.reduce((sum, token) => sum + (candidate.text.frequencies.has(token) ? (idf.get(token) ?? 1) : 0), 0);
+      const lineScore = matches + (containsPhrase(candidate.text, query) ? 4 : 0) +
+        (matches && candidate.line.sectionKind !== "body" ? 0.5 : 0);
+      if (lineScore > bestScore) { best = candidate; bestScore = lineScore; }
+    }
+    if (!best) continue;
+    const result: KnowledgeSearchResult = {
+      path: unit.entry.relPath, title: unit.document.title,
+      ...(best.line.heading ? { heading: best.line.heading } : {}),
+      startLine: best.line.lineNumber, endLine: best.line.lineNumber,
+      snippet: snippetForLine(best.line.text), sourceKind: unit.entry.sourceKind,
+      authority: unit.entry.authority, score, rank: 0,
+    };
+    const previous = results.get(result.path);
+    if (!previous || result.score > previous.score) results.set(result.path, result);
   }
+  return [...results.values()].sort(compareResults);
+}
 
-  const titleScore = scoreText(document.title, query) > 0 ? 10 : 0;
-  const sourceScore = entry.sourceKind === "wiki" || entry.sourceKind === "auto" ? 8 : 0;
-
-  return {
-    path: entry.relPath,
-    title: document.title,
-    ...(best.line.heading ? { heading: best.line.heading } : {}),
-    startLine: best.line.lineNumber,
-    endLine: best.line.lineNumber,
-    snippet: snippetForLine(best.line.text),
-    sourceKind: entry.sourceKind,
-    authority: entry.authority,
-    score: best.score + titleScore + sourceScore,
-    rank: 0,
-  };
+function compareResults(a: KnowledgeSearchResult, b: KnowledgeSearchResult): number {
+  return b.score - a.score || a.path.localeCompare(b.path) || a.startLine - b.startLine;
 }
 
 function normalizeGetPath(raw: unknown): string | KnowledgeFailure {
@@ -647,6 +628,13 @@ export function executeKnowledgeSearch(args: KnowledgeSearchArgs = {}, deps: Kno
       return searchFailure("rejected", "invalid-scope", "knowledge_search scope must be one of auto, default, diary, or all.");
     }
 
+    const rawVariants = args.variants === undefined ? [] : args.variants;
+    if (!Array.isArray(rawVariants) || rawVariants.length > MAX_QUERY_VARIANTS ||
+      rawVariants.some((value) => typeof value !== "string" || !value.trim() || value.length > MAX_QUERY_VARIANT_LENGTH)) {
+      return searchFailure("rejected", "invalid-variants",
+        `variants must be an array of at most ${MAX_QUERY_VARIANTS} non-empty strings, each at most ${MAX_QUERY_VARIANT_LENGTH} characters.`);
+    }
+
     const layout = resolveLayoutForDeps(deps);
     if (isKnowledgeFailure(layout)) {
       return { ...layout, results: [] };
@@ -655,18 +643,49 @@ export function executeKnowledgeSearch(args: KnowledgeSearchArgs = {}, deps: Kno
       return { ...unavailableForLayout(layout), results: [] };
     }
 
-    const prepared = prepareQuery(query);
-    const maxResults = coerceMaxResults(args.maxResults);
-    const results = buildCorpus(layout, scope)
-      .map((entry) => searchEntry(entry, prepared))
-      .filter((result): result is KnowledgeSearchResult => Boolean(result))
-      .sort(
-        (a, b) =>
-          b.score - a.score ||
-          a.path.localeCompare(b.path) ||
-          a.startLine - b.startLine,
-      )
-      .slice(0, maxResults)
+    const queries = [prepareQuery(query)];
+    for (const variant of rawVariants) {
+      const prepared = prepareQuery(variant);
+      if (!queries.some((existing) => existing.normalized === prepared.normalized)) queries.push(prepared);
+    }
+    const units = buildCorpus(layout, scope).flatMap(prepareEntry);
+    const averageLength = units.reduce((sum, unit) => sum + unit.body.length, 0) / (units.length || 1) || 1;
+    const documentFrequency = new Map<string, number>();
+    for (const unit of units) {
+      for (const token of new Set([...unit.body.frequencies.keys(), ...unit.title.frequencies.keys(), ...unit.path.frequencies.keys()])) {
+        documentFrequency.set(token, (documentFrequency.get(token) ?? 0) + 1);
+      }
+    }
+    const idf = new Map([...documentFrequency].map(([token, count]) =>
+      [token, Math.log(1 + (units.length - count + 0.5) / (count + 0.5))]));
+    const ranked = queries.map((prepared) => rankUnits(units, prepared, idf, averageLength));
+    const fused = new Map<string, KnowledgeSearchResult>();
+    for (const [queryIndex, list] of ranked.entries()) {
+      for (const [index, result] of list.entries()) {
+        // Give the required original query twice the weight of a reformulation.
+        const contribution = (queryIndex === 0 ? 2 : 1) / (60 + index + 1);
+        const existing = fused.get(result.path);
+        if (existing && result.sourceKind === "index") {
+          // Different catalog entries must not reinforce one another through variants.
+          if (contribution > existing.score) fused.set(result.path, { ...result, score: contribution });
+        } else if (existing) existing.score += contribution;
+        else fused.set(result.path, { ...result, score: contribution });
+      }
+    }
+    // Preserve exact original names/paths/identifiers even when several broad variants agree elsewhere.
+    const original = queries[0];
+    const boostedPaths = new Set<string>();
+    for (const unit of units) {
+      const hit = fused.get(unit.entry.relPath);
+      if (hit && !boostedPaths.has(unit.entry.relPath) && original.normalized &&
+        (unit.title.normalized === original.normalized || unit.path.normalized === original.normalized ||
+          (original.tokens.some((token) => /\p{N}/u.test(token)) && containsPhrase(unit.body, original)))) {
+        hit.score += 1;
+        boostedPaths.add(unit.entry.relPath);
+      }
+    }
+    const results = (queries.length === 1 ? ranked[0] : [...fused.values()].sort(compareResults))
+      .slice(0, coerceMaxResults(args.maxResults))
       .map((result, index) => ({ ...result, rank: index + 1 }));
 
     return {

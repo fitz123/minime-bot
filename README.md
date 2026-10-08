@@ -55,6 +55,8 @@ minime-bot knowledge migrate --workspace /path/to/agent-workspace --dry-run --re
 minime-bot knowledge migrate --workspace /path/to/agent-workspace --apply --allow-dirty --report /path/to/report.json --json
 ```
 
+Knowledge search accepts up to five optional reformulations (`variants` in the native tool; repeat `--variant "thermal control"` in the CLI), each at most 500 characters. Keep the required original query and exact IDs/names; supply useful synonyms, paraphrases or Russian/English equivalents in the same call. Whitespace is trimmed and normalized duplicate queries are ignored. Search ranks partial token matches and merges documents across variants; catalog matches use individual lines. Results are candidates, not evidence of an answer or of absence. Read relevant sources with `knowledge_get` and check freshness and authority before making claims. Searches read Markdown afresh on every call.
+
 Knowledge commands do not load config secrets. `search` reads the curated corpus
 by default (`wiki/index.md` and `wiki/pages/**/*.md` in v2, or `MEMORY.md` and
 `memory/auto/**/*.md` in legacy workspaces). `--scope default` and `--scope auto`

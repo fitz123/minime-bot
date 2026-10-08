@@ -1,7 +1,7 @@
 import { existsSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
-import { executeKnowledgeGet, executeKnowledgeSearch, formatKnowledgeToolResponse } from "../knowledge/tools.js";
+import { MAX_QUERY_VARIANTS, MAX_QUERY_VARIANT_LENGTH, executeKnowledgeGet, executeKnowledgeSearch, formatKnowledgeToolResponse } from "../knowledge/tools.js";
 import { resolveKnowledgeLayout, type ResolvedKnowledgeLayout } from "../knowledge/layout.js";
 import { executeKnowledgeUpdate, formatKnowledgeUpdateResponse } from "../knowledge/update.js";
 import { MINIME_AGENT_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
@@ -15,6 +15,7 @@ export const KNOWLEDGE_SEARCH_TOOL = {
     "knowledge can still be stale and diary entries are history, not current truth.",
   promptSnippet: "Search workspace knowledge before answering from prior decisions, preferences, projects, or history.",
   promptGuidelines: [
+    "For synonym/paraphrase or Russian/English-sensitive questions, supply the original query plus a few useful variants in the SAME call. Preserve exact IDs/names; do not invent facts or answers. Verify relevant sources with knowledge_get and check freshness/authority before claiming; unrelated or empty hits are not evidence.",
     "Use knowledge_search before answering about prior work, decisions, people, preferences, projects, health, dates, or what happened with something.",
     "Use default scope for curated durable facts, diary/all for chronology, and knowledge_get for exact source lines before important assertions.",
   ] as string[],
@@ -22,6 +23,11 @@ export const KNOWLEDGE_SEARCH_TOOL = {
     type: "object",
     properties: {
       query: { type: "string", description: "Case-insensitive search query." },
+      variants: {
+        type: "array", maxItems: MAX_QUERY_VARIANTS,
+        items: { type: "string", minLength: 1, maxLength: MAX_QUERY_VARIANT_LENGTH },
+        description: "Optional same-call synonyms, paraphrases, or Russian/English equivalents; retain exact IDs/names.",
+      },
       scope: {
         type: "string",
         enum: ["auto", "default", "diary", "all"],

@@ -1,4 +1,6 @@
 import { after, describe, it } from "node:test";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -61,6 +63,116 @@ function assertGetOk(response: KnowledgeGetResponse): asserts response is Extrac
 }
 
 describe("knowledge tools", () => {
+  it("recalls partial queries and same-call cross-language variants", () => {
+    const workspace = createV2Workspace({
+      "wiki/pages/project/cooling.md": "# Cooling system\n\nThermal control uses a radiator.\n",
+    });
+    for (const args of [
+      { query: "radiator maintenance details" },
+      { query: "охлаждение", variants: ["thermal control"] },
+    ]) {
+      const result = executeKnowledgeSearch(args, { agentWorkspaceRoot: workspace });
+      assertSearchOk(result);
+      assert.equal(result.results[0]?.path, "wiki/pages/project/cooling.md");
+    }
+  });
+
+  it("bounds variants, deduplicates normalized queries, and requires the original", () => {
+    const workspace = createV2Workspace({ "wiki/pages/topic.md": "# Café\nRadiator details.\n" });
+    const deps = { agentWorkspaceRoot: workspace };
+    const original = executeKnowledgeSearch({ query: "café" }, deps);
+    assert.deepEqual(executeKnowledgeSearch({ query: "café", variants: [" CAFÉ ", "cafe"] }, deps), original);
+    for (const variants of [null, "cafe", [1], [" "], ["x".repeat(501)], Array(6).fill("cafe")]) {
+      const response = executeKnowledgeSearch({ query: "cafe", variants }, deps);
+      assert.equal(response.ok, false);
+      if (!response.ok) assert.equal(response.reason, "invalid-variants");
+    }
+    assert.equal(executeKnowledgeSearch({ variants: ["cafe"] }, deps).ok, false);
+    assert.equal(executeKnowledgeSearch({ query: "cafe", variants: ["x".repeat(500)] }, deps).ok, true);
+  });
+
+  it("ranks exact names, paths and identifiers with whole-token boundaries", () => {
+    const workspace = createV2Workspace({
+      "wiki/pages/thermal.md": "---\nname: Thermal Control\ndescription: Radiator design\n---\n# Design\nRecord ZX-4317.\n",
+      "wiki/pages/other.md": "# Other\nThermal control is mentioned. Broad synonyms here. Record ZX-94317.\n",
+    });
+    const deps = { agentWorkspaceRoot: workspace };
+    for (const query of ["Thermal Control", "wiki/pages/thermal.md", "ZX-4317"]) {
+      const response = executeKnowledgeSearch({ query, variants: ["broad", "synonyms", "here"] }, deps);
+      assertSearchOk(response);
+      assert.equal(response.results[0].path, "wiki/pages/thermal.md");
+      assert.equal(new Set(response.results.map((hit) => hit.path)).size, response.results.length);
+    }
+    for (const query of ["431", "9431", "radi", "不存在"]) {
+      const response = executeKnowledgeSearch({ query }, deps);
+      assertSearchOk(response);
+      assert.deepEqual(response.results, []);
+    }
+    const description = executeKnowledgeSearch({ query: "radiator" }, deps);
+    assertSearchOk(description);
+    assert.equal(description.results[0].startLine, 3);
+  });
+
+  it("keeps catalog support line-local and returns faithful bounded source lines", () => {
+    const workspace = createV2Workspace({
+      "wiki/index.md": "# Catalog\n- Amber turbines\n- Violet reservoirs\n",
+      "wiki/pages/combined.md": "# Combined\nAmber reservoirs\n",
+    });
+    const deps = { agentWorkspaceRoot: workspace };
+    const response = executeKnowledgeSearch({ query: "amber reservoirs" }, deps);
+    assertSearchOk(response);
+    assert.equal(response.results[0].path, "wiki/pages/combined.md");
+    const withVariants = executeKnowledgeSearch({ query: "amber reservoirs", variants: ["violet", "turbines"] }, deps);
+    const unrelatedVariants = executeKnowledgeSearch({ query: "amber reservoirs", variants: ["missing"] }, deps);
+    assertSearchOk(withVariants);
+    assertSearchOk(unrelatedVariants);
+    assert.equal(withVariants.results.find((hit) => hit.sourceKind === "index")?.score,
+      unrelatedVariants.results.find((hit) => hit.sourceKind === "index")?.score);
+    const catalog = response.results.find((hit) => hit.sourceKind === "index")!;
+    assert.equal(catalog.authority, "catalog/discovery");
+    assert.equal(catalog.startLine, catalog.endLine);
+    assert.ok(["- Amber turbines", "- Violet reservoirs"].includes(catalog.snippet));
+    const source = executeKnowledgeGet({ path: catalog.path, startLine: catalog.startLine, endLine: catalog.endLine }, deps);
+    assertGetOk(source);
+    assert.equal(source.content, catalog.snippet);
+    writeFiles(workspace, { "wiki/index.md": "# Catalog\n- Amber turbines\n- Unrelated text\n" });
+    const isolated = executeKnowledgeSearch({ query: "amber reservoirs" }, deps);
+    assertSearchOk(isolated);
+    // Removing the other entry's matching term cannot remove support from this entry.
+    assert.ok(isolated.results.some((hit) => hit.path === "wiki/index.md" && hit.snippet === "- Amber turbines"));
+  });
+
+  it("reads each corpus file once across variants and sees edits on the next call", (t) => {
+    const workspace = createV2Workspace({
+      "wiki/pages/cooling.md": "# Cooling\nRadiator thermal control.\n",
+      "diary/day.md": "# History\nThermal recollection.\n",
+    });
+    const reads: string[] = [];
+    const realRead = fs.readFileSync;
+    t.mock.method(fs, "readFileSync", (...args: Parameters<typeof fs.readFileSync>) => {
+      reads.push(String(args[0]));
+      return realRead(...args);
+    });
+    syncBuiltinESMExports();
+    try {
+      const deps = { agentWorkspaceRoot: workspace };
+      const args = { query: "radiator", variants: ["thermal", "cooling"], scope: "all" };
+      const response = executeKnowledgeSearch(args, deps);
+      assertSearchOk(response);
+      for (const path of ["wiki/index.md", "wiki/pages/cooling.md", "diary/day.md"]) {
+        assert.equal(reads.filter((read) => read === join(workspace, path)).length, 1, path);
+      }
+      writeFiles(workspace, { "wiki/pages/cooling.md": "# Replacement\nNew content.\n" });
+      const updated = executeKnowledgeSearch({ query: "radiator", variants: ["thermal"] }, deps);
+      assertSearchOk(updated);
+      assert.equal(updated.results.some((hit) => hit.path === "wiki/pages/cooling.md"), false);
+      assert.equal(response.results.find((hit) => hit.sourceKind === "diary")?.authority, "narrative/history; stale-prone");
+    } finally {
+      t.mock.restoreAll();
+      syncBuiltinESMExports();
+    }
+  });
+
   it("searches v2 index and pages with punctuation-heavy queries", () => {
     const workspace = createV2Workspace({
       "wiki/pages/project/runtime/runtime-notes.md": [
@@ -113,7 +225,7 @@ describe("knowledge tools", () => {
 
       assertSearchOk(response);
       assert.deepEqual(
-        response.results.map((result) => result.path),
+        response.results.slice(0, 1).map((result) => result.path),
         ["wiki/pages/project/mixed-search.md"],
         query,
       );

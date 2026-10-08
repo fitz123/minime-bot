@@ -36,6 +36,7 @@ import { MINIME_CONFIG_PATH_ENV, MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../wo
 const KNOWLEDGE_DIRECTIVE = [
   "Use `knowledge_search` before answering about prior work, decisions, people, preferences, projects, health, dates, or \"what happened with X?\"",
   "",
+  "- For synonym/paraphrase or Russian/English-sensitive questions, supply the original query plus a few useful variants in the SAME call. Preserve exact IDs/names; do not invent facts or answers. Verify relevant sources with knowledge_get and check freshness/authority before claiming; unrelated or empty hits are not evidence.",
   "- Use default scope for curated/current facts.",
   "- Use `diary` or `all` scope for chronology and history.",
   "- Use `knowledge_get` for exact source lines before important assertions.",

@@ -83,7 +83,7 @@ const HELP_TEXT = `Usage:
   minime-bot --help
   minime-bot config validate --workspace <path>
   minime-bot workspace validate --workspace <path>
-  minime-bot knowledge search --workspace <agent-workspace> --query <q> [--scope auto|diary|all] [--json]
+  minime-bot knowledge search --workspace <agent-workspace> --query <q> [--variant <q> ...] [--scope auto|default|diary|all] [--json]
   minime-bot knowledge get --workspace <agent-workspace> --path <relpath> [--from N] [--lines N]
   minime-bot knowledge update --workspace <agent-workspace> --op create|update|upsert --type <type> --slug <slug> --frontmatter <json> --body-file <file> [--json]
   minime-bot knowledge update --workspace <agent-workspace> --op archive|restore --path <wiki/pages/type/page.md> [--json]
@@ -94,6 +94,7 @@ const HELP_TEXT = `Usage:
   minime-bot launchd crons sync --workspace <path> [--dry-run] [--no-prune] [--launch-agents-dir <path>] [--run-cron-script <absolute-path>]
 Options:
   --workspace <path>         Control/app workspace root for config/workspace commands. Agent workspace root for knowledge commands.
+  --variant <q>             Knowledge search reformulation; repeat up to 5 times, at most 500 characters each.
   --run-cron-script <path>  Preserve an explicit executable run-cron.sh path during launchd cron sync.
   -h, --help                 Show this help text.
 
@@ -170,12 +171,14 @@ function resolveKnowledgeAgentWorkspace(parsed: ParsedArgs, options: CliRunOptio
 }
 
 interface KnowledgeCommandOptions {
+  variants: string[];
   values: Map<string, string>;
   flags: Set<string>;
 }
 
 const KNOWLEDGE_VALUE_OPTIONS = new Set([
   "query",
+  "variant",
   "scope",
   "max-results",
   "path",
@@ -198,6 +201,7 @@ const KNOWLEDGE_BOOL_OPTIONS = new Set([
 ]);
 
 function parseKnowledgeCommandOptions(args: readonly string[]): KnowledgeCommandOptions {
+  const variants: string[] = [];
   const values = new Map<string, string>();
   const flags = new Set<string>();
 
@@ -236,10 +240,11 @@ function parseKnowledgeCommandOptions(args: readonly string[]): KnowledgeCommand
       value = next;
       i += 1;
     }
-    values.set(name, value);
+    if (name === "variant") variants.push(value);
+    else values.set(name, value);
   }
 
-  return { values, flags };
+  return { values, flags, variants };
 }
 
 function requiredKnowledgeValue(options: KnowledgeCommandOptions, name: string): string {
@@ -423,6 +428,7 @@ function runKnowledgeSearch(
   const response = executeKnowledgeSearch(
     {
       query: commandOptions.values.get("query"),
+      variants: commandOptions.variants,
       scope: commandOptions.values.get("scope"),
       maxResults: parsePositiveIntegerOption(commandOptions, "max-results"),
     },
