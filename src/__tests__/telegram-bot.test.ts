@@ -1460,6 +1460,7 @@ describe("command handler wiring", () => {
     const calls: string[] = [];
     return {
       calls,
+      sessionEffort: async (key: string, agent: string, value?: string) => { calls.push(`effort:${key}:${agent}:${value ?? "status"}`); return "Effort: high"; },
       closeSession: async (_chatId: string) => { calls.push("closeSession"); },
       destroySession: async (_chatId: string) => { calls.push("destroySession"); },
       sendSessionMessage: () => { calls.push("sendSessionMessage"); throw new Error("unexpected"); },
@@ -1734,6 +1735,21 @@ describe("command handler wiring", () => {
     await bot.handleUpdate(makeCommandUpdate("clean", 2, Math.floor(Date.now() / 1000) - 60 * 60));
     assert.ok(mockSM.calls.includes("destroySession"), "/clean should call destroySession");
     assert.ok(!mockSM.calls.includes("closeSession"), "/clean handler calls destroySession, not closeSession directly");
+  });
+
+  it("/effort routes plain-text status and setters to the current thread without model prompts or buttons", async () => {
+    const mockSM = createMockSessionManager();
+    const apiCalls: Array<{ method: string; payload: any }> = [];
+    const { bot } = initBot(mockSM, apiCalls);
+    await bot.handleUpdate(makeCommandUpdate("effort", 71));
+    const update = makeCommandUpdate("effort", 72);
+    update.message.text = "/effort high";
+    Object.assign(update.message, { message_thread_id: 9 });
+    await bot.handleUpdate(update);
+    assert.ok(mockSM.calls.includes("effort:111111111:main:status"));
+    assert.ok(mockSM.calls.includes("effort:111111111:9:main:high"));
+    assert.ok(!mockSM.calls.includes("sendSessionMessage"));
+    for (const reply of apiCalls.filter(call => call.method === "sendMessage")) assert.equal(reply.payload.reply_markup, undefined);
   });
 
   it("/status replies from local health/cache without opening a session", async () => {

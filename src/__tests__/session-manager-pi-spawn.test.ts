@@ -16,7 +16,7 @@ import { ensureSessionMediaDir, sessionMediaDir, allocateMediaPath, releaseMedia
 // Real protocol helpers the spawn-path capture needs (parse get_state replies).
 // Resolved here BEFORE mock.module installs the stub, so these are the genuine
 // implementations; the stub below re-exports them so capture parses correctly.
-import { MINIME_BOT_PI_SESSION_AGENT_ID_ENV, NewlineOnlyJsonlSplitter, PiStartupBlockingUiError, assertPiSessionIdentityMatchesBinding, normalizePiModel, parsePiStartupIdentityRecord, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions } from "../pi-rpc-protocol.js";
+import { MINIME_BOT_PI_SESSION_AGENT_ID_ENV, NewlineOnlyJsonlSplitter, handlePiExtensionUiRecord, PiStartupBlockingUiError, assertPiSessionIdentityMatchesBinding, normalizePiModel, parsePiStartupIdentityRecord, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions } from "../pi-rpc-protocol.js";
 import PQueue from "p-queue";
 import { CURRENT_SESSION_VERSION } from "@earendil-works/pi-coding-agent";
 
@@ -429,6 +429,7 @@ mock.module("../pi-rpc-protocol.js", {
     sendPiAcknowledgedSteer() {},
     PI_EXTENSIONS_DISABLED_ENV: "PI_EXTENSIONS_DISABLED",
     normalizePiModel,
+    handlePiExtensionUiRecord,
     async *readPiStream(): AsyncGenerator<StreamLine> {
       // Message-path reader (unused by the spawn-path capture, which now reads
       // child.stdout directly). Present so session-manager's import resolves.
@@ -564,6 +565,44 @@ describe("SessionManager exact Pi binding startup", () => {
       assert.ok(existsSync(reserved));
       await manager.getOrCreateSession("218", "pi");
       assert.ok(existsSync(reserved));
+    } finally { await manager.closeAll(); }
+  });
+
+  it("keeps effort separate from runtime signatures across reconnect, idle, restart, clean and rebinding", async () => {
+    const config = makeConfig();
+    let manager = new SessionManager(() => config, TEST_STORE_PATH, TEST_DIR);
+    try {
+      const session = await manager.getOrCreateSession("456:1", "pi");
+      session.effortOverride = "high";
+      session.thinking = "high";
+      assert.equal(await manager.getOrCreateSession("456:1", "pi"), session, "override does not trigger config respawn");
+      await manager.closeSession("456:1");
+      const resumed = await manager.getOrCreateSession("456:1", "pi");
+      assert.equal(resumed.sessionId, session.sessionId);
+      assert.equal(resumed.effortOverride, "high");
+      assert.equal(piSpawnCaptures.at(-1)?.agent.thinking, "high");
+      assert.deepEqual(piSpawnCaptures.at(-1)?.runtimeEnvOptions?.sessionEffort, { inherited: "xhigh", override: "high" });
+      resumed.idleTimeoutMs = 1;
+      manager.resetIdleTimer("456:1");
+      await new Promise(resolve => setTimeout(resolve, 20));
+      assert.equal(manager.getActive("456:1"), undefined);
+      await manager.closeAll();
+      manager = new SessionManager(() => config, TEST_STORE_PATH, TEST_DIR);
+      const restarted = await manager.getOrCreateSession("456:1", "pi");
+      assert.equal(restarted.effortOverride, "high");
+      assert.equal(restarted.sessionId, session.sessionId);
+      await manager.destroySession("456:1");
+      const cleaned = await manager.getOrCreateSession("456:1", "pi");
+      assert.equal(cleaned.effortOverride, undefined);
+      assert.equal(cleaned.thinking, "xhigh");
+      assert.notEqual(cleaned.sessionId, session.sessionId);
+      cleaned.effortOverride = "low";
+      cleaned.thinking = "low";
+      await manager.closeSession("456:1");
+      config.bindings[1].agentId = "main";
+      const rebound = await manager.getOrCreateSession("456:1", "main");
+      assert.equal(rebound.effortOverride, undefined);
+      assert.equal(rebound.thinking, undefined);
     } finally { await manager.closeAll(); }
   });
 

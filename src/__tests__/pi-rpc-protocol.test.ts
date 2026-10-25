@@ -768,7 +768,7 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
     assert.ok(noContextIdx < firstExtension, "context args must precede --extension args");
     assert.ok(firstExtension < session, "--extension args must precede --session");
     assert.strictEqual(args[session + 1], TEST_SESSION_BINDING.sessionFile);
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 7);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 8);
   });
 
   it("delivers file guidance without suppressing native AGENTS.md loading", () => {
@@ -871,6 +871,7 @@ describe("Pi extension loading (--extension)", () => {
   it("resolves a repeatable --extension arg (abs path) for each wrapper, in load order", () => {
     assert.deepStrictEqual(resolvePiExtensionArgs(presentAll), [
       "--extension", wrapperAbs("acknowledged-steer.ts"),
+      "--extension", wrapperAbs("session-effort.ts"),
       "--extension", wrapperAbs("compaction-continuation.ts"),
       "--extension", wrapperAbs("codex-transport-overflow.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
@@ -883,11 +884,11 @@ describe("Pi extension loading (--extension)", () => {
   it("defaults the wrapper list to acknowledged steering and the existing first-party tools", () => {
     assert.deepStrictEqual(
       [...PI_EXTENSION_WRAPPER_RELPATHS],
-      ["acknowledged-steer.ts", "compaction-continuation.ts", "codex-transport-overflow.ts", "web-tools.ts", "knowledge-tools.ts", "subagent/index.ts", "ask-agent/index.ts"],
+      ["acknowledged-steer.ts", "session-effort.ts", "compaction-continuation.ts", "codex-transport-overflow.ts", "web-tools.ts", "knowledge-tools.ts", "subagent/index.ts", "ask-agent/index.ts"],
     );
     assert.deepStrictEqual(
       [...PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS],
-      ["acknowledged-steer.js", "compaction-continuation.js", "codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js", "subagent/index.js", "ask-agent/index.js"],
+      ["acknowledged-steer.js", "session-effort.js", "compaction-continuation.js", "codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js", "subagent/index.js", "ask-agent/index.js"],
     );
   });
 
@@ -904,6 +905,7 @@ describe("Pi extension loading (--extension)", () => {
 
     assert.deepStrictEqual(parentArgs, [
       "--extension", wrapperAbs("acknowledged-steer.ts"),
+      "--extension", wrapperAbs("session-effort.ts"),
       "--extension", wrapperAbs("compaction-continuation.ts"),
       "--extension", wrapperAbs("codex-transport-overflow.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
@@ -941,10 +943,12 @@ describe("Pi extension loading (--extension)", () => {
     const sourceRelpaths: readonly string[] = PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS;
     const artifactRelpaths: readonly string[] = PI_ASK_AGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS;
     assert.ok(!sourceRelpaths.includes("acknowledged-steer.ts"));
+    assert.ok(!sourceRelpaths.includes("session-effort.ts"));
     assert.ok(!sourceRelpaths.includes("compaction-continuation.ts"));
     assert.ok(!sourceRelpaths.includes("subagent/index.ts"));
     assert.ok(!sourceRelpaths.includes("ask-agent/index.ts"));
     assert.ok(!artifactRelpaths.includes("acknowledged-steer.js"));
+    assert.ok(!artifactRelpaths.includes("session-effort.js"));
     assert.ok(!artifactRelpaths.includes("compaction-continuation.js"));
     assert.ok(!artifactRelpaths.includes("subagent/index.js"));
     assert.ok(!artifactRelpaths.includes("ask-agent/index.js"));
@@ -1171,6 +1175,7 @@ describe("Pi extension loading (--extension)", () => {
 
     assert.deepStrictEqual(args, [
       "--extension", resolve(artifactDir, "acknowledged-steer.js"),
+      "--extension", resolve(artifactDir, "session-effort.js"),
       "--extension", resolve(artifactDir, "compaction-continuation.js"),
       "--extension", resolve(artifactDir, "codex-transport-overflow.js"),
       "--extension", resolve(artifactDir, "web-tools.js"),
@@ -1190,6 +1195,7 @@ describe("Pi extension loading (--extension)", () => {
 
     assert.deepStrictEqual(args.slice(args.indexOf("--extension")), [
       "--extension", wrapperAbs("acknowledged-steer.ts"),
+      "--extension", wrapperAbs("session-effort.ts"),
       "--extension", wrapperAbs("compaction-continuation.ts"),
       "--extension", wrapperAbs("codex-transport-overflow.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
@@ -1213,6 +1219,7 @@ describe("Pi extension loading (--extension)", () => {
 
     assert.deepStrictEqual(args.slice(args.indexOf("--extension")), [
       "--extension", resolve(artifactDir, "acknowledged-steer.js"),
+      "--extension", resolve(artifactDir, "session-effort.js"),
       "--extension", resolve(artifactDir, "compaction-continuation.js"),
       "--extension", resolve(artifactDir, "codex-transport-overflow.js"),
       "--extension", resolve(artifactDir, "web-tools.js"),
@@ -1251,7 +1258,7 @@ describe("Pi extension loading (--extension)", () => {
     const args = buildPiSpawnArgs(testAgent, undefined, presentAll);
 
     assert.ok(args.includes("--no-extensions"), "ambient Pi extension discovery is always suppressed");
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 7);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 8);
     assert.ok(args.includes(wrapperAbs("acknowledged-steer.ts")));
     assert.ok(args.includes(wrapperAbs("compaction-continuation.ts")));
     assert.ok(args.includes(wrapperAbs("codex-transport-overflow.ts")));
@@ -1269,6 +1276,7 @@ describe("Pi extension loading (--extension)", () => {
 
     assert.deepStrictEqual(args.slice(args.indexOf("--extension")), [
       "--extension", wrapperAbs("acknowledged-steer.ts"),
+      "--extension", wrapperAbs("session-effort.ts"),
       "--extension", wrapperAbs("compaction-continuation.ts"),
       "--extension", wrapperAbs("codex-transport-overflow.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
@@ -1286,7 +1294,7 @@ describe("Pi extension loading (--extension)", () => {
       extraExtensions: [extraA, extraB],
     });
 
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 9);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 10);
     assert.deepStrictEqual(args.slice(-4), [
       "--extension", extraA,
       "--extension", extraB,
@@ -1305,6 +1313,7 @@ describe("Pi extension loading (--extension)", () => {
 
     assert.deepStrictEqual(args.slice(args.indexOf("--extension")), [
       "--extension", resolve(artifactDir, "acknowledged-steer.js"),
+      "--extension", resolve(artifactDir, "session-effort.js"),
       "--extension", resolve(artifactDir, "compaction-continuation.js"),
       "--extension", resolve(artifactDir, "codex-transport-overflow.js"),
       "--extension", resolve(artifactDir, "web-tools.js"),
@@ -1435,10 +1444,10 @@ describe("Pi extension loading (--extension)", () => {
     const args = resolvePiExtensionArgs({ env: {} });
 
     const flags = args.filter((a) => a === "--extension");
-    assert.strictEqual(flags.length, 7, "expected one --extension per wrapper");
+    assert.strictEqual(flags.length, 8, "expected one --extension per wrapper");
 
     const paths = args.filter((a) => a !== "--extension");
-    assert.strictEqual(paths.length, 7);
+    assert.strictEqual(paths.length, 8);
     for (const p of paths) {
       assert.ok(p.startsWith("/"), `wrapper path must be absolute: ${p}`);
       assert.ok(existsSync(p), `resolved wrapper must exist on disk: ${p}`);

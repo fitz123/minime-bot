@@ -643,6 +643,18 @@ environment.
 
 ### Runtime Session Controls
 
+Telegram effort is independent for each current thread. Send `/effort` for the
+actual value and the current model's supported levels, or `/effort high` to set
+an override. `/effort default` removes it and restores the agent's configured
+thinking level, falling back to Pi's native per-model/global default. An explicit
+natural-language request can also use the current-session `set_session_effort`
+tool. Changes apply to the next model request, including the next request in a
+running tool loop; an in-flight request keeps its effort. Overrides survive
+reconnect, idle closure, and bot restart. Cleaning or rebinding the session drops
+the override. These controls do not change the model or global defaults and are
+not available to cron or delegated child sessions. `/effort` uses plain text and
+is not registered in Telegram's command menu.
+
 `/clean` clears queued work, deletes the stored session state for that chat, and
 supersedes any in-flight startup for the same chat. The next accepted message for
 that chat starts a fresh Pi session instead of resuming the previous one.

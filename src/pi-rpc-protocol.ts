@@ -1,3 +1,4 @@
+import { SESSION_EFFORT_ENV } from "./pi-extensions/session-effort.js";
 import { readVisionImages } from "./vision-input.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -57,6 +58,7 @@ export const DEFAULT_PI_MODEL = "openai-codex/gpt-5.5";
  * Wrapper entrypoints loaded into every primary interactive Pi spawn, in load
  * order:
  *   acknowledged-steer (atomic active-lifecycle steering gate),
+ *   session-effort (Telegram current-session reasoning control),
  *   compaction-continuation (hidden continuation after a reasoning-only length stop),
  *   codex-transport-overflow (Codex request-byte overflow normalization),
  *   web-tools (subscription-backed Codex web_search),
@@ -68,6 +70,7 @@ export const DEFAULT_PI_MODEL = "openai-codex/gpt-5.5";
  */
 export const PI_EXTENSION_WRAPPER_RELPATHS = [
   "acknowledged-steer.ts",
+  "session-effort.ts",
   "compaction-continuation.ts",
   "codex-transport-overflow.ts",
   "web-tools.ts",
@@ -78,6 +81,7 @@ export const PI_EXTENSION_WRAPPER_RELPATHS = [
 
 export const PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS = [
   "acknowledged-steer.js",
+  "session-effort.js",
   "compaction-continuation.js",
   "codex-transport-overflow.js",
   "web-tools.js",
@@ -106,6 +110,7 @@ export const PI_SUBAGENT_CHILD_WRAPPER_RELPATHS = [
  */
 const PI_ASK_AGENT_CHILD_EXCLUDED_WRAPPER_RELPATHS = new Set<string>([
   "acknowledged-steer.ts",
+  "session-effort.ts",
   "compaction-continuation.ts",
   "subagent/index.ts",
   "ask-agent/index.ts",
@@ -127,6 +132,7 @@ export const PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS = [
 ] as const;
 const PI_ASK_AGENT_CHILD_EXCLUDED_ARTIFACT_WRAPPER_RELPATHS = new Set<string>([
   "acknowledged-steer.js",
+  "session-effort.js",
   "compaction-continuation.js",
   "subagent/index.js",
   "ask-agent/index.js",
@@ -178,6 +184,8 @@ export interface PiSpawnRuntimeEnvOptions {
   /** Deterministic per-chat outbox path supplied for an interactive session. */
   outboxPath?: string;
   telegramRichAnswers?: boolean;
+  /** Enables current-session effort tools only for Telegram-owned lanes. */
+  sessionEffort?: { inherited?: AgentConfig["thinking"]; override?: AgentConfig["thinking"] };
   /** Create a process group rooted at the Pi child so fence loss can kill its tool descendants. */
   startNewProcessGroup?: boolean;
 }
@@ -768,6 +776,7 @@ function buildAllowedPiChildEnv(
   copyExplicitControlPathEnv(env, contract, MINIME_CONFIG_PATH_ENV, "configPath");
   copyExplicitControlPathEnv(env, contract, MINIME_CRONS_PATH_ENV, "cronsPath");
   env[MINIME_BOT_PI_SESSION_ENV] = "1";
+  if (runtimeEnvOptions?.sessionEffort) env[SESSION_EFFORT_ENV] = JSON.stringify(runtimeEnvOptions.sessionEffort);
   if (runtimeEnvOptions?.collaborationSession && runtimeEnvOptions.collaborationSocket) {
     env.MINIME_COLLABORATION_SOCKET = runtimeEnvOptions.collaborationSocket;
     env.MINIME_COLLABORATION_SESSION = runtimeEnvOptions.collaborationSession;

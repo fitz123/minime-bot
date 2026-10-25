@@ -12,6 +12,7 @@ const artifactExtensionDir = join(packageRoot, "dist", "extensions", "pi");
 const wrappers = [
   ["collaboration.ts", "collaboration.js"],
   ["acknowledged-steer.ts", "acknowledged-steer.js"],
+  ["session-effort.ts", "session-effort.js"],
   ["compaction-continuation.ts", "compaction-continuation.js"],
   ["codex-usage.ts", "codex-usage.js"],
   ["codex-transport-overflow.ts", "codex-transport-overflow.js"],

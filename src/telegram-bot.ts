@@ -901,6 +901,20 @@ export function createTelegramBot(
     await ctx.reply("Session cleaned. Fresh start.");
   });
 
+  // Text-only effort control deliberately stays out of setMyCommands.
+  bot.command("effort", async ctx => {
+    const topicId = ctx.message?.message_thread_id;
+    if (ctx.message) setThread(ctx.chat.id, ctx.message.message_id, topicId);
+    const binding = resolveBinding(ctx.chat.id, config.bindings, topicId);
+    if (!binding) return;
+    const value = ctx.match.trim() || undefined;
+    try {
+      await ctx.reply(await sessionManager.sessionEffort(sessionKey(ctx.chat.id, topicId), binding.agentId, value));
+    } catch (error) {
+      await ctx.reply(`Effort change not confirmed: ${(error as Error).message}`);
+    }
+  });
+
   // /status command — compact local-only session and quota health.
   bot.command("status", async (ctx) => {
     const topicId = ctx.message?.message_thread_id;

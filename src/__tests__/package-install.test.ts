@@ -334,6 +334,7 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/pi-extensions/ask-agent-args.js",
     "dist/pi-extensions/pi-invocation.js",
     "dist/pi-extensions/acknowledged-steer.js",
+    "dist/pi-extensions/session-effort.js",
     "dist/pi-extensions/compaction-continuation.js",
     "dist/pi-extensions/knowledge-tools.js",
     "dist/knowledge/sync.d.ts",
@@ -341,6 +342,7 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/pi-extensions/codex-transport-overflow.js",
     "dist/extensions/pi/codex-usage.js",
     "dist/extensions/pi/acknowledged-steer.js",
+    "dist/extensions/pi/session-effort.js",
     "dist/extensions/pi/compaction-continuation.js",
     "dist/extensions/pi/codex-transport-overflow.js",
     "dist/extensions/pi/knowledge-tools.js",
@@ -1264,6 +1266,7 @@ assert.deepEqual(
   extensionPaths.map((path) => relative(artifactDir, path)),
   [
     "acknowledged-steer.js",
+    "session-effort.js",
     "compaction-continuation.js",
     "codex-transport-overflow.js",
     "web-tools.js",
