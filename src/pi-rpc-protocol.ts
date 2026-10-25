@@ -185,7 +185,7 @@ export interface PiSpawnRuntimeEnvOptions {
   outboxPath?: string;
   telegramRichAnswers?: boolean;
   /** Enables current-session effort tools only for Telegram-owned lanes. */
-  sessionEffort?: { inherited?: AgentConfig["thinking"]; override?: AgentConfig["thinking"] };
+  sessionEffort?: { model?: string; inherited?: AgentConfig["thinking"]; override?: AgentConfig["thinking"] };
   /** Create a process group rooted at the Pi child so fence loss can kill its tool descendants. */
   startNewProcessGroup?: boolean;
 }
@@ -1909,13 +1909,19 @@ export async function* readPiStream(
     throw new Error("Pi RPC child process stdout is not available");
   }
 
-  const splitter = new NewlineOnlyJsonlSplitter();
+  // Keep unread bytes intact so the next stdout owner can decode even a UTF-8
+  // character split across the terminal handoff.
+  let pending: Buffer = Buffer.alloc(0);
   const parseState: PiRpcParseState = { expectedPromptId };
 
   for (;;) {
     let chunk: Buffer | string | null;
     while ((chunk = stdout.read()) !== null) {
-      for (const record of splitter.push(chunk)) {
+      pending = Buffer.concat([pending, typeof chunk === "string" ? Buffer.from(chunk) : chunk]);
+      let newline: number;
+      while ((newline = pending.indexOf(10)) !== -1) {
+        const record = stripTrailingCarriageReturn(pending.subarray(0, newline).toString("utf8"));
+        pending = pending.subarray(newline + 1);
         const line = handlePiStreamRecord(
           child,
           record,
@@ -1924,6 +1930,12 @@ export async function* readPiStream(
           onAcknowledgedSteerResult,
         );
         if (line) {
+          // Return unread bytes before yielding: consumers may stop here, and
+          // keeping them in stdout also prevents EOF during a paused yield.
+          if (pending.length > 0) {
+            stdout.unshift(pending);
+            pending = Buffer.alloc(0);
+          }
           yield line;
           if (line.type === "result") {
             return;
@@ -1932,7 +1944,7 @@ export async function* readPiStream(
       }
     }
 
-    const handledResult = splitter.hasPendingRecord()
+    const handledResult = pending.length > 0
       ? null
       : consumeHandledPromptOutcome(parseState);
     if (handledResult) {
@@ -1946,7 +1958,9 @@ export async function* readPiStream(
     }
   }
 
-  for (const record of splitter.end()) {
+  if (pending.length > 0) {
+    const record = stripTrailingCarriageReturn(pending.toString("utf8"));
+    pending = Buffer.alloc(0);
     const line = handlePiStreamRecord(
       child,
       record,

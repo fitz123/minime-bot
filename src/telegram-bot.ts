@@ -908,11 +908,17 @@ export function createTelegramBot(
     const binding = resolveBinding(ctx.chat.id, config.bindings, topicId);
     if (!binding) return;
     const value = ctx.match.trim() || undefined;
-    try {
-      await ctx.reply(await sessionManager.sessionEffort(sessionKey(ctx.chat.id, topicId), binding.agentId, value));
-    } catch (error) {
-      await ctx.reply(`Effort change not confirmed: ${(error as Error).message}`);
-    }
+    // Startup and the session queue can be slow; release sequential polling
+    // while retaining this update's topic context for the eventual reply.
+    void (async () => {
+      let response: string;
+      try {
+        response = await sessionManager.sessionEffort(sessionKey(ctx.chat.id, topicId), binding.agentId, value);
+      } catch (error) {
+        response = `Effort change not confirmed: ${(error as Error).message}`;
+      }
+      await ctx.reply(response, topicId === undefined ? {} : { message_thread_id: topicId });
+    })().catch(error => log.warn("telegram-bot", `Effort reply failed: ${(error as Error).message}`));
   });
 
   // /status command — compact local-only session and quota health.

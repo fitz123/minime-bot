@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { Type, getSupportedThinkingLevels } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { resolveCliModel, type ModelRuntime, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { PiThinkingLevel } from "../../src/types.js";
 import { SESSION_EFFORT_ENV, SESSION_EFFORT_COMMAND, SESSION_EFFORT_ACK_COMMAND, effortNotice } from "../../src/pi-extensions/session-effort.js";
 
@@ -9,21 +9,30 @@ export default function sessionEffort(pi: ExtensionAPI): void {
   // cron wrapper lists omit this extension as well.
   const initial = process.env[SESSION_EFFORT_ENV];
   if (!initial) return;
-  const startup = JSON.parse(initial) as { inherited?: PiThinkingLevel; override?: PiThinkingLevel };
+  const startup = JSON.parse(initial) as { model?: string; inherited?: PiThinkingLevel; override?: PiThinkingLevel };
   const pending = new Map<string, (result: { text: string; ok: boolean }) => void>();
-  const inherited = (ctx: ExtensionContext, configured?: PiThinkingLevel): PiThinkingLevel => {
+  const inherited = (ctx: ExtensionContext, configured?: PiThinkingLevel, model?: string): PiThinkingLevel => {
+    if (configured !== undefined) return configured;
+    // The pinned native CLI resolver uses these two runtime methods. Adapt the
+    // extension's registry facade so exact colon-containing IDs keep priority
+    // over suffix syntax, without creating another model runtime.
+    const runtime: Pick<ModelRuntime, "getModels" | "hasConfiguredAuth"> = {
+      getModels: () => ctx.modelRegistry.getAll(),
+      hasConfiguredAuth: provider => ctx.modelRegistry.getAll().some(candidate => candidate.provider === provider && ctx.modelRegistry.hasConfiguredAuth(candidate)),
+    };
+    const modelLevel = model ? resolveCliModel({ cliModel: model, modelRuntime: runtime as ModelRuntime }).thinkingLevel : undefined;
     const settings = pi.getSettings();
     // Same fallback as the pinned native SDK; tested against a fresh SDK session.
-    return configured ?? (ctx.model && settings.modelThinkingLevels?.[`${ctx.model.provider}/${ctx.model.id}`])
+    return modelLevel ?? (ctx.model && settings.modelThinkingLevels?.[`${ctx.model.provider}/${ctx.model.id}`])
       ?? settings.defaultThinkingLevel ?? "medium";
   };
   pi.on("session_start", (_event, ctx) => {
-    pi.setThinkingLevel(startup.override ?? inherited(ctx, startup.inherited));
+    pi.setThinkingLevel(startup.override ?? inherited(ctx, startup.inherited, startup.model));
   });
   pi.registerCommand(SESSION_EFFORT_COMMAND, {
     description: "Control effort for the current Telegram session",
     handler: async (args, ctx) => {
-      const request = JSON.parse(Buffer.from(args, "base64url").toString()) as { id: string; value?: string; inherited?: PiThinkingLevel };
+      const request = JSON.parse(Buffer.from(args, "base64url").toString()) as { id: string; value?: string; inherited?: PiThinkingLevel; model?: string };
       if (!request.id) return;
       const levels = ctx.model ? getSupportedThinkingLevels(ctx.model) : [];
       const previous = pi.getThinkingLevel();
@@ -34,7 +43,7 @@ export default function sessionEffort(pi: ExtensionAPI): void {
         } else if (!ctx.model) {
           error = "No current model is available.";
         } else {
-          pi.setThinkingLevel(request.value === "default" ? inherited(ctx, request.inherited) : request.value as PiThinkingLevel);
+          pi.setThinkingLevel(request.value === "default" ? inherited(ctx, request.inherited, request.model) : request.value as PiThinkingLevel);
           if (request.value !== "default" && pi.getThinkingLevel() !== request.value) error = "Pi did not apply the requested effort.";
         }
       }

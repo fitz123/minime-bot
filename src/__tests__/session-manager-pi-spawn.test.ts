@@ -568,6 +568,25 @@ describe("SessionManager exact Pi binding startup", () => {
     } finally { await manager.closeAll(); }
   });
 
+  it("forwards native model suffix configuration unchanged at startup and resume", async () => {
+    const config = makeConfig();
+    config.agents.pi.model = "gpt-5.5:high";
+    delete config.agents.pi.thinking;
+    const manager = new SessionManager(() => config, TEST_STORE_PATH, TEST_DIR);
+    try {
+      const first = await manager.getOrCreateSession("456:1", "pi");
+      await manager.closeSession("456:1");
+      const resumed = await manager.getOrCreateSession("456:1", "pi");
+      assert.equal(resumed.sessionId, first.sessionId);
+      assert.equal(piSpawnCaptures.length, 2);
+      for (const capture of piSpawnCaptures) {
+        assert.equal(capture.agent.model, "gpt-5.5:high");
+        assert.equal(capture.agent.thinking, undefined);
+        assert.deepEqual(capture.runtimeEnvOptions?.sessionEffort, { model: "openai-codex/gpt-5.5:high", inherited: undefined, override: undefined });
+      }
+    } finally { await manager.closeAll(); }
+  });
+
   it("keeps effort separate from runtime signatures across reconnect, idle, restart, clean and rebinding", async () => {
     const config = makeConfig();
     let manager = new SessionManager(() => config, TEST_STORE_PATH, TEST_DIR);
@@ -581,7 +600,7 @@ describe("SessionManager exact Pi binding startup", () => {
       assert.equal(resumed.sessionId, session.sessionId);
       assert.equal(resumed.effortOverride, "high");
       assert.equal(piSpawnCaptures.at(-1)?.agent.thinking, "high");
-      assert.deepEqual(piSpawnCaptures.at(-1)?.runtimeEnvOptions?.sessionEffort, { inherited: "xhigh", override: "high" });
+      assert.deepEqual(piSpawnCaptures.at(-1)?.runtimeEnvOptions?.sessionEffort, { model: normalizePiModel(config.agents.pi.model), inherited: "xhigh", override: "high" });
       resumed.idleTimeoutMs = 1;
       manager.resetIdleTimer("456:1");
       await new Promise(resolve => setTimeout(resolve, 20));

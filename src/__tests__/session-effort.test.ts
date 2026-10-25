@@ -37,7 +37,7 @@ async function fixture(t: { after: (fn: () => unknown) => void }, thinking?: PiT
     let held: string | undefined;
     const stdout = new Readable({ read() {} });
     const emit = (event: unknown) => stdout.push(JSON.stringify(event) + "\n");
-    const context = { model, ui: { notify(message: string) { if (!suppressed) emit({ type: "extension_ui_request", id: "fixture-notice", method: "notify", notifyType: "info", message }); else held = message; } } } as ExtensionContext;
+    const context = { model, modelRegistry: { getAll: () => [model], hasConfiguredAuth: () => true }, ui: { notify(message: string) { if (!suppressed) emit({ type: "extension_ui_request", id: "fixture-notice", method: "notify", notifyType: "info", message }); else held = message; } } } as unknown as ExtensionContext;
     const pi = {
       getSettings: () => ({ defaultThinkingLevel: "low" }),
       getThinkingLevel: () => effective,
@@ -73,7 +73,15 @@ async function fixture(t: { after: (fn: () => unknown) => void }, thinking?: PiT
     };
     (manager as unknown as { active: Map<string, ActiveSession> }).active.set(key, session);
     store.setSession(key, { bindingState: "bound", sessionId: session.sessionId, sessionFile: session.sessionFile!, workspaceRealpath: root, chatId: key, agentId: "main", lastActivity: Date.now(), thinking });
-    return { session, stdout, writes, emit, tool, context, get effective() { return effective; }, suppress() { suppressed = true; }, release() { suppressed = false; if (held) context.ui.notify(held, "info"); }, settle() { emit({ type: "agent_end", messages: [] }); emit({ type: "agent_settled" }); } };
+    return { session, stdout, writes, emit, tool, context, get effective() { return effective; }, suppress() { suppressed = true; }, release() { suppressed = false; if (held) context.ui.notify(held, "info"); }, settle() { emit({ type: "agent_end", messages: [] }); emit({ type: "agent_settled" }); },
+      settleWithReply(split: boolean) {
+        assert.ok(held, "effort result is ready before settlement");
+        const reply = Buffer.from(JSON.stringify({ type: "extension_ui_request", id: "notice-🧠", method: "notify", notifyType: "info", message: held }) + "\n");
+        const boundary = split ? reply.indexOf(Buffer.from("🧠")) + 1 : reply.length;
+        stdout.push(Buffer.concat([Buffer.from('{"type":"agent_end","messages":[]}\n{"type":"agent_settled"}\n'), reply.subarray(0, boundary)]));
+        return () => { if (split) stdout.push(reply.subarray(boundary)); };
+      },
+    };
   }
   return { manager, store, root, config, lane };
 }
@@ -124,6 +132,18 @@ it("validates the current model rather than accepting a syntactically valid leve
   assert.equal(store.getSession("123:1")?.effortOverride, undefined);
 });
 
+it("passes configured model syntax and explicit thinking through default reset without reopening Pi", async t => {
+  const { manager, store, lane, config } = await fixture(t);
+  config.agents.main.model = "effort-fixture/fixture:high";
+  const current = lane("123:1");
+  assert.match(await manager.sessionEffort("123:1", "main", "default"), /Effort: high \(inherited default\)/);
+  assert.equal(store.getSession("123:1")?.effortOverride, undefined);
+  config.agents.main.thinking = "low";
+  assert.match(await manager.sessionEffort("123:1", "main", "default"), /Effort: low/);
+  assert.equal(manager.getActive("123:1"), current.session);
+  assert.equal(current.context.model?.id, "fixture");
+});
+
 it("changes a busy turn using its reader and persists an explicit tool request before acknowledgement", async t => {
   const { manager, store, lane } = await fixture(t, "low");
   const current = lane("123:1");
@@ -162,6 +182,40 @@ it("hands a late busy-control reply to an idle owner after settlement", async t 
   current.release();
   assert.match(await change, /Effort: high/);
 });
+
+for (const split of [false, true]) {
+  it(`preserves ${split ? "partial UTF-8 bytes" : "a coalesced effort result"} at settlement with one reader`, async t => {
+    const { manager, store, lane } = await fixture(t);
+    const current = lane("123:1");
+    const lines: string[] = [];
+    const turn = (async () => { for await (const line of manager.sendSessionMessage("123:1", "main", "question")) lines.push(line.type); })();
+    await new Promise(resolve => setTimeout(resolve, 10));
+    current.suppress();
+    const change = manager.sessionEffort("123:1", "main", "high");
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(current.stdout.listenerCount("data"), 0, "turn owns stdout alone");
+    let notices = 0;
+    const observer = manager as unknown as { observeEffortEvent: (...args: any[]) => void };
+    const original = observer.observeEffortEvent.bind(manager);
+    observer.observeEffortEvent = (...args) => { if (args[2].id === "notice-🧠") notices++; original(...args); };
+    current.stdout.on("newListener", event => {
+      if (event === "data") {
+        assert.equal(current.session.processingStartedAt, null, "fallback waits for turn reader release");
+        assert.equal(current.stdout.listenerCount("data"), 0, "only one fallback reader");
+      }
+    });
+    const finishReply = current.settleWithReply(split);
+    await turn;
+    finishReply();
+    assert.match(await change, /Effort: high/);
+    assert.equal(store.getSession("123:1")?.effortOverride, "high");
+    assert.equal(notices, 1, "notice is decoded intact exactly once");
+    assert.equal(lines.filter(type => type === "result").length, 1);
+    assert.equal(current.stdout.listenerCount("data"), 0, "fallback releases stdout");
+    current.release();
+    assert.match(await manager.sessionEffort("123:1", "main"), /Effort: high/);
+  });
+}
 
 it("does not confirm a clean race, missing acknowledgement, or failed durable write", async t => {
   const { manager, store, lane } = await fixture(t);

@@ -1040,7 +1040,7 @@ export class SessionManager {
     for (;;) {
       try {
         const effectiveAgent = { ...agent, thinking: prepared.state.effortOverride ?? agent.thinking };
-        if (telegramRichAnswers) runtimeEnvOptions.sessionEffort = { inherited: agent.thinking, override: prepared.state.effortOverride };
+        if (telegramRichAnswers) runtimeEnvOptions.sessionEffort = { model: normalizePiModel(agent.model), inherited: agent.thinking, override: prepared.state.effortOverride };
         child = spawnPiRpcSession(effectiveAgent, prepared.binding, extensionOptions, collaborationEnabled
           ? { ...runtimeEnvOptions, collaborationSession: prepared.binding.sessionId, collaborationSocket: this.collaborationSocket }
           : runtimeEnvOptions);
@@ -1620,7 +1620,7 @@ export class SessionManager {
         const apply = async (ownsReader: boolean): Promise<string> => {
           if (this.active.get(chatId) !== session) throw new Error("Current session closed.");
           const agent = configuredAgent();
-          const result = await this.requestEffort(chatId, session, value, agent.thinking, ownsReader);
+          const result = await this.requestEffort(chatId, session, value, agent, ownsReader);
           if (this.active.get(chatId) !== session || (this.sessionGenerations.get(chatId) ?? 0) !== generation) throw new Error("Current session changed.");
           const supported = `Supported: ${result.levels.join(", ") || "none"}, default.`;
           if (result.error) throw new Error(`${result.error} Effective effort: ${result.effective}. ${supported}`);
@@ -1635,7 +1635,7 @@ export class SessionManager {
             } catch (error) {
               // A failed durable write must not leave an untracked live override.
               if (result.previous && this.active.get(chatId) === session) {
-                const restored = await this.requestEffort(chatId, session, result.previous, agent.thinking, ownsReader);
+                const restored = await this.requestEffort(chatId, session, result.previous, agent, ownsReader);
                 if (restored.error) throw new Error(`Effort was not saved and restoring the previous value failed. Effective effort: ${restored.effective}.`);
               }
               throw error;
@@ -1678,7 +1678,7 @@ export class SessionManager {
     }
   }
 
-  private async requestEffort(chatId: string, session: ActiveSession, value: string | undefined, inherited: AgentConfig["thinking"], ownsReader: boolean): Promise<EffortResult> {
+  private async requestEffort(chatId: string, session: ActiveSession, value: string | undefined, agent: AgentConfig, ownsReader: boolean): Promise<EffortResult> {
     const id = randomUUID();
     const stdout = session.child.stdout;
     if (!stdout) throw new Error("Pi stdout is unavailable.");
@@ -1703,7 +1703,7 @@ export class SessionManager {
         onExit = () => reject(new Error("Pi exited before confirming effort."));
         session.child.once("exit", onExit);
         if (ownsReader) startReading();
-        try { sendPiPrompt(session.child, effortInvocation(SESSION_EFFORT_COMMAND, { id, value, inherited }), "followUp"); }
+        try { sendPiPrompt(session.child, effortInvocation(SESSION_EFFORT_COMMAND, { id, value, inherited: agent.thinking, model: normalizePiModel(agent.model) }), "followUp"); }
         catch (error) { reject(error); }
       });
       if (!ownsReader) {

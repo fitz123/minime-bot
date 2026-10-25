@@ -4573,6 +4573,28 @@ describe("readPiStream", () => {
     assert.strictEqual((lines[1] as { is_error?: boolean }).is_error, true);
   });
 
+  it("preserves coalesced records exactly once across terminal handoff on a finite stream", async () => {
+    const child = childWithStdout([
+      JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "first" } }),
+      JSON.stringify({ type: "agent_end", messages: [] }),
+      JSON.stringify({ type: "agent_settled" }),
+      JSON.stringify({ type: "response", command: "get_state", success: true, data: { sessionId: "next-owner" } }),
+    ]);
+    const observed: string[] = [];
+    const first = readPiStream(child, event => observed.push(event.type!));
+    assert.equal((await first.next()).value?.type, "stream_event");
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal((await first.next()).value?.type, "result");
+    await first.return(undefined);
+    const second = readPiStream(child, event => observed.push(event.type!));
+    const next = await second.next();
+    assert.equal(next.value?.type, "system");
+    assert.equal((next.value as { session_id: string }).session_id, "next-owner");
+    await second.return(undefined);
+    assert.deepEqual(observed, ["message_update", "agent_end", "agent_settled", "response"]);
+    assert.equal(child.stdout!.destroyed, false);
+  });
+
   it("throws when stdout is unavailable", async () => {
     const child = new EventEmitter() as unknown as ChildProcess;
     await assert.rejects(readPiStream(child).next(), /stdout is not available/);

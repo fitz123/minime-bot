@@ -3,8 +3,9 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createAgentSession, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, ModelRuntime, resolveCliModel, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
+import type { PiThinkingLevel } from "../types.js";
 
 it("native Pi uses live effort for the next request in the same tool loop", { timeout: 20_000 }, async (t) => {
   const cwd = await mkdtemp(join(tmpdir(), "minime-effort-native-"));
@@ -123,3 +124,75 @@ it("installed Pi extension changes effort through its tool and waits for durable
     if (previous === undefined) delete process.env[SESSION_EFFORT_ENV]; else process.env[SESSION_EFFORT_ENV] = previous;
   }
 });
+
+for (const scenario of [
+  { name: "model suffix", id: "reasoner", pattern: "reasoner:high", expected: "high", perModel: "medium" },
+  { name: "explicit thinking over suffix", id: "reasoner", pattern: "reasoner:high", thinking: "low", expected: "low", perModel: "medium" },
+  { name: "per-model default", id: "reasoner", pattern: "reasoner", expected: "medium", perModel: "medium" },
+  { name: "global default", id: "reasoner", pattern: "reasoner", expected: "minimal" },
+  { name: "literal colon model ID", id: "reasoner:high", pattern: "reasoner:high", expected: "medium", perModel: "medium" },
+  { name: "literal non-effort colon model ID", id: "reasoner:extended", pattern: "reasoner:extended", expected: "minimal" },
+] as const) {
+  it(`inherits ${scenario.name} at startup, reset and resume without changing models`, { timeout: 20_000 }, async t => {
+    const { resolve } = await import("node:path");
+    const { SESSION_EFFORT_ENV, SESSION_EFFORT_COMMAND, effortInvocation } = await import("../pi-extensions/session-effort.js");
+    const cwd = await mkdtemp(join(tmpdir(), "minime-effort-inheritance-"));
+    t.after(() => rm(cwd, { recursive: true, force: true }));
+    const runtime = await ModelRuntime.create({ modelsPath: null, authPath: join(cwd, "auth.json") });
+    const faux = fauxProvider({ provider: "effort-inheritance-test", models: [{ id: scenario.id, reasoning: true }] });
+    runtime.registerNativeProvider(faux.provider);
+    const configured = { model: `effort-inheritance-test/${scenario.pattern}`, inherited: "thinking" in scenario ? scenario.thinking : undefined };
+    const resolved = resolveCliModel({ cliModel: configured.model, cliThinking: configured.inherited, modelRuntime: runtime });
+    assert.equal(resolved.error, undefined);
+    assert.equal(resolved.model?.id, scenario.id, "native CLI resolution keeps the intended model");
+    const perModel = "perModel" in scenario ? scenario.perModel : undefined;
+    const settings = SettingsManager.inMemory({
+      extensions: [resolve("extensions/pi/session-effort.ts")], defaultThinkingLevel: "minimal",
+      modelThinkingLevels: perModel ? { [`effort-inheritance-test/${scenario.id}`]: perModel } : {},
+      compaction: { enabled: false }, retry: { enabled: false },
+    });
+    const previous = process.env[SESSION_EFFORT_ENV];
+    process.env[SESSION_EFFORT_ENV] = JSON.stringify(configured);
+    const nativeStore = SessionManager.create(cwd, join(cwd, "sessions"));
+    const options = { cwd, agentDir: join(cwd, "agent"), modelRuntime: runtime, model: resolved.model!, settingsManager: settings, noTools: "all" as const };
+    let active: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+    try {
+      const created = await createAgentSession({ ...options, sessionManager: nativeStore, thinkingLevel: configured.inherited ?? resolved.thinkingLevel });
+      active = created.session;
+      assert.deepEqual(created.extensionsResult.errors, []);
+      await active.bindExtensions({});
+      assert.equal(active.thinkingLevel, scenario.expected);
+      const reset = async () => {
+        await active!.prompt(effortInvocation(SESSION_EFFORT_COMMAND, { id: "change", value: "high" }));
+        await active!.prompt(effortInvocation(SESSION_EFFORT_COMMAND, { id: "reset", value: "default", ...configured }));
+        assert.equal(active!.thinkingLevel, scenario.expected);
+        assert.equal(active!.model?.id, scenario.id);
+        assert.equal(active!.model?.provider, "effort-inheritance-test");
+        assert.equal(settings.getDefaultThinkingLevel(), "minimal");
+      };
+      await reset();
+      active.setThinkingLevel("low");
+      const file = nativeStore.getSessionFile()!;
+      active.dispose();
+      active = undefined;
+      // Resume native saved effort without an override: configured inheritance
+      // still wins over the last native thinking entry.
+      const resumed = await createAgentSession({ ...options, sessionManager: SessionManager.open(file) });
+      active = resumed.session;
+      await active.bindExtensions({});
+      assert.equal(active.thinkingLevel, scenario.expected);
+      await reset();
+      active.dispose();
+      active = undefined;
+      process.env[SESSION_EFFORT_ENV] = JSON.stringify({ ...configured, override: "high" satisfies PiThinkingLevel });
+      const overridden = await createAgentSession({ ...options, sessionManager: SessionManager.open(file) });
+      active = overridden.session;
+      await active.bindExtensions({});
+      assert.equal(active.thinkingLevel, "high", "thread override wins on resume");
+      await reset();
+    } finally {
+      active?.dispose();
+      if (previous === undefined) delete process.env[SESSION_EFFORT_ENV]; else process.env[SESSION_EFFORT_ENV] = previous;
+    }
+  });
+}
