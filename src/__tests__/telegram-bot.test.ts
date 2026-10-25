@@ -1460,6 +1460,7 @@ describe("command handler wiring", () => {
     const calls: string[] = [];
     return {
       calls,
+      sessionEffort: async (key: string, agent: string, value?: string) => { calls.push(`effort:${key}:${agent}:${value ?? "status"}`); return "Effort: high"; },
       closeSession: async (_chatId: string) => { calls.push("closeSession"); },
       destroySession: async (_chatId: string) => { calls.push("destroySession"); },
       sendSessionMessage: () => { calls.push("sendSessionMessage"); throw new Error("unexpected"); },
@@ -1735,6 +1736,69 @@ describe("command handler wiring", () => {
     assert.ok(mockSM.calls.includes("destroySession"), "/clean should call destroySession");
     assert.ok(!mockSM.calls.includes("closeSession"), "/clean handler calls destroySession, not closeSession directly");
   });
+
+  it("/effort routes plain-text status and setters to the current thread without model prompts or buttons", async () => {
+    const mockSM = createMockSessionManager();
+    const apiCalls: Array<{ method: string; payload: any }> = [];
+    const { bot } = initBot(mockSM, apiCalls);
+    await bot.handleUpdate(makeCommandUpdate("effort", 71));
+    const update = makeCommandUpdate("effort", 72);
+    update.message.text = "/effort high";
+    Object.assign(update.message, { message_thread_id: 9 });
+    await bot.handleUpdate(update);
+    assert.ok(mockSM.calls.includes("effort:111111111:main:status"));
+    assert.ok(mockSM.calls.includes("effort:111111111:9:main:high"));
+    assert.ok(!mockSM.calls.includes("sendSessionMessage"));
+    for (const reply of apiCalls.filter(call => call.method === "sendMessage")) assert.equal(reply.payload.reply_markup, undefined);
+  });
+
+  it("releases sequential updates while /effort is pending and retains its topic for delivery", async () => {
+    const mockSM = createMockSessionManager();
+    const pending = deferred<string>();
+    mockSM.sessionEffort = () => pending.promise;
+    const apiCalls: Array<{ method: string; payload: any }> = [];
+    const { bot, updateProcessing } = initBot(mockSM, apiCalls);
+    const update = makeCommandUpdate("effort", 73);
+    Object.assign(update.message, { message_thread_id: 9 });
+    let returned = false;
+    const handling = bot.handleUpdate(update).then(() => { returned = true; });
+    try {
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(returned, true, "handler returns before Pi startup/queue completes");
+      assert.equal(updateProcessing.snapshot().inFlight, false);
+      const unrelated = makeCommandUpdate("status", 74);
+      Object.assign(unrelated.message, { message_thread_id: 10 });
+      await bot.handleUpdate(unrelated);
+      assert.ok(mockSM.calls.includes("getSessionHealth:111111111:10"));
+      assert.equal(apiCalls.some(call => call.payload.text === "Effort: high"), false);
+      pending.resolve("Effort: high");
+      await new Promise(resolve => setImmediate(resolve));
+      const replies = apiCalls.filter(call => call.payload.text === "Effort: high");
+      assert.equal(replies.length, 1);
+      assert.equal(replies[0].payload.message_thread_id, 9);
+    } finally { pending.resolve("Effort: high"); await handling; }
+  });
+
+  for (const fails of [false, true]) {
+    it(`catches detached /effort ${fails ? "failure" : "success"} reply delivery errors`, async () => {
+      const mockSM = createMockSessionManager();
+      const pending = deferred<string>();
+      mockSM.sessionEffort = () => pending.promise;
+      const apiCalls: Array<{ method: string; payload: any }> = [];
+      const { bot } = initBot(mockSM, apiCalls, undefined, method => {
+        if (method === "sendMessage") throw new Error("simulated delivery failure");
+      });
+      const update = makeCommandUpdate("effort", 75);
+      Object.assign(update.message, { message_thread_id: 9 });
+      await bot.handleUpdate(update);
+      if (fails) pending.reject(new Error("simulated startup failure")); else pending.resolve("Effort: high");
+      await new Promise(resolve => setImmediate(resolve));
+      const replies = apiCalls.filter(call => call.method === "sendMessage");
+      assert.equal(replies.length, 1, "failed delivery does not trigger a second send");
+      assert.equal(replies[0].payload.message_thread_id, 9);
+      assert.match(replies[0].payload.text, fails ? /Effort change not confirmed: simulated startup failure/ : /Effort: high/);
+    });
+  }
 
   it("/status replies from local health/cache without opening a session", async () => {
     const mockSM = createMockSessionManager();
