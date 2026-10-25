@@ -172,7 +172,10 @@ it("changes a busy turn using its reader and persists an explicit tool request b
 it("hands a late busy-control reply to an idle owner after settlement", async t => {
   const { manager, lane } = await fixture(t);
   const current = lane("123:1");
-  const turn = (async () => { for await (const _line of manager.sendSessionMessage("123:1", "main", "question")) { /* drain */ } })();
+  let finishOutput!: () => void;
+  const outputDone = new Promise<void>(resolve => { finishOutput = resolve; });
+  t.after(() => finishOutput());
+  const turn = (async () => { for await (const _line of manager.sendSessionMessage("123:1", "main", "question", { outputDone })) { /* drain */ } })();
   await new Promise(resolve => setTimeout(resolve, 10));
   current.suppress();
   const change = manager.sessionEffort("123:1", "main", "high");
@@ -181,14 +184,23 @@ it("hands a late busy-control reply to an idle owner after settlement", async t 
   await turn;
   current.release();
   assert.match(await change, /Effort: high/);
+  assert.equal(current.session.processingStartedAt, null);
+  assert.equal(current.session.queue.pending, 1, "delivery still owns the prompt queue");
+  assert.match(await manager.sessionEffort("123:1", "main"), /Effort: high/, "status after reader release does not wait for delivery");
+  assert.match(await manager.sessionEffort("123:1", "main", "low"), /Effort: low/, "a later control does not wait for delivery");
+  finishOutput();
+  await current.session.queue.onIdle();
 });
 
 for (const split of [false, true]) {
   it(`preserves ${split ? "partial UTF-8 bytes" : "a coalesced effort result"} at settlement with one reader`, async t => {
     const { manager, store, lane } = await fixture(t);
     const current = lane("123:1");
+    let finishOutput!: () => void;
+    const outputDone = new Promise<void>(resolve => { finishOutput = resolve; });
+    t.after(() => finishOutput());
     const lines: string[] = [];
-    const turn = (async () => { for await (const line of manager.sendSessionMessage("123:1", "main", "question")) lines.push(line.type); })();
+    const turn = (async () => { for await (const line of manager.sendSessionMessage("123:1", "main", "question", { outputDone })) lines.push(line.type); })();
     await new Promise(resolve => setTimeout(resolve, 10));
     current.suppress();
     const change = manager.sessionEffort("123:1", "main", "high");
@@ -212,10 +224,74 @@ for (const split of [false, true]) {
     assert.equal(notices, 1, "notice is decoded intact exactly once");
     assert.equal(lines.filter(type => type === "result").length, 1);
     assert.equal(current.stdout.listenerCount("data"), 0, "fallback releases stdout");
+    assert.equal(current.session.queue.pending, 1, "delivery retains the prompt queue");
     current.release();
     assert.match(await manager.sessionEffort("123:1", "main"), /Effort: high/);
+    finishOutput();
+    await current.session.queue.onIdle();
   });
 }
+
+it("keeps the next prompt queued when delivery finishes before the control reply", async t => {
+  const { manager, lane } = await fixture(t);
+  const current = lane("123:1");
+  let finishOutput!: () => void;
+  const outputDone = new Promise<void>(resolve => { finishOutput = resolve; });
+  t.after(() => finishOutput());
+  const turn = (async () => { for await (const _line of manager.sendSessionMessage("123:1", "main", "question", { outputDone })) { /* drain */ } })();
+  await new Promise(resolve => setTimeout(resolve, 10));
+  current.suppress();
+  const change = manager.sessionEffort("123:1", "main", "high");
+  await new Promise(resolve => setTimeout(resolve, 10));
+  current.settle();
+  await turn;
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(current.stdout.listenerCount("data"), 1, "control exclusively owns stdout during delivery");
+  const next = (async () => { for await (const _line of manager.sendSessionMessage("123:1", "main", "next question")) { /* drain */ } })();
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(current.writes.some(command => command.message === "next question"), false, "delivery holds the next prompt");
+  finishOutput();
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(current.writes.some(command => command.message === "next question"), false, "control reader holds the next prompt after delivery");
+  current.release();
+  assert.match(await change, /Effort: high/);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(current.writes.some(command => command.message === "next question"), true);
+  assert.equal(current.stdout.listenerCount("data"), 0, "next turn owns stdout without a duplicate control reader");
+  current.settle();
+  await next;
+});
+
+it("retains control ownership through restoration when delivery finishes during a failed save", async t => {
+  const { manager, store, lane } = await fixture(t, "low");
+  const current = lane("123:1");
+  let finishOutput!: () => void;
+  const outputDone = new Promise<void>(resolve => { finishOutput = resolve; });
+  t.after(() => finishOutput());
+  const turn = (async () => { for await (const _line of manager.sendSessionMessage("123:1", "main", "question", { outputDone })) { /* drain */ } })();
+  await new Promise(resolve => setTimeout(resolve, 10));
+  current.settle();
+  await turn;
+  const next = (async () => { for await (const _line of manager.sendSessionMessage("123:1", "main", "next question")) { /* drain */ } })();
+  store.compareAndSetSession = () => {
+    finishOutput();
+    current.suppress();
+    throw new Error("simulated write failure");
+  };
+  const rejected = assert.rejects(manager.sessionEffort("123:1", "main", "high"), /simulated write failure/);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(current.writes.filter(command => String(command.message).startsWith("/minime-session-effort ")).length, 2, "restoration was sent");
+  assert.equal(current.stdout.listenerCount("data"), 1, "restoration has one reader after delivery finishes");
+  assert.equal(current.writes.some(command => command.message === "next question"), false);
+  current.release();
+  await rejected;
+  assert.equal(current.effective, "low");
+  assert.equal(store.getSession("123:1")?.effortOverride, undefined);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(current.writes.some(command => command.message === "next question"), true);
+  current.settle();
+  await next;
+});
 
 it("does not confirm a clean race, missing acknowledgement, or failed durable write", async t => {
   const { manager, store, lane } = await fixture(t);

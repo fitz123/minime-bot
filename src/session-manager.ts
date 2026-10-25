@@ -179,6 +179,10 @@ export interface ActiveSession {
   outboxPath: string;
   /** Correlated steer requests still owned by the bot pending Pi response. */
   pendingSteers: Map<string, PendingSteer>;
+  /** Resolves when the turn reader releases stdout; retained through delivery. */
+  turnReaderDone?: Promise<void>;
+  /** Keeps the prompt queue held through control confirmation and restoration. */
+  effortControlDone?: Promise<void>;
   internalTurn?: boolean;
   internalCleanup?: Promise<void>;
   outputIsolationFailed?: boolean;
@@ -1039,9 +1043,8 @@ export class SessionManager {
     let child: ChildProcess | undefined;
     for (;;) {
       try {
-        const effectiveAgent = { ...agent, thinking: prepared.state.effortOverride ?? agent.thinking };
         if (telegramRichAnswers) runtimeEnvOptions.sessionEffort = { model: normalizePiModel(agent.model), inherited: agent.thinking, override: prepared.state.effortOverride };
-        child = spawnPiRpcSession(effectiveAgent, prepared.binding, extensionOptions, collaborationEnabled
+        child = spawnPiRpcSession(agent, prepared.binding, extensionOptions, collaborationEnabled
           ? { ...runtimeEnvOptions, collaborationSession: prepared.binding.sessionId, collaborationSocket: this.collaborationSocket }
           : runtimeEnvOptions);
         await waitForSpawn(child, this.startupTimeoutMs);
@@ -1339,6 +1342,7 @@ export class SessionManager {
       let savedOutbox: string | undefined;
       let ownsInternalOutbox = false;
       let releaseInternalCleanup: (() => void) | undefined;
+      let releaseTurnReader: (() => void) | undefined;
       let promptSent = false;
       try {
         if (session.outputIsolationFailed) throw new Error("Outbox isolation failed; reconnect the session before delivery");
@@ -1373,6 +1377,7 @@ export class SessionManager {
         // window would be rejected with "already processing" and the message
         // lost. followUp queues it behind the live turn instead.
         session.lastActivity = Date.now();
+        session.turnReaderDone = new Promise(resolve => { releaseTurnReader = resolve; });
         session.processingStartedAt = Date.now();
         this.resetIdleTimer(chatId);
         // An internal persistence failure must happen before Pi receives input.
@@ -1449,6 +1454,7 @@ export class SessionManager {
           ? new CollaborationDeliveryError(promptSent ? "unknown" : "rejected", promptSent ? "Pi delivery outcome lost; do not replay" : "exact target or output isolation unavailable")
           : err instanceof Error ? err : new Error(String(err)));
       } finally {
+        releaseTurnReader?.();
         try {
           if (options?.internal && promptSent && !internalSettled) {
             // A failed reader cannot leave private events buffered for the next
@@ -1475,6 +1481,8 @@ export class SessionManager {
           session.internalCleanup = undefined;
         }
         if (options?.outputDone) await options.outputDone;
+        session.turnReaderDone = undefined;
+        await session.effortControlDone;
         // A busy idle deadline is ignored below. Once this queue task reaches
         // its terminal boundary, start a fresh full idle window only if this
         // is still the chat's active incarnation; /clean or /reconnect may
@@ -1618,37 +1626,42 @@ export class SessionManager {
           ? current : await this.getOrCreateSession(chatId, agentId, undefined, true);
         if ((this.sessionGenerations.get(chatId) ?? 0) !== generation) throw new Error("Session changed; retry /effort.");
         const apply = async (ownsReader: boolean): Promise<string> => {
-          if (this.active.get(chatId) !== session) throw new Error("Current session closed.");
-          const agent = configuredAgent();
-          const result = await this.requestEffort(chatId, session, value, agent, ownsReader);
-          if (this.active.get(chatId) !== session || (this.sessionGenerations.get(chatId) ?? 0) !== generation) throw new Error("Current session changed.");
-          const supported = `Supported: ${result.levels.join(", ") || "none"}, default.`;
-          if (result.error) throw new Error(`${result.error} Effective effort: ${result.effective}. ${supported}`);
-          if (value !== undefined) {
-            const stored = this.store.getSession(chatId);
-            if (stored?.bindingState !== "bound" || stored.sessionId !== session.sessionId || stored.sessionFile !== session.sessionFile) throw new Error("Session binding changed; effort was not saved.");
-            const override = value === "default" ? undefined : result.effective;
-            const { effortOverride: _previous, ...snapshot } = this.toSessionState(chatId, session);
-            const replacement = { ...snapshot, thinking: override ?? agent.thinking, ...(override === undefined ? {} : { effortOverride: override }) };
-            try {
-              if (!this.store.compareAndSetSession(chatId, stored, replacement)) throw new Error("Session binding changed; effort was not saved.");
-            } catch (error) {
-              // A failed durable write must not leave an untracked live override.
-              if (result.previous && this.active.get(chatId) === session) {
-                const restored = await this.requestEffort(chatId, session, result.previous, agent, ownsReader);
-                if (restored.error) throw new Error(`Effort was not saved and restoring the previous value failed. Effective effort: ${restored.effective}.`);
+          const readerReleased = ownsReader ? Promise.resolve() : session.turnReaderDone;
+          let releaseControl!: () => void;
+          session.effortControlDone = new Promise(resolve => { releaseControl = resolve; });
+          try {
+            if (this.active.get(chatId) !== session) throw new Error("Current session closed.");
+            const agent = configuredAgent();
+            const result = await this.requestEffort(chatId, session, value, agent, readerReleased);
+            if (this.active.get(chatId) !== session || (this.sessionGenerations.get(chatId) ?? 0) !== generation) throw new Error("Current session changed.");
+            const supported = `Supported: ${result.levels.join(", ") || "none"}, default.`;
+            if (result.error) throw new Error(`${result.error} Effective effort: ${result.effective}. ${supported}`);
+            if (value !== undefined) {
+              const stored = this.store.getSession(chatId);
+              if (stored?.bindingState !== "bound" || stored.sessionId !== session.sessionId || stored.sessionFile !== session.sessionFile) throw new Error("Session binding changed; effort was not saved.");
+              const override = value === "default" ? undefined : result.effective;
+              const { effortOverride: _previous, ...snapshot } = this.toSessionState(chatId, session);
+              const replacement = { ...snapshot, thinking: override ?? agent.thinking, ...(override === undefined ? {} : { effortOverride: override }) };
+              try {
+                if (!this.store.compareAndSetSession(chatId, stored, replacement)) throw new Error("Session binding changed; effort was not saved.");
+              } catch (error) {
+                // A failed durable write must not leave an untracked live override.
+                if (result.previous && this.active.get(chatId) === session) {
+                  const restored = await this.requestEffort(chatId, session, result.previous, agent, readerReleased);
+                  if (restored.error) throw new Error(`Effort was not saved and restoring the previous value failed. Effective effort: ${restored.effective}.`);
+                }
+                throw error;
               }
-              throw error;
+              session.effortOverride = override;
+              session.thinking = override ?? agent.thinking;
             }
-            session.effortOverride = override;
-            session.thinking = override ?? agent.thinking;
-          }
-          this.touchActivity(chatId);
-          return `Effort: ${result.effective} (${session.effortOverride === undefined ? "inherited default" : `thread override: ${session.effortOverride}`}). ${supported} Changes apply to the next model request; an in-flight request is unchanged.`;
+            this.touchActivity(chatId);
+            return `Effort: ${result.effective} (${session.effortOverride === undefined ? "inherited default" : `thread override: ${session.effortOverride}`}). ${supported} Changes apply to the next model request; an in-flight request is unchanged.`;
+          } finally { releaseControl(); }
         };
-        // During a turn its existing reader routes the correlated notice. Idle
-        // controls take queue ownership, so a prompt cannot acquire stdout too.
-        if (session.processingStartedAt !== null) return await apply(false);
+        // A turn holds the queue through delivery, but releases stdout earlier.
+        // Controls can use that boundary without waiting for final delivery.
+        if (session.processingStartedAt !== null || session.turnReaderDone) return await apply(false);
         return await session.queue.add(() => apply(true)) as string;
       } finally { release(); }
     });
@@ -1678,7 +1691,7 @@ export class SessionManager {
     }
   }
 
-  private async requestEffort(chatId: string, session: ActiveSession, value: string | undefined, agent: AgentConfig, ownsReader: boolean): Promise<EffortResult> {
+  private async requestEffort(chatId: string, session: ActiveSession, value: string | undefined, agent: AgentConfig, readerReleased?: Promise<void>): Promise<EffortResult> {
     const id = randomUUID();
     const stdout = session.child.stdout;
     if (!stdout) throw new Error("Pi stdout is unavailable.");
@@ -1702,20 +1715,14 @@ export class SessionManager {
         timer = setTimeout(() => reject(new Error("Pi did not confirm effort; check /effort before retrying.")), this.startupTimeoutMs);
         onExit = () => reject(new Error("Pi exited before confirming effort."));
         session.child.once("exit", onExit);
-        if (ownsReader) startReading();
         try { sendPiPrompt(session.child, effortInvocation(SESSION_EFFORT_COMMAND, { id, value, inherited: agent.thinking, model: normalizePiModel(agent.model) }), "followUp"); }
         catch (error) { reject(error); }
       });
-      if (!ownsReader) {
-        // If settlement beats the command response, acquire stdout only after
-        // the turn releases the queue. Never install a second live-turn reader.
-        void session.queue.add(async () => {
-          if (!this.effortWaiters.has(id) || this.active.get(chatId) !== session) return;
-          startReading();
-          try { await response; } catch { /* Caller reports the failure. */ }
-          finally { stopReading(); }
-        }).catch(() => {});
-      }
+      // Settlement releases the turn reader before final transport delivery.
+      void readerReleased?.then(() => {
+        if (!this.effortWaiters.has(id) || this.active.get(chatId) !== session) return;
+        startReading();
+      }).catch(() => {});
       return await response;
     } finally {
       clearTimeout(timer);

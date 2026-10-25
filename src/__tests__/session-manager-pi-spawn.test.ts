@@ -16,9 +16,9 @@ import { ensureSessionMediaDir, sessionMediaDir, allocateMediaPath, releaseMedia
 // Real protocol helpers the spawn-path capture needs (parse get_state replies).
 // Resolved here BEFORE mock.module installs the stub, so these are the genuine
 // implementations; the stub below re-exports them so capture parses correctly.
-import { MINIME_BOT_PI_SESSION_AGENT_ID_ENV, NewlineOnlyJsonlSplitter, handlePiExtensionUiRecord, PiStartupBlockingUiError, assertPiSessionIdentityMatchesBinding, normalizePiModel, parsePiStartupIdentityRecord, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions } from "../pi-rpc-protocol.js";
+import { buildPiSpawnArgs, MINIME_BOT_PI_SESSION_AGENT_ID_ENV, NewlineOnlyJsonlSplitter, handlePiExtensionUiRecord, PiStartupBlockingUiError, assertPiSessionIdentityMatchesBinding, normalizePiModel, parsePiStartupIdentityRecord, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions } from "../pi-rpc-protocol.js";
 import PQueue from "p-queue";
-import { CURRENT_SESSION_VERSION } from "@earendil-works/pi-coding-agent";
+import { CURRENT_SESSION_VERSION, ModelRuntime, resolveCliModel } from "@earendil-works/pi-coding-agent";
 
 const TEST_DIR = "/tmp/minime-test-pi-spawn";
 const TEST_STORE_PATH = `${TEST_DIR}/sessions.json`;
@@ -587,6 +587,39 @@ describe("SessionManager exact Pi binding startup", () => {
     } finally { await manager.closeAll(); }
   });
 
+  it("preserves uncatalogued model suffix argv after reconnecting with an effort override", async () => {
+    const config = makeConfig();
+    config.agents.pi.model = "openai-codex/custom-id:high";
+    delete config.agents.pi.thinking;
+    const runtime = await ModelRuntime.create({ modelsPath: null, authPath: `${TEST_DIR}/auth.json` });
+    const manager = new SessionManager(() => config, TEST_STORE_PATH, TEST_DIR);
+    const captureArgs = () => {
+      const capture = piSpawnCaptures.at(-1)!;
+      return buildPiSpawnArgs(capture.agent, capture.sessionBinding, capture.extensionOptions, capture.runtimeEnvOptions);
+    };
+    const nativeModel = (args: string[]) => resolveCliModel({
+      cliModel: args[args.indexOf("--model") + 1],
+      cliThinking: args.includes("--thinking") ? args[args.indexOf("--thinking") + 1] as "low" : undefined,
+      modelRuntime: runtime,
+    });
+    try {
+      const first = await manager.getOrCreateSession("456:1", "pi");
+      const originalArgs = captureArgs();
+      assert.equal(nativeModel(originalArgs).model?.id, "custom-id");
+      first.effortOverride = "low";
+      first.thinking = "low";
+      await manager.closeSession("456:1");
+      const resumed = await manager.getOrCreateSession("456:1", "pi");
+      const resumedArgs = captureArgs();
+      assert.deepEqual(resumedArgs, originalArgs, "saved effort does not change native CLI parsing");
+      assert.equal(resumedArgs.includes("--thinking"), false);
+      assert.equal(nativeModel(resumedArgs).model?.id, "custom-id");
+      assert.deepEqual(piSpawnCaptures.at(-1)?.runtimeEnvOptions?.sessionEffort, { model: config.agents.pi.model, inherited: undefined, override: "low" });
+      assert.equal(resumed.thinking, "low", "runtime signature represents the effective override");
+      assert.equal(await manager.getOrCreateSession("456:1", "pi"), resumed);
+    } finally { await manager.closeAll(); }
+  });
+
   it("keeps effort separate from runtime signatures across reconnect, idle, restart, clean and rebinding", async () => {
     const config = makeConfig();
     let manager = new SessionManager(() => config, TEST_STORE_PATH, TEST_DIR);
@@ -599,7 +632,7 @@ describe("SessionManager exact Pi binding startup", () => {
       const resumed = await manager.getOrCreateSession("456:1", "pi");
       assert.equal(resumed.sessionId, session.sessionId);
       assert.equal(resumed.effortOverride, "high");
-      assert.equal(piSpawnCaptures.at(-1)?.agent.thinking, "high");
+      assert.equal(piSpawnCaptures.at(-1)?.agent.thinking, "xhigh");
       assert.deepEqual(piSpawnCaptures.at(-1)?.runtimeEnvOptions?.sessionEffort, { model: normalizePiModel(config.agents.pi.model), inherited: "xhigh", override: "high" });
       resumed.idleTimeoutMs = 1;
       manager.resetIdleTimer("456:1");
