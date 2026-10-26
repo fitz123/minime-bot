@@ -28,6 +28,34 @@ export interface CronDiagnosticText {
   redacted: boolean;
 }
 
+export type CronDiagnosticFailureCategory =
+  | "delivery_api"
+  | "delivery_error"
+  | "delivery_preparation"
+  | "delivery_subprocess"
+  | "delivery_timeout"
+  | "execution_error"
+  | "execution_timeout"
+  | "pi_exit"
+  | "pi_output_error"
+  | "pi_signal"
+  | "pi_spawn"
+  | "script_exit"
+  | "script_failure"
+  | "script_signal"
+  | "script_timeout";
+
+export interface CronDiagnosticFailure {
+  category: CronDiagnosticFailureCategory;
+  kind: "error" | "timeout";
+  summary: CronDiagnosticText;
+  code?: string;
+  status?: number;
+  signal?: string;
+  errorCode?: number;
+  timeoutMs?: number;
+}
+
 interface CronDiagnosticBase {
   cron: string;
   cronType: CronDiagnosticCronType;
@@ -68,9 +96,8 @@ export type CronDiagnosticEvent =
   })
   | (CronDiagnosticBase & {
     event: "execution_failure";
-    failureKind: "error" | "timeout";
+    failure: CronDiagnosticFailure;
     outcome: "failure";
-    summary: CronDiagnosticText;
   })
   | (CronDiagnosticBase & {
     attempt: number;
@@ -79,7 +106,7 @@ export type CronDiagnosticEvent =
     originalRunId?: string;
     outcome: CronDiagnosticOutcome;
     queueable?: boolean;
-    summary?: CronDiagnosticText;
+    failure?: CronDiagnosticFailure;
   })
   | (CronDiagnosticBase & {
     disposition: CronDiagnosticDisposition;
@@ -106,7 +133,7 @@ export type CronDiagnosticEventPayload = CronDiagnosticEvent extends infer Event
   : never;
 
 const URL_PATTERN = /\b(?:https?|ftp):\/\/[^\s<>"']+/giu;
-const NAMED_SECRET_PATTERN = /\b(password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential)(\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/giu;
+const NAMED_SECRET_PATTERN = /(^|[^\p{L}\p{N}_-])((?:["'](?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential)["'])|(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential))(\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}\]]+)/gimu;
 const AUTH_SECRET_PATTERN = /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/giu;
 const PROVIDER_SECRET_PATTERNS = [
   /\b(?:sk|rk|pk)-[A-Za-z0-9_-]{12,}\b/gu,
@@ -126,9 +153,14 @@ function redactCronDiagnosticText(value: string): { text: string; redacted: bool
     redacted = true;
     return "[REDACTED_URL]";
   });
-  text = text.replace(NAMED_SECRET_PATTERN, (_match, name: string, separator: string) => {
+  text = text.replace(NAMED_SECRET_PATTERN, (
+    _match,
+    prefix: string,
+    name: string,
+    separator: string,
+  ) => {
     redacted = true;
-    return `${name}${separator}[REDACTED]`;
+    return `${prefix}${name}${separator}[REDACTED]`;
   });
   text = text.replace(AUTH_SECRET_PATTERN, (_match, scheme: string) => {
     redacted = true;
@@ -205,6 +237,20 @@ function textRecord(value: CronDiagnosticText): CronDiagnosticText {
   };
 }
 
+function failureRecord(value: CronDiagnosticFailure): Record<string, unknown> {
+  const record: Record<string, unknown> = {
+    category: value.category,
+    kind: value.kind,
+    summary: textRecord(value.summary),
+  };
+  if (value.code !== undefined) record.code = value.code;
+  if (value.status !== undefined) record.status = value.status;
+  if (value.signal !== undefined) record.signal = value.signal;
+  if (value.errorCode !== undefined) record.errorCode = value.errorCode;
+  if (value.timeoutMs !== undefined) record.timeoutMs = value.timeoutMs;
+  return record;
+}
+
 export function serializeCronDiagnosticEvent(event: CronDiagnosticEvent): string {
   const record = commonRecord(event);
   switch (event.event) {
@@ -220,8 +266,7 @@ export function serializeCronDiagnosticEvent(event: CronDiagnosticEvent): string
     case "execution_failure":
       Object.assign(record, {
         outcome: event.outcome,
-        failureKind: event.failureKind,
-        summary: textRecord(event.summary),
+        failure: failureRecord(event.failure),
       });
       break;
     case "delivery_attempt":
@@ -234,7 +279,7 @@ export function serializeCronDiagnosticEvent(event: CronDiagnosticEvent): string
         record.originalRunId = boundedMetadata(event.originalRunId);
       }
       if (event.queueable !== undefined) record.queueable = event.queueable;
-      if (event.summary !== undefined) record.summary = textRecord(event.summary);
+      if (event.failure !== undefined) record.failure = failureRecord(event.failure);
       break;
     case "disposition":
       record.disposition = event.disposition;

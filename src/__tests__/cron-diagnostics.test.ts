@@ -81,7 +81,9 @@ describe("cron diagnostics writer", () => {
     const secret = `sk-${"a".repeat(24)}`;
     const bearer = `Bearer ${"b".repeat(24)}`;
     const url = "https://example.invalid/report?token=synthetic-value";
-    const source = `start\u0000\u001b[31m red\napi_key=${secret} ${bearer} ${url} ending`;
+    const jsonCredential = "opaque-json-credential";
+    const yamlCredential = "opaque-yaml-credential";
+    const source = `start\u0000\u001b[31m red\napi_key=${secret} ${bearer} ${url} {"password":"${jsonCredential}"} 'credential': '${yamlCredential}' ending`;
     const limit = 32;
     const fullySanitized = retainCronDiagnosticText(source, Number.MAX_SAFE_INTEGER);
     const retained = retainCronDiagnosticText(source, limit);
@@ -97,6 +99,9 @@ describe("cron diagnostics writer", () => {
     assert.doesNotMatch(retained.text, /[\u0000-\u001F\u007F-\u009F]/u);
     assert.doesNotMatch(retained.text, /example\.invalid|synthetic-value|a{12}|b{12}/u);
     assert.match(retained.text, /\[REDACTED/);
+    assert.doesNotMatch(fullySanitized.text, /opaque-json-credential|opaque-yaml-credential/u);
+    assert.match(fullySanitized.text, /"password":\[REDACTED\]/u);
+    assert.match(fullySanitized.text, /'credential': \[REDACTED\]/u);
   });
 
   it("serializes only allowlisted event and retained-text fields", () => {
@@ -107,10 +112,14 @@ describe("cron diagnostics writer", () => {
       cronType: "script",
       runId: longRunId,
       outcome: "failure",
-      failureKind: "error",
-      summary: {
-        ...retainCronDiagnosticText("safe summary", 100),
-        forbiddenNested: "must not be serialized",
+      failure: {
+        category: "execution_error",
+        kind: "error",
+        summary: {
+          ...retainCronDiagnosticText("safe summary", 100),
+          forbiddenNested: "must not be serialized",
+        },
+        forbiddenFailure: "must not be serialized",
       },
       prompt: "must not be serialized",
       stack: "must not be serialized",
@@ -122,14 +131,14 @@ describe("cron diagnostics writer", () => {
       "cron",
       "cronType",
       "event",
-      "failureKind",
+      "failure",
       "outcome",
       "runId",
       "schemaVersion",
-      "summary",
       "timestamp",
     ]);
-    assert.ok(!("forbiddenNested" in record.summary));
+    assert.deepStrictEqual(Object.keys(record.failure).sort(), ["category", "kind", "summary"]);
+    assert.ok(!("forbiddenNested" in record.failure.summary));
     assert.doesNotMatch(JSON.stringify(record), /must not be serialized/);
     const truncatedRunId = record.runId as string;
     const suffix = truncatedRunId.match(/ \[truncated (\d+) chars\]$/);

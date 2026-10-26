@@ -3239,13 +3239,19 @@ bindings: []
       });
     }
 
-    it("records safe thrown-error and timeout summaries without raw diagnostics", async () => {
+    it("records safe structured execution failures without generic source excerpts", async () => {
       const cron = makeMainCron();
       const { calls, deps } = makeMainHarness(cron);
-      const secret = `sk-${"z".repeat(40)}`;
+      const sourceExcerpt = [
+        "YAMLParseError: bad indentation at line 4",
+        "  systemPrompt: opaque-system-instruction",
+        "  command: opaque-command-value",
+        "  password: opaque-config-credential",
+      ].join("\n");
       deps.runPi = () => {
         throw Object.assign(
-          new Error(`request timed out token=${secret} https://example.invalid/private`),
+          new Error(sourceExcerpt),
+          { code: "ETIMEDOUT" },
           { diagnostics: "raw child stderr must stay out" },
         );
       };
@@ -3254,29 +3260,63 @@ bindings: []
 
       const failure = calls.diagnostics.find((event) => event.event === "execution_failure");
       assert.ok(failure && failure.event === "execution_failure");
-      assert.strictEqual(failure.failureKind, "timeout");
-      assert.strictEqual(failure.summary.redacted, true);
-      assert.doesNotMatch(failure.summary.text, /z{12}|example\.invalid|raw child stderr/);
+      assert.strictEqual(failure.failure.kind, "timeout");
+      assert.strictEqual(failure.failure.category, "execution_timeout");
+      assert.strictEqual(failure.failure.code, "ETIMEDOUT");
+      assert.strictEqual(failure.failure.summary.text, "Cron execution timed out");
+      assert.doesNotMatch(
+        JSON.stringify(failure),
+        /YAMLParseError|systemPrompt|opaque-system|opaque-command|opaque-config|raw child stderr/,
+      );
       assert.ok(!("diagnostics" in failure));
       assert.ok(!("stack" in failure));
 
       const thrown = makeMainHarness(makeMainCron({ name: "thrown-error-fixture" }));
-      thrown.deps.runPi = () => { throw new Error("ordinary execution failure"); };
+      thrown.deps.runPi = () => {
+        throw Object.assign(new Error(sourceExcerpt), {
+          code: "EOPAQUE_SYSTEM_PROMPT",
+          signal: "SIGOPAQUESECRET",
+        });
+      };
       await assertMainExits(thrown.deps, 1);
       const thrownFailure = thrown.calls.diagnostics.find((event) =>
         event.event === "execution_failure");
       assert.ok(thrownFailure && thrownFailure.event === "execution_failure");
-      assert.strictEqual(thrownFailure.failureKind, "error");
-      assert.strictEqual(thrownFailure.summary.text, "ordinary execution failure");
+      assert.strictEqual(thrownFailure.failure.kind, "error");
+      assert.strictEqual(thrownFailure.failure.category, "execution_error");
+      assert.strictEqual(thrownFailure.failure.summary.text, "Cron execution failed");
+      assert.strictEqual(thrownFailure.failure.code, undefined);
+      assert.strictEqual(thrownFailure.failure.signal, undefined);
+      assert.doesNotMatch(JSON.stringify(thrownFailure), /YAMLParseError|systemPrompt|opaque-/);
+
+      const scriptCron = makeMainCron({
+        name: "controlled-script-failure-fixture",
+        type: "script",
+        prompt: undefined,
+        command: "printf 'opaque-child-output'; exit 7",
+      });
+      const script = makeMainHarness(scriptCron);
+      script.deps.runScript = runScript;
+      await assertMainExits(script.deps, 1);
+      const scriptFailure = script.calls.diagnostics.find((event) =>
+        event.event === "execution_failure");
+      assert.ok(scriptFailure && scriptFailure.event === "execution_failure");
+      assert.strictEqual(scriptFailure.failure.category, "script_exit");
+      assert.strictEqual(scriptFailure.failure.status, 7);
+      assert.strictEqual(scriptFailure.failure.summary.text, "Script cron exited with code 7");
+      assert.doesNotMatch(JSON.stringify(scriptFailure), /opaque-child-output|stdout|stderr/);
     });
 
     it("records every fresh retry through recovery and exhaustion", async () => {
       const recoveredCron = makeMainCron();
       const recovered = makeMainHarness(recoveredCron);
+      const sourceExcerpt = "YAMLParseError\nsystemPrompt: opaque-delivery-instruction";
       let recoveredAttempts = 0;
       recovered.deps.deliver = () => {
         recoveredAttempts += 1;
-        if (recoveredAttempts === 1) throw new Error("temporary failure");
+        if (recoveredAttempts === 1) {
+          throw Object.assign(new Error(sourceExcerpt), { code: "ETIMEDOUT", status: 28 });
+        }
       };
 
       await main(recovered.deps);
@@ -3289,6 +3329,15 @@ bindings: []
             : assert.fail()),
         [[1, "failure"], [2, "success"]],
       );
+      const recoveredFailure = recovered.calls.diagnostics.find((event) =>
+        event.event === "delivery_attempt" && event.outcome === "failure");
+      assert.ok(recoveredFailure && recoveredFailure.event === "delivery_attempt");
+      assert.strictEqual(recoveredFailure.failure?.category, "delivery_timeout");
+      assert.strictEqual(recoveredFailure.failure?.kind, "timeout");
+      assert.strictEqual(recoveredFailure.failure?.code, "ETIMEDOUT");
+      assert.strictEqual(recoveredFailure.failure?.status, 28);
+      assert.strictEqual(recoveredFailure.failure?.summary.text, "Cron result delivery timed out");
+      assert.doesNotMatch(JSON.stringify(recoveredFailure), /YAMLParseError|systemPrompt|opaque-/);
       assert.deepStrictEqual(recovered.calls.sleeps, [CRON_DELIVERY_RETRY_DELAYS_MS[0]]);
 
       const exhaustedCron = makeMainCron({ name: "exhausted-fixture" });
@@ -3334,12 +3383,24 @@ bindings: []
       const deferred = makeMainHarness(deferCron);
       const deferRecord = makePendingRecord(deferCron, { attempts: 4 });
       deferred.state.pending = deferRecord;
-      deferred.deps.deliver = () => { throw new Error("network unavailable"); };
+      deferred.deps.deliver = () => {
+        throw Object.assign(
+          new Error("YAMLParseError\nsystemPrompt: opaque-replay-instruction"),
+          { code: "ECONNRESET" },
+        );
+      };
       await assertMainExits(deferred.deps, 1);
       assert.ok(deferred.calls.diagnostics.some((event) =>
         event.event === "disposition"
         && event.disposition === "replay_deferred"
         && event.originalRunId === deferRecord.runId));
+      const deferredAttempt = deferred.calls.diagnostics.find((event) =>
+        event.event === "delivery_attempt" && event.delivery === "replay");
+      assert.ok(deferredAttempt && deferredAttempt.event === "delivery_attempt");
+      assert.strictEqual(deferredAttempt.failure?.category, "delivery_error");
+      assert.strictEqual(deferredAttempt.failure?.code, "ECONNRESET");
+      assert.strictEqual(deferredAttempt.failure?.summary.text, "Cron result delivery failed");
+      assert.doesNotMatch(JSON.stringify(deferredAttempt), /YAMLParseError|systemPrompt|opaque-/);
       assert.deepStrictEqual(deferred.calls.metrics, []);
 
       const terminalCron = makeMainCron({ name: "replay-terminal-fixture" });
@@ -3362,6 +3423,12 @@ bindings: []
         event.event === "disposition"
         && event.disposition === "replay_terminal"
         && event.originalRunId === terminalRecord.runId));
+      const terminalAttempt = terminal.calls.diagnostics.find((event) =>
+        event.event === "delivery_attempt" && event.delivery === "replay");
+      assert.ok(terminalAttempt && terminalAttempt.event === "delivery_attempt");
+      assert.strictEqual(terminalAttempt.failure?.category, "delivery_subprocess");
+      assert.strictEqual(terminalAttempt.failure?.status, 1);
+      assert.doesNotMatch(JSON.stringify(terminalAttempt), /invalid destination|invalid chat_id/);
     });
 
     it("keeps diagnostic writer and warning failures observational", async () => {

@@ -75,6 +75,8 @@ import {
   type CronDiagnosticCronType,
   type CronDiagnosticEvent,
   type CronDiagnosticEventPayload,
+  type CronDiagnosticFailure,
+  type CronDiagnosticFailureCategory,
 } from "./cron-diagnostics.js";
 export { loadMergedCrons, resolveCronsPath } from "./cron-loader.js";
 
@@ -106,13 +108,78 @@ export type PiRunResult =
   | { status: "error"; message: string; diagnostics?: string };
 type PiErrorRunResult = Extract<PiRunResult, { status: "error" }>;
 
+interface CronDiagnosticFailureInput {
+  category: CronDiagnosticFailureCategory;
+  kind: "error" | "timeout";
+  summary: string;
+  code?: string;
+  status?: number;
+  signal?: string;
+  errorCode?: number;
+  timeoutMs?: number;
+}
+
+const SAFE_DIAGNOSTIC_CODES = new Set([
+  "EACCES",
+  "EAI_AGAIN",
+  "ECANCELED",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ENOBUFS",
+  "ENOENT",
+  "ENOMEM",
+  "ENOTFOUND",
+  "EPERM",
+  "EPIPE",
+  "ETIMEDOUT",
+]);
+const SAFE_DIAGNOSTIC_SIGNALS = new Set([
+  "SIGABRT",
+  "SIGALRM",
+  "SIGBUS",
+  "SIGCHLD",
+  "SIGCONT",
+  "SIGFPE",
+  "SIGHUP",
+  "SIGILL",
+  "SIGINT",
+  "SIGIO",
+  "SIGKILL",
+  "SIGPIPE",
+  "SIGPROF",
+  "SIGQUIT",
+  "SIGSEGV",
+  "SIGSTOP",
+  "SIGSYS",
+  "SIGTERM",
+  "SIGTRAP",
+  "SIGTSTP",
+  "SIGTTIN",
+  "SIGTTOU",
+  "SIGURG",
+  "SIGUSR1",
+  "SIGUSR2",
+  "SIGVTALRM",
+  "SIGWINCH",
+  "SIGXCPU",
+  "SIGXFSZ",
+]);
+
 class CronRunError extends Error {
   diagnostics?: string;
+  diagnosticFailure: CronDiagnosticFailureInput;
 
-  constructor(message: string, diagnostics?: string) {
+  constructor(
+    message: string,
+    diagnostics: string | undefined,
+    diagnosticFailure: CronDiagnosticFailureInput,
+  ) {
     super(message);
     this.name = "CronRunError";
     this.diagnostics = diagnostics;
+    this.diagnosticFailure = diagnosticFailure;
   }
 }
 
@@ -126,6 +193,88 @@ function cronErrorDiagnostics(err: unknown): string | undefined {
   }
   const diagnostics = (err as { diagnostics?: unknown }).diagnostics;
   return typeof diagnostics === "string" && diagnostics.trim() ? diagnostics : undefined;
+}
+
+function safeDiagnosticCode(value: unknown): string | undefined {
+  return typeof value === "string" && SAFE_DIAGNOSTIC_CODES.has(value)
+    ? value
+    : undefined;
+}
+
+function safeDiagnosticStatus(value: unknown): number | undefined {
+  return typeof value === "number"
+    && Number.isSafeInteger(value)
+    && value >= 0
+    && value <= 65_535
+    ? value
+    : undefined;
+}
+
+function safeDiagnosticSignal(value: unknown): string | undefined {
+  return typeof value === "string" && SAFE_DIAGNOSTIC_SIGNALS.has(value)
+    ? value
+    : undefined;
+}
+
+function safeDiagnosticErrorCode(value: unknown): number | undefined {
+  return typeof value === "number"
+    && Number.isInteger(value)
+    && value >= 100
+    && value <= 999
+    ? value
+    : undefined;
+}
+
+function safeDiagnosticTimeoutMs(value: unknown): number | undefined {
+  return typeof value === "number"
+    && Number.isSafeInteger(value)
+    && value > 0
+    ? value
+    : undefined;
+}
+
+function retainDiagnosticFailure(input: CronDiagnosticFailureInput): CronDiagnosticFailure {
+  return {
+    category: input.category,
+    kind: input.kind,
+    summary: retainCronDiagnosticText(input.summary, CRON_DIAGNOSTIC_SUMMARY_CHARS),
+    ...(input.code === undefined ? {} : { code: input.code }),
+    ...(input.status === undefined ? {} : { status: input.status }),
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
+    ...(input.errorCode === undefined ? {} : { errorCode: input.errorCode }),
+    ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }),
+  };
+}
+
+function genericDiagnosticFields(err: unknown): Pick<
+  CronDiagnosticFailureInput,
+  "code" | "status" | "signal"
+> {
+  const source = typeof err === "object" && err !== null
+    ? err as { code?: unknown; status?: unknown; signal?: unknown }
+    : undefined;
+  const code = safeDiagnosticCode(source?.code);
+  const status = safeDiagnosticStatus(source?.status);
+  const signal = safeDiagnosticSignal(source?.signal);
+  return {
+    ...(code === undefined ? {} : { code }),
+    ...(status === undefined ? {} : { status }),
+    ...(signal === undefined ? {} : { signal }),
+  };
+}
+
+function executionDiagnosticFailure(err: unknown): CronDiagnosticFailure {
+  if (err instanceof CronRunError) {
+    return retainDiagnosticFailure(err.diagnosticFailure);
+  }
+  const fields = genericDiagnosticFields(err);
+  const isTimeout = fields.code === "ETIMEDOUT";
+  return retainDiagnosticFailure({
+    category: isTimeout ? "execution_timeout" : "execution_error",
+    kind: isTimeout ? "timeout" : "error",
+    summary: isTimeout ? "Cron execution timed out" : "Cron execution failed",
+    ...fields,
+  });
 }
 
 export function resolveCronLogDir(): string {
@@ -864,6 +1013,49 @@ export class DeliveryError extends Error {
   }
 }
 
+function deliveryDiagnosticFailure(err: unknown): CronDiagnosticFailure {
+  if (err instanceof CronResultPreparationError) {
+    return retainDiagnosticFailure({
+      category: "delivery_preparation",
+      kind: "error",
+      summary: "Cron result preparation failed",
+    });
+  }
+  if (err instanceof DeliveryError) {
+    const code = safeDiagnosticCode(err.code);
+    const status = safeDiagnosticStatus(err.status);
+    const isTimeout = code === "ETIMEDOUT";
+    return retainDiagnosticFailure({
+      category: isTimeout ? "delivery_timeout" : "delivery_subprocess",
+      kind: isTimeout ? "timeout" : "error",
+      summary: isTimeout ? "Cron result delivery timed out" : "Cron result delivery failed",
+      ...(code === undefined ? {} : { code }),
+      ...(status === undefined ? {} : { status }),
+    });
+  }
+  const nativeErrorCode = safeDiagnosticErrorCode(
+    (typeof err === "object" && err !== null
+      ? err as { error_code?: unknown }
+      : undefined)?.error_code,
+  );
+  if (nativeErrorCode !== undefined) {
+    return retainDiagnosticFailure({
+      category: "delivery_api",
+      kind: "error",
+      summary: "Cron result delivery API rejected the request",
+      errorCode: nativeErrorCode,
+    });
+  }
+  const fields = genericDiagnosticFields(err);
+  const isTimeout = fields.code === "ETIMEDOUT";
+  return retainDiagnosticFailure({
+    category: isTimeout ? "delivery_timeout" : "delivery_error",
+    kind: isTimeout ? "timeout" : "error",
+    summary: isTimeout ? "Cron result delivery timed out" : "Cron result delivery failed",
+    ...fields,
+  });
+}
+
 export function isQueueableDeliveryFailure(err: unknown): boolean {
   if (err instanceof CronResultPreparationError) return false;
   const nativeCode = (err as { error_code?: unknown } | null)?.error_code;
@@ -974,6 +1166,52 @@ function formatScriptFailureDiagnostics(err: ScriptExecFailure): string | undefi
   return details.length > 0 ? details.join("; ") : undefined;
 }
 
+function scriptDiagnosticFailure(
+  err: ScriptExecFailure,
+  timeoutMs: number,
+): CronDiagnosticFailureInput {
+  const code = safeDiagnosticCode(err.code);
+  const status = safeDiagnosticStatus(err.status);
+  const signal = safeDiagnosticSignal(err.signal);
+  const retainedTimeoutMs = safeDiagnosticTimeoutMs(timeoutMs);
+  if (code === "ETIMEDOUT") {
+    return {
+      category: "script_timeout",
+      kind: "timeout",
+      summary: retainedTimeoutMs === undefined
+        ? "Script cron timed out"
+        : `Script cron timed out after ${retainedTimeoutMs}ms`,
+      code,
+      ...(retainedTimeoutMs === undefined ? {} : { timeoutMs: retainedTimeoutMs }),
+      ...(signal === undefined ? {} : { signal }),
+    };
+  }
+  if (signal !== undefined) {
+    return {
+      category: "script_signal",
+      kind: "error",
+      summary: `Script cron exited with signal ${signal}`,
+      signal,
+      ...(code === undefined ? {} : { code }),
+    };
+  }
+  if (status !== undefined) {
+    return {
+      category: "script_exit",
+      kind: "error",
+      summary: `Script cron exited with code ${status}`,
+      status,
+      ...(code === undefined ? {} : { code }),
+    };
+  }
+  return {
+    category: "script_failure",
+    kind: "error",
+    summary: "Script cron failed",
+    ...(code === undefined ? {} : { code }),
+  };
+}
+
 function runScript(cron: CronJob): string {
   if (!cron.command) {
     throw new Error(`Script-mode cron "${cron.name}" has no command`);
@@ -999,6 +1237,7 @@ function runScript(cron: CronJob): string {
       throw new CronRunError(
         formatScriptFailureSummary(error, timeoutMs),
         formatScriptFailureDiagnostics(error),
+        scriptDiagnosticFailure(error, timeoutMs),
       );
     }
     throw error;
@@ -1209,12 +1448,43 @@ function runPi(
 
   if (result.error) {
     const spawnError = piErrorResult(`Pi cron spawn failed: ${result.error.message}`, result.stdout, result.stderr);
-    throw new CronRunError(spawnError.message, spawnError.diagnostics);
+    const code = safeDiagnosticCode((result.error as NodeJS.ErrnoException).code);
+    throw new CronRunError(spawnError.message, spawnError.diagnostics, {
+      category: "pi_spawn",
+      kind: code === "ETIMEDOUT" ? "timeout" : "error",
+      summary: code === "ETIMEDOUT" ? "Pi cron spawn timed out" : "Pi cron spawn failed",
+      ...(code === undefined ? {} : { code }),
+    });
   }
 
   const classified = classifyPiResult(result.status, result.signal, result.stdout, result.stderr);
   if (classified.status === "error") {
-    throw new CronRunError(classified.message, classified.diagnostics);
+    const signal = safeDiagnosticSignal(result.signal);
+    const status = safeDiagnosticStatus(result.status);
+    const diagnosticFailure: CronDiagnosticFailureInput = result.signal
+      ? {
+          category: "pi_signal",
+          kind: "error",
+          summary: signal === undefined
+            ? "Pi cron exited by signal"
+            : `Pi cron exited with signal ${signal}`,
+          ...(signal === undefined ? {} : { signal }),
+        }
+      : result.status !== 0
+        ? {
+            category: "pi_exit",
+            kind: "error",
+            summary: status === undefined
+              ? "Pi cron exited without a valid exit code"
+              : `Pi cron exited with code ${status}`,
+            ...(status === undefined ? {} : { status }),
+          }
+        : {
+            category: "pi_output_error",
+            kind: "error",
+            summary: "Pi cron produced invalid process output",
+          };
+    throw new CronRunError(classified.message, classified.diagnostics, diagnosticFailure);
   }
   return classified.output;
 }
@@ -1390,10 +1660,7 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
           attempt,
           outcome: "failure",
           queueable: isQueueableDeliveryFailure(error),
-          summary: retainCronDiagnosticText(
-            errorFromUnknown(error).message,
-            CRON_DIAGNOSTIC_SUMMARY_CHARS,
-          ),
+          failure: deliveryDiagnosticFailure(error),
         }));
       }
       const delayMs = CRON_DELIVERY_RETRY_DELAYS_MS[attempt - 1];
@@ -1594,10 +1861,7 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
           originalRunId: pendingRecord.runId,
           outcome: "failure",
           queueable: isQueueableDeliveryFailure(error),
-          summary: retainCronDiagnosticText(
-            errorFromUnknown(error).message,
-            CRON_DIAGNOSTIC_SUMMARY_CHARS,
-          ),
+          failure: deliveryDiagnosticFailure(error),
         }));
         return { ok: false, error };
       }
@@ -1721,10 +1985,7 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     emitDiagnostic(() => ({
       event: "execution_failure",
       outcome: "failure",
-      failureKind: /\b(?:ETIMEDOUT|timed out|timeout)\b/i.test(error.message)
-        ? "timeout"
-        : "error",
-      summary: retainCronDiagnosticText(error.message, CRON_DIAGNOSTIC_SUMMARY_CHARS),
+      failure: executionDiagnosticFailure(err),
     }));
     try {
       try {
