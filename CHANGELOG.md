@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 2026.10.5
+
+- Retain bounded, redacted, run-correlated diagnostics for LLM and script crons, including logical failures, safe timeout/error metadata, delivery attempts, replay/queue dispositions and terminal outcomes (#242, #243).
+- Keep diagnostics fail-soft and owner-only, document deployment-owned rotation, and preserve existing execution, delivery, outbox, metric and exit behavior.
+
 ## 2026.10.4
 
 - Improve fresh-Markdown Knowledge retrieval with ranked partial whole-word matches and exact identity priority (#237, #238).
