@@ -137,8 +137,7 @@ const URL_PATTERN = /(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s<>"']+(?
 const SENSITIVE_KEY_SUFFIX_PATTERN = /(?:secret[_-]?key|password|passwd|private[_-]?key|access[_-]?key|api[_-]?key|credential|secret|token|pass|pwd)$/iu;
 const NAMED_SECRET_PATTERN = /(^|[^\p{L}\p{N}_-])((?:["'][\p{L}\p{N}_-]*(?:secret[_-]?key|password|passwd|private[_-]?key|access[_-]?key|api[_-]?key|credential|secret|token|pass|pwd)["'])|(?:[\p{L}\p{N}_-]*(?:secret[_-]?key|password|passwd|private[_-]?key|access[_-]?key|api[_-]?key|credential|secret|token|pass|pwd)))(\s*[:=]\s*)(?:(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?![|>][+-]?(?:\s|$))[^\s,;}\]]+)/gimu;
 const AUTHORIZATION_SECRET_PATTERN = /\b(Authorization\s*:\s*)(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/giu;
-const AUTH_SECRET_PATTERN = /\b(Bearer|Basic)\s+([A-Za-z0-9._~+/=-]{8,})/giu;
-const CLEAR_AUTH_TOKEN_PATTERN = /[0-9._~+/=-]/u;
+const AUTH_SECRET_PATTERN = /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gu;
 const PRIVATE_KEY_PATTERN = /-----BEGIN ((?:(?:RSA|EC|DSA|OPENSSH|ENCRYPTED) )?PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----[\s\S]*?-----END \1-----/gu;
 const PROVIDER_SECRET_PATTERNS = [
   /\b(?:sk|rk|pk)-[A-Za-z0-9_-]{12,}\b/gu,
@@ -318,8 +317,7 @@ function redactCronDiagnosticText(value: string): { text: string; redacted: bool
     redacted = true;
     return `${prefix}${name}${separator}[REDACTED]`;
   });
-  text = text.replace(AUTH_SECRET_PATTERN, (match, scheme: string, token: string) => {
-    if (!CLEAR_AUTH_TOKEN_PATTERN.test(token)) return match;
+  text = text.replace(AUTH_SECRET_PATTERN, (_match, scheme: string) => {
     redacted = true;
     return `${scheme} [REDACTED]`;
   });

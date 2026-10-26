@@ -212,6 +212,8 @@ describe("cron diagnostics writer", () => {
     const source = [
       "Authorization: Bearer opaqueheaderletters",
       "token: Bearer opaqueassignmentletters",
+      "Standalone Bearer opaqueletterscredential",
+      "Standalone Basic alphabeticcredential",
       "Standalone Bearer opaque123456789",
       "Standalone Basic dG9rZW4=",
       "basic troubleshooting steps",
@@ -220,11 +222,14 @@ describe("cron diagnostics writer", () => {
 
     const retained = retainCronDiagnosticText(source, Number.MAX_SAFE_INTEGER);
 
-    assert.doesNotMatch(retained.text, /opaqueheaderletters|opaqueassignmentletters|opaque123456789|dG9rZW4=/u);
+    assert.doesNotMatch(
+      retained.text,
+      /opaqueheaderletters|opaqueassignmentletters|opaqueletterscredential|alphabeticcredential|opaque123456789|dG9rZW4=/u,
+    );
     assert.match(retained.text, /Authorization: Bearer \[REDACTED\]/u);
     assert.match(retained.text, /token: \[REDACTED\]/u);
-    assert.match(retained.text, /Standalone Bearer \[REDACTED\]/u);
-    assert.match(retained.text, /Standalone Basic \[REDACTED\]/u);
+    assert.strictEqual(retained.text.match(/Standalone Bearer \[REDACTED\]/gu)?.length, 2);
+    assert.strictEqual(retained.text.match(/Standalone Basic \[REDACTED\]/gu)?.length, 2);
     assert.match(retained.text, /basic troubleshooting steps/u);
     assert.match(retained.text, /bearer instruments market/u);
   });
