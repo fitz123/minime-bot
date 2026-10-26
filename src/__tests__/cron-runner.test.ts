@@ -48,6 +48,10 @@ import {
   type CronOutboxRecord,
 } from "../cron-outbox.js";
 import type { CronJob } from "../types.js";
+import {
+  writeCronDiagnosticEvent as writeDefaultCronDiagnosticEvent,
+  type CronDiagnosticEvent,
+} from "../cron-diagnostics.js";
 import { installCronTestEnv } from "./cron-test-env.js";
 
 // We test the pure functions. runPi and deliver require real Pi/Telegram unless stubbed.
@@ -1869,6 +1873,8 @@ bindings: []
       outboxWrites: CronOutboxRecord[];
       outboxClears: string[];
       events: string[];
+      diagnostics: CronDiagnosticEvent[];
+      diagnosticWarnings: number;
       exits: number[];
     }
 
@@ -1929,6 +1935,8 @@ bindings: []
         outboxWrites: [],
         outboxClears: [],
         events: [],
+        diagnostics: [],
+        diagnosticWarnings: 0,
         exits: [],
       };
       const state: MainHarnessState = { pending: undefined };
@@ -2010,6 +2018,12 @@ bindings: []
           outcome: CronTerminalOutcome,
         ) => {
           calls.metrics.push({ cronName, exitCode, success: outcome === "success" });
+        },
+        writeCronDiagnosticEvent: (event: CronDiagnosticEvent) => {
+          calls.diagnostics.push(event);
+        },
+        warnCronDiagnosticFailure: () => {
+          calls.diagnosticWarnings += 1;
         },
       };
 
@@ -3122,6 +3136,294 @@ bindings: []
       assert.deepStrictEqual(calls.metrics, [
         { cronName: cron.name, exitCode: 0, success: true },
       ]);
+    });
+
+    it("records correlated LLM success output, fresh delivery, disposition, and terminal metadata", async () => {
+      const cron = makeMainCron();
+      const { calls, deps } = makeMainHarness(cron);
+
+      await main(deps);
+
+      assert.deepStrictEqual(calls.diagnostics.map((event) => event.event), [
+        "run_started",
+        "execution_result",
+        "delivery_attempt",
+        "disposition",
+        "run_terminal",
+      ]);
+      assert.ok(calls.diagnostics.every((event) => event.runId === calls.diagnostics[0].runId));
+      assert.ok(calls.diagnostics.every((event) => event.cronType === "llm"));
+      const result = calls.diagnostics[1];
+      assert.strictEqual(result.event, "execution_result");
+      assert.strictEqual(result.outcome, "success");
+      assert.strictEqual(result.detail, "completed");
+      assert.strictEqual(result.output.text, "llm output");
+      assert.strictEqual(result.output.truncated, false);
+      assert.deepStrictEqual(calls.diagnostics[2], {
+        event: "delivery_attempt",
+        delivery: "fresh",
+        attempt: 1,
+        outcome: "success",
+        cron: cron.name,
+        cronType: "llm",
+        runId: calls.diagnostics[0].runId,
+      });
+      assert.deepStrictEqual(calls.diagnostics.at(-1), {
+        event: "run_terminal",
+        outcome: "success",
+        disposition: "delivered",
+        cron: cron.name,
+        cronType: "llm",
+        runId: calls.diagnostics[0].runId,
+      });
+    });
+
+    it("records script output on the script path without LLM-only classification", async () => {
+      const cron = makeMainCron({
+        type: "script",
+        prompt: undefined,
+        command: "fixture-command",
+      });
+      const { calls, deps } = makeMainHarness(cron);
+      deps.runScript = () => `NO_REPLY\n${MINIME_CRON_UNRESOLVED_MARKER}`;
+
+      await main(deps);
+
+      const result = calls.diagnostics.find((event) => event.event === "execution_result");
+      assert.ok(result && result.event === "execution_result");
+      assert.strictEqual(result.cronType, "script");
+      assert.strictEqual(result.outcome, "success");
+      assert.strictEqual(result.detail, "completed");
+      assert.strictEqual(result.output.text, `NO_REPLY ${MINIME_CRON_UNRESOLVED_MARKER}`);
+      assert.ok(calls.diagnostics.some((event) =>
+        event.event === "delivery_attempt" && event.delivery === "fresh" && event.outcome === "success"));
+    });
+
+    it("retains explicit logical-failure detail and the stripped bounded report", async () => {
+      const cron = makeMainCron();
+      const { calls, deps } = makeMainHarness(cron);
+      deps.runPi = () => `Actionable unresolved report.\n${MINIME_CRON_UNRESOLVED_MARKER}`;
+
+      await assertMainExits(deps, 1);
+
+      const result = calls.diagnostics.find((event) => event.event === "execution_result");
+      assert.ok(result && result.event === "execution_result");
+      assert.strictEqual(result.outcome, "failure");
+      assert.strictEqual(result.detail, "logical_failure");
+      assert.strictEqual(result.output.text, "Actionable unresolved report.");
+      assert.ok(!result.output.text.includes(MINIME_CRON_UNRESOLVED_MARKER));
+      const terminal = calls.diagnostics.at(-1);
+      assert.ok(terminal && terminal.event === "run_terminal");
+      assert.strictEqual(terminal.outcome, "failure");
+      assert.strictEqual(terminal.disposition, "delivered");
+    });
+
+    for (const suppression of [
+      { name: "empty output", output: "", disposition: "empty_output" as const },
+      { name: "NO_REPLY", output: "NO_REPLY: fixture", disposition: "no_reply" as const },
+    ]) {
+      it(`records ${suppression.name} suppression without a delivery attempt`, async () => {
+        const cron = makeMainCron();
+        const { calls, deps } = makeMainHarness(cron);
+        deps.runPi = () => suppression.output;
+
+        await main(deps);
+
+        assert.ok(!calls.diagnostics.some((event) => event.event === "delivery_attempt"));
+        assert.ok(calls.diagnostics.some((event) =>
+          event.event === "disposition" && event.disposition === suppression.disposition));
+        const terminal = calls.diagnostics.at(-1);
+        assert.ok(terminal && terminal.event === "run_terminal");
+        assert.strictEqual(terminal.disposition, suppression.disposition);
+        assert.strictEqual(terminal.outcome, "success");
+      });
+    }
+
+    it("records safe thrown-error and timeout summaries without raw diagnostics", async () => {
+      const cron = makeMainCron();
+      const { calls, deps } = makeMainHarness(cron);
+      const secret = `sk-${"z".repeat(40)}`;
+      deps.runPi = () => {
+        throw Object.assign(
+          new Error(`request timed out token=${secret} https://example.invalid/private`),
+          { diagnostics: "raw child stderr must stay out" },
+        );
+      };
+
+      await assertMainExits(deps, 1);
+
+      const failure = calls.diagnostics.find((event) => event.event === "execution_failure");
+      assert.ok(failure && failure.event === "execution_failure");
+      assert.strictEqual(failure.failureKind, "timeout");
+      assert.strictEqual(failure.summary.redacted, true);
+      assert.doesNotMatch(failure.summary.text, /z{12}|example\.invalid|raw child stderr/);
+      assert.ok(!("diagnostics" in failure));
+      assert.ok(!("stack" in failure));
+
+      const thrown = makeMainHarness(makeMainCron({ name: "thrown-error-fixture" }));
+      thrown.deps.runPi = () => { throw new Error("ordinary execution failure"); };
+      await assertMainExits(thrown.deps, 1);
+      const thrownFailure = thrown.calls.diagnostics.find((event) =>
+        event.event === "execution_failure");
+      assert.ok(thrownFailure && thrownFailure.event === "execution_failure");
+      assert.strictEqual(thrownFailure.failureKind, "error");
+      assert.strictEqual(thrownFailure.summary.text, "ordinary execution failure");
+    });
+
+    it("records every fresh retry through recovery and exhaustion", async () => {
+      const recoveredCron = makeMainCron();
+      const recovered = makeMainHarness(recoveredCron);
+      let recoveredAttempts = 0;
+      recovered.deps.deliver = () => {
+        recoveredAttempts += 1;
+        if (recoveredAttempts === 1) throw new Error("temporary failure");
+      };
+
+      await main(recovered.deps);
+
+      assert.deepStrictEqual(
+        recovered.calls.diagnostics
+          .filter((event) => event.event === "delivery_attempt")
+          .map((event) => event.event === "delivery_attempt"
+            ? [event.attempt, event.outcome]
+            : assert.fail()),
+        [[1, "failure"], [2, "success"]],
+      );
+      assert.deepStrictEqual(recovered.calls.sleeps, [CRON_DELIVERY_RETRY_DELAYS_MS[0]]);
+
+      const exhaustedCron = makeMainCron({ name: "exhausted-fixture" });
+      const exhausted = makeMainHarness(exhaustedCron);
+      exhausted.deps.deliver = () => { throw new Error("transport unavailable"); };
+
+      await assertMainExits(exhausted.deps, 1);
+
+      assert.deepStrictEqual(
+        exhausted.calls.diagnostics
+          .filter((event) => event.event === "delivery_attempt")
+          .map((event) => event.event === "delivery_attempt"
+            ? [event.attempt, event.outcome, event.queueable]
+            : assert.fail()),
+        [[1, "failure", true], [2, "failure", true], [3, "failure", true]],
+      );
+      assert.ok(exhausted.calls.diagnostics.some((event) =>
+        event.event === "disposition" && event.disposition === "fresh_queued"));
+      const terminal = exhausted.calls.diagnostics.at(-1);
+      assert.ok(terminal && terminal.event === "run_terminal");
+      assert.strictEqual(terminal.disposition, "delivery_failed");
+    });
+
+    it("correlates replay success, defer, and deterministic terminal dispositions to the original run", async () => {
+      const successCron = makeMainCron({ name: "replay-success-fixture" });
+      const success = makeMainHarness(successCron);
+      const successRecord = makePendingRecord(successCron, { attempts: 2 });
+      success.state.pending = successRecord;
+      await main(success.deps);
+      const successAttempt = success.calls.diagnostics.find((event) =>
+        event.event === "delivery_attempt" && event.delivery === "replay");
+      assert.ok(successAttempt && successAttempt.event === "delivery_attempt");
+      assert.strictEqual(successAttempt.originalRunId, successRecord.runId);
+      assert.strictEqual(successAttempt.runId, success.calls.diagnostics[0].runId);
+      assert.notStrictEqual(successAttempt.runId, successAttempt.originalRunId);
+      assert.strictEqual(successAttempt.attempt, 3);
+      assert.ok(success.calls.diagnostics.some((event) =>
+        event.event === "disposition"
+        && event.disposition === "replay_delivered"
+        && event.originalRunId === successRecord.runId));
+
+      const deferCron = makeMainCron({ name: "replay-defer-fixture" });
+      const deferred = makeMainHarness(deferCron);
+      const deferRecord = makePendingRecord(deferCron, { attempts: 4 });
+      deferred.state.pending = deferRecord;
+      deferred.deps.deliver = () => { throw new Error("network unavailable"); };
+      await assertMainExits(deferred.deps, 1);
+      assert.ok(deferred.calls.diagnostics.some((event) =>
+        event.event === "disposition"
+        && event.disposition === "replay_deferred"
+        && event.originalRunId === deferRecord.runId));
+      assert.deepStrictEqual(deferred.calls.metrics, []);
+
+      const terminalCron = makeMainCron({ name: "replay-terminal-fixture" });
+      const terminal = makeMainHarness(terminalCron);
+      const terminalRecord = makePendingRecord(terminalCron);
+      terminal.state.pending = terminalRecord;
+      terminal.deps.loadAdminChatId = () => undefined;
+      let first = true;
+      terminal.deps.deliver = () => {
+        if (first) {
+          first = false;
+          throw new DeliveryError("invalid destination", {
+            status: 1,
+            stderrExcerpt: "[deliver] Error: invalid chat_id",
+          });
+        }
+      };
+      await main(terminal.deps);
+      assert.ok(terminal.calls.diagnostics.some((event) =>
+        event.event === "disposition"
+        && event.disposition === "replay_terminal"
+        && event.originalRunId === terminalRecord.runId));
+    });
+
+    it("keeps diagnostic writer and warning failures observational", async () => {
+      const cron = makeMainCron({ name: "diagnostic-failure-fixture" });
+      const { calls, deps, state } = makeMainHarness(cron);
+      let writerCalls = 0;
+      deps.writeCronDiagnosticEvent = () => {
+        writerCalls += 1;
+        throw new Error("diagnostic sink unavailable");
+      };
+      deps.warnCronDiagnosticFailure = () => {
+        calls.diagnosticWarnings += 1;
+        throw new Error("warning sink unavailable");
+      };
+      deps.deliver = (chatId, message, threadId) => {
+        calls.deliveries.push({ chatId, message, threadId });
+        throw new Error("delivery unavailable");
+      };
+
+      await assertMainExits(deps, 1);
+
+      assert.ok(writerCalls > 1, "later events still make best-effort writes");
+      assert.strictEqual(calls.diagnosticWarnings, 1);
+      assert.strictEqual(calls.deliveries.length, 3);
+      assert.deepStrictEqual(calls.sleeps, [...CRON_DELIVERY_RETRY_DELAYS_MS]);
+      assert.strictEqual(calls.outboxWrites.length, 1);
+      assert.strictEqual(state.pending, calls.outboxWrites[0]);
+      assert.strictEqual(calls.deliveryFailures.length, 1);
+      assert.deepStrictEqual(calls.metrics, [
+        { cronName: cron.name, exitCode: 1, success: false },
+      ]);
+      assert.deepStrictEqual(calls.exits, [1]);
+    });
+
+    it("keeps a default diagnostic filesystem failure observational", async () => {
+      const cron = makeMainCron({ name: "default-diagnostic-failure-fixture" });
+      const { calls, deps } = makeMainHarness(cron);
+      const previousLogDir = process.env.LOG_DIR;
+      const blocker = join(TEST_DIR, "diagnostic-log-blocker");
+      mkdirSync(TEST_DIR, { recursive: true });
+      writeFileSync(blocker, "fixture", "utf8");
+      process.env.LOG_DIR = join(blocker, "logs");
+      deps.writeCronDiagnosticEvent = writeDefaultCronDiagnosticEvent;
+
+      try {
+        await main(deps);
+      } finally {
+        if (previousLogDir === undefined) delete process.env.LOG_DIR;
+        else process.env.LOG_DIR = previousLogDir;
+        rmSync(blocker, { force: true });
+      }
+
+      assert.strictEqual(calls.diagnosticWarnings, 1);
+      assert.deepStrictEqual(calls.deliveries, [
+        { chatId: cron.deliveryChatId, message: "llm output", threadId: cron.deliveryThreadId },
+      ]);
+      assert.deepStrictEqual(calls.sleeps, []);
+      assert.deepStrictEqual(calls.outboxWrites, []);
+      assert.deepStrictEqual(calls.metrics, [
+        { cronName: cron.name, exitCode: 0, success: true },
+      ]);
+      assert.deepStrictEqual(calls.exits, []);
     });
   });
 

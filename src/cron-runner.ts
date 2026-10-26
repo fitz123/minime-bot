@@ -67,6 +67,15 @@ import {
   writeCronOutboxRecord,
   type CronOutboxRecord,
 } from "./cron-outbox.js";
+import {
+  CRON_DIAGNOSTIC_OUTPUT_CHARS,
+  CRON_DIAGNOSTIC_SUMMARY_CHARS,
+  retainCronDiagnosticText,
+  writeCronDiagnosticEvent,
+  type CronDiagnosticCronType,
+  type CronDiagnosticEvent,
+  type CronDiagnosticEventPayload,
+} from "./cron-diagnostics.js";
 export { loadMergedCrons, resolveCronsPath } from "./cron-loader.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -1268,6 +1277,8 @@ export interface CronRunnerMainDeps {
     exitCode: number,
     outcome: CronTerminalOutcome,
   ) => void;
+  writeCronDiagnosticEvent: (event: CronDiagnosticEvent) => void;
+  warnCronDiagnosticFailure: () => void;
 }
 
 const defaultMainDeps: Omit<CronRunnerMainDeps, "argv"> = {
@@ -1287,6 +1298,10 @@ const defaultMainDeps: Omit<CronRunnerMainDeps, "argv"> = {
   clearCronOutboxRecord,
   handleDeliveryFailure,
   writeCronHealthMetric,
+  writeCronDiagnosticEvent,
+  warnCronDiagnosticFailure: () => {
+    process.stderr.write("[cron-runner] WARN: cron diagnostics unavailable\n");
+  },
 };
 
 async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> {
@@ -1295,14 +1310,41 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     argv: process.argv,
     ...overrides,
   };
+  let diagnosticWarningWritten = false;
+  let diagnosticCron = "unknown";
+  let diagnosticCronType: CronDiagnosticCronType = "unknown";
+  let diagnosticRunId = `unknown@${new Date().toISOString()}#${process.pid}`;
+  const emitDiagnostic = (
+    eventOrBuild: CronDiagnosticEventPayload | (() => CronDiagnosticEventPayload),
+  ): void => {
+    try {
+      const event = typeof eventOrBuild === "function" ? eventOrBuild() : eventOrBuild;
+      deps.writeCronDiagnosticEvent({
+        ...event,
+        cron: diagnosticCron,
+        cronType: diagnosticCronType,
+        runId: diagnosticRunId,
+      } as CronDiagnosticEvent);
+    } catch {
+      if (diagnosticWarningWritten) return;
+      diagnosticWarningWritten = true;
+      try {
+        deps.warnCronDiagnosticFailure();
+      } catch {
+        // Diagnostics and their warning are observational only.
+      }
+    }
+  };
   let terminalFinalized = false;
   const finalizeInvocation = (
     cronName: string,
     outcome: CronTerminalOutcome,
+    disposition: Extract<CronDiagnosticEvent, { event: "run_terminal" }>["disposition"],
   ): void => {
     if (terminalFinalized) {
       throw new Error(`Cron invocation "${cronName}" was finalized more than once`);
     }
+    emitDiagnostic({ event: "run_terminal", outcome, disposition });
     deps.writeCronHealthMetric(cronName, outcome === "success" ? 0 : 1, outcome);
     terminalFinalized = true;
   };
@@ -1314,33 +1356,52 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     } catch {
       // Usage reporting is best-effort; the terminal failure still must publish.
     }
-    finalizeInvocation("unknown", "failure");
+    emitDiagnostic({ event: "run_started" });
+    finalizeInvocation("unknown", "failure", "usage_error");
     deps.exit(1);
   }
   const taskName = deps.argv[taskIdx + 1];
   const runId = `${taskName}@${new Date().toISOString()}#${process.pid}`;
+  diagnosticCron = taskName;
+  diagnosticRunId = runId;
 
   const deliverWithRetry = async (
     chatId: number,
     payload: string,
     threadId?: number,
   ): Promise<void> => {
-    try {
-      await deps.deliver(chatId, payload, threadId, { purpose: "result" });
-      return;
-    } catch (initialError) {
-      let lastError: unknown = initialError;
-      for (const delayMs of CRON_DELIVERY_RETRY_DELAYS_MS) {
-        await deps.sleep(delayMs);
-        try {
-          await deps.deliver(chatId, payload, threadId, { purpose: "result" });
-          return;
-        } catch (retryError) {
-          lastError = retryError;
-        }
+    let attempt = 1;
+    let lastError: unknown;
+    while (true) {
+      try {
+        await deps.deliver(chatId, payload, threadId, { purpose: "result" });
+        emitDiagnostic({
+          event: "delivery_attempt",
+          delivery: "fresh",
+          attempt,
+          outcome: "success",
+        });
+        return;
+      } catch (error) {
+        lastError = error;
+        emitDiagnostic(() => ({
+          event: "delivery_attempt",
+          delivery: "fresh",
+          attempt,
+          outcome: "failure",
+          queueable: isQueueableDeliveryFailure(error),
+          summary: retainCronDiagnosticText(
+            errorFromUnknown(error).message,
+            CRON_DIAGNOSTIC_SUMMARY_CHARS,
+          ),
+        }));
       }
-      throw lastError;
+      const delayMs = CRON_DELIVERY_RETRY_DELAYS_MS[attempt - 1];
+      if (delayMs === undefined) break;
+      await deps.sleep(delayMs);
+      attempt += 1;
     }
+    throw lastError;
   };
 
   const queueOutputIfEmpty = (
@@ -1351,10 +1412,14 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     try {
       if (deps.readCronOutboxRecord(taskName) !== undefined) {
         deps.log(taskName, "OUTBOX QUEUE-SKIPPED pending-existing");
+        const disposition = "fresh_queue_skipped_existing";
+        emitDiagnostic({ event: "disposition", disposition });
         return;
       }
     } catch {
       deps.log(taskName, "OUTBOX QUEUE-SKIPPED pending-existing");
+      const disposition = "fresh_queue_skipped_unreadable";
+      emitDiagnostic({ event: "disposition", disposition });
       return;
     }
 
@@ -1371,8 +1436,10 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
         attempts: 0,
       });
       deps.log(taskName, `OUTBOX QUEUED runId=${runId} kind=output`);
+      emitDiagnostic({ event: "disposition", disposition: "fresh_queued" });
     } catch (err) {
       deps.log(taskName, `OUTBOX QUEUE-WRITE-FAILED: ${errorFromUnknown(err).message}`);
+      emitDiagnostic({ event: "disposition", disposition: "fresh_queue_write_failed" });
     }
   };
 
@@ -1392,10 +1459,12 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     try {
       deps.log(taskName, `FAIL: ${(err as Error).message}`);
     } finally {
-      finalizeInvocation(taskName, "failure");
+      finalizeInvocation(taskName, "failure", "configuration_failed");
     }
     deps.exit(1);
   }
+  diagnosticCronType = cron.type;
+  emitDiagnostic({ event: "run_started" });
 
   let adminChatId: number | undefined;
   try {
@@ -1433,6 +1502,7 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     pendingRecord = deps.readCronOutboxRecord(taskName);
   } catch (err) {
     deps.log(taskName, `OUTBOX STATE-READ-FAILED: ${errorFromUnknown(err).message}`);
+    emitDiagnostic({ event: "disposition", disposition: "replay_state_failed" });
     // No logical cron execution started, so this outbox preflight failure must
     // not increment terminal logical-run counters.
     deps.exit(1);
@@ -1450,12 +1520,22 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
         taskName,
         `OUTBOX CLEAR-FAILED legacy-failure-notice runId=${pendingRecord.runId}: ${errorFromUnknown(err).message}`,
       );
+      emitDiagnostic({
+        event: "disposition",
+        disposition: "replay_clear_failed",
+        originalRunId: pendingRecord.runId,
+      });
       deps.exit(1);
     }
     deps.log(
       taskName,
       `OUTBOX DROPPED legacy-failure-notice runId=${pendingRecord.runId}`,
     );
+    emitDiagnostic({
+      event: "disposition",
+      disposition: "replay_dropped_legacy",
+      originalRunId: pendingRecord.runId,
+    });
     pendingRecord = undefined;
   }
 
@@ -1466,9 +1546,19 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
       deps.clearCronOutboxRecord(taskName);
     } catch (err) {
       deps.log(taskName, `OUTBOX CLEAR-FAILED expired runId=${pendingRecord.runId}: ${errorFromUnknown(err).message}`);
+      emitDiagnostic({
+        event: "disposition",
+        disposition: "replay_clear_failed",
+        originalRunId: pendingRecord.runId,
+      });
       deps.exit(1);
     }
     deps.log(taskName, `OUTBOX DROPPED expired runId=${pendingRecord.runId}`);
+    emitDiagnostic({
+      event: "disposition",
+      disposition: "replay_dropped_expired",
+      originalRunId: pendingRecord.runId,
+    });
     pendingRecord = undefined;
   }
 
@@ -1476,8 +1566,10 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     try {
       deps.clearCronOutboxRecord(taskName);
       deps.log(taskName, "OUTBOX TERMINAL corrupt");
+      emitDiagnostic({ event: "disposition", disposition: "replay_dropped_corrupt" });
     } catch (err) {
       deps.log(taskName, `OUTBOX CLEAR-FAILED corrupt: ${errorFromUnknown(err).message}`);
+      emitDiagnostic({ event: "disposition", disposition: "replay_clear_failed" });
       deps.exit(1);
     }
   } else if (pendingRecord !== undefined) {
@@ -1486,8 +1578,27 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     const deliveryAttempt: { ok: true } | { ok: false; error: unknown } = await (async () => {
       try {
         await deps.deliver(pendingRecord.chatId, pendingRecord.payload, pendingRecord.threadId, { purpose: "result" });
+        emitDiagnostic({
+          event: "delivery_attempt",
+          delivery: "replay",
+          attempt: pendingRecord.attempts + 1,
+          originalRunId: pendingRecord.runId,
+          outcome: "success",
+        });
         return { ok: true };
       } catch (error) {
+        emitDiagnostic(() => ({
+          event: "delivery_attempt",
+          delivery: "replay",
+          attempt: pendingRecord.attempts + 1,
+          originalRunId: pendingRecord.runId,
+          outcome: "failure",
+          queueable: isQueueableDeliveryFailure(error),
+          summary: retainCronDiagnosticText(
+            errorFromUnknown(error).message,
+            CRON_DIAGNOSTIC_SUMMARY_CHARS,
+          ),
+        }));
         return { ok: false, error };
       }
     })();
@@ -1506,12 +1617,22 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
             taskName,
             `OUTBOX RETRY-WRITE-FAILED runId=${pendingRecord.runId}: ${errorFromUnknown(writeError).message}`,
           );
+          emitDiagnostic({
+            event: "disposition",
+            disposition: "replay_write_failed",
+            originalRunId: pendingRecord.runId,
+          });
           deps.exit(1);
         }
         deps.log(
           taskName,
           `OUTBOX RETRY-DEFERRED runId=${pendingRecord.runId} attempts=${updatedRecord.attempts}`,
         );
+        emitDiagnostic({
+          event: "disposition",
+          disposition: "replay_deferred",
+          originalRunId: pendingRecord.runId,
+        });
         // This invocation only retried delivery owed by an earlier logical
         // run. It exits without generating or counting a new logical run.
         deps.exit(1);
@@ -1523,12 +1644,22 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
           taskName,
           `OUTBOX CLEAR-FAILED runId=${pendingRecord.runId}: ${errorFromUnknown(clearError).message}`,
         );
+        emitDiagnostic({
+          event: "disposition",
+          disposition: "replay_clear_failed",
+          originalRunId: pendingRecord.runId,
+        });
         deps.exit(1);
       }
       deps.log(
         taskName,
         `OUTBOX TERMINAL deterministic runId=${pendingRecord.runId} attempts=${pendingRecord.attempts}`,
       );
+      emitDiagnostic({
+        event: "disposition",
+        disposition: "replay_terminal",
+        originalRunId: pendingRecord.runId,
+      });
       await notifyAdminOfTerminalOutbox(pendingRecord, "deterministic");
     } else {
       try {
@@ -1538,12 +1669,22 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
           taskName,
           `OUTBOX CLEAR-FAILED runId=${pendingRecord.runId}: ${errorFromUnknown(err).message}`,
         );
+        emitDiagnostic({
+          event: "disposition",
+          disposition: "replay_clear_failed",
+          originalRunId: pendingRecord.runId,
+        });
         deps.exit(1);
       }
       deps.log(
         taskName,
         `OUTBOX REDELIVERED runId=${pendingRecord.runId} attempts=${pendingRecord.attempts}`,
       );
+      emitDiagnostic({
+        event: "disposition",
+        disposition: "replay_delivered",
+        originalRunId: pendingRecord.runId,
+      });
     }
   }
 
@@ -1567,10 +1708,24 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
       output = classified.output.trim();
       terminalOutcome = classified.outcome;
     }
+    emitDiagnostic(() => ({
+      event: "execution_result",
+      outcome: terminalOutcome,
+      detail: terminalOutcome === "failure" ? "logical_failure" : "completed",
+      output: retainCronDiagnosticText(output, CRON_DIAGNOSTIC_OUTPUT_CHARS),
+    }));
   } catch (err) {
     const error = errorFromUnknown(err);
     const errMsg = `Cron task "${taskName}" failed: ${error.message}`;
     const diagnostics = cronErrorDiagnostics(err);
+    emitDiagnostic(() => ({
+      event: "execution_failure",
+      outcome: "failure",
+      failureKind: /\b(?:ETIMEDOUT|timed out|timeout)\b/i.test(error.message)
+        ? "timeout"
+        : "error",
+      summary: retainCronDiagnosticText(error.message, CRON_DIAGNOSTIC_SUMMARY_CHARS),
+    }));
     try {
       try {
         deps.log(taskName, `FAIL: ${errMsg}`);
@@ -1580,13 +1735,14 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
         }
       }
     } finally {
-      finalizeInvocation(taskName, "failure");
+      finalizeInvocation(taskName, "failure", "execution_failed");
     }
     deps.exit(1);
   }
 
   if (!output) {
-    finalizeInvocation(taskName, terminalOutcome);
+    emitDiagnostic({ event: "disposition", disposition: "empty_output" });
+    finalizeInvocation(taskName, terminalOutcome, "empty_output");
     deps.log(taskName, "WARN: empty output — skipping delivery");
     if (terminalOutcome === "failure") {
       deps.exit(1);
@@ -1595,7 +1751,8 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     return;
   }
   if (cron.type === "llm" && shouldSuppressNoReply(output)) {
-    finalizeInvocation(taskName, terminalOutcome);
+    emitDiagnostic({ event: "disposition", disposition: "no_reply" });
+    finalizeInvocation(taskName, terminalOutcome, "no_reply");
     deps.log(taskName, "NO_REPLY — skipping delivery");
     if (terminalOutcome === "failure") {
       deps.exit(1);
@@ -1617,12 +1774,13 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
         deps.handleDeliveryFailure(taskName, cron.deliveryChatId, (err as Error).message, adminChatId);
       }
     } finally {
-      finalizeInvocation(taskName, "failure");
+      finalizeInvocation(taskName, "failure", "delivery_failed");
     }
     deps.exit(1);
   }
 
-  finalizeInvocation(taskName, terminalOutcome);
+  emitDiagnostic({ event: "disposition", disposition: "delivered" });
+  finalizeInvocation(taskName, terminalOutcome, "delivered");
   deps.log(taskName, `Delivered to chat ${cron.deliveryChatId}${cron.deliveryThreadId ? ` thread ${cron.deliveryThreadId}` : ""}`);
   if (terminalOutcome === "failure") {
     deps.exit(1);
