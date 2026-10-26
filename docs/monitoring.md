@@ -202,6 +202,18 @@ retry/outbox delivery, then records a logical failure and exits non-zero. A
 marker embedded in prose, quoted, repeated, or followed by another non-empty
 line is delivered unchanged. Script cron output is never marker-classified.
 
+The cron runner appends versioned diagnostic events to
+`$LOG_DIR/cron-diagnostics.jsonl` and enforces mode `0600` on the file. Its
+allowlisted metadata and bounded, control-character-sanitized,
+secret/URI-redacted final output or controlled failure summaries provide
+execution, fresh-delivery, and replay evidence without prompts, commands,
+configuration/environment objects, raw child diagnostics, or stacks. Use
+`runId` to correlate one invocation and
+`originalRunId` on replay events to locate the run that created the pending
+output. Rotation belongs to the deployment, which must apply a
+copytruncate-compatible policy to this exact file so concurrent cron appenders
+remain safe; the package does not provide rotation.
+
 The example `MinimeCronTerminalFailure` rule joins non-zero exit state to an
 existing terminal timestamp by `cron`. Its five-minute `for` period suppresses
 brief evaluation churn, and its five-minute future tolerance rejects
@@ -225,8 +237,9 @@ after upgrade is discarded without delivery.
 
 Pickup-only outbox preflight failures and deferred redelivery attempts happen
 before a new logical cron run begins. They exit non-zero without changing
-last-exit, last-run, last-success, or counter series; use their bounded
-`OUTBOX` cron-log evidence and process status for diagnosis.
+last-exit, last-run, last-success, or counter series; use their JSONL replay
+attempts/dispositions, existing bounded `OUTBOX` cron-log evidence, and process
+status for diagnosis.
 
 Run the deterministic rule fixture from the package root:
 

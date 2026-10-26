@@ -916,11 +916,23 @@ retry/outbox path, and then records a non-zero logical failure. Embedded,
 quoted, repeated, or non-final marker-like text is ordinary output, and script
 cron output is never interpreted as this marker.
 
+The cron runner also appends versioned JSONL evidence to
+`$LOG_DIR/cron-diagnostics.jsonl`. The package keeps this file owner-only at
+mode `0600`. Events contain only allowlisted metadata and bounded,
+control-character-sanitized, secret/URI-redacted final output or controlled
+failure summaries; they never contain prompts, commands, environment/config
+objects, raw child diagnostics, or stacks. A `runId` correlates one invocation, while replay
+delivery events also carry `originalRunId` to correlate them to the run that
+created the pending output. Rotation is deployment-owned: deployments must
+rotate this exact file with copytruncate-compatible behavior because cron
+processes may append concurrently. The package does not rotate it.
+
 Execution failures no longer send a direct generic `Cron FAIL` message or
 create a failure-notice outbox entry. Prometheus and Alertmanager own terminal
-incident grouping, repeats, and recovery. Bounded diagnostics remain in the
-local cron log, while the existing admin fallback for a delivery-path failure
-is unchanged. On upgrade, an old queued `failure-notice` record is discarded
+incident grouping, repeats, and recovery. The diagnostic JSONL retains safe
+structured execution evidence, and bounded legacy diagnostics remain in the
+per-cron local log. The existing admin fallback for a delivery-path failure is
+unchanged. On upgrade, an old queued `failure-notice` record is discarded
 without delivery.
 
 Cron delivery is pickup-first. At the start of each scheduled invocation, the
@@ -941,12 +953,13 @@ bot), and local destination validation errors, take the terminal clear/admin
 notice path so corrected configuration can run. Rate limits, 5xx, network errors,
 and unknown responses remain queueable. Legacy failure notices are dropped.
 Queue, redelivery, expiry, deferral, and terminal decisions are recorded as
+structured attempts/dispositions in `cron-diagnostics.jsonl` and as existing
 `OUTBOX` lines in `cron-<name>.log`.
 
 Pickup-only outbox preflight failures and deferred redelivery attempts do not
 start a new logical cron run, so they do not change terminal metrics or
-counters. Their non-zero process exit and `OUTBOX` log lines remain the
-diagnostic evidence.
+counters. Their JSONL replay evidence, non-zero process exit, and existing
+`OUTBOX` log lines support diagnosis.
 
 Delivery has at-least-once, not exactly-once, semantics: a process crash after
 the chat accepts a message but before the outbox record is cleared can produce
