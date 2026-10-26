@@ -132,8 +132,8 @@ export type CronDiagnosticEventPayload = CronDiagnosticEvent extends infer Event
     : never
   : never;
 
-const URL_PATTERN = /\b(?:https?|ftp):\/\/[^\s<>"']+/giu;
-const NAMED_SECRET_PATTERN = /(^|[^\p{L}\p{N}_-])((?:["'](?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential)["'])|(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential))(\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}\]]+)/gimu;
+const URL_PATTERN = /\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s<>"']+/gu;
+const NAMED_SECRET_PATTERN = /(^|[^\p{L}\p{N}_-])((?:["'][\p{L}\p{N}_-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential)["'])|(?:[\p{L}\p{N}_-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential)))(\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}\]]+)/gimu;
 const AUTH_SECRET_PATTERN = /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/giu;
 const PROVIDER_SECRET_PATTERNS = [
   /\b(?:sk|rk|pk)-[A-Za-z0-9_-]{12,}\b/gu,
