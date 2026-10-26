@@ -29,6 +29,7 @@ import {
   MINIME_CRON_UNRESOLVED_MARKER,
   resolveCronAgentData,
   resolveCronEngine,
+  runPi,
   runOneShot,
   runScript,
   writeCronHealthMetric,
@@ -38,6 +39,7 @@ import type {
   CronRunnerMainDeps,
   CronTerminalOutcome,
   DeliveryDefaults,
+  PiRunDeps,
 } from "../cron-runner.js";
 import {
   clearCronOutboxRecord,
@@ -3288,6 +3290,69 @@ bindings: []
       assert.strictEqual(thrownFailure.failure.code, undefined);
       assert.strictEqual(thrownFailure.failure.signal, undefined);
       assert.doesNotMatch(JSON.stringify(thrownFailure), /YAMLParseError|systemPrompt|opaque-/);
+
+      const piTimeoutCron = makeMainCron({
+        name: "controlled-pi-timeout-fixture",
+        timeout: 2_345,
+      });
+      const piTimeout = makeMainHarness(piTimeoutCron);
+      const timeoutWorkspace = process.env.MINIME_CONTROL_WORKSPACE_ROOT!;
+      piTimeout.deps.resolveCronAgentData = (agentId: string) => ({
+        id: agentId,
+        workspaceCwd: timeoutWorkspace,
+        model: "openai-codex/gpt-5.5",
+      });
+      const timeoutError = Object.assign(new Error("spawnSync pi ETIMEDOUT"), {
+        code: "ETIMEDOUT",
+      });
+      const piDeps: PiRunDeps = {
+        spawnSync: () => ({
+          pid: 12345,
+          output: [null, "partial private output", "private timeout diagnostics"],
+          stdout: "partial private output",
+          stderr: "private timeout diagnostics",
+          status: null,
+          signal: "SIGTERM",
+          error: timeoutError,
+        } as ReturnType<PiRunDeps["spawnSync"]>),
+        buildAgentConfig: (_cron, workspaceCwd, agentData) => ({
+          id: agentData?.id ?? "main",
+          workspaceCwd,
+          provider: "pi",
+          model: agentData?.model ?? "openai-codex/gpt-5.5",
+        }),
+        buildEnv: () => ({}),
+        assembleContext: () => null,
+        resolveExtensionArgs: () => [],
+      };
+      piTimeout.deps.runPi = (llmCron, workspaceCwd, agentData) =>
+        runPi(llmCron, workspaceCwd, piDeps, agentData);
+      await assertMainExits(piTimeout.deps, 1);
+      const piTimeoutFailure = piTimeout.calls.diagnostics.find((event) =>
+        event.event === "execution_failure");
+      assert.ok(piTimeoutFailure && piTimeoutFailure.event === "execution_failure");
+      assert.deepStrictEqual(
+        {
+          category: piTimeoutFailure.failure.category,
+          kind: piTimeoutFailure.failure.kind,
+          summary: piTimeoutFailure.failure.summary.text,
+          code: piTimeoutFailure.failure.code,
+          signal: piTimeoutFailure.failure.signal,
+          timeoutMs: piTimeoutFailure.failure.timeoutMs,
+        },
+        {
+          category: "pi_timeout",
+          kind: "timeout",
+          summary: "Pi cron timed out after 2345ms",
+          code: "ETIMEDOUT",
+          signal: "SIGTERM",
+          timeoutMs: 2_345,
+        },
+      );
+      assert.doesNotMatch(
+        JSON.stringify(piTimeoutFailure),
+        /partial private output|private timeout diagnostics|spawnSync pi/,
+      );
 
       const scriptCron = makeMainCron({
         name: "controlled-script-failure-fixture",

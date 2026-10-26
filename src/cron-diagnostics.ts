@@ -40,6 +40,7 @@ export type CronDiagnosticFailureCategory =
   | "pi_output_error"
   | "pi_signal"
   | "pi_spawn"
+  | "pi_timeout"
   | "script_exit"
   | "script_failure"
   | "script_signal"
@@ -132,16 +133,17 @@ export type CronDiagnosticEventPayload = CronDiagnosticEvent extends infer Event
     : never
   : never;
 
-const URL_PATTERN = /\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s<>"']+/gu;
-const NAMED_SECRET_PATTERN = /(^|[^\p{L}\p{N}_-])((?:["'][\p{L}\p{N}_-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential)["'])|(?:[\p{L}\p{N}_-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential)))(\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}\]]+)/gimu;
+const URL_PATTERN = /(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s<>"']+(?=$|[\s<>"'])/gu;
+const NAMED_SECRET_PATTERN = /(^|[^\p{L}\p{N}_-])((?:["'][\p{L}\p{N}_-]*(?:secret[_-]?key|password|passwd|private[_-]?key|access[_-]?key|api[_-]?key|credential|secret|token|pass|pwd)["'])|(?:[\p{L}\p{N}_-]*(?:secret[_-]?key|password|passwd|private[_-]?key|access[_-]?key|api[_-]?key|credential|secret|token|pass|pwd)))(\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}\]]+)/gimu;
 const AUTH_SECRET_PATTERN = /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/giu;
+const PRIVATE_KEY_PATTERN = /-----BEGIN ((?:RSA |EC )?PRIVATE KEY)-----[\s\S]*?-----END \1-----/gu;
 const PROVIDER_SECRET_PATTERNS = [
   /\b(?:sk|rk|pk)-[A-Za-z0-9_-]{12,}\b/gu,
   /\bgh[pousr]_[A-Za-z0-9]{20,}\b/gu,
   /\bxox[baprs]-[A-Za-z0-9-]{12,}\b/gu,
   /\bAKIA[0-9A-Z]{16}\b/gu,
   /\b\d{6,12}:[A-Za-z0-9_-]{20,}\b/gu,
-  /\b[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\b/gu,
+  /(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_-])/gu,
 ] as const;
 
 function redactCronDiagnosticText(value: string): { text: string; redacted: boolean } {
@@ -149,9 +151,17 @@ function redactCronDiagnosticText(value: string): { text: string; redacted: bool
   let text = value
     .replace(/\x1B\[[0-?]*[ -/]*[@-~]/gu, "")
     .replace(/[\u0000-\u001F\u007F-\u009F]/gu, " ");
+  text = text.replace(PRIVATE_KEY_PATTERN, () => {
+    redacted = true;
+    return "[REDACTED_PRIVATE_KEY]";
+  });
   text = text.replace(URL_PATTERN, () => {
     redacted = true;
     return "[REDACTED_URL]";
+  });
+  text = text.replace(AUTH_SECRET_PATTERN, (_match, scheme: string) => {
+    redacted = true;
+    return `${scheme} [REDACTED]`;
   });
   text = text.replace(NAMED_SECRET_PATTERN, (
     _match,
@@ -161,10 +171,6 @@ function redactCronDiagnosticText(value: string): { text: string; redacted: bool
   ) => {
     redacted = true;
     return `${prefix}${name}${separator}[REDACTED]`;
-  });
-  text = text.replace(AUTH_SECRET_PATTERN, (_match, scheme: string) => {
-    redacted = true;
-    return `${scheme} [REDACTED]`;
   });
   for (const pattern of PROVIDER_SECRET_PATTERNS) {
     text = text.replace(pattern, () => {

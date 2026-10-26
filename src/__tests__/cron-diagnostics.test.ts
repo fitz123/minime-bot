@@ -80,13 +80,16 @@ describe("cron diagnostics writer", () => {
   it("sanitizes controls, redacts secret-shaped material and URLs, and reports exact truncation", () => {
     const secret = `sk-${"a".repeat(24)}`;
     const bearer = `Bearer ${"b".repeat(24)}`;
+    const combinedAuth = "token: Bearer opaquecredentialvalue123456";
     const url = "https://example.invalid/report?token=synthetic-value";
     const connectionUri = "postgresql://opaque-user:opaque-uri-password@db.example.invalid/opaque-database?sslmode=opaque-mode";
+    const jwt = `${"j_".repeat(8)}.${"w-".repeat(8)}.${"t_".repeat(8)}`;
     const jsonCredential = "opaque-json-credential";
     const yamlCredential = "opaque-yaml-credential";
     const compoundCredentials = [
       '{"access_token":"opaque-json-access-token","client_secret":"opaque-json-client-secret","database_password":"opaque-json-password"}',
       '{"accessToken":"opaque-camel-access-token","refreshToken":"opaque-camel-refresh-token","clientSecret":"opaque-camel-client-secret","databasePassword":"opaque-camel-password"}',
+      '{"SECRET_KEY":"opaque-json-secret-key","service_secret_key":"opaque-json-prefixed-secret-key","databasePass":"opaque-camel-pass","cachePwd":"opaque-camel-pwd"}',
       "refresh_token: opaque-yaml-refresh-token",
       "service_passwd=opaque-yaml-passwd",
       "auth_api_key: opaque-yaml-api-key",
@@ -94,8 +97,13 @@ describe("cron diagnostics writer", () => {
       "tls_private_key: opaque-yaml-private-key",
       "storage_credential=opaque-yaml-credential",
     ].join(" ");
+    const privateKeyBlocks = [
+      "config: |\n  -----BEGIN RSA PRIVATE KEY-----\nopaque-rsa-private-material\n-----END RSA PRIVATE KEY-----",
+      "config: |\n  -----BEGIN EC PRIVATE KEY-----\nopaque-ec-private-material\n-----END EC PRIVATE KEY-----",
+      "config: |\n  -----BEGIN PRIVATE KEY-----\nopaque-pkcs8-private-material\n-----END PRIVATE KEY-----",
+    ].join("\n");
     const ordinaryKeys = "tokenizer: keep-tokenizer-value secretariat=keep-secretariat-value passwordless: keep-passwordless-value";
-    const source = `start\u0000\u001b[31m red\napi_key=${secret} ${bearer} ${url} ${connectionUri} {"password":"${jsonCredential}"} 'credential': '${yamlCredential}' ${compoundCredentials} ${ordinaryKeys} ending`;
+    const source = `start\u0000\u001b[31m red\napi_key=${secret} ${bearer} ${combinedAuth} ${url} ${connectionUri} ${jwt} ${jwt}. {"password":"${jsonCredential}"} 'credential': '${yamlCredential}' ${compoundCredentials} ${privateKeyBlocks} ${ordinaryKeys} ending`;
     const limit = 32;
     const fullySanitized = retainCronDiagnosticText(source, Number.MAX_SAFE_INTEGER);
     const retained = retainCronDiagnosticText(source, limit);
@@ -113,12 +121,19 @@ describe("cron diagnostics writer", () => {
     assert.match(retained.text, /\[REDACTED/);
     assert.doesNotMatch(
       fullySanitized.text,
-      /opaque-(?:json|yaml|camel)-(?:access-token|client-secret|password|refresh-token|passwd|api-key|access-key|private-key|credential)/u,
+      /opaque-(?:json|yaml|camel)-(?:access-token|client-secret|password|refresh-token|passwd|api-key|access-key|private-key|credential|secret-key|prefixed-secret-key|pass|pwd)/u,
     );
     assert.doesNotMatch(
       fullySanitized.text,
       /opaque-user|opaque-uri-password|db\.example\.invalid|opaque-database|opaque-mode/u,
     );
+    assert.doesNotMatch(
+      fullySanitized.text,
+      /opaquecredentialvalue|opaque-(?:rsa|ec|pkcs8)-private-material|BEGIN (?:RSA |EC )?PRIVATE KEY/u,
+    );
+    assert.ok(!fullySanitized.text.includes(jwt));
+    assert.match(fullySanitized.text, /\[REDACTED\] \[REDACTED\]\./u);
+    assert.match(fullySanitized.text, /token: \[REDACTED\] \[REDACTED\]/u);
     assert.match(fullySanitized.text, /"password":\[REDACTED\]/u);
     assert.match(fullySanitized.text, /'credential': \[REDACTED\]/u);
     assert.match(fullySanitized.text, /"access_token":\[REDACTED\]/u);
@@ -127,11 +142,30 @@ describe("cron diagnostics writer", () => {
     assert.match(fullySanitized.text, /"refreshToken":\[REDACTED\]/u);
     assert.match(fullySanitized.text, /"clientSecret":\[REDACTED\]/u);
     assert.match(fullySanitized.text, /"databasePassword":\[REDACTED\]/u);
+    assert.match(fullySanitized.text, /"SECRET_KEY":\[REDACTED\]/u);
+    assert.match(fullySanitized.text, /"service_secret_key":\[REDACTED\]/u);
+    assert.match(fullySanitized.text, /"databasePass":\[REDACTED\]/u);
+    assert.match(fullySanitized.text, /"cachePwd":\[REDACTED\]/u);
     assert.match(fullySanitized.text, /refresh_token: \[REDACTED\]/u);
     assert.match(fullySanitized.text, /tls_private_key: \[REDACTED\]/u);
     assert.match(fullySanitized.text, /tokenizer: keep-tokenizer-value/u);
     assert.match(fullySanitized.text, /secretariat=keep-secretariat-value/u);
     assert.match(fullySanitized.text, /passwordless: keep-passwordless-value/u);
+  });
+
+  it("handles bounded long URI/JWT-like non-candidates without overlapping rescans", () => {
+    const source = [
+      "a-".repeat(16_384),
+      `${"b".repeat(15)}.`.repeat(2_048),
+    ].join(" ");
+    const retained = retainCronDiagnosticText(source, 128);
+
+    assert.strictEqual(retained.sourceChars, Array.from(source).length);
+    assert.strictEqual(retained.retainedChars, 128);
+    assert.strictEqual(retained.omittedChars, Array.from(source).length - 128);
+    assert.strictEqual(retained.truncated, true);
+    assert.strictEqual(retained.redacted, false);
+    assert.strictEqual(retained.text, source.slice(0, 128));
   });
 
   it("serializes only allowlisted event and retained-text fields", () => {

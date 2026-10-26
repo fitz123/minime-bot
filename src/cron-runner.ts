@@ -1449,11 +1449,20 @@ function runPi(
   if (result.error) {
     const spawnError = piErrorResult(`Pi cron spawn failed: ${result.error.message}`, result.stdout, result.stderr);
     const code = safeDiagnosticCode((result.error as NodeJS.ErrnoException).code);
+    const signal = safeDiagnosticSignal(result.signal);
+    const timeoutMs = safeDiagnosticTimeoutMs(cron.timeout ?? DEFAULT_TIMEOUT_MS);
+    const isTimeout = code === "ETIMEDOUT";
     throw new CronRunError(spawnError.message, spawnError.diagnostics, {
-      category: "pi_spawn",
-      kind: code === "ETIMEDOUT" ? "timeout" : "error",
-      summary: code === "ETIMEDOUT" ? "Pi cron spawn timed out" : "Pi cron spawn failed",
+      category: isTimeout ? "pi_timeout" : "pi_spawn",
+      kind: isTimeout ? "timeout" : "error",
+      summary: isTimeout
+        ? timeoutMs === undefined
+          ? "Pi cron timed out"
+          : `Pi cron timed out after ${timeoutMs}ms`
+        : "Pi cron spawn failed",
       ...(code === undefined ? {} : { code }),
+      ...(signal === undefined ? {} : { signal }),
+      ...(!isTimeout || timeoutMs === undefined ? {} : { timeoutMs }),
     });
   }
 

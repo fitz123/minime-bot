@@ -358,8 +358,10 @@ Proven Telegram API 4xx rejections except 429, including deleted topics and
 blocked bots, clear the pending record through the terminal/admin-notice path,
 allowing corrected cron configuration to proceed. Local destination validation
 errors are also terminal. Rate limits, 5xx, transport failures, and unknown or
-non-JSON gateway responses remain queueable. Inspect `OUTBOX` log lines for
-pickup, deferral, expiry, and terminal decisions. Delivery is not exactly-once:
+non-JSON gateway responses remain queueable. Inspect the correlated
+delivery-attempt/disposition events in `$LOG_DIR/cron-diagnostics.jsonl` and
+the existing `OUTBOX` log lines for pickup, deferral, expiry, and terminal
+decisions. Delivery is not exactly-once:
 ambiguous transport failures, partial multi-chunk delivery, or a crash before
 record removal can cause duplicates. Ordinary bot API calls retain two short
 abort-aware transport retries shared across their bounded 429/5xx retries;

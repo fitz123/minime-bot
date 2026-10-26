@@ -738,7 +738,7 @@ describe("cron-runner runPi", () => {
     assert.throws(() => runPi(makeCron(), ws, deps), /Pi cron spawn failed: ENOENT pi/);
   });
 
-  it("keeps timeout spawn diagnostics separate from the public spawn error", () => {
+  it("keeps timeout spawn diagnostics separate and exposes safe timeout metadata", () => {
     const ws = makeWorkspace();
     const captures: SpawnCapture[] = [];
     const timeoutError = Object.assign(new Error("spawnSync pi ETIMEDOUT"), { code: "ETIMEDOUT" });
@@ -752,11 +752,22 @@ describe("cron-runner runPi", () => {
       })),
     });
 
-    assert.throws(() => runPi(makeCron(), ws, deps), (err: unknown) => {
+    assert.throws(() => runPi(makeCron({ timeout: 4_321 }), ws, deps), (err: unknown) => {
       assert.match((err as Error).message, /Pi cron spawn failed: spawnSync pi ETIMEDOUT/);
       assert.doesNotMatch((err as Error).message, /timeout stderr details/);
       assert.match((err as { diagnostics?: string }).diagnostics ?? "", /stderr: timeout stderr details/);
       assert.match((err as { diagnostics?: string }).diagnostics ?? "", /stdout: partial timeout stdout/);
+      assert.deepStrictEqual(
+        (err as { diagnosticFailure?: unknown }).diagnosticFailure,
+        {
+          category: "pi_timeout",
+          kind: "timeout",
+          summary: "Pi cron timed out after 4321ms",
+          code: "ETIMEDOUT",
+          signal: "SIGTERM",
+          timeoutMs: 4_321,
+        },
+      );
       return true;
     });
   });
