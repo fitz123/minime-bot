@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, it } from "node:test";
 import {
@@ -85,6 +86,7 @@ describe("cron diagnostics writer", () => {
     const connectionUri = "postgresql://opaque-user:opaque-uri-password@db.example.invalid/opaque-database?sslmode=opaque-mode";
     const jwt = `${"j_".repeat(8)}.${"w-".repeat(8)}.${"t_".repeat(8)}`;
     const jsonCredential = "opaque-json-credential";
+    const escapedJsonCredential = "opaque-escaped-json-credential";
     const yamlCredential = "opaque-yaml-credential";
     const compoundCredentials = [
       '{"access_token":"opaque-json-access-token","client_secret":"opaque-json-client-secret","database_password":"opaque-json-password"}',
@@ -101,9 +103,13 @@ describe("cron diagnostics writer", () => {
       "config: |\n  -----BEGIN RSA PRIVATE KEY-----\nopaque-rsa-private-material\n-----END RSA PRIVATE KEY-----",
       "config: |\n  -----BEGIN EC PRIVATE KEY-----\nopaque-ec-private-material\n-----END EC PRIVATE KEY-----",
       "config: |\n  -----BEGIN PRIVATE KEY-----\nopaque-pkcs8-private-material\n-----END PRIVATE KEY-----",
+      "config: |\n  -----BEGIN OPENSSH PRIVATE KEY-----\nopaque-openssh-private-material\n-----END OPENSSH PRIVATE KEY-----",
+      "config: |\n  -----BEGIN ENCRYPTED PRIVATE KEY-----\nopaque-encrypted-private-material\n-----END ENCRYPTED PRIVATE KEY-----",
+      "config: |\n  -----BEGIN PGP PRIVATE KEY BLOCK-----\nopaque-pgp-private-material\n-----END PGP PRIVATE KEY BLOCK-----",
     ].join("\n");
+    const escapedJson = `{\u0000\\"password\\":\\"${escapedJsonCredential}\\"}`;
     const ordinaryKeys = "tokenizer: keep-tokenizer-value secretariat=keep-secretariat-value passwordless: keep-passwordless-value";
-    const source = `start\u0000\u001b[31m red\napi_key=${secret} ${bearer} ${combinedAuth} ${url} ${connectionUri} ${jwt} ${jwt}. {"password":"${jsonCredential}"} 'credential': '${yamlCredential}' ${compoundCredentials} ${privateKeyBlocks} ${ordinaryKeys} ending`;
+    const source = `start\u0000\u001b[31m red\napi_key=${secret} ${bearer} ${combinedAuth} ${url} ${connectionUri} ${jwt} ${jwt}. {"password":"${jsonCredential}"} ${escapedJson} 'credential': '${yamlCredential}' ${compoundCredentials} ${privateKeyBlocks} ${ordinaryKeys} ending`;
     const limit = 32;
     const fullySanitized = retainCronDiagnosticText(source, Number.MAX_SAFE_INTEGER);
     const retained = retainCronDiagnosticText(source, limit);
@@ -129,12 +135,13 @@ describe("cron diagnostics writer", () => {
     );
     assert.doesNotMatch(
       fullySanitized.text,
-      /opaquecredentialvalue|opaque-(?:rsa|ec|pkcs8)-private-material|BEGIN (?:RSA |EC )?PRIVATE KEY/u,
+      /opaquecredentialvalue|opaque-escaped-json-credential|opaque-(?:rsa|ec|pkcs8|openssh|encrypted|pgp)-private-material|BEGIN (?:(?:RSA|EC|DSA|OPENSSH|ENCRYPTED) )?PRIVATE KEY|BEGIN PGP PRIVATE KEY BLOCK/u,
     );
     assert.ok(!fullySanitized.text.includes(jwt));
     assert.match(fullySanitized.text, /\[REDACTED\] \[REDACTED\]\./u);
     assert.match(fullySanitized.text, /token: \[REDACTED\] \[REDACTED\]/u);
     assert.match(fullySanitized.text, /"password":\[REDACTED\]/u);
+    assert.match(fullySanitized.text, /\{ \\"password\\":\[REDACTED\]\}/u);
     assert.match(fullySanitized.text, /'credential': \[REDACTED\]/u);
     assert.match(fullySanitized.text, /"access_token":\[REDACTED\]/u);
     assert.match(fullySanitized.text, /"client_secret":\[REDACTED\]/u);
@@ -155,17 +162,21 @@ describe("cron diagnostics writer", () => {
 
   it("handles bounded long URI/JWT-like non-candidates without overlapping rescans", () => {
     const source = [
-      "a-".repeat(16_384),
-      `${"b".repeat(15)}.`.repeat(2_048),
+      "a-".repeat(100_000),
+      `${"b".repeat(15)}.`.repeat(12_500),
     ].join(" ");
+    const startedAt = performance.now();
     const retained = retainCronDiagnosticText(source, 128);
+    const elapsedMs = performance.now() - startedAt;
 
+    assert.strictEqual(source.length, 400_001);
     assert.strictEqual(retained.sourceChars, Array.from(source).length);
     assert.strictEqual(retained.retainedChars, 128);
     assert.strictEqual(retained.omittedChars, Array.from(source).length - 128);
     assert.strictEqual(retained.truncated, true);
     assert.strictEqual(retained.redacted, false);
     assert.strictEqual(retained.text, source.slice(0, 128));
+    assert.ok(elapsedMs < 1_000, `sanitizing adversarial input took ${elapsedMs.toFixed(1)}ms`);
   });
 
   it("serializes only allowlisted event and retained-text fields", () => {

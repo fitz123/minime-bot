@@ -134,9 +134,9 @@ export type CronDiagnosticEventPayload = CronDiagnosticEvent extends infer Event
   : never;
 
 const URL_PATTERN = /(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s<>"']+(?=$|[\s<>"'])/gu;
-const NAMED_SECRET_PATTERN = /(^|[^\p{L}\p{N}_-])((?:["'][\p{L}\p{N}_-]*(?:secret[_-]?key|password|passwd|private[_-]?key|access[_-]?key|api[_-]?key|credential|secret|token|pass|pwd)["'])|(?:[\p{L}\p{N}_-]*(?:secret[_-]?key|password|passwd|private[_-]?key|access[_-]?key|api[_-]?key|credential|secret|token|pass|pwd)))(\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}\]]+)/gimu;
+const NAMED_SECRET_PATTERN = /(^|[^\p{L}\p{N}_-])((?:\\?["'][\p{L}\p{N}_-]*(?:secret[_-]?key|password|passwd|private[_-]?key|access[_-]?key|api[_-]?key|credential|secret|token|pass|pwd)\\?["'])|(?:[\p{L}\p{N}_-]*(?:secret[_-]?key|password|passwd|private[_-]?key|access[_-]?key|api[_-]?key|credential|secret|token|pass|pwd)))(\s*[:=]\s*)(?:\\"(?:\\.|[^"\\])*\\"(?=\s*[,}\]])|\\'(?:\\.|[^'\\])*\\'(?=\s*[,}\]])|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}\]]+)/gimu;
 const AUTH_SECRET_PATTERN = /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/giu;
-const PRIVATE_KEY_PATTERN = /-----BEGIN ((?:RSA |EC )?PRIVATE KEY)-----[\s\S]*?-----END \1-----/gu;
+const PRIVATE_KEY_PATTERN = /-----BEGIN ((?:(?:RSA|EC|DSA|OPENSSH|ENCRYPTED) )?PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----[\s\S]*?-----END \1-----/gu;
 const PROVIDER_SECRET_PATTERNS = [
   /\b(?:sk|rk|pk)-[A-Za-z0-9_-]{12,}\b/gu,
   /\bgh[pousr]_[A-Za-z0-9]{20,}\b/gu,
