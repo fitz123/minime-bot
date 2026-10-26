@@ -80,7 +80,7 @@ describe("cron diagnostics writer", () => {
 
   it("sanitizes controls, redacts secret-shaped material and URLs, and reports exact truncation", () => {
     const secret = `sk-${"a".repeat(24)}`;
-    const bearer = `Bearer ${"b".repeat(24)}`;
+    const bearer = `Bearer ${"b".repeat(20)}1234`;
     const combinedAuth = "token: Bearer opaquecredentialvalue123456";
     const url = "https://example.invalid/report?token=synthetic-value";
     const connectionUri = "postgresql://opaque-user:opaque-uri-password@db.example.invalid/opaque-database?sslmode=opaque-mode";
@@ -139,7 +139,7 @@ describe("cron diagnostics writer", () => {
     );
     assert.ok(!fullySanitized.text.includes(jwt));
     assert.match(fullySanitized.text, /\[REDACTED\] \[REDACTED\]\./u);
-    assert.match(fullySanitized.text, /token: \[REDACTED\] \[REDACTED\]/u);
+    assert.match(fullySanitized.text, /token: \[REDACTED\]/u);
     assert.match(fullySanitized.text, /"password":\[REDACTED\]/u);
     assert.match(fullySanitized.text, /\{ \\"password\\":\[REDACTED\]\}/u);
     assert.match(fullySanitized.text, /'credential': \[REDACTED\]/u);
@@ -158,6 +158,75 @@ describe("cron diagnostics writer", () => {
     assert.match(fullySanitized.text, /tokenizer: keep-tokenizer-value/u);
     assert.match(fullySanitized.text, /secretariat=keep-secretariat-value/u);
     assert.match(fullySanitized.text, /passwordless: keep-passwordless-value/u);
+  });
+
+  it("redacts sensitive YAML block bodies before control normalization", () => {
+    const source = [
+      "password: |",
+      "  opaque-literal-first",
+      "  opaque-literal-second",
+      "following: preserved-value",
+      "secret_key: >-",
+      "    opaque-folded-first",
+      "    opaque-folded-second",
+      "tail: preserved-tail",
+    ].join("\n");
+
+    const retained = retainCronDiagnosticText(source, Number.MAX_SAFE_INTEGER);
+
+    assert.strictEqual(retained.redacted, true);
+    assert.doesNotMatch(retained.text, /opaque-(?:literal|folded)/u);
+    assert.strictEqual(retained.text.match(/\[REDACTED\]/gu)?.length, 2);
+    assert.match(retained.text, /password: \|   \[REDACTED\] following: preserved-value/u);
+    assert.match(retained.text, /secret_key: >-     \[REDACTED\] tail: preserved-tail/u);
+  });
+
+  it("redacts escaped nested JSON fields without consuming later fields", () => {
+    const source = String.raw`kubectl.kubernetes.io/last-applied-configuration: {\"password\":\"opaque-password, with \\\"inner\\\" material\", \"note\":\"kept, with spaces and \\\"inner\\\" material\", \"count\":2, \"token\":\"opaque-token\", \"tail\":\"preserved\"}`;
+    const expected = String.raw`kubectl.kubernetes.io/last-applied-configuration: {\"password\":[REDACTED], \"note\":\"kept, with spaces and \\\"inner\\\" material\", \"count\":2, \"token\":[REDACTED], \"tail\":\"preserved\"}`;
+
+    const retained = retainCronDiagnosticText(source, Number.MAX_SAFE_INTEGER);
+
+    assert.strictEqual(retained.text, expected);
+    assert.strictEqual(retained.redacted, true);
+    assert.doesNotMatch(retained.text, /opaque-password|opaque-token/u);
+  });
+
+  it("handles repeated unterminated escaped secret assignments linearly", () => {
+    const fragment = String.raw`{\"password\":\"unterminated-value`;
+    const source = fragment.repeat(Math.ceil(400_000 / fragment.length)).slice(0, 400_000);
+    const startedAt = performance.now();
+    const retained = retainCronDiagnosticText(source, 128);
+    const elapsedMs = performance.now() - startedAt;
+
+    assert.strictEqual(retained.sourceChars, 400_000);
+    assert.strictEqual(retained.text, String.raw`{\"password\":[REDACTED]`);
+    assert.strictEqual(retained.retainedChars, retained.text.length);
+    assert.strictEqual(retained.omittedChars, 0);
+    assert.strictEqual(retained.truncated, false);
+    assert.strictEqual(retained.redacted, true);
+    assert.ok(elapsedMs < 1_000, `sanitizing malformed escaped JSON took ${elapsedMs.toFixed(1)}ms`);
+  });
+
+  it("redacts auth credentials in explicit contexts without redacting prose", () => {
+    const source = [
+      "Authorization: Bearer opaqueheaderletters",
+      "token: Bearer opaqueassignmentletters",
+      "Standalone Bearer opaque123456789",
+      "Standalone Basic dG9rZW4=",
+      "basic troubleshooting steps",
+      "bearer instruments market",
+    ].join("; ");
+
+    const retained = retainCronDiagnosticText(source, Number.MAX_SAFE_INTEGER);
+
+    assert.doesNotMatch(retained.text, /opaqueheaderletters|opaqueassignmentletters|opaque123456789|dG9rZW4=/u);
+    assert.match(retained.text, /Authorization: Bearer \[REDACTED\]/u);
+    assert.match(retained.text, /token: \[REDACTED\]/u);
+    assert.match(retained.text, /Standalone Bearer \[REDACTED\]/u);
+    assert.match(retained.text, /Standalone Basic \[REDACTED\]/u);
+    assert.match(retained.text, /basic troubleshooting steps/u);
+    assert.match(retained.text, /bearer instruments market/u);
   });
 
   it("handles bounded long URI/JWT-like non-candidates without overlapping rescans", () => {
