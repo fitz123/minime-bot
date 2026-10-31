@@ -6,10 +6,147 @@ import { tmpdir } from "node:os";
 import { createTelegramApiAdapter, createTelegramAdapter } from "../telegram-adapter.js";
 import { relayStream } from "../stream-relay.js";
 import type { StreamLine } from "../types.js";
-import { prepareRichAnswer, RICH_RESERVED_DIR } from "../telegram-rich.js";
+import { prepareRichAnswer, richDraftPayload, RICH_RESERVED_DIR } from "../telegram-rich.js";
 
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=", "base64");
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
+
+describe('simple answer typography', () => {
+  for (const introduction of ['A **brief** introduction.', 'Set <token> in env.']) {
+    it(`shares title, paragraph and schedule structure: ${introduction}`, () => {
+      const source = `## Daily plan\n${introduction}\n\nNext steps.\n\n09:00 Review\n10:00 Walk`;
+      const expected = [
+        { type: 'heading', size: 2, text: 'Daily plan' },
+        { type: 'paragraph', text: introduction.startsWith('A ')
+          ? ['A ', { type: 'bold', text: 'brief' }, ' introduction.'] : introduction },
+        { type: 'paragraph', text: 'Next steps.' },
+        { type: 'paragraph', text: '09:00 Review\n10:00 Walk' },
+      ];
+      assert.deepEqual(richDraftPayload(source), { blocks: expected });
+      const { chunks } = prepareRichAnswer(source);
+      assert.equal(chunks.length, 1);
+      assert.equal(chunks[0].text, source);
+      assert.deepEqual(chunks[0].options.nativeBlocks, expected);
+    });
+  }
+
+  it('uses source blank lines as paragraph boundaries without adding empty blocks', () => {
+    const source = '\n\nFirst paragraph.\n\n\nSecond paragraph.\n\n';
+    const blocks = [{ type: 'paragraph', text: 'First paragraph.' }, { type: 'paragraph', text: 'Second paragraph.' }];
+    assert.deepEqual(richDraftPayload(source), { blocks });
+    assert.deepEqual(prepareRichAnswer(source).chunks[0].options.nativeBlocks, blocks);
+  });
+
+  it('keeps a short answer as exactly one unpadded paragraph', () => {
+    assert.deepEqual(richDraftPayload('Okay.'), { blocks: [{ type: 'paragraph', text: 'Okay.' }] });
+    const chunk = prepareRichAnswer('Okay.').chunks[0];
+    assert.equal(chunk.text, 'Okay.');
+    assert.equal(chunk.options.indexText, 'Okay.');
+    assert.deepEqual(chunk.options.nativeBlocks, [{ type: 'paragraph', text: 'Okay.' }]);
+  });
+
+  it('preserves adjacent heading levels, Unicode and plain schedule newlines', () => {
+    const source = 'Before.\n# Today\n09:00 Review 😀\n10:00 Прогулка\n### Later\nAfter _review_.';
+    const blocks = [
+      { type: 'paragraph', text: 'Before.' }, { type: 'heading', size: 1, text: 'Today' },
+      { type: 'paragraph', text: '09:00 Review 😀\n10:00 Прогулка' },
+      { type: 'heading', size: 3, text: 'Later' },
+      { type: 'paragraph', text: ['After ', { type: 'italic', text: 'review' }, '.'] },
+    ];
+    assert.deepEqual(richDraftPayload(source), { blocks });
+    assert.deepEqual(prepareRichAnswer(source).chunks[0].options.nativeBlocks, blocks);
+  });
+
+  it('delivers the representative typography as native draft and final blocks', async () => {
+    const source = '# Daily plan\nSet <token> in env.\n\n09:00 Review\n10:00 Walk';
+    const expected = [
+      { type: 'heading', size: 1, text: 'Daily plan' },
+      { type: 'paragraph', text: 'Set <token> in env.' },
+      { type: 'paragraph', text: '09:00 Review\n10:00 Walk' },
+    ];
+    for (const context of [false, true]) {
+      const calls: string[] = [];
+      const api: any = {
+        async sendRichMessageDraft(_chat: number, _id: number, rich: any) {
+          calls.push('draft'); assert.deepEqual(rich, { blocks: expected }); return true;
+        },
+        async sendRichMessage(_chat: number, rich: any) {
+          calls.push('final'); assert.deepEqual(rich, { blocks: expected }); return { message_id: 1 };
+        },
+      };
+      const binding = { kind: 'dm' as const, chatId: 1, agentId: 'test', typingIndicator: false };
+      const adapter = context ? createTelegramAdapter({ api, chat: { id: 1 } } as any, binding)
+        : createTelegramApiAdapter({ api, chatId: 1, binding });
+      await relayStream(answer(source), adapter);
+      assert.deepEqual(calls, ['draft', 'final']);
+    }
+  });
+
+  for (const source of [
+    '- first\n- second', '1. first\n2. second', '> quote\ncontinued',
+    '[label][ref]\n\n[ref]: https://example.test', '$x + y$', '$$\nx\n$$',
+    '| Name |\n| --- |\n| Value |', 'Name\n:---\nValue', 'Title\n===', '* * *',
+    '\\# literal heading\nNext', '\\- literal list item\nNext',
+    'First  \nSecond', 'First\\\nSecond', '` spaced  code `', '``a ` b``',
+    'reader@example.test',
+    '[label](https://example.test/a_(b))', '[label](https://example.test "title")',
+    'https://example.test/my_file_name', '***nested***', '**outer _inner_**',
+    '~~removed~~', 'Use &amp; here', '<u>underlined</u>',
+    '   # Indented heading', '## Closing heading ##',
+  ]) it(`retains existing Markdown routing for ${JSON.stringify(source)}`, () => {
+    assert.deepEqual(richDraftPayload(source), { markdown: source });
+    const { chunks } = prepareRichAnswer(source);
+    assert.equal(chunks.length, 1);
+    assert.equal(chunks[0].text, source);
+    assert.equal(chunks[0].options.nativeBlocks, undefined);
+  });
+
+  it('retains the existing literal fallback for autolinks', () => {
+    for (const [source, text] of [
+      ['<https://example.test/path>', ['<', 'https://example.test/path', '>']],
+      ['<reader@example.test>', '<reader@example.test>'],
+    ] as const) {
+      const blocks = [{ type: 'paragraph', text }];
+      assert.deepEqual(richDraftPayload(source), { blocks });
+      assert.deepEqual(prepareRichAnswer(source).chunks[0].options.nativeBlocks, blocks);
+    }
+  });
+
+  for (const source of ['```xml\n<widget>\n\n  value\n```', '    example\n\n    value']) {
+    it(`keeps code whitespace on its existing path: ${JSON.stringify(source)}`, () => {
+      assert.deepEqual(richDraftPayload(source), { markdown: source });
+      const { chunks } = prepareRichAnswer(source);
+      assert.equal(chunks.length, 1);
+      assert.deepEqual(chunks[0].options.nativeBlocks, [{ type: 'pre', text: source.startsWith('```')
+        ? '<widget>\n\n  value' : 'example\n\nvalue', ...(source.startsWith('```') ? { language: 'xml' } : {}) }]);
+    });
+  }
+
+  it('does not reinterpret complex siblings when simple chunks opt in', () => {
+    const complex = '**outer _inner_**';
+    const { chunks } = prepareRichAnswer('x'.repeat(23990) + '\n\n' + complex);
+    assert.equal(chunks.length, 2);
+    assert.deepEqual(chunks[0].options.nativeBlocks, [{ type: 'paragraph', text: 'x'.repeat(23990) }]);
+    assert.equal(chunks[1].text, complex);
+    assert.equal(chunks[1].options.nativeBlocks, undefined);
+  });
+
+  it('keeps projected drafts and finals within byte and block budgets', () => {
+    const source = Array.from({ length: 500 }, (_, i) => `## Slot ${i}\n09:00 Review 😀\n10:00 Walk`).join('\n\n');
+    const draft = richDraftPayload(source);
+    assert.ok(draft.blocks && draft.blocks.length <= 400);
+    assert.ok(Buffer.byteLength(JSON.stringify(draft)) < 24000);
+    const chunks = prepareRichAnswer(source).chunks;
+    assert.ok(chunks.length > 1);
+    assert.equal(chunks.map(c => c.text).join('\n\n'), source);
+    for (const chunk of chunks) {
+      assert.ok(Buffer.byteLength(chunk.text) <= 24000);
+      assert.ok(chunk.options.nativeBlocks && chunk.options.nativeBlocks.length <= 400);
+      assert.ok(!chunk.text.includes('\uFFFD'));
+    }
+  });
+});
+
 async function* answer(text: string): AsyncGenerator<StreamLine> {
   yield { type: "stream_event", event: { delta: { type: "text_delta", text } } } as StreamLine;
   await tick();
@@ -333,7 +470,7 @@ it('short agent answers are rich while service/error sends stay ordinary and ind
   const { lookupMessage } = await import('../message-content-index.js');
   const methods: string[] = [];
   const api: any = {
-    async sendRichMessage(_chat: number, rich: any) { methods.push('rich'); assert.equal(rich.markdown, 'Okay.'); return { message_id: 218 }; },
+    async sendRichMessage(_chat: number, rich: any) { methods.push('rich'); assert.deepEqual(rich.blocks, [{ type: 'paragraph', text: 'Okay.' }]); return { message_id: 218 }; },
     async sendMessage() { methods.push('ordinary'); return { message_id: 219 }; },
   };
   const adapter = createTelegramApiAdapter({ api, chatId: 1, threadId: 7, binding: { chatId: 1, agentId: 'test', kind: 'group', typingIndicator: false } });

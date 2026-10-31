@@ -111,11 +111,11 @@ describe("cron native result routing", () => {
     });
   }
 
-  it("uses native Markdown for short results and omits an absent thread", async () => {
+  it("uses a native paragraph for short results and omits an absent thread", async () => {
     const h = harness();
     await deliver(123, "A short report", undefined, { ...h.transport, purpose: "result" });
     assert.equal(h.calls[0].method, "sendRichMessage");
-    assert.deepEqual(h.calls[0].body.rich_message, { markdown: "A short report", media: [] });
+    assert.deepEqual(h.calls[0].body.rich_message, { blocks: [{ type: "paragraph", text: "A short report" }] });
     assert.equal(h.calls[0].body.message_thread_id, undefined);
   });
 
@@ -126,7 +126,7 @@ describe("cron native result routing", () => {
     assert.deepEqual(h.calls.map(c => [c.method, c.body.chat_id, c.body.message_thread_id]), [
       ["sendRichMessage", 456, 73], ["sendRichMessage", 123, 42],
     ]);
-    assert.equal(h.calls[0].body.rich_message.markdown, "Retained report");
+    assert.deepEqual(h.calls[0].body.rich_message.blocks, [{ type: "paragraph", text: "Retained report" }]);
     assert.equal(h.generated(), 1);
     assert.equal(readCronOutboxRecord(h.name), undefined);
     assert.deepEqual(h.ordinary, []);
@@ -188,9 +188,9 @@ describe("cron native result routing", () => {
     h.fail(400);
     h.failThread(73, "Bad Request: message thread not found");
     await h.run();
-    assert.deepEqual(h.calls.map(c => [c.method, c.body.chat_id, c.body.message_thread_id, c.body.rich_message.markdown]), [
-      ["sendRichMessage", 456, 73, "Old topic report"],
-      ["sendRichMessage", 123, 42, "Fresh corrected report"],
+    assert.deepEqual(h.calls.map(c => [c.method, c.body.chat_id, c.body.message_thread_id, c.body.rich_message.blocks]), [
+      ["sendRichMessage", 456, 73, [{ type: "paragraph", text: "Old topic report" }]],
+      ["sendRichMessage", 123, 42, [{ type: "paragraph", text: "Fresh corrected report" }]],
     ]);
     assert.equal(h.generated(), 1);
     assert.equal(readCronOutboxRecord(h.name), undefined);
