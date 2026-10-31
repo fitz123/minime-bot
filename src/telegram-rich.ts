@@ -240,14 +240,17 @@ function compatibleNativeBlocks(text: string): InputRichMessageWithoutUpload["bl
  */
 function simpleTypographyBlocks(text: string): InputRichMessageWithoutUpload["blocks"] | undefined {
   if (!text || /^[ \t]|[ \t]+$|\r/m.test(text)
-    || /^(?:[-+*](?:\s|$)|\d+[.)](?:\s|$)|[-=_* ]+$|:?-{3,}:?(?:\s|$))/m.test(text)
+    || /^(?:[-+*](?:\s|$)|\d+[.)](?:\s|$)|[-=_* ]+$)/m.test(text)
+    || /^\s*\|?\s*:?-{3,}/m.test(text)
     || /https?:\/\//i.test(text)) return undefined;
   let syntax = text.replace(/^#{1,6} (?=\S)/gm, "");
   // Unknown placeholder tags are literal; supported HTML and document tags
   // retain their prior handling rather than widening this inline subset.
   syntax = syntax.replace(/<([\w/-]+)>/g, (tag, name: string) =>
     name in INLINE_HTML_TYPES || /^(?:\/?(?:div|details|summary|table|ul|ol|li|p|h[1-6]))$/i.test(name) ? tag : "");
-  syntax = syntax.replace(/(\*\*|__|\*|_)([^\s*_](?:[^*_\n]*[^\s*_])?)\1/g, "$2")
+  // Admit word/phrase emphasis only at clear prose boundaries. Ambiguous
+  // punctuation and intraword delimiters stay on the existing Markdown path.
+  syntax = syntax.replace(/(?<!\S)(\*\*|__|\*|_)([\p{L}\p{N}](?:[^*_\n]*[\p{L}\p{N}])?)\1(?=$|[\s.,!?;:])/gu, "$2")
     .replace(/(?<![\p{L}\p{N}])[\p{L}\p{N}]+(?:_[\p{L}\p{N}]+)+/gu, "");
   if (/[`\\[\]<>$|*_~=#&@]/.test(syntax)) return undefined;
   return compatibleNativeBlocks(text);
