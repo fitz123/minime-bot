@@ -139,6 +139,8 @@ export function literalRichText(text: string, depth = 0): RichText {
 export function richDraftPayload(source: string): InputRichMessageWithoutUpload {
   const text = richDraft(source);
   if (blockCost(text) > 400 || excessiveFormattingDepth(text)) return { blocks: [{ type: "pre", text }] };
+  const blocks = simpleTypographyBlocks(text);
+  if (blocks) return { blocks };
   return needsLiteralEncoding(text) ? { blocks: [{ type: "paragraph", text: literalRichText(text) }] } : { markdown: text };
 }
 
@@ -230,6 +232,28 @@ function compatibleNativeBlocks(text: string): InputRichMessageWithoutUpload["bl
     flushParagraph();
   }
   return result;
+}
+
+/** Opt in only plain prose, ATX headings, simple emphasis and literal placeholders.
+ * The compatibility builder is not a Markdown parser: code, links, escapes and
+ * complex syntax must keep their existing routes, including in draft windows.
+ */
+function simpleTypographyBlocks(text: string): InputRichMessageWithoutUpload["blocks"] | undefined {
+  if (!text || /^[ \t]|[ \t]+$|\r/m.test(text)
+    || /^(?:[-+*](?:\s|$)|\d+[.)](?:\s|$)|[-=_* ]+$)/m.test(text)
+    || /^\s*\|?\s*:?-{3,}/m.test(text)
+    || /https?:\/\//i.test(text)) return undefined;
+  let syntax = text.replace(/^#{1,6} (?=\S)/gm, "");
+  // Unknown placeholder tags are literal; supported HTML and document tags
+  // retain their prior handling rather than widening this inline subset.
+  syntax = syntax.replace(/<([\w/-]+)>/g, (tag, name: string) =>
+    name in INLINE_HTML_TYPES || /^(?:\/?(?:div|details|summary|table|ul|ol|li|p|h[1-6]))$/i.test(name) ? tag : "");
+  // Admit word/phrase emphasis only at clear prose boundaries. Ambiguous
+  // punctuation and intraword delimiters stay on the existing Markdown path.
+  syntax = syntax.replace(/(?<!\S)(\*\*|__|\*|_)([\p{L}\p{N}](?:[^*_\n]*[\p{L}\p{N}])?)\1(?=$|[\s.,!?;:])/gu, "$2")
+    .replace(/(?<![\p{L}\p{N}])[\p{L}\p{N}]+(?:_[\p{L}\p{N}]+)+/gu, "");
+  if (/[`\\[\]<>$|*_~=#&@]/.test(syntax)) return undefined;
+  return compatibleNativeBlocks(text);
 }
 
 function packCompatibleChunks(chunks: RichAnswerChunk[]): void {
@@ -378,6 +402,11 @@ export function prepareRichAnswer(source: string, outboxPath?: string): {
   }
   flush();
   packCompatibleChunks(chunks);
+  // Project after packing so opting simple prose in cannot pull an adjacent
+  // complex Markdown chunk through the more permissive compatibility builder.
+  for (const chunk of chunks) {
+    if (!chunk.options.nativeBlocks) chunk.options.nativeBlocks = simpleTypographyBlocks(chunk.text);
+  }
   // Only references actually retained as media need custody (literal examples do not).
   for (const [name, id] of names) {
     if (!chunks.some(chunk => (!chunk.options.nativeBlocks || chunk.options.nativeBlocks.some(block => block.type === "photo")) && chunk.text.includes(`tg://photo?id=${id})`))) names.delete(name);

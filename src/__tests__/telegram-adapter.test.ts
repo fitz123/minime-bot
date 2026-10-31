@@ -168,7 +168,7 @@ describe("createTelegramAdapter", () => {
       assert.strictEqual(draftCalls[0].chatId, 12345);
       assert.strictEqual(draftCalls[0].draftId, 42);
       assert.strictEqual(draftCalls[0].opts?.parse_mode, undefined);
-      assert.deepStrictEqual(draftCalls[0].text, { markdown: "streaming text" });
+      assert.deepStrictEqual(draftCalls[0].text, { blocks: [{ type: "paragraph", text: "streaming text" }] });
     });
 
     it("forwards cancellation to the Telegram request", async () => {
@@ -200,7 +200,7 @@ describe("createTelegramAdapter", () => {
         const adapter = createTelegramAdapter(ctx, defaultBinding);
         const controller = new AbortController();
         assert.deepEqual(await adapter.sendDraft(42, "**bold**", controller.signal), { status: "failed" });
-        assert.deepEqual(calls, [[12345, 42, { markdown: "**bold**" }, { message_thread_id: 77 }, controller.signal]]);
+        assert.deepEqual(calls, [[12345, 42, { blocks: [{ type: "paragraph", text: { type: "bold", text: "bold" } }] }, { message_thread_id: 77 }, controller.signal]]);
       });
     }
 
