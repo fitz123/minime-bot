@@ -114,6 +114,7 @@ describe('simple answer typography', () => {
     '- first\n- second', '1. first\n2. second', '> quote\ncontinued',
     '[label][ref]\n\n[ref]: https://example.test', '$x + y$', '$$\nx\n$$',
     '| Name |\n| --- |\n| Value |', 'Name\n:---\nValue', 'Title\n===', '* * *',
+    'Before\n\n--\t--\n\nAfter',
     ...['---FAILED---', ':---FAILED---', '|---FAILED---', '| :---FAILED---']
       .map(line => `Status\n${line}\nRetry required.`),
     'Match report*.* files.', 'Match report**.** files.', 'Use *.* here.',
@@ -156,10 +157,15 @@ describe('simple answer typography', () => {
   }
 
   it('does not reinterpret complex siblings when simple chunks opt in', () => {
-    const complex = '**outer _inner_**';
-    const { chunks } = prepareRichAnswer('x'.repeat(23990) + '\n\n' + complex);
+    const simple = Array(150).fill('Line').join('\n');
+    const complex = ['***nested***', ...Array(30).fill('Tail')].join('\n');
+    const source = `${simple}\n\n${complex}`;
+    assert.ok(Buffer.byteLength(source) < 24000);
+    assert.equal(source.split('\n').length, 182);
+    const { chunks } = prepareRichAnswer(source);
     assert.equal(chunks.length, 2);
-    assert.deepEqual(chunks[0].options.nativeBlocks, [{ type: 'paragraph', text: 'x'.repeat(23990) }]);
+    assert.equal(chunks[0].text, simple);
+    assert.deepEqual(chunks[0].options.nativeBlocks, [{ type: 'paragraph', text: simple }]);
     assert.equal(chunks[1].text, complex);
     assert.equal(chunks[1].options.nativeBlocks, undefined);
   });
@@ -168,6 +174,12 @@ describe('simple answer typography', () => {
     const source = Array.from({ length: 500 }, (_, i) => `## Slot ${i}\n09:00 Review 😀\n10:00 Walk`).join('\n\n');
     const draft = richDraftPayload(source);
     assert.ok(draft.blocks && draft.blocks.length <= 400);
+    assert.ok(draft.blocks.length > 2 && draft.blocks.length % 2 === 0);
+    for (let i = 0; i < draft.blocks.length; i += 2) {
+      assert.equal(draft.blocks[i].type, 'heading');
+      assert.deepEqual(draft.blocks[i + 1], { type: 'paragraph', text: '09:00 Review 😀\n10:00 Walk' });
+    }
+    assert.deepEqual(draft.blocks.at(-2), { type: 'heading', size: 2, text: 'Slot 499' });
     assert.ok(Buffer.byteLength(JSON.stringify(draft)) < 24000);
     const chunks = prepareRichAnswer(source).chunks;
     assert.ok(chunks.length > 1);
@@ -175,8 +187,27 @@ describe('simple answer typography', () => {
     for (const chunk of chunks) {
       assert.ok(Buffer.byteLength(chunk.text) <= 24000);
       assert.ok(chunk.options.nativeBlocks && chunk.options.nativeBlocks.length <= 400);
+      assert.ok(chunk.options.nativeBlocks.every(block => block.type === 'heading' || block.type === 'paragraph'));
       assert.ok(!chunk.text.includes('\uFFFD'));
     }
+  });
+
+  it('uses actual simple draft block counts through 400 and falls back at 401', () => {
+    const source = Array(200).fill('# H\np').join('\n');
+    assert.deepEqual(richDraftPayload(source), { blocks: Array.from({ length: 200 }, () => [
+      { type: 'heading', size: 1, text: 'H' }, { type: 'paragraph', text: 'p' },
+    ]).flat() });
+    const over = `${source}\n# H`;
+    assert.deepEqual(richDraftPayload(over), { blocks: [{ type: 'pre', text: over }] });
+  });
+
+  it('preserves the generic draft cost boundary and excessive formatting protection', () => {
+    const source = ['***nested***', ...Array(199).fill('x')].join('\n');
+    assert.deepEqual(richDraftPayload(source), { markdown: source });
+    const over = `${source}\nx`;
+    assert.deepEqual(richDraftPayload(over), { blocks: [{ type: 'pre', text: over }] });
+    const excessive = `# H\na${'_'.repeat(33)}b`;
+    assert.deepEqual(richDraftPayload(excessive), { blocks: [{ type: 'pre', text: excessive }] });
   });
 });
 

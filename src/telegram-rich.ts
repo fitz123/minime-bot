@@ -138,9 +138,10 @@ export function literalRichText(text: string, depth = 0): RichText {
 
 export function richDraftPayload(source: string): InputRichMessageWithoutUpload {
   const text = richDraft(source);
-  if (blockCost(text) > 400 || excessiveFormattingDepth(text)) return { blocks: [{ type: "pre", text }] };
+  if (excessiveFormattingDepth(text)) return { blocks: [{ type: "pre", text }] };
   const blocks = simpleTypographyBlocks(text);
-  if (blocks) return { blocks };
+  if (blocks && blocks.length <= 400) return { blocks };
+  if (blockCost(text) > 400) return { blocks: [{ type: "pre", text }] };
   return needsLiteralEncoding(text) ? { blocks: [{ type: "paragraph", text: literalRichText(text) }] } : { markdown: text };
 }
 
@@ -240,7 +241,7 @@ function compatibleNativeBlocks(text: string): InputRichMessageWithoutUpload["bl
  */
 function simpleTypographyBlocks(text: string): InputRichMessageWithoutUpload["blocks"] | undefined {
   if (!text || /^[ \t]|[ \t]+$|\r/m.test(text)
-    || /^(?:[-+*](?:\s|$)|\d+[.)](?:\s|$)|[-=_* ]+$)/m.test(text)
+    || /^(?:[-+*](?:\s|$)|\d+[.)](?:\s|$)|[-=_* \t]+$)/m.test(text)
     || /^\s*\|?\s*:?-{3,}/m.test(text)
     || /https?:\/\//i.test(text)) return undefined;
   let syntax = text.replace(/^#{1,6} (?=\S)/gm, "");
