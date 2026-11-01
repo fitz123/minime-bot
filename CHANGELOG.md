@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 2026.11.0
+
+- Preserve explicit heading hierarchy, separated paragraphs and schedule line breaks in simple native Telegram drafts and final answers (#245, #246).
+- Keep short replies unpadded and complex Markdown on its existing paths; cover Unicode, block budgets, media custody and conservative syntax routing.
+
 ## 2026.10.5
 
 - Retain bounded, redacted, run-correlated diagnostics for LLM and script crons, including logical failures, safe timeout/error metadata, delivery attempts, replay/queue dispositions and terminal outcomes (#242, #243).
