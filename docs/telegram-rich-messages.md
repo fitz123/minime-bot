@@ -2,6 +2,8 @@
 
 Telegram agent answers use native rich messages, including short paragraphs. Existing commands, errors, service notices, Discord output, and unreferenced outbox attachments keep their ordinary delivery behavior. Telegram DM previews use text-only native rich drafts showing the latest bounded source blocks (with fence context retained for code tails). Identical projected previews are deduplicated and visible drafts refresh every 15 seconds. Draft calls bypass automatic transport retries; final calls retain the existing bounded retries and their ambiguous-delivery risk.
 
+Simple answers use the same explicit heading and paragraph projection in drafts and finals: ATX headings may sit directly beside prose, blank source lines separate paragraphs, and single newlines inside a paragraph remain native RichText newlines for schedules and plain list-like lines. Short replies remain one paragraph without padding or invisible spacers. This conservative subset includes simple emphasis and literal placeholders; complex Markdown, links, inline code, escapes and hard-break syntax retain their existing rendering paths. Telegram clients control heading size, paragraph margins and line spacing; payload tests guarantee structure and newline preservation, not a particular device's visual layout.
+
 To interleave a local photo with an answer, write a JPEG or PNG to the session outbox (`MINIME_OUTBOX`) and reference its basename:
 
 ```markdown

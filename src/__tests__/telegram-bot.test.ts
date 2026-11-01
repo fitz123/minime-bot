@@ -2038,8 +2038,8 @@ describe("command handler wiring", () => {
     t.mock.timers.tick(3_000);
     await flushAsyncWork();
     assert.deepStrictEqual(
-      apiCalls.filter(({ method }) => method === "sendRichMessageDraft").map(({ payload }) => payload.rich_message.markdown),
-      ["obsolete preview"],
+      apiCalls.filter(({ method }) => method === "sendRichMessageDraft").map(({ payload }) => payload.rich_message.blocks),
+      [[{ type: "paragraph", text: "obsolete preview" }]],
     );
 
     await bot.handleUpdate(makeTextUpdate("consumed correction", 51));
@@ -2064,8 +2064,8 @@ describe("command handler wiring", () => {
       "permanent delivery waits for the already in-flight draft to settle",
     );
     assert.deepStrictEqual(
-      apiCalls.filter(({ method }) => method === "sendRichMessageDraft").map(({ payload }) => payload.rich_message.markdown),
-      ["obsolete preview"],
+      apiCalls.filter(({ method }) => method === "sendRichMessageDraft").map(({ payload }) => payload.rich_message.blocks),
+      [[{ type: "paragraph", text: "obsolete preview" }]],
       "interleaved inputs and response reset cannot reactivate the suspended draft",
     );
 
@@ -2082,9 +2082,9 @@ describe("command handler wiring", () => {
     ]);
 
     const drafts = apiCalls.filter(({ method }) => method === "sendRichMessageDraft");
-    assert.deepStrictEqual(drafts.map(({ payload }) => payload.rich_message.markdown), [
-      "obsolete preview",
-      "fallback preview",
+    assert.deepStrictEqual(drafts.map(({ payload }) => payload.rich_message.blocks), [
+      [{ type: "paragraph", text: "obsolete preview" }],
+      [{ type: "paragraph", text: "fallback preview" }],
     ]);
     assert.notStrictEqual(
       drafts[0].payload.draft_id,
@@ -2092,8 +2092,8 @@ describe("command handler wiring", () => {
       "the fallback relay owns a fresh native draft",
     );
     assert.deepStrictEqual(
-      apiCalls.filter(({ method }) => method === "sendRichMessage").map(({ payload }) => payload.rich_message.markdown),
-      ["revised final", "fallback preview"],
+      apiCalls.filter(({ method }) => method === "sendRichMessage").map(({ payload }) => payload.rich_message.blocks),
+      [[{ type: "paragraph", text: "revised final" }], [{ type: "paragraph", text: "fallback preview" }]],
       "each relay sends exactly one permanent final and consumed steering is not duplicated",
     );
 
@@ -2861,8 +2861,8 @@ describe("command handler wiring", () => {
     t.mock.timers.tick(3_000);
     await flushAsyncWork();
     assert.deepStrictEqual(
-      apiCalls.filter(({ method }) => method === "sendRichMessageDraft").map(({ payload }) => payload.rich_message.markdown),
-      ["obsolete preview"],
+      apiCalls.filter(({ method }) => method === "sendRichMessageDraft").map(({ payload }) => payload.rich_message.blocks),
+      [[{ type: "paragraph", text: "obsolete preview" }]],
     );
 
     (
@@ -2875,16 +2875,16 @@ describe("command handler wiring", () => {
     t.mock.timers.tick(DRAFT_REFRESH_INTERVAL_MS * 2);
     await flushAsyncWork();
     assert.deepStrictEqual(
-      apiCalls.filter(({ method }) => method === "sendRichMessageDraft").map(({ payload }) => payload.rich_message.markdown),
-      ["obsolete preview"],
+      apiCalls.filter(({ method }) => method === "sendRichMessageDraft").map(({ payload }) => payload.rich_message.blocks),
+      [[{ type: "paragraph", text: "obsolete preview" }]],
       "echo suspension survives response reset, later deltas, and the refresh interval",
     );
 
     finish.resolve();
     await flushAsyncWork();
     assert.deepStrictEqual(
-      apiCalls.filter(({ method }) => method === "sendRichMessage").map(({ payload }) => payload.rich_message.markdown),
-      ["permanent final"],
+      apiCalls.filter(({ method }) => method === "sendRichMessage").map(({ payload }) => payload.rich_message.blocks),
+      [[{ type: "paragraph", text: "permanent final" }]],
       "the relay still emits exactly one permanent final",
     );
     messageQueue.clearAll();
