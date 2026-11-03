@@ -94,3 +94,16 @@ Validation under isolated HOME/agent/control/media/log directories and workspace
 - `npm run typecheck` and `git diff --check`: **passed**.
 
 Only this test fixture and implementation log changed. No provider calls, runtime changes, full-suite rerun or production access occurred.
+
+## Review 2 Telegram default authority decision
+
+Parent reported final CI at **2,670 passed / 4 skipped**, and independent review 2 completed 2/2 nondegraded with no retained findings. Parent resolved the remaining authority question conservatively: Telegram default mutations require both an actual private chat and a `dm` binding. Group/thread overrides and status commands remain available; native trusted local default commands are unchanged.
+
+The handler checks only exact valid `default on|off` arguments before configuration/preference access and directs blocked callers to a private chat with a DM binding. Malformed arguments still reach the existing usage parser without writing. No owner/role system or native invocation changes were introduced.
+
+The new authority matrix failed before the guard and now covers private DM mutations, groups/supergroups, both chat/binding mismatch directions, blocked commands with absent or existing preference files, unchanged per-thread/status commands, and malformed arguments. Under the isolated environment documented above:
+
+- `node --experimental-test-module-mocks --import tsx --test --test-concurrency=1 --test-timeout=240000 src/__tests__/{telegram-bot,codex-fast}.test.ts`: **307/307 passed**.
+- `npm run build`, `npm run typecheck`, and `git diff --check`: **passed**.
+
+This follow-up made no provider calls or production changes and did not rerun the full suite.

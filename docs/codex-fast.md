@@ -35,6 +35,11 @@ Authenticated Telegram commands use the actual chat/topic binding:
 | `/fast default off` | Stop default priority requests from this adapter |
 | `/fast default status` | Show status without changing preferences |
 
+Telegram `/fast default on` and `/fast default off` require both an actual
+private chat and a `dm` binding. Group chats and threads retain per-thread
+controls, `/fast status`, and `/fast default status`. Trusted native local
+default commands are unchanged.
+
 A new thread inherits its default. Defaults also apply to identified non-chat
 consumers: native local Pi sessions, crons running as the agent, and `ask_agent`
 requests targeting that agent. Those consumers never inherit the caller's

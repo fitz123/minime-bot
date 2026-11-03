@@ -1592,10 +1592,77 @@ describe("command handler wiring", () => {
     await send("");
     assert.match(apiCalls.at(-1)!.payload.text, /override: on/);
     await send("default on");
+    assert.match(apiCalls.at(-1)!.payload.text, /private chat.*DM binding/);
     await send("", 12);
-    assert.match(apiCalls.at(-1)!.payload.text, /intent: priority/);
+    assert.match(apiCalls.at(-1)!.payload.text, /intent: off/);
     await send("inherit");
     assert.match(apiCalls.at(-1)!.payload.text, /override: inherit/);
+  });
+
+  it("allows Telegram Fast default mutations only for private chats with DM bindings", async t => {
+    for (const [chatType, kind] of [
+      ["private", "dm"], ["group", "group"], ["supergroup", "group"],
+      ["private", "group"], ["supergroup", "dm"],
+    ] as const) {
+      await t.test(`${chatType} chat / ${kind} binding`, async t => {
+        const root = mkdtempSync(join(tmpdir(), "telegram-fast-authority-"));
+        const oldRoot = process.env.MINIME_CONTROL_WORKSPACE_ROOT;
+        process.env.MINIME_CONTROL_WORKSPACE_ROOT = root;
+        t.after(() => {
+          if (oldRoot === undefined) delete process.env.MINIME_CONTROL_WORKSPACE_ROOT;
+          else process.env.MINIME_CONTROL_WORKSPACE_ROOT = oldRoot;
+          rmSync(root, { recursive: true, force: true });
+        });
+        const primary = { id: "main", workspaceCwd: root, model: "openai-codex/gpt-6-astra", codexFast: { provider: "openai-codex" as const, model: "gpt-6-astra" } };
+        const manager = createMockSessionManager();
+        const apiCalls: Array<{ method: string; payload: any }> = [];
+        const { bot, messageQueue } = initBot(manager, apiCalls, undefined, undefined, (base, sm, options) => {
+          const currentConfig: BotConfig = { ...base, agents: { main: primary }, bindings: [{ chatId: testChatId, agentId: "main", kind }] };
+          return createTelegramBot(currentConfig, sm, { ...options, loadConfig: () => currentConfig });
+        });
+        t.after(() => messageQueue.clearAll());
+        const send = async (args: string) => {
+          const update = makeCommandUpdate("fast", 800 + apiCalls.length);
+          update.message.text = `/fast ${args}`;
+          Object.assign(update.message.chat, { type: chatType });
+          Object.assign(update.message, { message_thread_id: 11 });
+          await bot.handleUpdate(update);
+          return apiCalls.at(-1)!.payload.text as string;
+        };
+        const path = join(root, "data/codex-fast.json");
+        assert.match(await send("default on extra"), /Usage:/);
+        assert.equal(existsSync(path), false);
+        if (chatType !== "private" || kind !== "dm") {
+          assert.match(await send("default on"), /private chat.*DM binding/);
+          assert.equal(existsSync(path), false);
+        }
+        assert.match(await send("on"), /override: on/);
+        const beforeDefault = readFileSync(path, "utf8");
+        if (chatType === "private" && kind === "dm") {
+          assert.match(await send("default on"), /Default: on/);
+          assert.equal(readFastStatus({ agent: primary }).enabled, true);
+          assert.equal(readFastStatus({ agent: primary, threadKey: "new-thread" }).enabled, true);
+          assert.match(await send("default off"), /Default: off/);
+          assert.equal(readFastStatus({ agent: primary }).enabled, false);
+        } else {
+          for (const args of ["default on", "default off"]) {
+            assert.match(await send(args), /private chat.*DM binding/);
+            assert.equal(readFileSync(path, "utf8"), beforeDefault);
+          }
+        }
+        const beforeReadOnly = readFileSync(path, "utf8");
+        assert.match(await send("default status"), /Default: off/);
+        assert.match(await send("status"), /override: on/);
+        for (const args of ["default", "default on extra", "default off extra", "default inherit", "default ON"]) {
+          assert.match(await send(args), /Usage:/);
+          assert.equal(readFileSync(path, "utf8"), beforeReadOnly);
+        }
+        assert.match(await send("off"), /override: off/);
+        assert.match(await send("inherit"), /override: inherit/);
+        assert.equal(readFastStatus({ agent: primary, threadKey: `${testChatId}:11` }).enabled, false);
+        assert.deepEqual(manager.calls, [], "Fast commands must not invoke model sessions");
+      });
+    }
   });
 
   it("reloads /fast model pins and added/removed opt-in from current merged config", async t => {

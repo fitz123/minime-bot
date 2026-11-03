@@ -869,6 +869,10 @@ export function createTelegramBot(
     if (!binding) return;
     if (ctx.message) setThread(ctx.chat.id, ctx.message.message_id, topicId);
     try {
+      if (/^default\s+(?:on|off)$/.test(ctx.match.trim()) && (ctx.chat.type !== "private" || binding.kind !== "dm")) {
+        await ctx.reply("Use a private chat with a DM binding to change Fast defaults.");
+        return;
+      }
       const currentConfig = opts?.loadConfig ? opts.loadConfig() : loadConfig(undefined, { resolveSecrets: false });
       await ctx.reply(handleFastCommand(ctx.match, {
         agent: currentConfig.agents[binding.agentId],
