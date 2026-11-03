@@ -1,7 +1,9 @@
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { dirname, extname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { validateAgent } from "../config.js";
 import { handleFastCommand, isFastEligible, PI_FAST_THREAD_ENV, readFastStatus, type FastScope } from "../codex-fast.js";
@@ -117,4 +119,17 @@ test("actual installed Pi loads Fast, routes native commands without LLM, and ru
   assert.equal(result.piVersion, "1.5.0");
   assert.ok(result.requestChecks >= 21);
   assert.ok(result.commandsChecked >= 21);
+});
+
+test("offline verifier CLI executes through a current directory symlink", { timeout: 30_000 }, t => {
+  const root = fixture(t);
+  const current = join(root, "current");
+  const testPath = fileURLToPath(import.meta.url);
+  symlinkSync(dirname(dirname(testPath)), current, "dir");
+  const result = spawnSync(process.execPath, ["--import", "tsx", join(current, `verify-codex-fast${extname(testPath)}`)], {
+    encoding: "utf8", timeout: 25_000, env: { ...process.env, TMPDIR: root },
+  });
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.deepEqual(JSON.parse(result.stdout), { piVersion: "1.5.0", requestChecks: 23, commandsChecked: 24 });
 });

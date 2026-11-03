@@ -1,3 +1,4 @@
+import { loadConfig } from "./config.js";
 import { formatFastCommandError, handleFastCommand } from "./codex-fast.js";
 import { statSync } from "node:fs";
 import type { RichMessage } from "grammy/types";
@@ -761,6 +762,8 @@ export function createTelegramBot(
     onUpdate?: () => void;
     onSuccessfulPoll?: () => void;
     draftCoordinator?: ActiveDraftCoordinator;
+    /** Fresh local-control config; defaults to the regular loader without secret resolution. */
+    loadConfig?: () => BotConfig;
   },
 ): TelegramBotResult {
   if (!config.telegramToken) {
@@ -866,8 +869,9 @@ export function createTelegramBot(
     if (!binding) return;
     if (ctx.message) setThread(ctx.chat.id, ctx.message.message_id, topicId);
     try {
+      const currentConfig = opts?.loadConfig ? opts.loadConfig() : loadConfig(undefined, { resolveSecrets: false });
       await ctx.reply(handleFastCommand(ctx.match, {
-        agent: config.agents[binding.agentId],
+        agent: currentConfig.agents[binding.agentId],
         threadKey: sessionKey(ctx.chat.id, topicId),
       }));
     } catch (error) {

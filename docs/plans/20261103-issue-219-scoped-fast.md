@@ -51,15 +51,30 @@ Result: **731/731 passed**. Includes default/override matrix, warm scope reads, 
 - `npm run build` (also run by successful prepack), `npm run typecheck`, `npm run check:schema-guard-contract`, `node dist/cli.js --help`, `git diff --check`: **passed**.
 - `TMPDIR="$PWD/.tmp/test-tmp" node dist/verify-codex-fast.js`: **passed**, Pi 1.5.0, **23 request checks / 24 command checks**. Exercises the real Codex request builder with synthetic claims and stops inside onPayload before transport; on/off differs only by priority tier.
 - `node dist/cli.js workspace validate --workspace test-fixtures/minimal-workspace`: **passed**, with the fixture's expected missing optional resource warnings.
-- `npm run workspace:validate -- --workspace test-fixtures/minimal-workspace`: **blocked by sandbox EPERM on tsx IPC listen**. Parent must rerun the canonical command outside this sandbox. This check was not weakened or reported as passing.
+- `npm run workspace:validate -- --workspace test-fixtures/minimal-workspace`: initially blocked by sandbox EPERM on tsx IPC listen; **subsequently passed in parent canonical validation**.
 
 ## Handoff risks and remaining checks
 
-Parent owns the full canonical suite, external review and lifecycle; no push, merge, deployment, host upgrade or production activation occurred. No real provider calls were made.
+Parent owns external review and lifecycle. The implementation was committed as `93d48f3` and opened as PR #248. The coding executor made no real provider calls or production changes. Parent validation results are recorded below.
 
 Backend-granted priority remains unknown. Independent `service_tier` values are preserved, so adapter-off cannot override independent priority and adapter-on cannot replace an existing tier. Status and docs say this explicitly. A writer crash can leave a stale `data/codex-fast.json.lock`; the next command gives an actionable retry/removal message.
 
 The parent-reported existing undici 6 advisory remains: `npm ls undici` traces 6.29.0 through discord.js/@discordjs/rest and pi-ai/openai 7.19.0; Pi coding-agent itself uses 8.12.3. Only the four direct Pi pins changed; no unrelated dependency sweep was performed.
 
+## Parent validation and review 1 follow-up
 
-Commit handoff: staging the explicit task-owned paths was denied by the sandbox when Git tried to create the shared worktree index lock. No source commit was created and no unrelated state was staged. Parent must stage these task-owned changes and commit, for example with `user.name=Minime Bot contributors`, `user.email=minime-bot@users.noreply.github.com`, and subject `Upgrade Pi to 1.5.0 and add scoped Codex Fast`.
+Parent reported the full canonical suite at **2,667 passed / 1 skipped / 0 failed**, plus passing canonical workspace validation. Three isolated OAuth smoke requests confirmed off/no-tier and on/priority with the same Astra/high model and reasoning; the returned service tier was not exposed. Request intent remains distinct from backend-granted priority.
+
+Independent Astra and Opus review completed, 2/2 nondegraded, with two findings:
+
+1. Telegram `/fast` captured startup agent configuration while SessionManager and the request hook reload it. The handler now reloads the bound agent from the regular merged-config source with secret resolution disabled. An optional loader uses the existing bot options DI pattern. Authentication and topic routing remain unchanged. Regression edits merged config after bot creation: adding opt-in, changing model plus pin, removing opt-in without mutating preferences, and restoring opt-in.
+2. The standalone verifier's lexical entrypoint comparison silently skipped execution through directory symlinks. It now uses the existing `realpathOrResolve` pattern on both paths. A subprocess regression invokes the actual CLI through a `current` directory symlink and asserts its real JSON version/request/command evidence.
+
+Both new regressions failed before the fixes. With the isolated environment above, review follow-up validation passed:
+
+- `node --experimental-test-module-mocks --import tsx --test --test-concurrency=1 --test-timeout=240000 src/__tests__/{telegram-bot,codex-fast}.test.ts`: **301/301 passed**.
+- `npm run build` and `npm run typecheck`: **passed**.
+- `node --experimental-test-module-mocks --import tsx --test --test-concurrency=1 --test-timeout=240000 dist/__tests__/codex-fast.test.js`: **7/7 passed**, including the compiled CLI invoked through a directory symlink and JSON assertions for Pi 1.5.0, 23 request checks and 24 command checks.
+- `git diff --check`: **passed**.
+
+The full canonical suite was not rerun in the sandbox. This follow-up made no provider calls or production changes.

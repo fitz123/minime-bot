@@ -8,7 +8,7 @@ import { mediaPipelineErrors, telegramApiCalls, telegramApiErrors } from "../met
 import type { TelegramBinding, BotConfig } from "../types.js";
 import type { SessionManager } from "../session-manager.js";
 import { cleanupSessionMediaDir } from "../media-store.js";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readFastStatus } from "../codex-fast.js";
@@ -1557,10 +1557,13 @@ describe("command handler wiring", () => {
     const primary = { id: "main", workspaceCwd: root, model: "openai-codex/gpt-6-astra", thinking: "high" as const, codexFast: { provider: "openai-codex" as const, model: "gpt-6-astra" } };
     const manager = createMockSessionManager();
     const apiCalls: Array<{ method: string; payload: any }> = [];
-    const { bot, messageQueue } = initBot(manager, apiCalls, undefined, undefined, (base, sm, options) => createTelegramBot({
-      ...base, agents: { main: primary, other: { ...primary, id: "other", codexFast: undefined } },
-      bindings: [{ chatId: testChatId, agentId: "main", kind: "group", topics: [{ topicId: 22, agentId: "other" }] }],
-    }, sm, options));
+    const { bot, messageQueue } = initBot(manager, apiCalls, undefined, undefined, (base, sm, options) => {
+      const currentConfig: BotConfig = {
+        ...base, agents: { main: primary, other: { ...primary, id: "other", codexFast: undefined } },
+        bindings: [{ chatId: testChatId, agentId: "main", kind: "group", topics: [{ topicId: 22, agentId: "other" }] }],
+      };
+      return createTelegramBot(currentConfig, sm, { ...options, loadConfig: () => currentConfig });
+    });
     t.after(() => messageQueue.clearAll());
     const send = async (args: string, topic = 11, chat = testChatId) => {
       const update = makeCommandUpdate("fast", 500 + apiCalls.length);
@@ -1593,6 +1596,57 @@ describe("command handler wiring", () => {
     assert.match(apiCalls.at(-1)!.payload.text, /intent: priority/);
     await send("inherit");
     assert.match(apiCalls.at(-1)!.payload.text, /override: inherit/);
+  });
+
+  it("reloads /fast model pins and added/removed opt-in from current merged config", async t => {
+    const root = mkdtempSync(join(tmpdir(), "telegram-fast-reload-"));
+    const keys = ["MINIME_CONTROL_WORKSPACE_ROOT", "MINIME_CONFIG_PATH", "MINIME_INSTANCE_CONFIG_PATH"];
+    const previous = keys.map(key => process.env[key]);
+    process.env.MINIME_CONTROL_WORKSPACE_ROOT = root;
+    process.env.MINIME_CONFIG_PATH = join(root, "config.yaml");
+    delete process.env.MINIME_INSTANCE_CONFIG_PATH;
+    t.after(() => {
+      keys.forEach((key, i) => { if (previous[i] === undefined) delete process.env[key]; else process.env[key] = previous[i]; });
+      rmSync(root, { recursive: true, force: true });
+    });
+    const primary = { id: "main", workspaceCwd: root, model: "openai-codex/gpt-6-astra", thinking: "high" as const };
+    const initialConfig: BotConfig = { ...handlerConfig, agents: { main: primary } };
+    writeFileSync(join(root, "config.yaml"), JSON.stringify({ ...initialConfig, telegramTokenEnv: "UNUSED_FAST_RELOAD_TOKEN" }));
+    const localPath = join(root, "config.local.yaml");
+    const pin = (model: string) => ({ provider: "openai-codex" as const, model });
+    const updateAgent = (settings: Record<string, unknown>) => writeFileSync(localPath, JSON.stringify({ agents: { main: settings } }));
+    const manager = createMockSessionManager();
+    const apiCalls: Array<{ method: string; payload: any }> = [];
+    const { bot, messageQueue } = initBot(manager, apiCalls, undefined, undefined,
+      (_base, sm, options) => createTelegramBot(initialConfig, sm, options));
+    t.after(() => messageQueue.clearAll());
+    const send = async (args: string) => {
+      const update = makeCommandUpdate("fast", 700 + apiCalls.length);
+      update.message.text = `/fast ${args}`;
+      Object.assign(update.message, { message_thread_id: 11 });
+      await bot.handleUpdate(update);
+      return apiCalls.at(-1)!.payload.text as string;
+    };
+    assert.match(await send("status"), /unavailable/);
+    updateAgent({ codexFast: pin("gpt-6-astra") });
+    assert.match(await send("on"), /model=openai-codex\/gpt-6-astra/);
+    assert.equal(readFastStatus({ agent: { ...primary, codexFast: pin("gpt-6-astra") }, threadKey: `${testChatId}:11` }).enabled, true);
+    updateAgent({ model: "openai-codex/gpt-6-sol", codexFast: pin("gpt-6-sol") });
+    const changed = await send("status");
+    assert.match(changed, /model=openai-codex\/gpt-6-sol/);
+    assert.match(changed, /intent: off/);
+    assert.match(await send("default on"), /Default: on/);
+    const sol = { ...primary, model: "openai-codex/gpt-6-sol", codexFast: { provider: "openai-codex" as const, model: "gpt-6-sol" } };
+    assert.equal(readFastStatus({ agent: sol }).enabled, true);
+    // The base config has no opt-in; removing the overlay removes eligibility.
+    updateAgent({ model: "openai-codex/gpt-6-sol" });
+    const before = readFileSync(join(root, "data/codex-fast.json"), "utf8");
+    assert.match(await send("on"), /unavailable/);
+    assert.match(await send("default off"), /unavailable/);
+    assert.equal(readFileSync(join(root, "data/codex-fast.json"), "utf8"), before);
+    updateAgent({ model: sol.model, codexFast: sol.codexFast });
+    assert.match(await send("status"), /Default: on/);
+    assert.deepEqual(manager.calls, [], "Local commands must not invoke or create model sessions");
   });
 
   function createSteeringSessionManager() {

@@ -1,6 +1,6 @@
 /** Offline installed-package verifier. All writes are confined to a disposable fixture. */
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -159,7 +159,15 @@ export async function verifyCodexFast(extensionPath?: string): Promise<{ piVersi
   }
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+function realpathOrResolve(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
+if (process.argv[1] && realpathOrResolve(process.argv[1]) === realpathOrResolve(fileURLToPath(import.meta.url))) {
   const deadline = setTimeout(() => { process.stderr.write("Codex Fast offline verification timed out\n"); process.exit(1); }, 20_000);
   verifyCodexFast().then(result => { console.log(JSON.stringify(result)); }).catch(error => { console.error(error); process.exitCode = 1; }).finally(() => clearTimeout(deadline));
 }
