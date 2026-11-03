@@ -469,6 +469,18 @@ export function validateAgent(
     throw new Error(`Agent "${id}" missing model (Pi agents must set an explicit model${defaultHint})`);
   }
   const model = obj.model;
+  let codexFast: AgentConfig["codexFast"];
+  if (obj.codexFast !== undefined) {
+    const fast = obj.codexFast;
+    if (!isConfigRecord(fast) || Object.keys(fast).some(key => !["provider", "model"].includes(key)) ||
+        fast.provider !== "openai-codex" || typeof fast.model !== "string" ||
+        !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(fast.model) ||
+        (model.includes("/") ? model : `openai-codex/${model}`) !== `openai-codex/${fast.model}`) {
+      throw new Error(`Agent "${id}" codexFast must pin its exact openai-codex provider/model`);
+    }
+    codexFast = { provider: "openai-codex", model: fast.model };
+  }
+
   if (obj.fallbackModel !== undefined) {
     throw new Error(
       `Agent "${id}" uses fallbackModel, but fallback models were removed with the Claude runtime; remove fallbackModel`,
@@ -507,6 +519,7 @@ export function validateAgent(
     thinking: obj.thinking as AgentConfig["thinking"] | undefined,
     provider: "pi",
     askAgent,
+    codexFast,
   };
 }
 

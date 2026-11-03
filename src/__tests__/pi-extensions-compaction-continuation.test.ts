@@ -276,7 +276,7 @@ describe("compaction continuation Pi extension", () => {
     });
     const sessionDir = join(testRoot, "sessions");
     const sessionManager = SessionManager.create(testRoot, sessionDir);
-    const modelRuntime = await ModelRuntime.create({ modelsPath: null });
+    const modelRuntime = await ModelRuntime.create({ modelsPath: null, authPath: join(testRoot, "auth.json") });
     const faux = fauxProvider({
       provider: "compaction-continuation-test",
       api: "compaction-continuation-test",
@@ -307,7 +307,10 @@ describe("compaction continuation Pi extension", () => {
       extensions: [resolve("extensions/pi/compaction-continuation.ts")],
       compaction: {
         enabled: true,
-        reserveTokens: 199_000,
+        // Pi 1.5 includes the retained system transcript in context accounting:
+        // first response ~2.9K, compacted/continued context ~1.5K. A 2K
+        // threshold exercises one compaction without recompacting the result.
+        reserveTokens: 198_000,
         keepRecentTokens: 1,
       },
       retry: { enabled: false },

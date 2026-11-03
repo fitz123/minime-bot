@@ -16,7 +16,7 @@ locations.
 
 ## Runtime compatibility boundary
 
-The current package pins its package-owned Pi runtime to 0.99.1 and grammY to
+The current package pins its package-owned Pi runtime to 1.5.0 and grammY to
 1.46.0. Pi owns bounded summarization retries. Its
 `summarization_retry_scheduled`, `summarization_retry_attempt_start`, and
 `summarization_retry_finished` records are continued stream activity, not a

@@ -8,7 +8,10 @@ import { mediaPipelineErrors, telegramApiCalls, telegramApiErrors } from "../met
 import type { TelegramBinding, BotConfig } from "../types.js";
 import type { SessionManager } from "../session-manager.js";
 import { cleanupSessionMediaDir } from "../media-store.js";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { readFastStatus } from "../codex-fast.js";
 import {
   TELEGRAM_GET_UPDATES_TIMEOUT_SECONDS,
 } from "../poll-progress.js";
@@ -252,9 +255,9 @@ describe("BOT_COMMANDS", () => {
     assert.deepEqual(TELEGRAM_ALLOWED_UPDATES, ["message", "message_reaction"]);
   });
 
-  it("contains start, reconnect, clean, and status commands", () => {
+  it("contains start, reconnect, clean, status, and fast commands", () => {
     const names = BOT_COMMANDS.map((c) => c.command);
-    assert.deepStrictEqual(names, ["start", "reconnect", "clean", "status"]);
+    assert.deepStrictEqual(names, ["start", "reconnect", "clean", "status", "fast"]);
   });
 
   it("each command has a non-empty description", () => {
@@ -1545,6 +1548,52 @@ describe("command handler wiring", () => {
     };
     return result;
   }
+
+  it("routes authenticated /fast before prompting, uses actual topic binding, and survives /clean", async t => {
+    const root = mkdtempSync(join(tmpdir(), "telegram-fast-"));
+    const oldRoot = process.env.MINIME_CONTROL_WORKSPACE_ROOT;
+    process.env.MINIME_CONTROL_WORKSPACE_ROOT = root;
+    t.after(() => { if (oldRoot === undefined) delete process.env.MINIME_CONTROL_WORKSPACE_ROOT; else process.env.MINIME_CONTROL_WORKSPACE_ROOT = oldRoot; rmSync(root, { recursive: true, force: true }); });
+    const primary = { id: "main", workspaceCwd: root, model: "openai-codex/gpt-6-astra", thinking: "high" as const, codexFast: { provider: "openai-codex" as const, model: "gpt-6-astra" } };
+    const manager = createMockSessionManager();
+    const apiCalls: Array<{ method: string; payload: any }> = [];
+    const { bot, messageQueue } = initBot(manager, apiCalls, undefined, undefined, (base, sm, options) => createTelegramBot({
+      ...base, agents: { main: primary, other: { ...primary, id: "other", codexFast: undefined } },
+      bindings: [{ chatId: testChatId, agentId: "main", kind: "group", topics: [{ topicId: 22, agentId: "other" }] }],
+    }, sm, options));
+    t.after(() => messageQueue.clearAll());
+    const send = async (args: string, topic = 11, chat = testChatId) => {
+      const update = makeCommandUpdate("fast", 500 + apiCalls.length);
+      update.message.text = `/fast${args ? ` ${args}` : ""}`;
+      Object.assign(update.message, { message_thread_id: topic });
+      update.message.chat.id = chat;
+      await bot.handleUpdate(update);
+    };
+    await send("on");
+    assert.match(apiCalls.at(-1)!.payload.text, /override: on/);
+    assert.equal(readFastStatus({ agent: primary, threadKey: `${testChatId}:11` }).enabled, true);
+    await send("", 12);
+    assert.match(apiCalls.at(-1)!.payload.text, /override: inherit/);
+    await send("on", 22);
+    assert.match(apiCalls.at(-1)!.payload.text, /unavailable/);
+    await send("on extra");
+    assert.match(apiCalls.at(-1)!.payload.text, /Usage:/);
+    const beforeUnauthorized = apiCalls.length;
+    await send("default on", 11, 444);
+    assert.equal(apiCalls.length, beforeUnauthorized);
+    assert.deepEqual(manager.calls, [], "Fast must not create sessions, steer, or invoke a model");
+    const clean = makeCommandUpdate("clean", 600);
+    Object.assign(clean.message, { message_thread_id: 11 });
+    await bot.handleUpdate(clean);
+    assert.deepEqual(manager.calls, ["destroySession"]);
+    await send("");
+    assert.match(apiCalls.at(-1)!.payload.text, /override: on/);
+    await send("default on");
+    await send("", 12);
+    assert.match(apiCalls.at(-1)!.payload.text, /intent: priority/);
+    await send("inherit");
+    assert.match(apiCalls.at(-1)!.payload.text, /override: inherit/);
+  });
 
   function createSteeringSessionManager() {
     const sent: string[] = [];

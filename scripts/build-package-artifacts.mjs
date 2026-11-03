@@ -14,6 +14,7 @@ const wrappers = [
   ["acknowledged-steer.ts", "acknowledged-steer.js"],
   ["compaction-continuation.ts", "compaction-continuation.js"],
   ["codex-usage.ts", "codex-usage.js"],
+  ["codex-fast.ts", "codex-fast.js"],
   ["codex-transport-overflow.ts", "codex-transport-overflow.js"],
   ["web-tools.ts", "web-tools.js"],
   ["knowledge-tools.ts", "knowledge-tools.js"],
@@ -62,6 +63,8 @@ for (const [sourceRel, targetRel] of wrappers) {
     join(artifactExtensionDir, targetRel),
   );
 }
+
+cpSync(join(sourceExtensionDir, "codex-fast-LICENSE.md"), join(artifactExtensionDir, "codex-fast-LICENSE.md"));
 
 for (const rel of [
   join("subagent", "agents"),

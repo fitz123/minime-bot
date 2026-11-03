@@ -48,7 +48,8 @@
     "docs/launchd-operations.md",
     "docs/monitoring.md",
     "docs/collaboration.md",
-    "examples/monitoring/*"
+    "examples/monitoring/*",
+    "docs/codex-fast.md"
   ],
   "keywords": [
     "telegram",
@@ -66,10 +67,10 @@
     "node": ">=22.19.0"
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "0.99.1",
-    "@earendil-works/pi-ai": "0.99.1",
-    "@earendil-works/pi-coding-agent": "0.99.1",
-    "@earendil-works/pi-tui": "0.99.1",
+    "@earendil-works/pi-agent-core": "1.5.0",
+    "@earendil-works/pi-ai": "1.5.0",
+    "@earendil-works/pi-coding-agent": "1.5.0",
+    "@earendil-works/pi-tui": "1.5.0",
     "@grammyjs/auto-retry": "^2.0.2",
     "discord.js": "^14.27.0",
     "grammy": "1.46.0",

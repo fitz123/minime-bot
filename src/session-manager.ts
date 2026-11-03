@@ -1025,7 +1025,7 @@ export class SessionManager {
     const telegramLane = /^(-?\d+)(?::(\d+))?$/.exec(chatId);
     const telegramRichAnswers = !!telegramLane && !!resolveBinding(Number(telegramLane[1]), freshConfig.bindings,
       telegramLane[2] === undefined ? undefined : Number(telegramLane[2]));
-    const runtimeEnvOptions: PiSpawnRuntimeEnvOptions = { askCallerAgentId: agentId, outboxPath, ...(telegramRichAnswers ? { telegramRichAnswers: true } : {}) };
+    const runtimeEnvOptions: PiSpawnRuntimeEnvOptions = { askCallerAgentId: agentId, fastThreadKey: chatId, outboxPath, ...(telegramRichAnswers ? { telegramRichAnswers: true } : {}) };
     let prepared = this.prepareSessionBinding(chatId, agentId, agent, freshConfig, Boolean(expectedId));
     if (isStartupSuperseded()) {
       await abortSupersededStartup();

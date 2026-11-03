@@ -4,7 +4,8 @@ import { appendFileSync, chmodSync, mkdirSync, realpathSync, rmSync, existsSync,
 import { EventEmitter } from "node:events";
 import { Readable, Writable } from "node:stream";
 import type { ChildProcess } from "node:child_process";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import type { AgentConfig, BotConfig, BoundSessionState, StreamLine } from "../types.js";
 import type { ActiveSession } from "../session-manager.js";
 import type { InteractiveSessionBinding } from "../interactive-session-binding.js";
@@ -20,7 +21,7 @@ import { MINIME_BOT_PI_SESSION_AGENT_ID_ENV, NewlineOnlyJsonlSplitter, PiStartup
 import PQueue from "p-queue";
 import { CURRENT_SESSION_VERSION } from "@earendil-works/pi-coding-agent";
 
-const TEST_DIR = "/tmp/minime-test-pi-spawn";
+const TEST_DIR = join(tmpdir(), "minime-test-pi-spawn");
 const TEST_STORE_PATH = `${TEST_DIR}/sessions.json`;
 const MAIN_WORKSPACE = `${TEST_DIR}/workspace-main`;
 const PI_WORKSPACE = `${TEST_DIR}/workspace-pi`;
@@ -560,6 +561,7 @@ describe("SessionManager exact Pi binding startup", () => {
       assert.ok(existsSync(reserved));
       assert.ok(!existsSync(`${path}/stale.txt`));
       assert.equal(piSpawnCaptures[0].runtimeEnvOptions?.telegramRichAnswers, true);
+      assert.equal(piSpawnCaptures[0].runtimeEnvOptions?.fastThreadKey, "218");
       await manager.closeSession("218");
       assert.ok(existsSync(reserved));
       await manager.getOrCreateSession("218", "pi");
@@ -582,6 +584,7 @@ describe("SessionManager exact Pi binding startup", () => {
     assert.strictEqual(session.outboxPath, outboxDir("pi-chat"));
     assert.deepStrictEqual(piSpawnCaptures[0].runtimeEnvOptions, {
       askCallerAgentId: "pi",
+      fastThreadKey: "pi-chat",
       outboxPath: session.outboxPath,
     });
     assert.ok(!session.outboxPath.startsWith("/tmp/bot-outbox"));
@@ -758,6 +761,7 @@ describe("SessionManager exact Pi binding startup", () => {
       assert.strictEqual(piSpawnCaptures[0].agent.id, "pi");
       assert.deepStrictEqual(piSpawnCaptures[0].runtimeEnvOptions, {
         askCallerAgentId: "pi",
+        fastThreadKey: "pi-caller",
         outboxPath: outboxDir("pi-caller"),
       });
     } finally {
@@ -1268,8 +1272,8 @@ describe("SessionManager exact-path recovery", () => {
     assert.deepStrictEqual(
       piSpawnCaptures.map((capture) => capture.runtimeEnvOptions),
       [
-        { askCallerAgentId: "pi", outboxPath: outboxDir("pi-stale") },
-        { askCallerAgentId: "pi", outboxPath: outboxDir("pi-stale") },
+        { askCallerAgentId: "pi", fastThreadKey: "pi-stale", outboxPath: outboxDir("pi-stale") },
+        { askCallerAgentId: "pi", fastThreadKey: "pi-stale", outboxPath: outboxDir("pi-stale") },
       ],
       "recovery retry keeps the exact session outbox path",
     );

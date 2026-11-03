@@ -58,7 +58,7 @@ export default function (pi: ExtensionAPI): void {
             extensionArgs: resolvePiAskAgentChildExtensionArgs({
               extraExtensions: config.piExtraExtensions,
             }),
-            env: buildPiAskAgentChildSpawnEnv(request.target.workspaceCwd),
+            env: buildPiAskAgentChildSpawnEnv(request.target.workspaceCwd, request.target.id),
             warn: (event) => {
               // eslint-disable-next-line no-console -- structured metadata-only warn for the Pi session
               console.warn(formatAskAgentChildWarn(event));

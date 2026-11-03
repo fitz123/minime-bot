@@ -143,6 +143,20 @@ function assertCronSystemInstruction(value: string): void {
 }
 
 describe("cron-runner runPi", () => {
+  it("supplies the current cron agent identity without a caller thread", () => {
+    const ws = makeWorkspace();
+    const captures: SpawnCapture[] = [];
+    runPi(makeCron(), ws, makeDeps(captures, {
+      buildEnv: (cwd, options) => {
+        assert.equal(cwd, ws);
+        assert.deepEqual(options, { askCallerAgentId: "main" });
+        return buildPiSpawnEnv(cwd, options);
+      },
+    }));
+    assert.equal(captures[0].options.env?.MINIME_BOT_PI_SESSION_AGENT_ID, "main");
+    assert.equal(captures[0].options.env?.MINIME_BOT_PI_SESSION_THREAD_KEY, undefined);
+  });
+
   it("spawns Pi in print one-shot mode with the required argv and spawn options", () => {
     const ws = makeWorkspace();
     const captures: SpawnCapture[] = [];
@@ -230,9 +244,9 @@ describe("cron-runner runPi", () => {
     }
 
     const extensions = flagValues(captures[0].args, "--extension");
-    assert.strictEqual(extensions.length, 2);
+    assert.strictEqual(extensions.length, 3);
     assert.equal(extensions.filter((path) => path.endsWith("web-tools.ts")).length, 1);
-    assert.ok(extensions[1].endsWith("knowledge-tools.ts"));
+    assert.ok(extensions[2].endsWith("knowledge-tools.ts"));
     assert.ok(!extensions.includes(extraExtension));
   });
 

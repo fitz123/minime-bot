@@ -45,6 +45,7 @@ import {
   resolvePiExtensionArgs,
   resolveValidatedPiAgentWorkspaceCwd,
   shouldIncludePiChildEnvKey,
+  type PiSpawnRuntimeEnvOptions,
 } from "./pi-rpc-protocol.js";
 import { assemblePiContext } from "./pi-context-assembler.js";
 import {
@@ -1354,7 +1355,7 @@ type PiSpawnSync = (
 export interface PiRunDeps {
   spawnSync: PiSpawnSync;
   buildAgentConfig: (cron: CronJob, workspaceCwd: string, agentData?: CronAgentData) => AgentConfig;
-  buildEnv: (agentWorkspaceRoot?: string) => Record<string, string>;
+  buildEnv: (agentWorkspaceRoot?: string, options?: PiSpawnRuntimeEnvOptions) => Record<string, string>;
   assembleContext: typeof assemblePiContext;
   resolveExtensionArgs?: () => string[];
 }
@@ -1400,7 +1401,7 @@ function runPi(
   const validatedWorkspaceCwd = resolveValidatedPiAgentWorkspaceCwd(agent);
   const thinking = isCronPiThinking(agent.thinking) ? agent.thinking : "medium";
   const systemInstruction = buildCronSystemInstruction();
-  const env = hardenPiCronEnv(deps.buildEnv(validatedWorkspaceCwd));
+  const env = hardenPiCronEnv(deps.buildEnv(validatedWorkspaceCwd, { askCallerAgentId: cron.agentId }));
   env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = validatedWorkspaceCwd;
   // Pi authenticates via ~/.pi/agent/auth.json, not legacy OAuth credentials.
   env.HOME ||= homedir();

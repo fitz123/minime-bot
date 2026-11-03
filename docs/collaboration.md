@@ -44,7 +44,7 @@ MINIME_COLLABORATION_LABEL='Planning terminal' \
   pi --extension /path/to/minime-bot/dist/extensions/pi/collaboration.js
 ```
 
-Use Pi **0.99.1**, the package's pinned version. A source checkout can load
+Use Pi **1.5.0**, the package's pinned version. A source checkout can load
 `extensions/pi/collaboration.ts` instead. The package does not read or assemble
 private terminal-launcher context. The parent launcher owns those inputs.
 

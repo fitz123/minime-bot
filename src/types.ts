@@ -25,6 +25,8 @@ export interface AgentConfig {
    */
   provider?: "pi";
   askAgent?: AskAgentConfig;
+  /** Explicit eligibility only; preferences start off and live in control data. */
+  codexFast?: { provider: "openai-codex"; model: string };
 }
 
 export interface TopicOverride {

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Upgrade the coherent package-owned Pi runtime to 1.5.0, with offline RPC, session resume, extension and tool compatibility checks (#219).
+- Add explicit agent/exact-model Codex Fast opt-in, initially off, with persistent per-thread `/fast` overrides and agent defaults for identified non-chat consumers. Preserve reasoning, independent provider tiers and `models.json`; ship an offline installed-package verifier and upstream MIT attribution.
+
 ## 2026.11.0
 
 - Preserve explicit heading hierarchy, separated paragraphs and schedule line breaks in simple native Telegram drafts and final answers (#245, #246).

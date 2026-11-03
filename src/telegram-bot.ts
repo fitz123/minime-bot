@@ -1,3 +1,4 @@
+import { formatFastCommandError, handleFastCommand } from "./codex-fast.js";
 import { statSync } from "node:fs";
 import type { RichMessage } from "grammy/types";
 import { validateRichPhoto } from "./telegram-rich.js";
@@ -66,6 +67,7 @@ export const BOT_COMMANDS = [
   { command: "reconnect", description: "Reconnect session (keeps context)" },
   { command: "clean", description: "Clean session (fresh start)" },
   { command: "status", description: "Show bot status" },
+  { command: "fast", description: "Show/set scoped Codex Fast" },
 ] as const;
 
 export const TELEGRAM_ALLOWED_UPDATES = ["message", "message_reaction"] as const;
@@ -854,6 +856,22 @@ export function createTelegramBot(
       await next();
     } finally {
       releaseInput?.();
+    }
+  });
+
+  // Authenticated local control, before text framing or any model invocation.
+  bot.command("fast", async (ctx) => {
+    const topicId = ctx.message?.message_thread_id;
+    const binding = resolveBinding(ctx.chat.id, config.bindings, topicId);
+    if (!binding) return;
+    if (ctx.message) setThread(ctx.chat.id, ctx.message.message_id, topicId);
+    try {
+      await ctx.reply(handleFastCommand(ctx.match, {
+        agent: config.agents[binding.agentId],
+        threadKey: sessionKey(ctx.chat.id, topicId),
+      }));
+    } catch (error) {
+      await ctx.reply(formatFastCommandError(error));
     }
   });
 

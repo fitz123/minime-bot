@@ -768,7 +768,7 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
     assert.ok(noContextIdx < firstExtension, "context args must precede --extension args");
     assert.ok(firstExtension < session, "--extension args must precede --session");
     assert.strictEqual(args[session + 1], TEST_SESSION_BINDING.sessionFile);
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 7);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 8);
   });
 
   it("delivers file guidance without suppressing native AGENTS.md loading", () => {
@@ -873,6 +873,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", wrapperAbs("acknowledged-steer.ts"),
       "--extension", wrapperAbs("compaction-continuation.ts"),
       "--extension", wrapperAbs("codex-transport-overflow.ts"),
+      "--extension", wrapperAbs("codex-fast.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
       "--extension", wrapperAbs("subagent/index.ts"),
@@ -883,11 +884,11 @@ describe("Pi extension loading (--extension)", () => {
   it("defaults the wrapper list to acknowledged steering and the existing first-party tools", () => {
     assert.deepStrictEqual(
       [...PI_EXTENSION_WRAPPER_RELPATHS],
-      ["acknowledged-steer.ts", "compaction-continuation.ts", "codex-transport-overflow.ts", "web-tools.ts", "knowledge-tools.ts", "subagent/index.ts", "ask-agent/index.ts"],
+      ["acknowledged-steer.ts", "compaction-continuation.ts", "codex-transport-overflow.ts", "codex-fast.ts", "web-tools.ts", "knowledge-tools.ts", "subagent/index.ts", "ask-agent/index.ts"],
     );
     assert.deepStrictEqual(
       [...PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS],
-      ["acknowledged-steer.js", "compaction-continuation.js", "codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js", "subagent/index.js", "ask-agent/index.js"],
+      ["acknowledged-steer.js", "compaction-continuation.js", "codex-transport-overflow.js", "codex-fast.js", "web-tools.js", "knowledge-tools.js", "subagent/index.js", "ask-agent/index.js"],
     );
   });
 
@@ -906,6 +907,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", wrapperAbs("acknowledged-steer.ts"),
       "--extension", wrapperAbs("compaction-continuation.ts"),
       "--extension", wrapperAbs("codex-transport-overflow.ts"),
+      "--extension", wrapperAbs("codex-fast.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
       "--extension", wrapperAbs("subagent/index.ts"),
@@ -917,6 +919,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", wrapperAbs("knowledge-tools.ts"),
     ]);
     assert.deepStrictEqual(cronArgs, [
+      "--extension", wrapperAbs("codex-fast.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
     ]);
@@ -993,6 +996,15 @@ describe("Pi extension loading (--extension)", () => {
     }
   });
 
+  it("loads Fast only for identified-agent consumers and retains extension kill switches", () => {
+    for (const relpaths of [PI_EXTENSION_WRAPPER_RELPATHS, PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS, PI_CRON_WRAPPER_RELPATHS]) {
+      assert.equal(relpaths.filter(path => path === "codex-fast.ts").length, 1);
+      assert.deepEqual(resolvePiExtensionArgs({ ...presentAll, relpaths, env: { PI_EXTENSIONS_DISABLED: "1" } }), []);
+    }
+    assert.equal((PI_SUBAGENT_CHILD_WRAPPER_RELPATHS as readonly string[]).includes("codex-fast.ts"), false);
+    assert.equal((PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS as readonly string[]).includes("codex-fast.js"), false);
+  });
+
   it("loads the canonical web-tools wrapper exactly once on every package-managed runtime inventory", () => {
     const inventories: Record<string, readonly string[]> = {
       interactive: PI_EXTENSION_WRAPPER_RELPATHS,
@@ -1011,7 +1023,7 @@ describe("Pi extension loading (--extension)", () => {
   });
 
   it("the Pi cron wrapper subset exposes search and Knowledge without child-spawning tools", () => {
-    assert.deepStrictEqual([...PI_CRON_WRAPPER_RELPATHS], ["web-tools.ts", "knowledge-tools.ts"]);
+    assert.deepStrictEqual([...PI_CRON_WRAPPER_RELPATHS], ["codex-fast.ts", "web-tools.ts", "knowledge-tools.ts"]);
     assert.equal(PI_CRON_WRAPPER_RELPATHS.some((path) => /subagent|ask-agent/.test(path)), false);
   });
 
@@ -1034,6 +1046,7 @@ describe("Pi extension loading (--extension)", () => {
 
     assert.deepStrictEqual(args, [
       "--extension", wrapperAbs("codex-transport-overflow.ts"),
+      "--extension", wrapperAbs("codex-fast.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
       "--extension", extraA,
@@ -1077,6 +1090,7 @@ describe("Pi extension loading (--extension)", () => {
       }
       for (const file of [
         join(sourceDir, "web-tools.ts"),
+        join(sourceDir, "codex-fast.ts"),
         join(sourceDir, "codex-transport-overflow.ts"),
         join(sourceDir, "knowledge-tools.ts"),
         join(sourceDir, "ask-agent", "index.ts"),
@@ -1113,6 +1127,7 @@ describe("Pi extension loading (--extension)", () => {
   it("resolves only the requested relpaths subset for Pi cron search and Knowledge", () => {
     const args = resolvePiExtensionArgs({ ...presentAll, relpaths: PI_CRON_WRAPPER_RELPATHS });
     assert.deepStrictEqual(args, [
+      "--extension", wrapperAbs("codex-fast.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
     ]);
@@ -1140,6 +1155,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", wrapperAbs("knowledge-tools.ts"),
     ]);
     assert.deepStrictEqual(cronArgs, [
+      "--extension", wrapperAbs("codex-fast.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
     ]);
@@ -1173,6 +1189,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", resolve(artifactDir, "acknowledged-steer.js"),
       "--extension", resolve(artifactDir, "compaction-continuation.js"),
       "--extension", resolve(artifactDir, "codex-transport-overflow.js"),
+      "--extension", resolve(artifactDir, "codex-fast.js"),
       "--extension", resolve(artifactDir, "web-tools.js"),
       "--extension", resolve(artifactDir, "knowledge-tools.js"),
       "--extension", resolve(artifactDir, "subagent/index.js"),
@@ -1192,6 +1209,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", wrapperAbs("acknowledged-steer.ts"),
       "--extension", wrapperAbs("compaction-continuation.ts"),
       "--extension", wrapperAbs("codex-transport-overflow.ts"),
+      "--extension", wrapperAbs("codex-fast.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
       "--extension", wrapperAbs("subagent/index.ts"),
@@ -1215,6 +1233,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", resolve(artifactDir, "acknowledged-steer.js"),
       "--extension", resolve(artifactDir, "compaction-continuation.js"),
       "--extension", resolve(artifactDir, "codex-transport-overflow.js"),
+      "--extension", resolve(artifactDir, "codex-fast.js"),
       "--extension", resolve(artifactDir, "web-tools.js"),
       "--extension", resolve(artifactDir, "knowledge-tools.js"),
       "--extension", resolve(artifactDir, "subagent/index.js"),
@@ -1251,7 +1270,7 @@ describe("Pi extension loading (--extension)", () => {
     const args = buildPiSpawnArgs(testAgent, undefined, presentAll);
 
     assert.ok(args.includes("--no-extensions"), "ambient Pi extension discovery is always suppressed");
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 7);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 8);
     assert.ok(args.includes(wrapperAbs("acknowledged-steer.ts")));
     assert.ok(args.includes(wrapperAbs("compaction-continuation.ts")));
     assert.ok(args.includes(wrapperAbs("codex-transport-overflow.ts")));
@@ -1271,6 +1290,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", wrapperAbs("acknowledged-steer.ts"),
       "--extension", wrapperAbs("compaction-continuation.ts"),
       "--extension", wrapperAbs("codex-transport-overflow.ts"),
+      "--extension", wrapperAbs("codex-fast.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
       "--extension", wrapperAbs("subagent/index.ts"),
@@ -1286,7 +1306,7 @@ describe("Pi extension loading (--extension)", () => {
       extraExtensions: [extraA, extraB],
     });
 
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 9);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 10);
     assert.deepStrictEqual(args.slice(-4), [
       "--extension", extraA,
       "--extension", extraB,
@@ -1307,6 +1327,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", resolve(artifactDir, "acknowledged-steer.js"),
       "--extension", resolve(artifactDir, "compaction-continuation.js"),
       "--extension", resolve(artifactDir, "codex-transport-overflow.js"),
+      "--extension", resolve(artifactDir, "codex-fast.js"),
       "--extension", resolve(artifactDir, "web-tools.js"),
       "--extension", resolve(artifactDir, "knowledge-tools.js"),
       "--extension", resolve(artifactDir, "subagent/index.js"),
@@ -1435,10 +1456,10 @@ describe("Pi extension loading (--extension)", () => {
     const args = resolvePiExtensionArgs({ env: {} });
 
     const flags = args.filter((a) => a === "--extension");
-    assert.strictEqual(flags.length, 7, "expected one --extension per wrapper");
+    assert.strictEqual(flags.length, 8, "expected one --extension per wrapper");
 
     const paths = args.filter((a) => a !== "--extension");
-    assert.strictEqual(paths.length, 7);
+    assert.strictEqual(paths.length, 8);
     for (const p of paths) {
       assert.ok(p.startsWith("/"), `wrapper path must be absolute: ${p}`);
       assert.ok(existsSync(p), `resolved wrapper must exist on disk: ${p}`);

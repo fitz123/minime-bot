@@ -10,7 +10,7 @@ export function registerCollaboration(pi: ExtensionAPI): void {
   // an internal turn must retain a private outbox after human turns resume.
   const humanOutbox = process.env.MINIME_COLLABORATION_SESSION ? process.env.MINIME_OUTBOX : undefined;
   pi.on("before_agent_start", event => {
-    if (humanOutbox) process.env.MINIME_OUTBOX = event.prompt.startsWith("[Internal collaboration ")
+    if (humanOutbox) process.env.MINIME_OUTBOX = (event.messageType === "custom" ? event.message.customType === "minime-collaboration" : event.prompt.startsWith("[Internal collaboration "))
       ? `${humanOutbox}.internal` : humanOutbox;
   });
   let client: CollaborationClient | undefined;
