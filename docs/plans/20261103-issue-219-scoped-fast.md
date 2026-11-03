@@ -19,7 +19,7 @@ Verified the published `@llblab/pi-codex-usage@0.13.2` tarball from the package 
 
 Fast implementation is documented in [scoped Codex Fast](../codex-fast.md). Defaults and actual thread overrides use atomic control-data writes and live request reads. Model, reasoning, auth, history and independent provider tiers remain unchanged. No operator configuration enables Fast in this change.
 
-Pi 1.5's real continuation test reported two threshold compactions with the old 1K fixture threshold: first response usage 2,879 tokens, post-compaction estimate 1,468 and continuation usage 1,543. Installed `agent-session.js` checks both post-response usage and projected context. Raised only the fixture threshold to 2K (reserve 198K of its 200K window), retaining assertions for exactly one compaction, three faux calls and no persisted continuation marker. Also isolated its credential path. Runtime compaction settings are unchanged.
+The initial continuation-fixture adjustment raised its threshold from 1K to 2K and isolated its credential path, preserving exact lifecycle and persistence assertions. CI later exposed that this remained dependent on implicitly discovered host context. The deterministic fixture correction and reproduction are recorded below; runtime compaction settings are unchanged.
 
 Workspace-local packaging fixtures needed explicit isolation: source-path assertions now distinguish installed fixture descendants from source extension paths, and an empty fixture `.pi/agents` bounds existing ancestor discovery. No production discovery behavior was changed; broader discovery work remains separate.
 
@@ -78,3 +78,19 @@ Both new regressions failed before the fixes. With the isolated environment abov
 - `git diff --check`: **passed**.
 
 The full canonical suite was not rerun in the sandbox. This follow-up made no provider calls or production changes.
+
+
+## CI continuation-fixture isolation follow-up
+
+At `c96de32`, Linux CI reported no threshold compaction where the test required exactly one. Inspected installed `resource-loader.js`, `agent-session.js`, compaction accounting and the faux provider: implicit resources change the system transcript; faux usage counts message characters divided by four, and threshold compaction requires usage strictly greater than `contextWindow - reserveTokens`.
+
+An isolated HOME/agent directory alone still inherited ancestor context in the local nested worktree. Making the resource loader explicit while retaining the old stimulus reproduced CI's exact `[]` versus `["threshold"]` failure. The final fixture disables context files, skills, prompts, themes and ambient extensions, loads only the continuation wrapper, fixes the system prompt and disables append-prompt discovery. Its ~1.4K-token input plus a full-budget 1K-token reasoning response crosses the existing 2K fixture threshold; compacted continuation remains below it. No runtime compaction settings changed.
+
+The real installed Pi session now runs four synthetic host variants: minimal, global resources, project resources, and both. Each asserts one threshold event after the reasoning response, one persisted compaction, three faux calls, one settlement, the same final answer, and no persisted/resumed continuation marker. Resource-list assertions prove host context was excluded.
+
+Validation under isolated HOME/agent/control/media/log directories and workspace-local scratch:
+
+- `node --experimental-test-module-mocks --import tsx --test --test-concurrency=1 --test-timeout=240000 src/__tests__/pi-extensions-compaction-continuation.test.ts`: **13/13 passed**, including all four host variants.
+- `npm run typecheck` and `git diff --check`: **passed**.
+
+Only this test fixture and implementation log changed. No provider calls, runtime changes, full-suite rerun or production access occurred.
