@@ -100,13 +100,13 @@ minime-codex-quota-sampler --workspace /path/to/workspace --textfile-dir /path/t
 ```
 
 Interactive RPC sessions, cron runs, subagents, and ask-agent children resolve
-the package-owned Pi 0.99.1 entrypoints and execute them with Node. They never
+the package-owned Pi 1.5.0 entrypoints and execute them with Node. They never
 fall back to a global `pi` from `PATH`; a missing packaged entrypoint fails
 explicitly. Startup logs report only the expected version, entrypoint kind, and
 mismatch state, without exposing the resolved host path.
 
 The runtime dependency contract pins all four package-owned Pi packages to
-0.99.1 and grammY to 1.46.0 (`@grammyjs/types` 5.0.0). Pi owns the bounded
+1.5.0 and grammY to 1.46.0 (`@grammyjs/types` 5.0.0). Pi owns the bounded
 summarization retry, including transient WebSocket recovery; Minime treats its
 retry records as stream activity and does not add a second compaction retry.
 `agent_settled` remains the accepted-turn terminal boundary. In primary
@@ -115,6 +115,11 @@ visible text continues automatically after successful threshold compaction
 through a hidden follow-up. If compaction produces no meaningful continuation
 outcome, Minime returns a specific length-limit error. Cron, subagent-child, and
 ask-agent-child sessions do not load this continuation wrapper.
+
+Codex Fast priority requests are available through an explicit agent/exact-model
+opt-in and per-thread `/fast` controls; preferences start off. See
+[scoped Codex Fast](docs/codex-fast.md) for commands, isolation, existing-tier
+precedence, and the offline installed-package verifier.
 
 Other direct dependency targets are discord.js 14.27.0, p-queue 9.3.3,
 typebox 1.3.34, yaml 2.9.1, tsx 4.23.15, and @types/node 26.6.3. Already-current
@@ -410,7 +415,7 @@ that point back at the first-party `subagent` or `ask-agent` wrappers.
 Bot-created RPC sessions do not provide an interactive extension UI bridge.
 Blocking `select`, `confirm`, `input`, and `editor` requests are answered as
 cancelled; fire-and-forget UI updates are ignored. External extensions must
-handle cancellation or provide a noninteractive path. Pi 0.99.1 does not bind
+handle cancellation or provide a noninteractive path. Pi 1.5.0 does not bind
 its RPC input reader until startup handlers complete, so a blocking dialog from
 `session_start` instead fails session creation promptly and the child is reaped.
 

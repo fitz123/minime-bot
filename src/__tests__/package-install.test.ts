@@ -108,6 +108,8 @@ function runNpmPack(args: readonly string[], cwd = BOT_ROOT): PackResult {
 function createWorkspace(root: string): string {
   const workspace = join(root, "workspace");
   mkdirSync(join(workspace, "agent-workspace"), { recursive: true });
+  // Bound project-agent discovery to this fixture when TMPDIR is inside a checkout.
+  mkdirSync(join(workspace, ".pi", "agents"), { recursive: true });
   mkdirSync(join(workspace, "config"), { recursive: true });
   writeFileSync(join(workspace, "config", "secrets.sops.yaml"), "placeholder: true\n", "utf8");
   writeFileSync(
@@ -340,6 +342,11 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/knowledge/sync.js",
     "dist/pi-extensions/codex-transport-overflow.js",
     "dist/extensions/pi/codex-usage.js",
+    "dist/extensions/pi/codex-fast.js",
+    "dist/extensions/pi/codex-fast-LICENSE.md",
+    "dist/pi-extensions/codex-fast-request.js",
+    "dist/codex-fast.js",
+    "dist/verify-codex-fast.js",
     "dist/extensions/pi/acknowledged-steer.js",
     "dist/extensions/pi/compaction-continuation.js",
     "dist/extensions/pi/codex-transport-overflow.js",
@@ -473,7 +480,7 @@ describe("package artifact install", () => {
         const manifest = JSON.parse(
           readFileSync(join(projectDir, "node_modules", ...packageName.split("/"), "package.json"), "utf8"),
         ) as { version?: string };
-        assert.equal(manifest.version, "0.99.1", packageName);
+        assert.equal(manifest.version, "1.5.0", packageName);
       }
       const codingAgentRoot = join(
         projectDir,
@@ -494,13 +501,13 @@ describe("package artifact install", () => {
         const nestedManifest = JSON.parse(
           readFileSync(resolvedManifestPath, "utf8"),
         ) as { version?: string };
-        assert.equal(nestedManifest.version, "0.99.1", `Pi nested ${packageName}`);
+        assert.equal(nestedManifest.version, "1.5.0", `Pi nested ${packageName}`);
       }
       assert.equal(
         (JSON.parse(readFileSync(codingAgentRequire.resolve("brace-expansion/package.json"), "utf8")) as {
           version?: string;
         }).version,
-        "5.0.9",
+        "5.0.12",
       );
       assert.equal(
         (JSON.parse(readFileSync(codingAgentRequire.resolve("protobufjs/package.json"), "utf8")) as {
@@ -1116,7 +1123,7 @@ const INSTALLED_ARTIFACT_CHECK = String.raw`
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const workspace = process.env.FIXTURE_WORKSPACE;
@@ -1127,6 +1134,10 @@ assert.ok(sourceBotRoot, "SOURCE_BOT_ROOT is required");
 const projectDir = process.cwd();
 const packageDir = join(projectDir, "node_modules", "minime-bot");
 const artifactDir = join(packageDir, "dist", "extensions", "pi");
+const fastLicense = readFileSync(join(artifactDir, "codex-fast-LICENSE.md"), "utf8");
+assert.match(fastLicense, /Copyright \(c\) 2026 narumiruna/);
+assert.match(fastLicense, /Copyright \(c\) 2026 llblab/);
+assert.match(fastLicense, /Permission is hereby granted/);
 const agentWorkspace = join(workspace, "agent-workspace");
 const controlWorkspaceEnv = "MINIME_CONTROL_WORKSPACE_ROOT";
 const agentWorkspaceEnv = "MINIME_AGENT_WORKSPACE_ROOT";
@@ -1155,7 +1166,7 @@ const { resolvePackageOwnedPiInvocation } = await importPackageFile("dist/pi-run
 const installedRpcInvocation = resolvePackageOwnedPiInvocation("rpc", ["--offline"]);
 const installedCliInvocation = resolvePackageOwnedPiInvocation("cli", ["--offline"]);
 
-assert.equal(installedPiManifest.version, "0.99.1");
+assert.equal(installedPiManifest.version, "1.5.0");
 assert.equal(installedRpcEntry, join(installedPiRoot, "dist", "bundle", "rpc-entry.js"));
 assert.deepEqual(installedRpcInvocation.args, [installedRpcEntry, "--offline"]);
 assert.deepEqual(
@@ -1266,6 +1277,7 @@ assert.deepEqual(
     "acknowledged-steer.js",
     "compaction-continuation.js",
     "codex-transport-overflow.js",
+    "codex-fast.js",
     "web-tools.js",
     "knowledge-tools.js",
     "subagent/index.js",
@@ -1299,7 +1311,7 @@ const cronExtensionArgs = piRpc.resolvePiExtensionArgs({
 });
 assert.deepEqual(
   extensionPathsFromArgs(cronExtensionArgs).map((path) => relative(artifactDir, path)),
-  ["web-tools.js", "knowledge-tools.js"],
+  ["codex-fast.js", "web-tools.js", "knowledge-tools.js"],
 );
 assertCanonicalWebWrapper("cron", extensionPathsFromArgs(cronExtensionArgs));
 assert.equal(
@@ -1312,7 +1324,7 @@ assertNoGuardContract("cron Pi extension args must not load the retired guard", 
 
 for (const extensionPath of extensionPaths) {
   assert.ok(extensionPath.startsWith(artifactDir + "/"), extensionPath);
-  assert.equal(extensionPath.startsWith(sourceBotRoot), false);
+  assert.equal(extensionPath.startsWith(join(sourceBotRoot, "extensions", "pi")), false);
   const mod = await importFile(extensionPath);
   assert.equal(typeof mod.default, "function", extensionPath);
 }
@@ -1444,7 +1456,7 @@ const launchdCronResult = launchdCronPlists.generateLaunchdCronPlists({
 });
 assert.equal(launchdCronResult.context.runCronScript, join(packageDir, "scripts", "run-cron.sh"));
 assert.ok(launchdCronResult.plists[0].content.includes("<string>" + join(packageDir, "scripts", "run-cron.sh") + "</string>"));
-assert.equal(launchdCronResult.plists[0].content.includes(sourceBotRoot), false);
+assert.equal(launchdCronResult.plists[0].content.replaceAll(dirname(projectDir), "<install-fixture>").includes(sourceBotRoot), false);
 
 const registeredTools = [];
 const registeredToolDefs = [];
@@ -1551,6 +1563,11 @@ try {
 
 const askAgentArgs = await importPackageFile("dist/pi-extensions/ask-agent-args.js");
 const piInvocation = await importPackageFile("dist/pi-extensions/pi-invocation.js");
+const fastVerifier = await importPackageFile("dist/verify-codex-fast.js");
+const fastEvidence = await fastVerifier.verifyCodexFast();
+assert.equal(fastEvidence.piVersion, "1.5.0");
+assert.ok(fastEvidence.requestChecks >= 21);
+assert.ok(fastEvidence.commandsChecked >= 21);
 const installedChildInvocation = piInvocation.resolvePiInvocation(["--mode", "json"]);
 assert.equal(installedChildInvocation.command, process.execPath);
 assert.match(
@@ -1636,7 +1653,7 @@ assert.equal(askAgentSpawnCalls[0].args[askAgentSpawnCalls[0].args.indexOf("--ap
 const askAgentLoadedExtensions = extensionPathsFromSpawnArgs(askAgentSpawnCalls[0].args);
 assert.deepEqual(
   askAgentLoadedExtensions.map((path) => relative(artifactDir, path)),
-  ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js"],
+  ["codex-transport-overflow.js", "codex-fast.js", "web-tools.js", "knowledge-tools.js"],
 );
 assertCanonicalWebWrapper("ask-agent child", askAgentLoadedExtensions);
 assert.equal(
@@ -1759,12 +1776,12 @@ try {
   });
   assert.equal(existsSync(globalPiMarkerPath), false);
   assert.equal(readFileSync(askAgentWrapperCwdPath, "utf8").trim(), askAgentTargetWorkspace);
-  assert.equal(readFileSync(askAgentWrapperCallerEnvPath, "utf8").trim(), "__unset__");
+  assert.equal(readFileSync(askAgentWrapperCallerEnvPath, "utf8").trim(), "agent-c");
   const askAgentWrapperArgv = readFileSync(askAgentWrapperArgvPath, "utf8").split("\0").filter(Boolean);
   const askAgentWrapperExtensions = extensionPathsFromSpawnArgs(askAgentWrapperArgv);
   assert.deepEqual(
     askAgentWrapperExtensions.map((path) => relative(artifactDir, path)),
-    ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js"],
+    ["codex-transport-overflow.js", "codex-fast.js", "web-tools.js", "knowledge-tools.js"],
   );
   assertCanonicalWebWrapper("ask-agent wrapper child", askAgentWrapperExtensions);
   assert.equal(
@@ -1946,7 +1963,7 @@ assert.deepEqual(bundledAgentNames, expectedBundledAgentFiles.map((file) => file
 const bundledWorker = discovery.agents.find((agent) => agent.name === "worker" && agent.source === "bundled");
 assert.ok(bundledWorker, "expected bundled worker agent from installed artifact");
 assert.ok(bundledWorker.filePath.startsWith(join(artifactDir, "subagent", "agents")));
-assert.equal(bundledWorker.filePath.startsWith(sourceBotRoot), false);
+assert.equal(bundledWorker.filePath.startsWith(join(sourceBotRoot, "extensions", "pi")), false);
 
 assert.equal(resourceHandlers.length, 1);
 const resources = resourceHandlers[0]();

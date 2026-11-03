@@ -196,7 +196,7 @@ describe("project naming", () => {
   it("README and monitoring docs preserve the Pi and grammY upgrade contract", () => {
     const normalizedReadme = normalizeDoc(readme);
     for (const expected of [
-      "all four package-owned Pi packages to 0.99.1",
+      "all four package-owned Pi packages to 1.5.0",
       "grammY to 1.46.0",
       "@grammyjs/types` 5.0.0",
       "TypeScript stays on 6.0.3",
@@ -215,7 +215,7 @@ describe("project naming", () => {
 
     const normalizedMonitoringDoc = normalizeDoc(monitoringDoc);
     for (const expected of [
-      "Pi runtime to 0.99.1",
+      "Pi runtime to 1.5.0",
       "grammY to 1.46.0",
       "Pi owns bounded summarization retries",
       "`summarization_retry_scheduled`",

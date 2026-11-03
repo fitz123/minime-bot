@@ -57,3 +57,26 @@ test("empty bot identity registers standalone; queued input wakes after manual c
     }
   }
 });
+
+test("Pi 1.5 user/custom starts retain collaboration outbox routing", () => {
+  const keys = ["MINIME_COLLABORATION_SOCKET", "MINIME_COLLABORATION_SESSION", "MINIME_OUTBOX"];
+  const previous = keys.map(key => process.env[key]);
+  const handlers = new Map<string, (event: any) => void>();
+  try {
+    process.env.MINIME_COLLABORATION_SOCKET = "/unused/fixture.sock";
+    process.env.MINIME_COLLABORATION_SESSION = "fixture-session";
+    process.env.MINIME_OUTBOX = "/unused/fixture-outbox";
+    registerCollaboration({ on: (name: string, handler: any) => { handlers.set(name, handler); }, registerTool: () => {} } as any);
+    const start = handlers.get("before_agent_start")!;
+    start({ messageType: "user", prompt: "human input" });
+    assert.equal(process.env.MINIME_OUTBOX, "/unused/fixture-outbox");
+    start({ messageType: "custom", message: { customType: "minime-collaboration" } });
+    assert.equal(process.env.MINIME_OUTBOX, "/unused/fixture-outbox.internal");
+    start({ messageType: "custom", message: { customType: "other" } });
+    assert.equal(process.env.MINIME_OUTBOX, "/unused/fixture-outbox");
+    start({ messageType: "user", prompt: "[Internal collaboration fixture]" });
+    assert.equal(process.env.MINIME_OUTBOX, "/unused/fixture-outbox.internal");
+  } finally {
+    keys.forEach((key, i) => { if (previous[i] === undefined) delete process.env[key]; else process.env[key] = previous[i]; });
+  }
+});

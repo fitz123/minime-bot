@@ -211,7 +211,7 @@ describe("Pi spawn workspace contract", () => {
           assert.doesNotMatch(serializedChildContract, new RegExp(value));
         }
         const extensions = flagValues(capture.args, "--extension");
-        assert.equal(extensions.length, 7);
+        assert.equal(extensions.length, 8);
         assert.equal(extensions.some((path) => path.endsWith("acknowledged-steer.ts")), true);
         assert.equal(extensions.some((path) => path.endsWith("compaction-continuation.ts")), true);
         assert.equal(extensions.filter((path) => path.endsWith("web-tools.ts")).length, 1);

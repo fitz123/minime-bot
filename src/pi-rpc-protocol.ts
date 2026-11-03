@@ -41,6 +41,7 @@ import {
   parsePiAcknowledgedSteerResultNotice,
 } from "./pi-extensions/acknowledged-steer.js";
 import { isReasoningOnlyLengthAgentEnd } from "./pi-extensions/compaction-continuation.js";
+import { PI_FAST_THREAD_ENV } from "./codex-fast.js";
 import { MINIME_OUTBOX_ENV } from "./pi-runtime-env.js";
 import { RUNTIME_READINESS_PATH_ENV } from "./runtime-readiness.js";
 import {
@@ -59,6 +60,7 @@ export const DEFAULT_PI_MODEL = "openai-codex/gpt-5.5";
  *   acknowledged-steer (atomic active-lifecycle steering gate),
  *   compaction-continuation (hidden continuation after a reasoning-only length stop),
  *   codex-transport-overflow (Codex request-byte overflow normalization),
+ *   codex-fast (opted-in agent/thread priority request intent),
  *   web-tools (subscription-backed Codex web_search),
  *   knowledge-tools (knowledge_search/knowledge_get/knowledge_update + managed wiki protection),
  *   subagent (isolated `pi -p` child spawn),
@@ -70,6 +72,7 @@ export const PI_EXTENSION_WRAPPER_RELPATHS = [
   "acknowledged-steer.ts",
   "compaction-continuation.ts",
   "codex-transport-overflow.ts",
+  "codex-fast.ts",
   "web-tools.ts",
   "knowledge-tools.ts",
   "subagent/index.ts",
@@ -80,6 +83,7 @@ export const PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS = [
   "acknowledged-steer.js",
   "compaction-continuation.js",
   "codex-transport-overflow.js",
+  "codex-fast.js",
   "web-tools.js",
   "knowledge-tools.js",
   "subagent/index.js",
@@ -116,9 +120,9 @@ export const PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS = Object.freeze(
 
 /**
  * Wrappers a Pi print-mode cron must load. Crons receive the canonical search
- * wrapper and the Knowledge wrapper, but no child-spawning tools.
+ * wrapper, Knowledge wrapper and scoped Fast adapter, but no child-spawning tools.
  */
-export const PI_CRON_WRAPPER_RELPATHS = ["web-tools.ts", "knowledge-tools.ts"] as const;
+export const PI_CRON_WRAPPER_RELPATHS = ["codex-fast.ts", "web-tools.ts", "knowledge-tools.ts"] as const;
 
 export const PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS = [
   "codex-transport-overflow.js",
@@ -175,6 +179,8 @@ export interface PiSpawnRuntimeEnvOptions {
   collaborationSocket?: string;
   /** Trusted current agent id supplied by SessionManager for first-party tools. */
   askCallerAgentId?: string;
+  /** Actual interactive chat/thread identity, never inherited by other consumers. */
+  fastThreadKey?: string;
   /** Deterministic per-chat outbox path supplied for an interactive session. */
   outboxPath?: string;
   telegramRichAnswers?: boolean;
@@ -210,6 +216,7 @@ const PI_CHILD_ENV_KEY_ALLOWLIST = new Set([
   MINIME_CRONS_PATH_ENV,
   MINIME_INSTANCE_CONFIG_PATH_ENV,
   MINIME_OUTBOX_ENV,
+  PI_FAST_THREAD_ENV,
   "NO_COLOR",
   "PATH",
   "PI_CODING_AGENT_DIR",
@@ -718,8 +725,8 @@ export function buildPiSubagentChildSpawnEnv(agentWorkspaceRoot?: string): Recor
   return buildAllowedPiChildEnv(resolveWorkspaceContract(), agentWorkspaceRoot);
 }
 
-export function buildPiAskAgentChildSpawnEnv(agentWorkspaceRoot?: string): Record<string, string> {
-  return buildAllowedPiChildEnv(resolveWorkspaceContract(), agentWorkspaceRoot);
+export function buildPiAskAgentChildSpawnEnv(agentWorkspaceRoot?: string, targetAgentId?: string): Record<string, string> {
+  return buildAllowedPiChildEnv(resolveWorkspaceContract(), agentWorkspaceRoot, { askCallerAgentId: targetAgentId });
 }
 
 function buildAllowedPiChildEnv(
@@ -752,6 +759,7 @@ function buildAllowedPiChildEnv(
   delete env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
   delete env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
   delete env[MINIME_OUTBOX_ENV];
+  delete env[PI_FAST_THREAD_ENV];
   env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = contract.paths.controlWorkspaceRoot;
   const agentRoot = agentWorkspaceRoot?.trim();
   if (agentRoot) {
@@ -761,6 +769,7 @@ function buildAllowedPiChildEnv(
   if (askCallerAgentId) {
     env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = askCallerAgentId;
   }
+  if (askCallerAgentId && runtimeEnvOptions?.fastThreadKey) env[PI_FAST_THREAD_ENV] = runtimeEnvOptions.fastThreadKey;
   const outboxPath = runtimeEnvOptions?.outboxPath?.trim();
   if (outboxPath) {
     env[MINIME_OUTBOX_ENV] = outboxPath;

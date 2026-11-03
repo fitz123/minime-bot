@@ -145,8 +145,8 @@ describe("package-owned Pi invocation", () => {
     assert.equal(invocation.command, "/usr/local/bin/node");
     assert.deepEqual(invocation.args, [RPC_ENTRY, "--model", "gpt-5.5"]);
     assert.deepEqual(invocation.diagnostic, {
-      expectedVersion: "0.99.1",
-      detectedVersion: "0.99.1",
+      expectedVersion: "1.5.0",
+      detectedVersion: "1.5.0",
       entrypointKind: "rpc",
       versionMismatch: false,
     });
@@ -162,7 +162,7 @@ describe("package-owned Pi invocation", () => {
     assert.notEqual(invocation.command, "pi");
   });
 
-  it("resolves the real installed 0.99.1 CLI/RPC and preserves upstream GPT-5.6 metadata", () => {
+  it("resolves the real installed 1.5.0 CLI/RPC and preserves upstream GPT-5.6 metadata", () => {
     const rpcEntry = fileURLToPath(
       import.meta.resolve("@earendil-works/pi-coding-agent/rpc-entry"),
     );
@@ -200,7 +200,7 @@ describe("package-owned Pi invocation", () => {
   });
 
   it(
-    "resumes a copied Pi 0.80.6 session through the installed 0.99.1 RPC without provider work",
+    "resumes a copied Pi 0.80.6 session through the installed 1.5.0 RPC without provider work",
     { timeout: 20_000 },
     async () => {
       const temp = mkdtempSync(join(tmpdir(), "minime-pi-0806-resume-"));
@@ -398,7 +398,7 @@ describe("package-owned Pi invocation", () => {
     }));
     const diagnostic = formatPiRuntimeDiagnostic(invocation.diagnostic);
 
-    assert.match(diagnostic, /expectedVersion=0\.99\.1/);
+    assert.match(diagnostic, /expectedVersion=1\.5\.0/);
     assert.match(diagnostic, /entrypointKind=cli/);
     assert.match(diagnostic, /versionMismatch=true/);
     assert.doesNotMatch(diagnostic, /\/opt\//);
@@ -461,15 +461,9 @@ describe("package-owned Pi invocation", () => {
     assert.equal(packageLock.packages[""].dependencies?.["@grammyjs/auto-retry"], "^2.0.2");
     assert.equal(
       packageLock.packages[
-        "node_modules/@earendil-works/pi-coding-agent/node_modules/brace-expansion"
+        "node_modules/brace-expansion"
       ].version,
-      "5.0.9",
-    );
-    assert.equal(
-      packageLock.packages[
-        "node_modules/@earendil-works/pi-coding-agent/node_modules/protobufjs"
-      ].version,
-      "7.6.6",
+      "5.0.12",
     );
     assert.equal(packageLock.packages["node_modules/protobufjs"].version, "7.6.6");
   });

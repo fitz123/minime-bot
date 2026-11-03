@@ -1,3 +1,5 @@
+import { loadConfig } from "./config.js";
+import { formatFastCommandError, handleFastCommand } from "./codex-fast.js";
 import { statSync } from "node:fs";
 import type { RichMessage } from "grammy/types";
 import { validateRichPhoto } from "./telegram-rich.js";
@@ -66,6 +68,7 @@ export const BOT_COMMANDS = [
   { command: "reconnect", description: "Reconnect session (keeps context)" },
   { command: "clean", description: "Clean session (fresh start)" },
   { command: "status", description: "Show bot status" },
+  { command: "fast", description: "Show/set scoped Codex Fast" },
 ] as const;
 
 export const TELEGRAM_ALLOWED_UPDATES = ["message", "message_reaction"] as const;
@@ -759,6 +762,8 @@ export function createTelegramBot(
     onUpdate?: () => void;
     onSuccessfulPoll?: () => void;
     draftCoordinator?: ActiveDraftCoordinator;
+    /** Fresh local-control config; defaults to the regular loader without secret resolution. */
+    loadConfig?: () => BotConfig;
   },
 ): TelegramBotResult {
   if (!config.telegramToken) {
@@ -854,6 +859,27 @@ export function createTelegramBot(
       await next();
     } finally {
       releaseInput?.();
+    }
+  });
+
+  // Authenticated local control, before text framing or any model invocation.
+  bot.command("fast", async (ctx) => {
+    const topicId = ctx.message?.message_thread_id;
+    const binding = resolveBinding(ctx.chat.id, config.bindings, topicId);
+    if (!binding) return;
+    if (ctx.message) setThread(ctx.chat.id, ctx.message.message_id, topicId);
+    try {
+      if (/^default\s+(?:on|off)$/.test(ctx.match.trim()) && (ctx.chat.type !== "private" || binding.kind !== "dm")) {
+        await ctx.reply("Use a private chat with a DM binding to change Fast defaults.");
+        return;
+      }
+      const currentConfig = opts?.loadConfig ? opts.loadConfig() : loadConfig(undefined, { resolveSecrets: false });
+      await ctx.reply(handleFastCommand(ctx.match, {
+        agent: currentConfig.agents[binding.agentId],
+        threadKey: sessionKey(ctx.chat.id, topicId),
+      }));
+    } catch (error) {
+      await ctx.reply(formatFastCommandError(error));
     }
   });
 
