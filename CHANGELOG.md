@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 2026.11.2
+
+- Simplify `/fast` output and move technical priority/scope details to read-only `/fast help` (#219, #250).
+- Show Fast preference beside the actual current thread model/thinking in `/status`, distinguishing inheritance, overrides, unavailable models and read errors without changing settings or quotas.
+
 ## 2026.11.1
 
 - Upgrade the coherent package-owned Pi runtime to 1.5.0, with offline RPC, session resume, extension and tool compatibility checks (#219).
