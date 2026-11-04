@@ -11,7 +11,7 @@ import { cleanupSessionMediaDir } from "../media-store.js";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readFastStatus } from "../codex-fast.js";
+import { handleFastCommand, readFastStatus } from "../codex-fast.js";
 import {
   TELEGRAM_GET_UPDATES_TIMEOUT_SECONDS,
 } from "../poll-progress.js";
@@ -1573,10 +1573,10 @@ describe("command handler wiring", () => {
       await bot.handleUpdate(update);
     };
     await send("on");
-    assert.match(apiCalls.at(-1)!.payload.text, /override: on/);
+    assert.match(apiCalls.at(-1)!.payload.text, /Этот тред: включён \(переопределение\)/);
     assert.equal(readFastStatus({ agent: primary, threadKey: `${testChatId}:11` }).enabled, true);
     await send("", 12);
-    assert.match(apiCalls.at(-1)!.payload.text, /override: inherit/);
+    assert.match(apiCalls.at(-1)!.payload.text, /Этот тред: по умолчанию/);
     await send("on", 22);
     assert.match(apiCalls.at(-1)!.payload.text, /unavailable/);
     await send("on extra");
@@ -1590,13 +1590,13 @@ describe("command handler wiring", () => {
     await bot.handleUpdate(clean);
     assert.deepEqual(manager.calls, ["destroySession"]);
     await send("");
-    assert.match(apiCalls.at(-1)!.payload.text, /override: on/);
+    assert.match(apiCalls.at(-1)!.payload.text, /Этот тред: включён \(переопределение\)/);
     await send("default on");
     assert.match(apiCalls.at(-1)!.payload.text, /private chat.*DM binding/);
     await send("", 12);
-    assert.match(apiCalls.at(-1)!.payload.text, /intent: off/);
+    assert.match(apiCalls.at(-1)!.payload.text, /Fast: выключен/);
     await send("inherit");
-    assert.match(apiCalls.at(-1)!.payload.text, /override: inherit/);
+    assert.match(apiCalls.at(-1)!.payload.text, /Этот тред: по умолчанию/);
   });
 
   it("allows Telegram Fast default mutations only for private chats with DM bindings", async t => {
@@ -1636,13 +1636,13 @@ describe("command handler wiring", () => {
           assert.match(await send("default on"), /private chat.*DM binding/);
           assert.equal(existsSync(path), false);
         }
-        assert.match(await send("on"), /override: on/);
+        assert.match(await send("on"), /Этот тред: включён \(переопределение\)/);
         const beforeDefault = readFileSync(path, "utf8");
         if (chatType === "private" && kind === "dm") {
-          assert.match(await send("default on"), /Default: on/);
+          assert.match(await send("default on"), /Общий режим .*: включён/);
           assert.equal(readFastStatus({ agent: primary }).enabled, true);
           assert.equal(readFastStatus({ agent: primary, threadKey: "new-thread" }).enabled, true);
-          assert.match(await send("default off"), /Default: off/);
+          assert.match(await send("default off"), /Общий режим .*: выключен/);
           assert.equal(readFastStatus({ agent: primary }).enabled, false);
         } else {
           for (const args of ["default on", "default off"]) {
@@ -1651,14 +1651,14 @@ describe("command handler wiring", () => {
           }
         }
         const beforeReadOnly = readFileSync(path, "utf8");
-        assert.match(await send("default status"), /Default: off/);
-        assert.match(await send("status"), /override: on/);
+        assert.match(await send("default status"), /Общий режим .*: выключен/);
+        assert.match(await send("status"), /Этот тред: включён \(переопределение\)/);
         for (const args of ["default", "default on extra", "default off extra", "default inherit", "default ON"]) {
           assert.match(await send(args), /Usage:/);
           assert.equal(readFileSync(path, "utf8"), beforeReadOnly);
         }
-        assert.match(await send("off"), /override: off/);
-        assert.match(await send("inherit"), /override: inherit/);
+        assert.match(await send("off"), /Этот тред: выключен \(переопределение\)/);
+        assert.match(await send("inherit"), /Этот тред: по умолчанию/);
         assert.equal(readFastStatus({ agent: primary, threadKey: `${testChatId}:11` }).enabled, false);
         assert.deepEqual(manager.calls, [], "Fast commands must not invoke model sessions");
       });
@@ -1696,13 +1696,13 @@ describe("command handler wiring", () => {
     };
     assert.match(await send("status"), /unavailable/);
     updateAgent({ codexFast: pin("gpt-6-astra") });
-    assert.match(await send("on"), /model=openai-codex\/gpt-6-astra/);
+    assert.match(await send("on"), /Модель: Astra/);
     assert.equal(readFastStatus({ agent: { ...primary, codexFast: pin("gpt-6-astra") }, threadKey: `${testChatId}:11` }).enabled, true);
     updateAgent({ model: "openai-codex/gpt-6-sol", codexFast: pin("gpt-6-sol") });
     const changed = await send("status");
-    assert.match(changed, /model=openai-codex\/gpt-6-sol/);
-    assert.match(changed, /intent: off/);
-    assert.match(await send("default on"), /Default: on/);
+    assert.match(changed, /Модель: openai-codex\/gpt-6-sol/);
+    assert.match(changed, /Fast: выключен/);
+    assert.match(await send("default on"), /Общий режим .*: включён/);
     const sol = { ...primary, model: "openai-codex/gpt-6-sol", codexFast: { provider: "openai-codex" as const, model: "gpt-6-sol" } };
     assert.equal(readFastStatus({ agent: sol }).enabled, true);
     // The base config has no opt-in; removing the overlay removes eligibility.
@@ -1712,7 +1712,7 @@ describe("command handler wiring", () => {
     assert.match(await send("default off"), /unavailable/);
     assert.equal(readFileSync(join(root, "data/codex-fast.json"), "utf8"), before);
     updateAgent({ model: sol.model, codexFast: sol.codexFast });
-    assert.match(await send("status"), /Default: on/);
+    assert.match(await send("status"), /Общий режим .*: включён/);
     assert.deepEqual(manager.calls, [], "Local commands must not invoke or create model sessions");
   });
 
@@ -1920,6 +1920,85 @@ describe("command handler wiring", () => {
     assert.ok(mockSM.calls.includes("getSessionHealth:111111111"));
     assert.ok(!mockSM.calls.includes("sendSessionMessage"));
     assert.ok(!mockSM.calls.includes("getOrCreateSession"));
+  });
+
+  it("/status reads Fast for the actual session agent/model and queried topic without changing settings", async t => {
+    const root = mkdtempSync(join(tmpdir(), "telegram-fast-status-"));
+    const oldRoot = process.env.MINIME_CONTROL_WORKSPACE_ROOT;
+    process.env.MINIME_CONTROL_WORKSPACE_ROOT = root;
+    t.after(() => {
+      if (oldRoot === undefined) delete process.env.MINIME_CONTROL_WORKSPACE_ROOT;
+      else process.env.MINIME_CONTROL_WORKSPACE_ROOT = oldRoot;
+      rmSync(root, { recursive: true, force: true });
+    });
+    const primary = { id: "main", workspaceCwd: root, model: "openai-codex/gpt-6-astra", thinking: "high" as const, codexFast: { provider: "openai-codex" as const, model: "gpt-6-astra" } };
+    let currentConfig: BotConfig = {
+      ...handlerConfig, agents: { main: primary, other: { ...primary, id: "other", codexFast: undefined } },
+      bindings: [{ chatId: testChatId, agentId: "other", kind: "group" }],
+    };
+    let configReads = 0;
+    let configError = false;
+    const manager = createMockSessionManager();
+    const getHealth = manager.getSessionHealth.bind(manager);
+    let health: ReturnType<SessionManager["getSessionHealth"]> = { ...getHealth("fixture")!, model: primary.model, thinking: "high" };
+    manager.calls.length = 0;
+    manager.getSessionHealth = key => { manager.calls.push(`getSessionHealth:${key}`); return health; };
+    const apiCalls: Array<{ method: string; payload: any }> = [];
+    const { bot, messageQueue } = initBot(manager, apiCalls, undefined, undefined, (_base, sm, options) =>
+      createTelegramBot(currentConfig, sm, { ...options, loadConfig: () => {
+        configReads++;
+        if (configError) throw new Error("synthetic config error");
+        return currentConfig;
+      } }));
+    t.after(() => messageQueue.clearAll());
+    const path = join(root, "data/codex-fast.json");
+    const send = async (topic: number, command = "status") => {
+      const update = makeCommandUpdate(command.split(" ")[0], 900 + apiCalls.length);
+      update.message.text = `/${command}`;
+      Object.assign(update.message, { message_thread_id: topic });
+      await bot.handleUpdate(update);
+      return String(apiCalls.at(-1)!.payload.text);
+    };
+    assert.match(await send(11), /Thinking: high\nFast: off · inherited\nState:/);
+    assert.equal(existsSync(path), false);
+    handleFastCommand("default on", { agent: primary }, path);
+    handleFastCommand("off", { agent: primary, threadKey: `${testChatId}:11` }, path);
+    const bytes = readFileSync(path, "utf8");
+    const overridden = await send(11);
+    assert.match(overridden, /Fast: off · thread override/);
+    assert.match(overridden, /Session ID: session-123/);
+    assert.match(overridden, /Codex quota:/);
+    assert.match(await send(12), /Fast: on · inherited/);
+    assert.ok(manager.calls.includes(`getSessionHealth:${testChatId}:12`));
+    health = { ...health!, agentId: "other" };
+    assert.match(await send(12), /Fast: unavailable \(agent\/model not opted in\)/);
+    health = { ...health, agentId: "main" };
+    // Config changes do not replace the already running session for a status read.
+    currentConfig = { ...currentConfig, agents: { ...currentConfig.agents, main: {
+      ...primary, model: "openai-codex/gpt-6-sol", codexFast: { provider: "openai-codex", model: "gpt-6-sol" },
+    } } };
+    const mismatch = await send(12);
+    assert.match(mismatch, /Model: openai-codex\/gpt-6-astra\nThinking: high\nFast: unavailable/);
+    assert.doesNotMatch(mismatch, /Model: .*gpt-6-sol/);
+    currentConfig = { ...currentConfig, agents: { ...currentConfig.agents, main: primary } };
+    configError = true;
+    assert.match(await send(12), /Fast: unknown \(read error\)/);
+    configError = false;
+    assert.equal(readFileSync(path, "utf8"), bytes);
+    writeFileSync(path, "invalid fixture preferences");
+    assert.match(await send(12), /Fast: unknown \(read error\)/);
+    // Help remains useful even if config and preferences cannot be read.
+    configError = true;
+    const readsBeforeHelp = configReads;
+    assert.match(await send(12, "fast help"), /service_tier=priority/);
+    assert.equal(configReads, readsBeforeHelp);
+    health = undefined;
+    const noSession = await send(12);
+    assert.match(noSession, /Sessions: 1\/2/);
+    assert.doesNotMatch(noSession, /Agent:|Model:|Thinking:|Fast:|Session ID:/);
+    assert.equal(configReads, readsBeforeHelp, "No-session status must not read Fast config");
+    assert.equal(readFileSync(path, "utf8"), "invalid fixture preferences");
+    assert.ok(manager.calls.every(call => call.startsWith("getSessionHealth:")), "Status/help must never create or prompt a session");
   });
 
   it("handles delayed command and text updates through their normal paths", async () => {

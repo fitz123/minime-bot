@@ -27,7 +27,8 @@ Authenticated Telegram commands use the actual chat/topic binding:
 
 | Command | Effect |
 | --- | --- |
-| `/fast` or `/fast status` | Show agent, exact model, default, thread override, and effective adapter request intent |
+| `/fast` or `/fast status` | Show compact Russian Fast state, model, thread override, and agent/model default |
+| `/fast help` | Read-only command help, scope rules, and priority/usage caveats; works without opt-in |
 | `/fast on` | Request priority for this thread |
 | `/fast off` | Stop this adapter from requesting priority in this thread |
 | `/fast inherit` | Remove the thread override and follow the agent/model default |
@@ -39,6 +40,31 @@ Telegram `/fast default on` and `/fast default off` require both an actual
 private chat and a `dm` binding. Group chats and threads retain per-thread
 controls, `/fast status`, and `/fast default status`. Trusted native local
 default commands are unchanged.
+
+For example, an opted-in `main` agent using `gpt-6-astra` can show:
+
+```text
+Fast: включён
+Модель: Astra
+Этот тред: по умолчанию
+Общий режим Main/Astra: включён
+```
+
+`Этот тред` shows `включён (переопределение)` or `выключен (переопределение)`
+for an explicit override. Consumers without a thread show
+`Область: только общий режим (без треда)` instead. `Main` labels only agent
+`main`, and `Astra` labels only `gpt-6-astra` in this Fast display; other agent
+and model identities remain truthful. These labels do not change model IDs.
+
+Telegram `/status` adds Fast immediately after the existing model/thinking lines
+for the queried thread's active session: `Fast: on · inherited`,
+`Fast: off · inherited`, or `Fast: on/off · thread override`. Eligibility uses
+that session's agent and model together with the current configuration's exact
+opt-in. An unopted agent or mismatched model shows `Fast: unavailable (agent/model
+not opted in)`; config/preferences read failures show `Fast: unknown (read error)`.
+The existing session, diagnostics, and quota information stays intact. Without
+an active session, no session or Fast block is invented. Status and help do not
+write preferences or create sessions, models, or provider requests.
 
 A new thread inherits its default. Defaults also apply to identified non-chat
 consumers: native local Pi sessions, crons running as the agent, and `ask_agent`
@@ -59,8 +85,10 @@ remove the stale `data/codex-fast.json.lock` before retrying.
 Independent provider `service_tier` settings are preserved. For example, an
 existing `priority` value still requests priority while this adapter's preference
 is off; an existing `auto` value prevents this adapter from adding priority even
-when its preference is on. Status always describes adapter intent and this
-caveat. Backend-granted priority cannot be inferred. No `models.json` is edited.
+when its preference is on. The compact Fast state describes this adapter's
+preference; backend-granted priority cannot be inferred. `/fast help` explains
+this distinction and the independent tier behavior. Quota/usage information
+remains separate in `/status`. No `models.json` is edited.
 
 The request helper is copied from `@llblab/pi-codex-usage@0.13.2` with its MIT
 license, shipped at `dist/extensions/pi/codex-fast-LICENSE.md`. The upstream
@@ -73,7 +101,8 @@ node node_modules/minime-bot/dist/verify-codex-fast.js
 ```
 
 The bounded offline verifier checks the resolved Pi versions, loads the real
-packaged wrapper, exercises native command routing and a request-hook matrix,
+packaged wrapper, exercises compact native command output, read-only help even
+without valid opt-in configuration, session Fast status formatting, and a request-hook matrix,
 and executes Pi's Codex request builder with a synthetic token, stopping before
 transport. It checks unchanged model/reasoning and preserves independent tiers.
 All fixture writes go to a disposable temporary directory; configured preferences,

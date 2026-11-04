@@ -6,7 +6,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, w
 import { dirname, extname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { validateAgent } from "../config.js";
-import { handleFastCommand, isFastEligible, PI_FAST_THREAD_ENV, readFastStatus, type FastScope } from "../codex-fast.js";
+import { formatFastStatusLine, handleFastCommand, isFastEligible, PI_FAST_THREAD_ENV, readFastStatus, type FastScope } from "../codex-fast.js";
 import { applyFastToRequest } from "../pi-extensions/codex-fast-request.js";
 import { buildPiAskAgentChildSpawnEnv, buildPiSpawnEnv, buildPiSubagentChildSpawnEnv, MINIME_BOT_PI_SESSION_AGENT_ID_ENV } from "../pi-rpc-protocol.js";
 import { SessionStore } from "../session-store.js";
@@ -43,6 +43,68 @@ test("priority helper preserves malformed, mismatched, independently configured 
   assert.equal(applyFastToRequest(payload, "gpt-6-astra", false), undefined);
   assert.deepEqual(applyFastToRequest(payload, "gpt-6-astra", true), { ...payload, service_tier: "priority" });
   assert.equal("service_tier" in payload, false);
+});
+
+test("Fast presentation distinguishes inherited, overridden and default-only scopes with exact labels", t => {
+  const path = join(fixture(t), "codex-fast.json");
+  const scope = { agent: { ...agent, id: "main" }, threadKey: "fixture-topic" };
+  assert.equal(handleFastCommand("", scope, path), [
+    "Fast: выключен", "Модель: Astra", "Этот тред: по умолчанию", "Общий режим Main/Astra: выключен",
+  ].join("\n"));
+  assert.equal(existsSync(path), false);
+  handleFastCommand("default on", scope, path);
+  assert.match(handleFastCommand("off", scope, path), /Fast: выключен\nМодель: Astra\nЭтот тред: выключен \(переопределение\)\nОбщий режим Main\/Astra: включён/);
+  assert.match(handleFastCommand("on", scope, path), /Этот тред: включён \(переопределение\)/);
+  assert.match(handleFastCommand("inherit", scope, path), /Fast: включён[\s\S]*Этот тред: по умолчанию/);
+  const bytes = readFileSync(path, "utf8");
+  assert.match(handleFastCommand("status", { agent: scope.agent }, path), /Область: только общий режим \(без треда\)/);
+  assert.equal(readFileSync(path, "utf8"), bytes);
+  const other = { ...agent, id: "helper", model: "openai-codex/gpt-6-sol", codexFast: { provider: "openai-codex" as const, model: "gpt-6-sol" } };
+  const text = handleFastCommand("", { agent: other }, path);
+  assert.match(text, /Модель: openai-codex\/gpt-6-sol/);
+  assert.match(text, /Общий режим helper\/openai-codex\/gpt-6-sol: выключен/);
+  assert.doesNotMatch(text, /Astra|Main|priority|service_tier|Backend/);
+});
+
+test("Fast help is read-only and useful without identity, opt-in or valid preferences", t => {
+  const path = join(fixture(t), "codex-fast.json");
+  const help = handleFastCommand("help", undefined, path);
+  assert.match(help, /\/fast default on\|off\|status/);
+  assert.match(help, /service_tier/);
+  assert.match(help, /priority/);
+  assert.match(help, /\/status/);
+  assert.equal(existsSync(path), false);
+  writeFileSync(path, "invalid fixture preferences");
+  assert.equal(handleFastCommand("help", { agent: { ...agent, codexFast: undefined } }, path), help);
+  assert.equal(readFileSync(path, "utf8"), "invalid fixture preferences");
+  assert.match(handleFastCommand("help extra", undefined, path), /Usage:/);
+});
+
+test("session Fast line checks the actual model and distinguishes unreadable preferences from off", t => {
+  const root = fixture(t);
+  const path = join(root, "codex-fast.json");
+  const scope = { agent, threadKey: "fixture-topic" };
+  assert.equal(formatFastStatusLine(scope, agent.model, path), "Fast: off · inherited");
+  assert.equal(existsSync(path), false);
+  handleFastCommand("default on", scope, path);
+  assert.equal(formatFastStatusLine(scope, agent.model, path), "Fast: on · inherited");
+  handleFastCommand("off", scope, path);
+  assert.equal(formatFastStatusLine(scope, agent.model, path), "Fast: off · thread override");
+  handleFastCommand("on", scope, path);
+  const bytes = readFileSync(path, "utf8");
+  assert.equal(formatFastStatusLine(scope, agent.model, path), "Fast: on · thread override");
+  assert.equal(formatFastStatusLine(scope, "gpt-6-astra", path), "Fast: on · thread override");
+  assert.equal(readFileSync(path, "utf8"), bytes);
+  for (const [currentScope, model] of [
+    [undefined, agent.model],
+    [{ agent: { ...agent, codexFast: undefined } }, agent.model],
+    [scope, "openai-codex/gpt-6-sol"],
+    [scope, "other/gpt-6-astra"],
+  ] as const) assert.equal(formatFastStatusLine(currentScope, model, path), "Fast: unavailable (agent/model not opted in)");
+  writeFileSync(path, "invalid fixture preferences");
+  assert.equal(formatFastStatusLine(scope, agent.model, path), "Fast: unknown (read error)");
+  assert.equal(formatFastStatusLine(scope, agent.model, root), "Fast: unknown (read error)");
+  assert.equal(readFileSync(path, "utf8"), "invalid fixture preferences");
 });
 
 test("defaults/overrides stay isolated by agent/model/thread and survive actual clean/restart", async t => {
@@ -131,5 +193,5 @@ test("offline verifier CLI executes through a current directory symlink", { time
   });
   assert.equal(result.error, undefined);
   assert.equal(result.status, 0, result.stderr || result.stdout);
-  assert.deepEqual(JSON.parse(result.stdout), { piVersion: "1.5.0", requestChecks: 23, commandsChecked: 24 });
+  assert.deepEqual(JSON.parse(result.stdout), { piVersion: "1.5.0", requestChecks: 24, commandsChecked: 28 });
 });

@@ -99,20 +99,50 @@ function setPreference(scope: FastScope, value: FastOverride, defaultScope: bool
   }
 }
 
-export const FAST_USAGE = "Usage: /fast [status|on|off|inherit] or /fast default [on|off|status]";
-export function handleFastCommand(args: string, scope: FastScope | undefined, path = fastPreferencesPath()): string {
+/** Presentation for the queried session, gated by current opt-in and its actual model. */
+export function formatFastStatusLine(scope: FastScope | undefined, model: string, path?: string): string {
+  if (!scope || !isFastEligible(scope.agent) ||
+      (model !== scope.agent.codexFast.model && model !== `${scope.agent.codexFast.provider}/${scope.agent.codexFast.model}`)) {
+    return "Fast: unavailable (agent/model not opted in)";
+  }
+  try {
+    const status = readFastStatus(scope, path);
+    return `Fast: ${status.enabled ? "on" : "off"} · ${status.override === "inherit" ? "inherited" : "thread override"}`;
+  } catch {
+    return "Fast: unknown (read error)";
+  }
+}
+
+export const FAST_USAGE = "Usage: /fast [status|on|off|inherit|help] or /fast default [on|off|status]";
+const FAST_HELP = [
+  "/fast или /fast status — показать режим для этого треда.",
+  "/fast on|off — включить или выключить Fast в этом треде.",
+  "/fast inherit — следовать общему режиму агента/модели.",
+  "/fast default on|off|status — общий режим агента/модели; без треда доступен только общий режим.",
+  "В Telegram менять общий режим можно только в личном чате с DM-привязкой.",
+  "Нужен явный opt-in агента для точной модели openai-codex. /fast help доступен и без него.",
+  "Fast — настройка запроса service_tier=priority; выданный сервером приоритет неизвестен.",
+  "Независимые настройки service_tier сохраняются: priority действует и при выключенном Fast, а auto или другой заданный tier мешает адаптеру добавить priority.",
+  "Fast не меняет модель, thinking, авторизацию или историю. Квоты и расход — отдельно: /status показывает доступные данные квот.",
+].join("\n");
+export function handleFastCommand(args: string, scope: FastScope | undefined, path?: string): string {
   const words = args.trim().split(/\s+/).filter(Boolean);
+  if (words.length === 1 && words[0] === "help") return FAST_HELP;
   const defaultScope = words[0] === "default";
   const value = defaultScope ? words[1] : words[0];
   if (defaultScope ? words.length !== 2 || !["on", "off", "status"].includes(value) : words.length > 1 || (value !== undefined && !["status", "on", "off", "inherit"].includes(value))) return FAST_USAGE;
   if (!scope || !isFastEligible(scope.agent)) return "Codex Fast unavailable: an identified agent must explicitly opt into its exact openai-codex model.";
   if (!defaultScope && value !== undefined && value !== "status" && scope.threadKey === undefined) return "No identified chat/thread here. Use /fast default on|off|status.";
-  if (value !== undefined && value !== "status") setPreference(scope, value as FastOverride, defaultScope, path);
+  if (value !== undefined && value !== "status") setPreference(scope, value as FastOverride, defaultScope, path ?? fastPreferencesPath());
   const status = readFastStatus(scope, path);
+  const agentLabel = scope.agent.id === "main" ? "Main" : scope.agent.id;
+  const modelLabel = scope.agent.codexFast.model === "gpt-6-astra" ? "Astra" : `${scope.agent.codexFast.provider}/${scope.agent.codexFast.model}`;
+  const enabledLabel = (enabled: boolean) => enabled ? "включён" : "выключен";
   return [
-    `Codex Fast: agent=${scope.agent.id}; model=${scope.agent.codexFast.provider}/${scope.agent.codexFast.model}`,
-    `Default: ${status.defaultEnabled ? "on" : "off"}; thread override: ${scope.threadKey === undefined ? "none (default-only consumer)" : status.override}`,
-    `Effective adapter request intent: ${status.enabled ? "priority" : "off"}. Backend-granted priority is unknown.`,
-    "Independent service_tier settings are preserved, including priority when this preference is off; an existing tier can also prevent this adapter from requesting priority.",
+    `Fast: ${enabledLabel(status.enabled)}`,
+    `Модель: ${modelLabel}`,
+    scope.threadKey === undefined ? "Область: только общий режим (без треда)" :
+      `Этот тред: ${status.override === "inherit" ? "по умолчанию" : `${enabledLabel(status.enabled)} (переопределение)`}`,
+    `Общий режим ${agentLabel}/${modelLabel}: ${enabledLabel(status.defaultEnabled)}`,
   ].join("\n");
 }

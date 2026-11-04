@@ -17,6 +17,7 @@ export interface BuildStatusReportOptions {
   maxSessions: number;
   uptimeSeconds: number;
   sessionHealth?: SessionHealth;
+  fastStatusLine?: string;
   quotaStatus?: QuotaStatus;
   now?: Date;
   lastSuccessStaleMs?: number;
@@ -30,7 +31,7 @@ export function buildStatusReport(options: BuildStatusReportOptions): string {
   ];
 
   if (options.sessionHealth) {
-    lines.push("", ...formatSessionHealth(options.sessionHealth, now, options.lastSuccessStaleMs));
+    lines.push("", ...formatSessionHealth(options.sessionHealth, now, options.lastSuccessStaleMs, options.fastStatusLine));
   }
 
   const quotaLines = formatQuotaBlock(options.quotaStatus, options.sessionHealth, now);
@@ -45,11 +46,13 @@ function formatSessionHealth(
   health: SessionHealth,
   now: Date,
   lastSuccessStaleMs = DEFAULT_SESSION_LAST_SUCCESS_STALE_MS,
+  fastStatusLine?: string,
 ): string[] {
   const lines = [
     `Agent: ${health.agentId} (${health.provider})`,
     `Model: ${health.model}`,
     formatReasoningLine(health),
+    ...(fastStatusLine ? [fastStatusLine] : []),
     `State: ${formatSessionState(health)}`,
     `Session ID: ${health.sessionId}`,
   ];

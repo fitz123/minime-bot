@@ -65,6 +65,18 @@ function baseReport(overrides: Partial<Parameters<typeof buildStatusReport>[0]> 
 }
 
 describe("buildStatusReport", () => {
+  it("places Fast beside model/thinking while preserving session and quota lines", () => {
+    const baseline = baseReport();
+    const text = baseReport({ fastStatusLine: "Fast: on · inherited" });
+    assert.match(text, /Model: openai-codex\/gpt-5\.5\nThinking: xhigh\nFast: on · inherited\nState: idle/);
+    assert.equal(text.replace("Fast: on · inherited\n", ""), baseline);
+  });
+
+  it("does not invent a session or Fast state when no session exists", () => {
+    const text = baseReport({ sessionHealth: undefined, fastStatusLine: "Fast: off · inherited" });
+    assert.equal(text, "Sessions: 1/3\nUptime: 2h 5m");
+  });
+
   it("renders compact idle session health without healthy-path noise", () => {
     const text = baseReport();
 

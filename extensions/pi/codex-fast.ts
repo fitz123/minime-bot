@@ -20,9 +20,9 @@ export default function codexFast(pi: ExtensionAPI): void {
     return applyFastToRequest(event.payload, ctx.model.id, readFastStatus(scope).enabled);
   });
   pi.registerCommand("fast", {
-    description: "Show/set scoped Codex priority request intent; /fast default on|off|status",
+    description: "Show/set scoped Fast; /fast help for scopes and priority details",
     handler: async (args, ctx) => {
-      try { ctx.ui.notify(handleFastCommand(args, currentScope(ctx.model)), "info"); }
+      try { ctx.ui.notify(handleFastCommand(args, args.trim() === "help" ? undefined : currentScope(ctx.model)), "info"); }
       catch (error) { ctx.ui.notify(formatFastCommandError(error), "error"); }
     },
   });
