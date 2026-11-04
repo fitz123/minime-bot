@@ -123,7 +123,7 @@ const FAST_HELP = [
   "Нужен явный opt-in агента для точной модели openai-codex. /fast help доступен и без него.",
   "Fast — настройка запроса service_tier=priority; выданный сервером приоритет неизвестен.",
   "Независимые настройки service_tier сохраняются: priority действует и при выключенном Fast, а auto или другой заданный tier мешает адаптеру добавить priority.",
-  "Fast не меняет модель, thinking, авторизацию или историю. Квоты и расход — отдельно: /status показывает доступные данные квот.",
+  "Fast не меняет модель, thinking, авторизацию или историю. Квоты и расход — отдельно: в Telegram /status показывает доступные данные квот.",
 ].join("\n");
 export function handleFastCommand(args: string, scope: FastScope | undefined, path?: string): string {
   const words = args.trim().split(/\s+/).filter(Boolean);

@@ -72,7 +72,7 @@ test("Fast help is read-only and useful without identity, opt-in or valid prefer
   assert.match(help, /\/fast default on\|off\|status/);
   assert.match(help, /service_tier/);
   assert.match(help, /priority/);
-  assert.match(help, /\/status/);
+  assert.match(help, /Квоты и расход — отдельно: в Telegram \/status показывает доступные данные квот\./);
   assert.equal(existsSync(path), false);
   writeFileSync(path, "invalid fixture preferences");
   assert.equal(handleFastCommand("help", { agent: { ...agent, codexFast: undefined } }, path), help);
