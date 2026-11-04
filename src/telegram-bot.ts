@@ -1,5 +1,5 @@
 import { loadConfig } from "./config.js";
-import { formatFastCommandError, handleFastCommand } from "./codex-fast.js";
+import { formatFastCommandError, formatFastStatusLine, handleFastCommand } from "./codex-fast.js";
 import { statSync } from "node:fs";
 import type { RichMessage } from "grammy/types";
 import { validateRichPhoto } from "./telegram-rich.js";
@@ -869,6 +869,10 @@ export function createTelegramBot(
     if (!binding) return;
     if (ctx.message) setThread(ctx.chat.id, ctx.message.message_id, topicId);
     try {
+      if (ctx.match.trim() === "help") {
+        await ctx.reply(handleFastCommand(ctx.match, undefined));
+        return;
+      }
       if (/^default\s+(?:on|off)$/.test(ctx.match.trim()) && (ctx.chat.type !== "private" || binding.kind !== "dm")) {
         await ctx.reply("Use a private chat with a DM binding to change Fast defaults.");
         return;
@@ -934,11 +938,22 @@ export function createTelegramBot(
     const binding = resolveBinding(ctx.chat.id, config.bindings, topicId);
     if (!binding) return;
     const key = sessionKey(ctx.chat.id, topicId);
+    const sessionHealth = sessionManager.getSessionHealth(key);
+    let fastStatusLine: string | undefined;
+    if (sessionHealth) {
+      try {
+        const currentConfig = opts?.loadConfig ? opts.loadConfig() : loadConfig(undefined, { resolveSecrets: false });
+        fastStatusLine = formatFastStatusLine({ agent: currentConfig.agents[sessionHealth.agentId], threadKey: key }, sessionHealth.model);
+      } catch {
+        fastStatusLine = "Fast: unknown (read error)";
+      }
+    }
     await ctx.reply(buildStatusReport({
       activeCount: sessionManager.getActiveCount(),
       maxSessions: config.sessionDefaults.maxConcurrentSessions,
       uptimeSeconds: Math.floor(process.uptime()),
-      sessionHealth: sessionManager.getSessionHealth(key),
+      sessionHealth,
+      fastStatusLine,
       quotaStatus: readQuotaStatus(),
     }));
   });

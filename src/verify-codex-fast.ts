@@ -8,7 +8,8 @@ import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager
 import { normalizeContext } from "@earendil-works/pi-ai";
 import { stream as buildCodexRequest } from "@earendil-works/pi-ai/api/openai-codex-responses";
 import { OPENAI_CODEX_MODELS } from "@earendil-works/pi-ai/providers/openai-codex.models";
-import { PI_FAST_THREAD_ENV } from "./codex-fast.js";
+import { formatFastStatusLine, PI_FAST_THREAD_ENV } from "./codex-fast.js";
+import { buildStatusReport } from "./status-report.js";
 import { EXPECTED_PI_PACKAGE_VERSION, resolvePackageOwnedPiInvocation } from "./pi-runtime.js";
 import { MINIME_CONFIG_PATH_ENV, MINIME_CONTROL_WORKSPACE_ROOT_ENV, MINIME_INSTANCE_CONFIG_PATH_ENV } from "./workspace-contract.js";
 
@@ -49,7 +50,7 @@ export async function verifyCodexFast(extensionPath?: string): Promise<{ piVersi
     const agentDir = join(root, "agent");
     mkdirSync(agentDir);
     // Synthetic bindings allow the regular no-resolve-secrets config loader.
-    const agent = { workspaceCwd: root, model: "openai-codex/gpt-6-astra", thinking: "high", codexFast: { provider: "openai-codex", model: "gpt-6-astra" } };
+    const agent = { workspaceCwd: root, model: "openai-codex/gpt-6-astra", thinking: "high" as const, codexFast: { provider: "openai-codex" as const, model: "gpt-6-astra" } };
     const config = { agents: { "fixture-primary": agent, "fixture-other": { ...agent, codexFast: undefined } }, telegramTokenEnv: "UNUSED_FAST_VERIFIER_TOKEN", bindings: [{ chatId: 1, agentId: "fixture-primary", kind: "dm" }] };
     writeFileSync(join(root, "config.yaml"), JSON.stringify(config));
     const sourceDir = dirname(fileURLToPath(import.meta.url));
@@ -75,6 +76,12 @@ export async function verifyCodexFast(extensionPath?: string): Promise<{ piVersi
       await session!.prompt(`/fast${args ? ` ${args}` : ""}`);
       assert.equal(notices.length, count + 1);
       assert.match(notices.at(-1)!, expected);
+      if (notices.at(-1)!.startsWith("Fast:")) {
+        assert.equal(notices.at(-1)!.split("\n").length, 4);
+        assert.match(notices.at(-1)!, /Модель: Astra/);
+        assert.match(notices.at(-1)!, /Общий режим fixture-primary\/Astra:/);
+        assert.doesNotMatch(notices.at(-1)!, /service_tier|priority|Backend/);
+      }
       commandsChecked++;
     };
     const payload = { model: "gpt-6-astra", reasoning: { effort: "high" }, input: [] };
@@ -87,40 +94,66 @@ export async function verifyCodexFast(extensionPath?: string): Promise<{ piVersi
       assert.equal((result as typeof payload).model, body.model);
       requestChecks++;
     };
-    await command("", /intent: off/); await check(false);
-    await command("on", /override: on/); await check(true);
-    await command("off", /intent: off/); await check(false);
-    await command("inherit", /override: inherit/); await check(false);
-    await command("default on", /Default: on/); await check(true);
-    await command("off", /override: off/); await check(false);
+    const preferencesPath = join(root, "data/codex-fast.json");
+    await command("help", /service_tier=priority/);
+    await command("", /Fast: выключен/); await check(false);
+    assert.equal(existsSync(preferencesPath), false, "Help/status must not create preferences");
+    await command("on", /Этот тред: включён \(переопределение\)/); await check(true);
+    await command("off", /Fast: выключен/); await check(false);
+    await command("inherit", /Этот тред: по умолчанию/); await check(false);
+    await command("default on", /Общий режим .*: включён/); await check(true);
+    await command("off", /Этот тред: выключен \(переопределение\)/); await check(false);
     process.env[PI_FAST_THREAD_ENV] = "fixture-chat:two";
-    await command("", /override: inherit/); await check(true);
-    await command("on", /override: on/);
-    await command("default off", /Default: off/); await check(true);
+    await command("", /Этот тред: по умолчанию/); await check(true);
+    const statusScope = { agent: { ...agent, id: "fixture-primary" }, threadKey: process.env[PI_FAST_THREAD_ENV] };
+    const beforeStatus = readFileSync(preferencesPath, "utf8");
+    const fastStatusLine = formatFastStatusLine(statusScope, agent.model);
+    assert.equal(fastStatusLine, "Fast: on · inherited");
+    const report = buildStatusReport({
+      activeCount: 1, maxSessions: 2, uptimeSeconds: 60, fastStatusLine,
+      sessionHealth: { agentId: "fixture-primary", model: agent.model, thinking: "high", provider: "pi", sessionId: "fixture-session", pid: null, alive: true, idleMs: 0, processingMs: null, lastSuccessAt: Date.now(), restartCount: 0 },
+    });
+    assert.match(report, /Model: openai-codex\/gpt-6-astra\nThinking: high\nFast: on · inherited\nState:/);
+    assert.match(report, /Session ID: fixture-session/);
+    assert.match(report, /Codex quota:/);
+    assert.equal(readFileSync(preferencesPath, "utf8"), beforeStatus);
+    await command("on", /Этот тред: включён \(переопределение\)/);
+    await command("default off", /Общий режим .*: выключен/); await check(true);
     process.env[PI_FAST_THREAD_ENV] = "fixture-chat:one"; await check(false);
-    await command("inherit", /override: inherit/); await check(false);
-    await command("default on", /Default: on/);
+    await command("inherit", /Этот тред: по умолчанию/); await check(false);
+    await command("default on", /Общий режим .*: включён/);
     delete process.env[PI_FAST_THREAD_ENV];
-    await command("", /default-only consumer/); await check(true);
-    await command("status", /default-only consumer/);
+    await command("", /Область: только общий режим \(без треда\)/); await check(true);
+    await command("status", /Область: только общий режим \(без треда\)/);
     await command("off", /No identified chat/); await check(true);
-    await command("default status", /Default: on/);
+    await command("default status", /Общий режим .*: включён/);
     await command("default inherit", /Usage:/);
     await command("on extra", /Usage:/);
     await check(false, { ...payload, service_tier: "auto" });
     await check(false, { ...payload, service_tier: "priority" });
-    await command("default off", /Independent service_tier settings are preserved/);
+    await command("default off", /Общий режим .*: выключен/);
     await check(false, { ...payload, service_tier: "priority" });
     await check(false, { ...payload, model: "another-model" });
-    await command("default on", /Default: on/);
+    await command("default on", /Общий режим .*: включён/);
     for (const id of ["fixture-other", "unknown", ""]) {
       process.env.MINIME_BOT_PI_SESSION_AGENT_ID = id;
       await check(false); await command("on", /unavailable/);
     }
     process.env.MINIME_BOT_PI_SESSION_AGENT_ID = "fixture-primary";
+    // The native scope uses ctx.model, not a replacement configured model.
+    writeFileSync(join(root, "config.yaml"), JSON.stringify({ ...config, agents: { ...config.agents, "fixture-primary": { ...agent, model: "openai-codex/gpt-6-sol", codexFast: { provider: "openai-codex", model: "gpt-6-sol" } } } }));
+    const beforeHelp = readFileSync(preferencesPath, "utf8");
+    await command("status", /unavailable/);
+    assert.equal(readFileSync(preferencesPath, "utf8"), beforeHelp);
+    await check(false);
     // Configuration is re-read by the already-loaded hook.
     writeFileSync(join(root, "config.yaml"), JSON.stringify({ ...config, agents: { ...config.agents, "fixture-primary": { ...agent, codexFast: undefined } } }));
     await check(false);
+    await command("help", /\/fast default on\|off\|status/);
+    // Help must not even need valid opt-in configuration or preferences.
+    writeFileSync(join(root, "config.yaml"), "invalid fixture config");
+    await command("help", /выданный сервером приоритет неизвестен/);
+    assert.equal(readFileSync(preferencesPath, "utf8"), beforeHelp);
     writeFileSync(join(root, "config.yaml"), JSON.stringify(config));
     await check(true);
     // Execute Pi's real Codex request builder, stopping inside onPayload before
@@ -128,7 +161,7 @@ export async function verifyCodexFast(extensionPath?: string): Promise<{ piVersi
     const token = `fixture.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture" } })).toString("base64url")}.fixture`;
     const built: Record<string, unknown>[] = [];
     for (const enabled of [true, false]) {
-      await command(`default ${enabled ? "on" : "off"}`, /Default:/);
+      await command(`default ${enabled ? "on" : "off"}`, /Общий режим /);
       const result = await buildCodexRequest(OPENAI_CODEX_MODELS["gpt-6-astra"], normalizeContext({ messages: [{ role: "user", content: "offline fixture", timestamp: 0 }] }), {
         apiKey: token, reasoningEffort: "high", transport: "sse",
         onPayload: async body => {
