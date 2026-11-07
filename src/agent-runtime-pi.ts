@@ -6,7 +6,7 @@ import {
 } from './pi-rpc-protocol.js';
 import type { InteractiveSessionBinding } from './interactive-session-binding.js';
 import type { StreamLine } from './types.js';
-import { AGENT_RUNTIME_MAX_FRAME_BYTES, AgentRuntimeError } from './agent-runtime-protocol.js';
+import { AgentRuntimeError } from './agent-runtime-protocol.js';
 
 /** One stdout owner for the whole child lifetime, including startup and side replies. */
 export class AgentRuntimePi {
@@ -19,7 +19,7 @@ export class AgentRuntimePi {
 
   constructor(readonly child: ChildProcess, binding: InteractiveSessionBinding, startupTimeoutMs: number,
     expected: { model: string; thinking: string }) {
-    const splitter = new NewlineOnlyJsonlSplitter(AGENT_RUNTIME_MAX_FRAME_BYTES);
+    const splitter = new NewlineOnlyJsonlSplitter();
     this.exited = new Promise(resolve => child.once('close', resolve));
     this.ready = new Promise((resolve, reject) => { this.startup = { id: randomUUID(), resolve, reject }; });
     const timer = setTimeout(() => this.fail(new AgentRuntimeError('startup_timeout', 'Pi startup identity deadline exceeded')), startupTimeoutMs);
@@ -84,7 +84,7 @@ export class AgentRuntimePi {
     this.active = undefined;
   }
 
-  /** Pi 1.5.0 SIGTERM kills its tracked detached bash groups and disposes tools. */
+  /** Pi 1.5.0 SIGTERM cleans active tracked tools; completed detached jobs are unowned. */
   stop(): Promise<void> {
     return this.stopped ??= this.stopOwnedChild();
   }

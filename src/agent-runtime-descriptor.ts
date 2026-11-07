@@ -29,7 +29,7 @@ export interface AgentRuntimeDescriptor {
 const tools = new Set(['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls']);
 export function validateAgentRuntimeDescriptor(input: unknown): AgentRuntimeDescriptor {
   const d = input as AgentRuntimeDescriptor;
-  if (!d || d.version !== 1 || !/^[a-zA-Z0-9_-]{1,80}$/.test(d.agentId)) throw new Error('Invalid worker descriptor identity/version');
+  if (!d || d.version !== 1 || typeof d.agentId !== 'string' || !/^[a-zA-Z0-9_-]{1,80}$/.test(d.agentId)) throw new Error('Invalid worker descriptor identity/version');
   const fields = ['version', 'agentId', 'workerUid', 'workerGid', 'home', 'controllerUid', 'controllerName',
     'workspace', 'stateRoot', 'sessionRoot', 'contextRoot', 'socketDirectory', 'socketPath', 'model',
     'thinking', 'knowledge', 'capabilities', 'tools', 'offline'];
@@ -38,7 +38,7 @@ export function validateAgentRuntimeDescriptor(input: unknown): AgentRuntimeDesc
     if (!Number.isSafeInteger(value) || value <= 0) throw new Error('Positive nonroot worker identity required');
   }
   if (!Number.isSafeInteger(d.controllerUid) || d.controllerUid < 0) throw new Error('Explicit controller UID required');
-  if (!/^[a-zA-Z_][a-zA-Z0-9_.-]*$/.test(d.controllerName)) throw new Error('Invalid controller name');
+  if (typeof d.controllerName !== 'string' || !/^[a-zA-Z_][a-zA-Z0-9_.-]*$/.test(d.controllerName)) throw new Error('Invalid controller name');
   for (const p of [d.home, d.workspace, d.stateRoot, d.sessionRoot, d.contextRoot, d.socketDirectory, d.socketPath]) {
     if (typeof p !== 'string' || !isAbsolute(p) || resolve(p) !== p || /[\0\r\n]/.test(p)) throw new Error('Explicit canonical absolute worker paths required');
   }
@@ -75,16 +75,50 @@ export function assertAgentRuntimeIdentity(d: AgentRuntimeDescriptor): void {
   if (realpathSync(d.workspace) !== d.workspace) throw new Error('Workspace must be canonical');
 }
 
+/** Controller-local expected identity; never accepted from IPC. */
+export interface AgentRuntimeEndpointIdentity {
+  workerUid: number;
+  /** Required when the expected worker UID differs from the caller's UID. */
+  controllerName?: string;
+}
+
+export function assertAgentEndpointMetadata(path: string, workerUid: number, kind: 'directory' | 'socket'): void {
+  const s = lstatSync(path);
+  const mode = kind === 'directory' ? 0o700 : 0o600;
+  if (s.isSymbolicLink() || !(kind === 'directory' ? s.isDirectory() : s.isSocket())
+    || s.uid !== workerUid || (s.mode & 0o777) !== mode) {
+    throw new Error(`Worker ${kind} must be nonsymlink, worker-owned ${mode.toString(8)}`);
+  }
+}
+
+export function verifyAgentRuntimeEndpoint(socketPath: string, expected: AgentRuntimeEndpointIdentity): void {
+  if (!Number.isSafeInteger(expected.workerUid) || expected.workerUid <= 0) throw new Error('Explicit nonroot worker UID required');
+  const controllerUid = process.getuid!();
+  if (expected.workerUid !== controllerUid
+    && (typeof expected.controllerName !== 'string' || !/^[a-zA-Z_][a-zA-Z0-9_.-]*$/.test(expected.controllerName))) {
+    throw new Error('Cross-UID connection requires expected worker UID and controller name');
+  }
+  assertAgentEndpointMetadata(dirname(socketPath), expected.workerUid, 'directory');
+  assertAgentEndpointMetadata(socketPath, expected.workerUid, 'socket');
+  const identity = { ...expected, controllerUid };
+  endpointAcl(dirname(socketPath), identity, 'search', false);
+  endpointAcl(socketPath, identity, 'write', false);
+}
+
 // The physical macOS mechanism was established by the separate canary. No peercred addon.
 export function ensureAgentEndpointAcl(path: string, d: AgentRuntimeDescriptor, permission: 'search' | 'write'): void {
+  endpointAcl(path, d, permission, true);
+}
+function endpointAcl(path: string, d: AgentRuntimeEndpointIdentity & { controllerUid: number },
+  permission: 'search' | 'write', provision: boolean): void {
   if (d.controllerUid === d.workerUid) return;
   if (process.platform !== 'darwin') throw new Error('Cross-UID worker endpoint requires macOS ACLs');
-  const options = { encoding: 'utf8' as const, timeout: 2_000, env: { PATH: '/usr/bin:/bin', HOME: d.home } };
-  const uid = execFileSync('/usr/bin/id', ['-u', d.controllerName], options).trim();
+  const options = { encoding: 'utf8' as const, timeout: 2_000, env: { PATH: '/usr/bin:/bin' } };
+  const uid = execFileSync('/usr/bin/id', ['-u', d.controllerName!], options).trim();
   if (Number(uid) !== d.controllerUid) throw new Error('Controller name/UID mismatch');
   const entries = () => execFileSync('/bin/ls', ['-lde', path], options).split('\n')
     .filter(line => /^\s*\d+:/.test(line)).map(line => line.replace(/^\s*\d+:\s*/, '').trim());
-  if (!entries().length) execFileSync('/bin/chmod', ['+a', `user:${d.controllerName} allow ${permission}`, path], options);
+  if (provision && !entries().length) execFileSync('/bin/chmod', ['+a', `user:${d.controllerName} allow ${permission}`, path], options);
   const actual = entries();
   if (actual.length !== 1 || actual[0] !== `user:${d.controllerName} allow ${permission}`) throw new Error('Endpoint requires sole exact controller ACL grant');
 }

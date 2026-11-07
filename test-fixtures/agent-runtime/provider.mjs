@@ -26,7 +26,15 @@ export default function(pi) {
           } else {
             const prompt = text(last);
             let script;
-            if (/^WRITE [a-z0-9-]+$/.test(prompt)) {
+            if (prompt === 'CONTEXT') {
+              const instructions = JSON.stringify(context.messages.filter(m => m.role === 'system'));
+              content = [{ type: 'text', text: JSON.stringify({
+                sentinel: instructions.includes('SYNTHETIC_AMBIENT_SYSTEM_SENTINEL'),
+                defaultPrompt: instructions.includes('You are a coding assistant running inside pi'),
+                before: instructions.includes('SYNTHETIC_LANE_BEFORE'),
+                after: instructions.includes('SYNTHETIC_LANE_AFTER'),
+              }) }];
+            } else if (/^WRITE [a-z0-9-]+$/.test(prompt)) {
               const marker = prompt.slice(6);
               const instructions = JSON.stringify(context.messages.filter(m => m.role === 'system'));
               const value = { marker, context: instructions.includes('SYNTHETIC_LOCAL_CONTEXT')

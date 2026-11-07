@@ -43,7 +43,7 @@ export class WorkerLaneStore {
   load(): WorkerLaneRecord {
     try {
       const s = lstatSync(this.path);
-      if (!s.isFile() || s.isSymbolicLink() || s.uid !== process.getuid!() || (s.mode & 0o777) !== 0o600 || s.size > 64 * 1024) throw new Error('Unsafe binding');
+      if (!s.isFile() || s.isSymbolicLink() || s.uid !== process.getuid!() || (s.mode & 0o777) !== 0o600) throw new Error('Unsafe binding');
       const r = JSON.parse(readFileSync(this.path, 'utf8')) as WorkerLaneRecord;
       if (r.version !== 1 || r.agentId !== this.agentId || r.laneId !== this.laneId
         || !Number.isSafeInteger(r.generation) || r.generation < 0

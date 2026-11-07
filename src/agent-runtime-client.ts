@@ -2,8 +2,9 @@ import { createConnection, type Socket } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { NewlineOnlyJsonlSplitter } from './pi-rpc-protocol.js';
 import type { StreamLine } from './types.js';
+import { verifyAgentRuntimeEndpoint, type AgentRuntimeEndpointIdentity } from './agent-runtime-descriptor.js';
 import {
-  AGENT_RUNTIME_MAX_FRAME_BYTES, AGENT_RUNTIME_RPC_TIMEOUT_MS, AGENT_RUNTIME_PROMPT_TIMEOUT_MS,
+  AGENT_RUNTIME_MAX_FRAME_BYTES, AGENT_RUNTIME_RPC_TIMEOUT_MS, AGENT_RUNTIME_CLIENT_PROMPT_TIMEOUT_MS,
   AgentRuntimeError, AgentRuntimeUncertainError,
   type AgentLaneHandle, type AgentLaneState, type AgentRuntimeMessage, type AgentRuntimeOperation,
 } from './agent-runtime-protocol.js';
@@ -12,7 +13,7 @@ interface Pending {
   prompt: boolean;
   accepted(state: AgentLaneState | undefined): void;
   finished(state: AgentLaneState | undefined): void;
-  reject(error: Error): void;
+  reject(error: unknown): void;
   event?(event: StreamLine): void;
   timer: ReturnType<typeof setTimeout>;
 }
@@ -20,7 +21,7 @@ export interface AgentRuntimePrompt {
   accepted: Promise<AgentLaneState>;
   completed: Promise<AgentLaneState>;
 }
-/** Explicit socket client. Disconnect/deadline ends the call; it never reconnects or resends. */
+/** Explicit socket client. Disconnect/deadline interrupts every owned lane; no reconnect/resend. */
 export class AgentRuntimeClient {
   private readonly pending = new Map<string, Pending>();
   private ended = false;
@@ -39,8 +40,10 @@ export class AgentRuntimeClient {
           } else if (message.type === 'response') {
             pending.accepted(message.state);
             if (!pending.prompt) { pending.finished(message.state); this.finish(message.id); }
-          } else if (message.type === 'event') pending.event?.(message.event);
-          else if (message.type === 'finished') { pending.finished(message.state); this.finish(message.id); }
+          } else if (message.type === 'event') {
+            try { pending.event?.(message.event); }
+            catch (error) { pending.reject(error); this.finish(message.id); }
+          } else if (message.type === 'finished') { pending.finished(message.state); this.finish(message.id); }
           else throw new Error('Invalid worker reply');
         }
       } catch { this.disconnect(); }
@@ -50,8 +53,11 @@ export class AgentRuntimeClient {
     socket.on('end', () => this.disconnect());
   }
 
-  static async connect(socketPath: string, timeoutMs = AGENT_RUNTIME_RPC_TIMEOUT_MS): Promise<AgentRuntimeClient> {
+  /** Same-UID by default. Cross-UID callers must supply expected worker UID/controller name. */
+  static async connect(socketPath: string, timeoutMs = AGENT_RUNTIME_RPC_TIMEOUT_MS,
+    expected: AgentRuntimeEndpointIdentity = { workerUid: process.getuid!() }): Promise<AgentRuntimeClient> {
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300_000) throw new Error('Invalid client timeout');
+    verifyAgentRuntimeEndpoint(socketPath, expected);
     const socket = createConnection(socketPath);
     try {
       await new Promise<void>((resolve, reject) => {
@@ -80,7 +86,7 @@ export class AgentRuntimeClient {
   shutdown(): Promise<void> { return this.call({ op: 'shutdown' }).then(() => {}); }
 
   prompt(handle: AgentLaneHandle, requestId: string, text: string, onEvent?: (event: StreamLine) => void,
-    timeoutMs = AGENT_RUNTIME_PROMPT_TIMEOUT_MS): AgentRuntimePrompt {
+    timeoutMs = AGENT_RUNTIME_CLIENT_PROMPT_TIMEOUT_MS): AgentRuntimePrompt {
     const result = this.request({ op: 'prompt', handle, requestId, text }, timeoutMs, onEvent);
     return result as AgentRuntimePrompt;
   }
@@ -99,8 +105,8 @@ export class AgentRuntimeClient {
     if (Buffer.byteLength(frame) > AGENT_RUNTIME_MAX_FRAME_BYTES) throw new AgentRuntimeError('frame_too_large', 'Controller request exceeds frame limit');
     let accept!: Pending['accepted'];
     let finish!: Pending['finished'];
-    let rejectAccept!: (error: Error) => void;
-    let rejectFinish!: (error: Error) => void;
+    let rejectAccept!: (error: unknown) => void;
+    let rejectFinish!: (error: unknown) => void;
     const accepted = new Promise<AgentLaneState | undefined>((resolve, reject) => { accept = resolve; rejectAccept = reject; });
     const completed = new Promise<AgentLaneState | undefined>((resolve, reject) => { finish = resolve; rejectFinish = reject; });
     // Either promise may be the one a caller chooses to await first.

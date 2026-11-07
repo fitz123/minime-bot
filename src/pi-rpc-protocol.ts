@@ -845,7 +845,9 @@ export function spawnPreparedPiRpcSession(options: {
     "--session-dir", binding.sessionDirectory, "--session", binding.sessionFile,
     "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files",
     "--append-system-prompt", context.appendSystemPromptPath];
-  if (context.systemPromptPath) args.push("--system-prompt", context.systemPromptPath);
+  // Pi discovers SYSTEM.md independently of --no-context-files. Empty input
+  // suppresses that discovery while retaining Pi's built-in default prompt.
+  args.push("--system-prompt", context.systemPromptPath ?? "");
   if (options.tools.length) args.push("--tools", options.tools.join(","));
   else args.push("--no-tools");
   for (const extension of options.extensions) args.push("--extension", extension);

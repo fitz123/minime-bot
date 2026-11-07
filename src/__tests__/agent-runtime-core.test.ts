@@ -140,3 +140,87 @@ test('direct worker core still reaps active Pi/tools when interrupted-state pers
   await until(() => !alive(sleeper.pid) && !alive(piPid));
   injected.mock.restore();
 });
+
+test('prepared worker Pi suppresses ambient SYSTEM.md while retaining its default provider prompt', { timeout: 20_000 }, async t => {
+  const f = fixture(); t.after(() => f.worker.shutdown());
+  mkdirSync(join(f.d.stateRoot, 'pi'), { mode: 0o700 });
+  writeFileSync(join(f.d.stateRoot, 'pi', 'SYSTEM.md'), 'SYNTHETIC_AMBIENT_SYSTEM_SENTINEL');
+  const opened = await f.open();
+  await f.dispatch({ op: 'prompt', handle: opened.handle, requestId: 'context', text: 'CONTEXT' });
+  const result = [...f.messages].reverse().find(m => m.type === 'event' && m.event.type === 'result');
+  assert.ok(result?.type === 'event' && result.event.type === 'result');
+  assert.deepEqual(JSON.parse(result.event.result!), { sentinel: false, defaultPrompt: true, before: false, after: false });
+});
+
+test('public close rejects abort cleanup and reopen transitions instead of reporting a closed lane', { timeout: 25_000 }, async t => {
+  const f = fixture(); t.after(() => f.worker.shutdown());
+  const opened = await f.open();
+  const pending = f.dispatch({ op: 'prompt', handle: opened.handle, requestId: 'wait', text: 'WAIT' });
+  await until(() => existsSync(join(f.d.workspace, 'sleeper.json')));
+  const runtime = f.worker as unknown as { startPi(lane: unknown): Promise<void> };
+  const startPi = runtime.startPi.bind(runtime);
+  let release!: () => void;
+  let reopening = false;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  t.mock.method(runtime, 'startPi', async (lane: unknown) => { reopening = true; await gate; await startPi(lane); });
+  t.after(release);
+  const abort = f.dispatch({ op: 'abort', handle: opened.handle, requestId: 'wait' });
+  await assert.rejects(f.dispatch({ op: 'close', handle: opened.handle }), (e: AgentRuntimeError) => e.code === 'busy');
+  await until(() => reopening);
+  await assert.rejects(f.dispatch({ op: 'close', handle: opened.handle }), (e: AgentRuntimeError) => e.code === 'busy');
+  release(); await abort; await pending;
+  assert.equal((f.messages.at(-1) as { state: AgentLaneState }).state.phase, 'ready');
+  await f.dispatch({ op: 'close', handle: opened.handle });
+  assert.equal((f.messages.at(-1) as { state: AgentLaneState }).state.phase, 'closed');
+});
+
+test('overlapping different-lane opens keep their own artifacts and manifest after source edits', { timeout: 30_000 }, async t => {
+  const f = fixture(); t.after(() => f.worker.shutdown());
+  writeFileSync(join(f.d.workspace, 'CLAUDE.md'), 'SYNTHETIC_LANE_BEFORE\n');
+  const runtime = f.worker as unknown as { startPi(lane: { record: WorkerLaneRecord }): Promise<void> };
+  const startPi = runtime.startPi.bind(runtime);
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  t.after(release);
+  t.mock.method(runtime, 'startPi', async (lane: { record: WorkerLaneRecord }) => {
+    if (lane.record.laneId === 'before') await gate;
+    await startPi(lane);
+  });
+  const firstOpen = f.dispatch({ op: 'open', laneId: 'before' });
+  // The first lane is awaiting spawn; the second assembles edited source first.
+  writeFileSync(join(f.d.workspace, 'CLAUDE.md'), 'SYNTHETIC_LANE_AFTER\n');
+  await f.dispatch({ op: 'open', laneId: 'after' });
+  const after = (f.messages.at(-1) as { state: AgentLaneState }).state;
+  release(); await firstOpen;
+  const before = (f.messages.at(-1) as { state: AgentLaneState }).state;
+  assert.notEqual(before.contextDigest, after.contextDigest);
+  for (const [opened, expected] of [[before, { before: true, after: false }], [after, { before: false, after: true }]] as const) {
+    const store = new WorkerLaneStore(join(f.d.stateRoot, 'lanes'), f.d.agentId, opened.handle.laneId, true);
+    assert.equal(store.load().contextManifest?.digest, opened.contextDigest);
+    await f.dispatch({ op: 'prompt', handle: opened.handle, requestId: 'context', text: 'CONTEXT' });
+    const result = [...f.messages].reverse().find(m => m.type === 'event' && m.event.type === 'result');
+    assert.ok(result?.type === 'event' && result.event.type === 'result');
+    assert.deepEqual(JSON.parse(result.event.result!), { sentinel: false, defaultPrompt: true, ...expected });
+  }
+});
+
+test('owner-private binding can save, load and reopen a valid context manifest larger than 64KiB', { timeout: 30_000 }, async t => {
+  const f = fixture(); t.after(() => f.worker.shutdown());
+  mkdirSync(join(f.d.workspace, 'sources'));
+  const imports = Array.from({ length: 600 }, (_, i) => {
+    const name = `sources/synthetic-source-${i}.md`;
+    writeFileSync(join(f.d.workspace, name), `SYNTHETIC_SOURCE_${i}\n`);
+    return `@${name}`;
+  });
+  writeFileSync(join(f.d.workspace, 'CLAUDE.md'), imports.join('\n') + '\n');
+  const opened = await f.open();
+  const store = new WorkerLaneStore(join(f.d.stateRoot, 'lanes'), f.d.agentId, 'lane', true);
+  const record = store.load();
+  assert.ok(Buffer.byteLength(JSON.stringify(record.contextManifest)) > 64 * 1024);
+  store.save(record);
+  assert.deepEqual(store.load(), record);
+  await f.dispatch({ op: 'close', handle: opened.handle });
+  const reopened = await f.open(opened.handle.sessionId);
+  assert.equal(reopened.handle.sessionId, opened.handle.sessionId);
+  assert.equal(reopened.contextDigest, opened.contextDigest);
+});

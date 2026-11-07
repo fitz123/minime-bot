@@ -38,6 +38,9 @@ not adapted in this slice. Knowledge v2 **context** can be required independentl
 of Knowledge **tools**. There is no global extensions kill-switch workaround.
 
 Ambient extensions, skills, prompt templates, and context discovery are disabled.
+Prepared worker spawns always pass `--system-prompt`: the explicit persona path
+when present, otherwise an empty string. In pinned Pi 1.5.0 this suppresses
+independent `SYSTEM.md` discovery while retaining Pi's built-in default prompt.
 Only the trusted constructor's `trustedTestExtensions` can add fixture code;
 there is no extension-path, cwd, executable, environment, or transcript-path
 field in IPC. The standalone CLI does not load test extensions. Offline tests
@@ -49,8 +52,10 @@ fallbacks.
 ## Context and session ownership
 
 The workspace must contain a real local `CLAUDE.md`. Declared imports and rules
-are assembled strictly into private artifacts below `contextRoot/.tmp` before
-Pi is spawned. With `knowledge: "v2"`, local marked `wiki/schema.md` and
+are assembled strictly into private artifacts below
+`contextRoot/<sha256(laneId)>/.tmp` before Pi is spawned. Paths are stable within
+each lane; overlapping lane opens cannot replace another lane's pending context.
+With `knowledge: "v2"`, local marked `wiki/schema.md` and
 `wiki/index.md` are required. The binding record preserves the content-redacted
 context manifest; controller state exposes only its digest. External/symlink
 rule directories are rejected before the assembler's legacy shared-platform
@@ -67,9 +72,16 @@ Each lane directory records that a lane existed. Pi authors its transcript
 header; the worker fsyncs the exact binding and generation before spawning Pi,
 then verifies Pi's correlated startup session ID **and** exact transcript file,
 model, and thinking selection. Pi fuzzy-model fallback is rejected.
-Close and restart reuse that same binding. Existing missing/corrupt bindings or
-transcripts cause an error rather than minting replacement identities. An
-incomplete initial lane allocation also needs explicit administrator recovery;
+Close and restart reuse that same binding. Missing, corrupt, or unsafe binding
+records reject rather than minting replacement identities. Transcript checks
+cover path, ownership/mode, header, identity, and Pi openability; they do not
+validate full JSONL integrity. Pinned Pi 1.5.0 skips malformed later records,
+including an unparseable partial tail, when loading history. A parseable final
+record is handled normally. For a valid-header file with a nonempty unterminated
+tail, Pi appends a newline; it does not truncate the skipped malformed bytes.
+This slice adds no whole-history validation,
+migration, or repair. An incomplete initial lane allocation also needs explicit
+administrator recovery;
 there is no automatic repair or history rotation. Only one worker may own a
 state root: there is no cross-process lease or database.
 
@@ -79,7 +91,10 @@ state root: there is no cross-process lease or database.
 expectedSessionId?)`, `prompt(handle, requestId, text, onEvent?)`,
 `getState(handle)`, `abort(handle, requestId)`, `close(handle)`, and `shutdown()`.
 A prompt returns separate `accepted` and `completed` promises; `onEvent` receives
-normalized text/tool/result stream events. Native Pi `agent_settled` completes a
+normalized text/tool/result stream events. A thrown `onEvent` error rejects that
+prompt call with the original error. The connection and other lanes remain
+usable, and later frames are still parsed. The worker may continue that prompt;
+inspect its lane state before further work. Native Pi `agent_settled` completes a
 started run; `agent_end` alone does not. A correlated Pi preflight rejection may
 finish without a run. Paths, cwd, executable details, and child environment are
 not included in controller state.
@@ -87,7 +102,9 @@ not included in controller state.
 Handles contain opaque agent/lane/session identity and a persisted generation.
 Open increments the generation; old handles reject. One connection owns an open
 lane. Lane transitions are serialized by rejecting conflicting calls; a lane
-accepts only one prompt at a time. There is no queue or implicit resend. State
+accepts only one prompt at a time. Public `close` rejects with `busy` while a
+lane is opening or closing, including abort cleanup and its reopen. Internal
+cleanup remains idempotent. There is no queue or implicit resend. State
 contains the current/last request ID and `accepted`, `settled`, or `interrupted`
 outcome. `settled` means the lifecycle ended, including a model/tool failure;
 the result event carries the prompt result. Only the most recent request ID is
@@ -96,28 +113,46 @@ retained, not an idempotency ledger. An interrupted request is never replay-safe
 Acceptance is persisted before writing the prompt to Pi. After restart an
 unsettled accepted request becomes `interrupted` when its lane is reopened.
 Reconnect by opening with the expected session ID, then inspect state. A client
-disconnect or deadline reports `AgentRuntimeUncertainError`; acceptance or
-partial tool side effects may already have occurred. The client never
-reconnects/resends automatically. The worker aborts owned work on disconnect.
+disconnect or any transport/client call deadline reports
+`AgentRuntimeUncertainError` and ends the shared connection, interrupting all
+lanes it owns. Acceptance or partial tool side effects may already have occurred.
+The client never reconnects/resends automatically. The worker aborts owned work on disconnect.
 
-Abort terminates/reaps the owned Pi process and tool descendants, then opens the
-same exact transcript with the same handle before accepting another prompt.
+Abort terminates/reaps the owned Pi process and active tracked tools, then opens
+the same exact transcript with the same handle before accepting another prompt.
 Close, disconnect, and SIGTERM reap Pi without deleting history. Cleanup uses
-Pi 1.5.0's tracked detached-tool SIGTERM behavior, with bounded process-group
-SIGKILL fallback. This is not a generic supervisor; the host still owns worker
-lifecycle. A hard worker kill/power loss remains host-supervisor recovery work.
+Pi 1.5.0's active tracked bash-group SIGTERM behavior, with bounded process-group
+SIGKILL fallback. Pi stops tracking a bash group once its originating shell
+returns. Detached jobs whose originating bash tool already completed are outside
+this cleanup guarantee. Keep worker bash work foregrounded and awaited; any
+escaped user-local background work requires explicit operator ownership. Cleanup
+is not proof that all processes under the worker UID are gone. This slice has
+no descendant supervisor and does not claim production parity. The host owns
+worker lifecycle, including hard worker kill/power-loss recovery.
 
 IPC is versioned LF-delimited JSON, with a 1 MiB frame bound, 5-second incomplete
 frame deadline, bounded client calls, 10-second Pi startup and 120-second worker
-prompt deadlines. Trusted constructors may select finite deadlines up to
-300 seconds. Oversized/invalid requests fail explicitly and close the connection.
+prompt deadlines. The default client prompt completion deadline is 130 seconds,
+allowing 10 seconds for worker timeout cleanup and transport. Explicit custom
+client/worker bounds remain finite, up to 300 seconds; callers selecting a custom
+worker deadline must leave a suitable client margin. The raw Pi stdout splitter
+is unbounded, as in the local Pi path: large image/tool/`agent_end` records may
+normalize to small controller events. The 1 MiB bound remains on controller IPC.
+Oversized/invalid requests fail explicitly and close the connection.
 The worker has one stdout reader per Pi lifetime, correlating startup replies
 and prompt events without competing readers.
 
 On macOS cross-UID endpoints use a worker-owned 0700 directory and 0600 socket,
 with sole exact `user:<controllerName> allow search` and `... allow write` ACLs,
-respectively. Same-UID runs omit ACL grants. No native peercred module or custom
-auth manager is introduced. Shared package code and the controller are trusted;
+respectively. Before connecting, the client verifies the nonsymlink directory
+and socket types, expected worker ownership, and these modes. Same-UID calls
+default the expected worker UID to the caller UID and omit ACL grants.
+Cross-UID callers must configure the expected identity locally:
+`AgentRuntimeClient.connect(socketPath, undefined, { workerUid, controllerName })`.
+The caller UID supplies the controller UID; the controller name must resolve to
+it. The client verifies both sole exact controller ACLs without provisioning or
+changing them. Identity is never taken from IPC. No native peercred module or
+custom auth manager is introduced. Shared package code and the controller are trusted;
 these checks are coordination and filesystem isolation, not a same-UID hostile
 agent boundary.
 

@@ -1,4 +1,5 @@
 import { createServer, type Server, type Socket } from 'node:net';
+import { createHash } from 'node:crypto';
 import { chmodSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, join, relative, isAbsolute } from 'node:path';
 import { assemblePiContext, type PiContextArtifacts } from './pi-context-assembler.js';
@@ -9,7 +10,7 @@ import { NewlineOnlyJsonlSplitter, spawnPreparedPiRpcSession } from './pi-rpc-pr
 import { AgentRuntimePi } from './agent-runtime-pi.js';
 import { WorkerLaneStore, requirePrivateWorkerDirectory, type WorkerLaneRecord } from './agent-runtime-store.js';
 import {
-  validateAgentRuntimeDescriptor, assertAgentRuntimeIdentity, ensureAgentEndpointAcl, type AgentRuntimeDescriptor,
+  validateAgentRuntimeDescriptor, assertAgentRuntimeIdentity, assertAgentEndpointMetadata, ensureAgentEndpointAcl, type AgentRuntimeDescriptor,
 } from './agent-runtime-descriptor.js';
 import {
   AGENT_RUNTIME_MAX_FRAME_BYTES, AGENT_RUNTIME_PROMPT_TIMEOUT_MS, AgentRuntimeError,
@@ -83,12 +84,11 @@ export class AgentRuntimeWorker {
     try {
       chmodSync(d.socketPath, 0o600);
       ensureAgentEndpointAcl(d.socketPath, d, 'write');
-      const s = lstatSync(d.socketPath);
-      if (!s.isSocket() || s.uid !== d.workerUid || (s.mode & 0o777) !== 0o600) throw new Error('Worker socket must be worker-owned 0600');
+      assertAgentEndpointMetadata(d.socketPath, d.workerUid, 'socket');
     } catch (error) { await this.shutdown(); throw error; }
   }
 
-  private prepareContext(): PiContextArtifacts {
+  private prepareContext(laneId: string): PiContextArtifacts {
     const d = this.descriptor;
     try {
       const claude = join(d.workspace, 'CLAUDE.md');
@@ -109,8 +109,10 @@ export class AgentRuntimeWorker {
         }
         if (resolveKnowledgeLayout(d.workspace).kind !== 'v2') throw new Error('Expected Knowledge v2');
       }
+      const artifactRoot = join(d.contextRoot, createHash('sha256').update(laneId).digest('hex'));
+      requirePrivateWorkerDirectory(artifactRoot, d.workerUid);
       const context = assemblePiContext({ id: d.agentId, workspaceCwd: d.workspace, model: d.model, thinking: d.thinking },
-        { strict: true, artifactWorkspaceCwd: d.contextRoot });
+        { strict: true, artifactWorkspaceCwd: artifactRoot });
       if (!context) throw new Error('No worker context');
       return context;
     } catch { return fail('context_invalid', 'Required local context/imports/rules are missing or unsupported; Pi was not started'); }
@@ -175,7 +177,7 @@ export class AgentRuntimeWorker {
     let lane = this.lanes.get(laneId);
     if (lane && lane.phase !== 'closed') return fail('busy', 'Lane is already open or changing state');
     // Source failures cannot mint a new session or create an unbound lane marker.
-    const context = this.prepareContext();
+    const context = this.prepareContext(laneId);
     const d = this.descriptor;
     const location = resolveExplicitInteractiveSessionLocation(d.workspace, d.sessionRoot, d.workerUid);
     const root = join(d.stateRoot, 'lanes');
@@ -327,12 +329,15 @@ export class AgentRuntimeWorker {
       if (owner?.destroyed || this.stopping) return fail('disconnected', 'Lane owner disconnected');
       lane.owner = owner; lane.phase = 'opening';
       try {
-        lane.context = this.prepareContext();
+        lane.context = this.prepareContext(lane.record.laneId);
         lane.record.contextManifest = lane.context.manifest;
         lane.store.save(lane.record);
         await this.startPi(lane);
       } catch (error) { lane.phase = 'closed'; lane.owner = undefined; throw error; }
-    } else await this.closeLane(lane);
+    } else {
+      if (lane.phase === 'opening' || lane.phase === 'closing') return fail('busy', 'Lane has an active state transition');
+      await this.closeLane(lane);
+    }
     this.send(socket, { version: 1, type: 'response', id: r.id, state: this.state(lane) });
   }
 

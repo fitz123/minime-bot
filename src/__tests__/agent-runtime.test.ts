@@ -78,8 +78,8 @@ function call(controller: ReturnType<typeof start>, op: string, args: Record<str
   return { id, done: () => until(() => controller.messages.find(m => m.id === id && m.done), 20_000),
     accepted: () => until(() => controller.messages.find(m => m.id === id && (m.accepted || m.error)), 20_000) };
 }
-async function launch(t: TestContext, f: ReturnType<typeof setup>, extension = 'provider.mjs', startupTimeout = 10_000) {
-  const worker = start(t, 'worker.ts', [f.path, join(fixtures, extension), String(startupTimeout)], f.dirs.home);
+async function launch(t: TestContext, f: ReturnType<typeof setup>, extension = 'provider.mjs', startupTimeout = 10_000, promptTimeout = 30_000) {
+  const worker = start(t, 'worker.ts', [f.path, join(fixtures, extension), String(startupTimeout), String(promptTimeout)], f.dirs.home);
   await worker.ready();
   return worker;
 }
@@ -121,7 +121,7 @@ test('worker/client processes use real pinned Pi, private context, durable exact
   assert.equal(lstatSync(f.dirs.sessions).mode & 0o777, 0o700);
   assert.equal(lstatSync(f.descriptor.socketPath).mode & 0o777, 0o600);
   assert.equal(existsSync(join(f.dirs.workspace, '.pi', 'context')), false);
-  const artifacts = readdirSync(join(f.dirs.context, '.tmp'));
+  const artifacts = readdirSync(join(f.dirs.context, readdirSync(f.dirs.context)[0], '.tmp'));
   assert.ok(artifacts.length > 0);
   const closed = await call(c, 'close').done(); assert.equal(closed.state.phase, 'closed');
   assert.equal(closed.state.handle.sessionId, handle.sessionId);
@@ -262,4 +262,31 @@ test('client deadline reports uncertain outcome and disconnect cleanup allows re
   }
   const reopened = await observer.open('lane', opened.handle.sessionId);
   assert.deepEqual(reopened.request, { requestId: 'deadline-request', outcome: 'interrupted' });
+});
+
+test('client verifies actual endpoint owner, directory/socket mode and symlinks before connecting', { timeout: 15_000 }, async t => {
+  const f = setup(); await launch(t, f);
+  const socket = f.descriptor.socketPath;
+  await assert.rejects(AgentRuntimeClient.connect(socket, undefined, { workerUid: uid + 1, controllerName: 'fixture-controller' }), /worker-owned/);
+  for (const [path, mode] of [[f.dirs.socket, 0o700], [socket, 0o600]] as const) {
+    chmodSync(path, 0o777);
+    await assert.rejects(AgentRuntimeClient.connect(socket), /worker-owned/);
+    chmodSync(path, mode);
+  }
+  const linkedDir = join(f.root, 'linked-socket'); symlinkSync(f.dirs.socket, linkedDir);
+  await assert.rejects(AgentRuntimeClient.connect(join(linkedDir, 'worker.sock')), /nonsymlink/);
+  const linkedSocket = join(f.dirs.socket, 'linked.sock'); symlinkSync(socket, linkedSocket);
+  await assert.rejects(AgentRuntimeClient.connect(linkedSocket), /nonsymlink/);
+  const client = await AgentRuntimeClient.connect(socket); t.after(() => client.disconnect());
+  assert.equal((await client.open('verified')).phase, 'ready');
+});
+
+test('worker prompt timeout delivers interrupted outcome before the default client completion deadline', { timeout: 20_000 }, async t => {
+  const f = setup(); await launch(t, f, 'provider.mjs', 10_000, 500);
+  const client = await AgentRuntimeClient.connect(f.descriptor.socketPath); t.after(() => client.disconnect());
+  const opened = await client.open('lane');
+  const prompt = client.prompt(opened.handle, 'worker-timeout', 'WAIT');
+  await prompt.accepted;
+  assert.equal((await prompt.completed).request?.outcome, 'interrupted');
+  assert.equal((await client.getState(opened.handle)).request?.outcome, 'interrupted');
 });

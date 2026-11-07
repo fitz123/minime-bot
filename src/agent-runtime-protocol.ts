@@ -4,6 +4,7 @@ import type { StreamLine } from './types.js';
 export const AGENT_RUNTIME_MAX_FRAME_BYTES = 1024 * 1024;
 export const AGENT_RUNTIME_RPC_TIMEOUT_MS = 15_000;
 export const AGENT_RUNTIME_PROMPT_TIMEOUT_MS = 120_000;
+export const AGENT_RUNTIME_CLIENT_PROMPT_TIMEOUT_MS = AGENT_RUNTIME_PROMPT_TIMEOUT_MS + 10_000;
 
 export interface AgentLaneHandle {
   agentId: string;
