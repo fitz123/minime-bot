@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 2026.11.3
+
+- Allow standalone read-only Knowledge CLI get/search commands through the Knowledge integrity guard (#254).
+- Preserve managed-file mutation and output-redirection protection; compound or unsupported shell syntax retains conservative fallback.
+
 ## 2026.11.2
 
 - Simplify `/fast` output and move technical priority/scope details to read-only `/fast help` (#219, #250).
