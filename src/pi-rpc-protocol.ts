@@ -20,6 +20,7 @@ import {
   fileDeliveryContext,
   PiContextArtifactWriteError,
   type PiContextAssemblyOptions,
+  type PiContextArtifacts,
 } from "./pi-context-assembler.js";
 import {
   formatPiRuntimeDiagnostic,
@@ -499,6 +500,10 @@ export class NewlineOnlyJsonlSplitter {
   private readonly decoder = new StringDecoder("utf8");
   private buffer = "";
 
+  constructor(private readonly maxRecordBytes = Infinity) {
+    if (!(maxRecordBytes > 0)) throw new Error("JSONL frame bound must be positive");
+  }
+
   push(chunk: Buffer | Uint8Array | string): string[] {
     this.buffer += decodeChunk(this.decoder, chunk);
     return this.takeCompleteRecords();
@@ -515,6 +520,7 @@ export class NewlineOnlyJsonlSplitter {
     }
 
     const finalRecord = stripTrailingCarriageReturn(this.buffer);
+    this.assertBound(finalRecord);
     this.buffer = "";
     return [finalRecord];
   }
@@ -529,12 +535,20 @@ export class NewlineOnlyJsonlSplitter {
     for (;;) {
       const newlineIndex = this.buffer.indexOf("\n");
       if (newlineIndex === -1) {
+        this.assertBound(this.buffer);
         return records;
       }
 
       const record = this.buffer.slice(0, newlineIndex);
+      this.assertBound(record);
       records.push(stripTrailingCarriageReturn(record));
       this.buffer = this.buffer.slice(newlineIndex + 1);
+    }
+  }
+
+  private assertBound(record: string): void {
+    if (Buffer.byteLength(record) > this.maxRecordBytes) {
+      throw new Error("JSONL frame exceeds byte limit");
     }
   }
 }
@@ -811,6 +825,38 @@ export interface PiStartupDiagnostics {
 
 /** Cap on buffered startup stderr (the classifier only needs the startup tail). */
 const PI_STARTUP_STDERR_CAP = 64 * 1024;
+
+/** Worker seam: all context, environment and resource choices are already explicit. */
+export function spawnPreparedPiRpcSession(options: {
+  binding: InteractiveSessionBinding;
+  context: PiContextArtifacts;
+  model: string;
+  thinking: string;
+  tools: readonly string[];
+  extensions: readonly string[];
+  env: NodeJS.ProcessEnv;
+  offline: boolean;
+}): ChildProcess {
+  const { binding, context } = options;
+  if (!options.model.trim() || !options.thinking) throw new Error("Explicit Pi model/thinking required");
+  const inspection = inspectInteractiveSessionBinding(binding, binding.sessionFile, binding.sessionId);
+  if (!inspection.valid) throw new Error(`Invalid prepared Pi binding: ${inspection.reason}`);
+  const args = ["--mode", "rpc", "--model", options.model, "--thinking", options.thinking,
+    "--session-dir", binding.sessionDirectory, "--session", binding.sessionFile,
+    "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files",
+    "--append-system-prompt", context.appendSystemPromptPath];
+  if (context.systemPromptPath) args.push("--system-prompt", context.systemPromptPath);
+  if (options.tools.length) args.push("--tools", options.tools.join(","));
+  else args.push("--no-tools");
+  for (const extension of options.extensions) args.push("--extension", extension);
+  if (options.offline) args.push("--offline");
+  const invocation = resolvePackageOwnedPiInvocation("rpc", args);
+  if (invocation.diagnostic.versionMismatch) throw new Error("Worker requires the pinned Pi runtime");
+  return spawn(invocation.command, invocation.args, {
+    cwd: binding.workspaceRealpath, env: options.env,
+    stdio: ["pipe", "pipe", "pipe"], detached: true,
+  });
+}
 
 export function spawnPiRpcSession(
   agent: AgentConfig,
