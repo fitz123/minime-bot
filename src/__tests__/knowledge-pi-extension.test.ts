@@ -548,6 +548,127 @@ describe("Knowledge Pi extension helpers", () => {
     }
   });
 
+  for (const [action, options] of [
+    ["get", "--path wiki/index.md --from 1 --lines 8"],
+    ["search", '--query "wiki/index.md" --variant index --scope all --max-results 8 --json'],
+  ]) {
+    it(`allows standalone minime-bot knowledge ${action} readers`, () => {
+      const workspace = createV2Workspace();
+
+      for (const binary of ["minime-bot", "/opt/minime-test/bin/minime-bot"]) {
+        for (const args of [
+          `knowledge ${action} --workspace "${workspace}" ${options}`,
+          `knowledge ${action} --workspace="${workspace}" ${options}`,
+          `--workspace "${workspace}" knowledge ${action} ${options}`,
+          `knowledge --workspace="${workspace}" ${action} ${options}`,
+          `knowledge ${action} ${options}`,
+          `knowledge ${action} ${options} > /dev/null`,
+          `knowledge ${action} ${options} &> /dev/null`,
+          `knowledge ${action} ${options} 2>&1`,
+          `knowledge ${action} ${options} && cat wiki/index.md`,
+        ]) {
+          const command = `${binary} ${args}`;
+          assert.equal(
+            classifyKnowledgeIntegrityToolCall(
+              { toolName: "bash", input: { command } },
+              { agentWorkspaceRoot: workspace, cwd: workspace, env: {} },
+            ),
+            undefined,
+            command,
+          );
+        }
+      }
+    });
+  }
+
+  it("preserves write targets and chained mutations after CLI knowledge readers", () => {
+    const workspace = createV2Workspace();
+
+    for (const binary of ["minime-bot", "/opt/minime-test/bin/minime-bot"]) {
+      for (const args of ["get --path wiki/index.md", 'search --query "wiki/index.md"']) {
+        const reader = `${binary} knowledge ${args} --workspace "${workspace}"`;
+        for (const [suffix, target] of [
+          [" > wiki/index.md", "wiki/index.md"],
+          [" 2>> wiki/log.md", "wiki/log.md"],
+          [" &> wiki/log.md", "wiki/log.md"],
+          [" | tee wiki/index.md", "wiki/index.md"],
+          [" && touch wiki/index.md", "wiki/index.md"],
+          ["; rm wiki/index.md", "wiki/index.md"],
+          [" || git reset --hard", workspace],
+        ]) {
+          assertBlocked(workspace, { toolName: "bash", input: { command: reader + suffix } }, target);
+        }
+      }
+    }
+  });
+
+  for (const [syntax, options] of [
+    ["background commands", "wiki/index.md & touch wiki/log.md"],
+    ["attached background commands", "wiki/index.md&touch wiki/log.md"],
+    ["descriptor redirections", "wiki/index.md >& wiki/log.md"],
+    ["command substitutions", '"$(touch wiki/index.md)"'],
+    ["output process substitutions", "index --json > >(tee wiki/index.md)"],
+    ["input process substitutions", "index < <(touch wiki/index.md)"],
+    ["background recursive deletion", "wiki/index.md & rm -rf wiki/pages"],
+    ["backtick substitutions", '"`touch wiki/index.md`"'],
+  ]) {
+    it(`keeps CLI knowledge readers with ${syntax} on managed-path fallback`, () => {
+      const workspace = createV2Workspace();
+
+      for (const binary of ["minime-bot", "/opt/minime-test/bin/minime-bot"]) {
+        for (const reader of ["get --path", "search --query"]) {
+          const command = `${binary} knowledge ${reader} ${options}`;
+          assertBlocked(workspace, { toolName: "bash", input: { command } }, "wiki/index.md");
+        }
+      }
+    });
+  }
+
+  for (const group of ["(git pull --ff-only)", "{ git pull --ff-only; }"]) {
+    it(`keeps reader fallback when the surrounding command contains ${group}`, () => {
+      const workspace = createV2Workspace();
+
+      for (const binary of ["minime-bot", "/opt/minime-test/bin/minime-bot"]) {
+        for (const args of ["get --path wiki/index.md", "search --query wiki/index.md"]) {
+          const reader = `${binary} knowledge --workspace . ${args}`;
+          for (const command of [
+            `${reader} && ${group}`,
+            `${group} || ${reader}`,
+            `bash -lc '${reader}' && ${group}`,
+          ]) {
+            assertBlocked(workspace, { toolName: "bash", input: { command } }, "wiki/index.md");
+          }
+        }
+      }
+    });
+  }
+
+  it("does not exempt mutating or unknown CLI commands or other executable forms", () => {
+    const workspace = createV2Workspace();
+
+    for (const binary of ["minime-bot", "/opt/minime-test/bin/minime-bot"]) {
+      for (const args of [
+        "knowledge update --op archive --path wiki/index.md",
+        "knowledge maintain --report wiki/index.md",
+        "knowledge migrate --apply --report wiki/index.md",
+        "knowledge sync --path wiki/index.md",
+        "knowledge unknown --path wiki/index.md",
+        "unknown get --path wiki/index.md",
+      ]) {
+        assertBlocked(workspace, { toolName: "bash", input: { command: `${binary} ${args}` } }, "wiki/index.md");
+      }
+    }
+    for (const command of [
+      "./minime-bot knowledge get --path wiki/index.md",
+      "bin/minime-bot knowledge search --query wiki/index.md",
+      "minime-bot-other knowledge get --path wiki/index.md",
+      "node /opt/minime-test/dist/cli.js knowledge get --path wiki/index.md",
+      "node -e 'console.log(\"minime-bot knowledge get --path wiki/index.md\")'",
+    ]) {
+      assertBlocked(workspace, { toolName: "bash", input: { command } }, "wiki/index.md");
+    }
+  });
+
   it("maps raw Git worktree mutations through a symlinked workspace root", () => {
     const workspace = createV2Workspace();
     const notes = join(workspace, "notes");
