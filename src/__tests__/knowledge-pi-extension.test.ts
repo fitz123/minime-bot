@@ -624,6 +624,25 @@ describe("Knowledge Pi extension helpers", () => {
     });
   }
 
+  for (const group of ["(git pull --ff-only)", "{ git pull --ff-only; }"]) {
+    it(`keeps reader fallback when the surrounding command contains ${group}`, () => {
+      const workspace = createV2Workspace();
+
+      for (const binary of ["minime-bot", "/opt/minime-test/bin/minime-bot"]) {
+        for (const args of ["get --path wiki/index.md", "search --query wiki/index.md"]) {
+          const reader = `${binary} knowledge --workspace . ${args}`;
+          for (const command of [
+            `${reader} && ${group}`,
+            `${group} || ${reader}`,
+            `bash -lc '${reader}' && ${group}`,
+          ]) {
+            assertBlocked(workspace, { toolName: "bash", input: { command } }, "wiki/index.md");
+          }
+        }
+      }
+    });
+  }
+
   it("does not exempt mutating or unknown CLI commands or other executable forms", () => {
     const workspace = createV2Workspace();
 

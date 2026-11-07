@@ -597,7 +597,14 @@ function staticShellPathPrefix(rawPath: string): string {
   return literalPrefix.slice(0, separatorIndex) || "/";
 }
 
-function extractBashWriteTargetsAtDepth(command: string, depth: number, cwd?: string, env?: NodeJS.ProcessEnv): string[] {
+function extractBashWriteTargetsAtDepth(
+  command: string,
+  depth: number,
+  cwd?: string,
+  env?: NodeJS.ProcessEnv,
+  // Grouping is unsupported; even quoted literal markers conservatively retain reader fallback.
+  hasUnsupportedGrouping = /[(){}]/.test(command),
+): string[] {
   if (depth > MAX_NESTED_SHELL_DEPTH) {
     return extractManagedKnowledgePathReferences(command);
   }
@@ -606,7 +613,12 @@ function extractBashWriteTargetsAtDepth(command: string, depth: number, cwd?: st
   let currentCwd = cwd;
 
   for (const segment of splitShellSegments(tokens)) {
-    appendTargetCandidates(targets, extractCommandWriteTargets(segment, depth, currentCwd, env), currentCwd, env);
+    appendTargetCandidates(
+      targets,
+      extractCommandWriteTargets(segment, depth, hasUnsupportedGrouping, currentCwd, env),
+      currentCwd,
+      env,
+    );
     currentCwd = cwdAfterSegment(segment, currentCwd, env);
   }
 
@@ -832,6 +844,7 @@ function redirectionTargets(segment: string[]): string[] {
 function extractCommandWriteTargets(
   segment: string[],
   depth: number,
+  hasUnsupportedGrouping: boolean,
   cwd?: string,
   env?: NodeJS.ProcessEnv,
 ): string[] {
@@ -850,7 +863,7 @@ function extractCommandWriteTargets(
   if (NESTED_SHELL_COMMANDS.has(name)) {
     const nestedCommand = nestedShellCommand(args);
     const nestedTargets = nestedCommand
-      ? [...targets, ...extractBashWriteTargetsAtDepth(nestedCommand, depth + 1, commandCwd, commandEnv)]
+      ? [...targets, ...extractBashWriteTargetsAtDepth(nestedCommand, depth + 1, commandCwd, commandEnv, hasUnsupportedGrouping)]
       : targets;
     return targetCandidates(nestedTargets, commandCwd, commandEnv);
   }
@@ -880,7 +893,7 @@ function extractCommandWriteTargets(
     return targetCandidates([...targets, ...commandOperands(args)], commandCwd, commandEnv);
   }
 
-  if (isReadOnlyShellCommand(command[0], args)) {
+  if (isReadOnlyShellCommand(command[0], args, hasUnsupportedGrouping)) {
     return targetCandidates(targets, commandCwd, commandEnv);
   }
   return targetCandidates(
@@ -921,10 +934,10 @@ function nestedShellCommand(args: string[]): string | undefined {
   return undefined;
 }
 
-function isReadOnlyShellCommand(executable: string, args: string[]): boolean {
+function isReadOnlyShellCommand(executable: string, args: string[], hasUnsupportedGrouping: boolean): boolean {
   const name = basename(executable);
   if (name === "minime-bot" && (executable === name || isAbsolute(executable))) {
-    return isReadOnlyKnowledgeCliCommand(args);
+    return !hasUnsupportedGrouping && isReadOnlyKnowledgeCliCommand(args);
   }
   if (name === "find") {
     return !args.some((arg) => arg === "-delete" || arg === "-exec" || arg === "-execdir");
