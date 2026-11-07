@@ -602,20 +602,24 @@ function extractBashWriteTargetsAtDepth(
   depth: number,
   cwd?: string,
   env?: NodeJS.ProcessEnv,
-  // Grouping is unsupported; even quoted literal markers conservatively retain reader fallback.
-  hasUnsupportedGrouping = /[(){}]/.test(command),
+  retainKnowledgeCliFallback = false,
 ): string[] {
   if (depth > MAX_NESTED_SHELL_DEPTH) {
     return extractManagedKnowledgePathReferences(command);
   }
   const tokens = expandAttachedRedirections(tokenizeShell(command).map((token) => token.value));
+  // Only simple standalone readers are exempt; quoted syntax markers also retain fallback.
+  retainKnowledgeCliFallback ||= /[(){}\r\n`]/.test(command) || tokens.some((token, index) =>
+    /[;&|]/.test(token) && !isWriteRedirection(token) &&
+    !(/^&\d+$/.test(token) && (tokens[index - 1] === ">" || tokens[index - 1] === "<"))
+  );
   const targets: string[] = [];
   let currentCwd = cwd;
 
   for (const segment of splitShellSegments(tokens)) {
     appendTargetCandidates(
       targets,
-      extractCommandWriteTargets(segment, depth, hasUnsupportedGrouping, currentCwd, env),
+      extractCommandWriteTargets(segment, depth, retainKnowledgeCliFallback, currentCwd, env),
       currentCwd,
       env,
     );
@@ -844,7 +848,7 @@ function redirectionTargets(segment: string[]): string[] {
 function extractCommandWriteTargets(
   segment: string[],
   depth: number,
-  hasUnsupportedGrouping: boolean,
+  retainKnowledgeCliFallback: boolean,
   cwd?: string,
   env?: NodeJS.ProcessEnv,
 ): string[] {
@@ -863,7 +867,7 @@ function extractCommandWriteTargets(
   if (NESTED_SHELL_COMMANDS.has(name)) {
     const nestedCommand = nestedShellCommand(args);
     const nestedTargets = nestedCommand
-      ? [...targets, ...extractBashWriteTargetsAtDepth(nestedCommand, depth + 1, commandCwd, commandEnv, hasUnsupportedGrouping)]
+      ? [...targets, ...extractBashWriteTargetsAtDepth(nestedCommand, depth + 1, commandCwd, commandEnv, retainKnowledgeCliFallback)]
       : targets;
     return targetCandidates(nestedTargets, commandCwd, commandEnv);
   }
@@ -893,7 +897,7 @@ function extractCommandWriteTargets(
     return targetCandidates([...targets, ...commandOperands(args)], commandCwd, commandEnv);
   }
 
-  if (isReadOnlyShellCommand(command[0], args, hasUnsupportedGrouping)) {
+  if (isReadOnlyShellCommand(command[0], args, retainKnowledgeCliFallback)) {
     return targetCandidates(targets, commandCwd, commandEnv);
   }
   return targetCandidates(
@@ -934,10 +938,10 @@ function nestedShellCommand(args: string[]): string | undefined {
   return undefined;
 }
 
-function isReadOnlyShellCommand(executable: string, args: string[], hasUnsupportedGrouping: boolean): boolean {
+function isReadOnlyShellCommand(executable: string, args: string[], retainKnowledgeCliFallback: boolean): boolean {
   const name = basename(executable);
   if (name === "minime-bot" && (executable === name || isAbsolute(executable))) {
-    return !hasUnsupportedGrouping && isReadOnlyKnowledgeCliCommand(args);
+    return !retainKnowledgeCliFallback && isReadOnlyKnowledgeCliCommand(args);
   }
   if (name === "find") {
     return !args.some((arg) => arg === "-delete" || arg === "-exec" || arg === "-execdir");
@@ -949,15 +953,6 @@ function isReadOnlyShellCommand(executable: string, args: string[], hasUnsupport
 }
 
 function isReadOnlyKnowledgeCliCommand(args: string[]): boolean {
-  // The tokenizer does not model background commands or substitution side effects.
-  // Keep those forms on managed-path fallback, including split >(...) / <(...) tokens.
-  if (args.some((arg, index) =>
-    arg.includes("`") || arg.includes("$(") ||
-    (arg.includes("&") && !isWriteRedirection(arg) && !/^&\d+$/.test(arg)) ||
-    ((arg === ">" || arg === "<") && args[index + 1]?.startsWith("("))
-  )) {
-    return false;
-  }
   // cli.ts parseArgs removes global workspace/help options before scope/action dispatch.
   const command: string[] = [];
   for (let index = 0; index < args.length; index += 1) {

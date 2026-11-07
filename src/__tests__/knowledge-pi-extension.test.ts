@@ -563,9 +563,10 @@ describe("Knowledge Pi extension helpers", () => {
           `knowledge --workspace="${workspace}" ${action} ${options}`,
           `knowledge ${action} ${options}`,
           `knowledge ${action} ${options} > /dev/null`,
+          `knowledge ${action} ${options} >> /dev/null`,
           `knowledge ${action} ${options} &> /dev/null`,
+          `knowledge ${action} ${options} &>> /dev/null`,
           `knowledge ${action} ${options} 2>&1`,
-          `knowledge ${action} ${options} && cat wiki/index.md`,
         ]) {
           const command = `${binary} ${args}`;
           assert.equal(
@@ -594,7 +595,7 @@ describe("Knowledge Pi extension helpers", () => {
           [" | tee wiki/index.md", "wiki/index.md"],
           [" && touch wiki/index.md", "wiki/index.md"],
           ["; rm wiki/index.md", "wiki/index.md"],
-          [" || git reset --hard", workspace],
+          [" || git reset --hard", "wiki/index.md"],
         ]) {
           assertBlocked(workspace, { toolName: "bash", input: { command: reader + suffix } }, target);
         }
@@ -638,6 +639,39 @@ describe("Knowledge Pi extension helpers", () => {
           ]) {
             assertBlocked(workspace, { toolName: "bash", input: { command } }, "wiki/index.md");
           }
+        }
+      }
+    });
+  }
+
+  for (const [syntax, suffix] of [
+    ["conditional Git commands", " && if [ -d .git ]; then git pull --ff-only; fi"],
+    ["background commands after another segment", " && ls & touch wiki/log.md"],
+    ["ambiguous redirection after another segment", " && cat /dev/null >& wiki/log.md"],
+    ["read-only chains", " && cat wiki/index.md"],
+    ["semicolon separators", "; cat /dev/null"],
+    ["pipelines", " | cat"],
+    ["OR chains", " || cat /dev/null"],
+    ["newline separators", "\ncat /dev/null"],
+  ]) {
+    it(`retains reader fallback for ${syntax}`, () => {
+      const workspace = createV2Workspace();
+      for (const binary of ["minime-bot", "/opt/minime-test/bin/minime-bot"]) {
+        for (const args of ["get --path wiki/index.md", "search --query wiki/index.md"]) {
+          const command = `${binary} knowledge ${args}${suffix}`;
+          assertBlocked(workspace, { toolName: "bash", input: { command } }, "wiki/index.md");
+        }
+      }
+    });
+  }
+
+  for (const suffix of [" & touch wiki/log.md", " `touch wiki/log.md`"]) {
+    it(`retains fallback for nested readers with outer ${suffix}`, () => {
+      const workspace = createV2Workspace();
+      for (const binary of ["minime-bot", "/opt/minime-test/bin/minime-bot"]) {
+        for (const args of ["get --path wiki/index.md", "search --query wiki/index.md"]) {
+          const reader = `bash -lc '${binary} knowledge ${args}'`;
+          assertBlocked(workspace, { toolName: "bash", input: { command: reader + suffix } }, "wiki/index.md");
         }
       }
     });
