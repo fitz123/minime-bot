@@ -562,6 +562,10 @@ describe("Knowledge Pi extension helpers", () => {
           `--workspace "${workspace}" knowledge ${action} ${options}`,
           `knowledge --workspace="${workspace}" ${action} ${options}`,
           `knowledge ${action} ${options}`,
+          `knowledge ${action} ${options} > /dev/null`,
+          `knowledge ${action} ${options} &> /dev/null`,
+          `knowledge ${action} ${options} 2>&1`,
+          `knowledge ${action} ${options} && cat wiki/index.md`,
         ]) {
           const command = `${binary} ${args}`;
           assert.equal(
@@ -586,6 +590,7 @@ describe("Knowledge Pi extension helpers", () => {
         for (const [suffix, target] of [
           [" > wiki/index.md", "wiki/index.md"],
           [" 2>> wiki/log.md", "wiki/log.md"],
+          [" &> wiki/log.md", "wiki/log.md"],
           [" | tee wiki/index.md", "wiki/index.md"],
           [" && touch wiki/index.md", "wiki/index.md"],
           ["; rm wiki/index.md", "wiki/index.md"],
@@ -596,6 +601,28 @@ describe("Knowledge Pi extension helpers", () => {
       }
     }
   });
+
+  for (const [syntax, options] of [
+    ["background commands", "wiki/index.md & touch wiki/log.md"],
+    ["attached background commands", "wiki/index.md&touch wiki/log.md"],
+    ["descriptor redirections", "wiki/index.md >& wiki/log.md"],
+    ["command substitutions", '"$(touch wiki/index.md)"'],
+    ["output process substitutions", "index --json > >(tee wiki/index.md)"],
+    ["input process substitutions", "index < <(touch wiki/index.md)"],
+    ["background recursive deletion", "wiki/index.md & rm -rf wiki/pages"],
+    ["backtick substitutions", '"`touch wiki/index.md`"'],
+  ]) {
+    it(`keeps CLI knowledge readers with ${syntax} on managed-path fallback`, () => {
+      const workspace = createV2Workspace();
+
+      for (const binary of ["minime-bot", "/opt/minime-test/bin/minime-bot"]) {
+        for (const reader of ["get --path", "search --query"]) {
+          const command = `${binary} knowledge ${reader} ${options}`;
+          assertBlocked(workspace, { toolName: "bash", input: { command } }, "wiki/index.md");
+        }
+      }
+    });
+  }
 
   it("does not exempt mutating or unknown CLI commands or other executable forms", () => {
     const workspace = createV2Workspace();

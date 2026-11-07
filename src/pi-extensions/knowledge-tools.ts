@@ -936,6 +936,15 @@ function isReadOnlyShellCommand(executable: string, args: string[]): boolean {
 }
 
 function isReadOnlyKnowledgeCliCommand(args: string[]): boolean {
+  // The tokenizer does not model background commands or substitution side effects.
+  // Keep those forms on managed-path fallback, including split >(...) / <(...) tokens.
+  if (args.some((arg, index) =>
+    arg.includes("`") || arg.includes("$(") ||
+    (arg.includes("&") && !isWriteRedirection(arg) && !/^&\d+$/.test(arg)) ||
+    ((arg === ">" || arg === "<") && args[index + 1]?.startsWith("("))
+  )) {
+    return false;
+  }
   // cli.ts parseArgs removes global workspace/help options before scope/action dispatch.
   const command: string[] = [];
   for (let index = 0; index < args.length; index += 1) {
