@@ -247,7 +247,16 @@ export class AgentRuntimeWorker {
         if (lane.phase === 'prompting') { lane.phase = 'closed'; lane.owner = undefined; }
       } finally {
         clearTimeout(timer);
-        lane.store.save(lane.record);
+        try { lane.store.save(lane.record); }
+        catch (error) {
+          if (lane.record.request) lane.record.request.outcome = 'interrupted';
+          lane.phase = 'closing';
+          // Reap directly: closeLane would await this promptDone itself.
+          try { await lane.pi?.stop(); }
+          catch { /* Preserve the persistence failure even if cleanup fails. */ }
+          finally { lane.pi = undefined; lane.promptDone = undefined; lane.owner = undefined; lane.phase = 'closed'; }
+          throw error;
+        }
         if (lane.phase === 'prompting') lane.phase = 'ready';
         this.send(socket, { version: 1, type: 'finished', id: request.id, state: this.state(lane) });
       }

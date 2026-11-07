@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path';
 import type { Socket } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 import { AgentRuntimeWorker } from '../agent-runtime-worker.js';
+import { AgentRuntimePi } from '../agent-runtime-pi.js';
 import { WorkerLaneStore, type WorkerLaneRecord } from '../agent-runtime-store.js';
 import type { AgentRuntimeDescriptor } from '../agent-runtime-descriptor.js';
 import { AgentRuntimeError, type AgentLaneState, type AgentRuntimeMessage, type AgentRuntimeOperation } from '../agent-runtime-protocol.js';
@@ -140,6 +141,49 @@ test('direct worker core still reaps active Pi/tools when interrupted-state pers
   await until(() => !alive(sleeper.pid) && !alive(piPid));
   injected.mock.restore();
 });
+
+for (const cleanupFails of [false, true]) {
+  test(`settlement-save failure closes the lane and preserves its binding (cleanup error: ${cleanupFails})`, { timeout: 20_000 }, async t => {
+    const f = fixture(); t.after(() => f.worker.shutdown()); const opened = await f.open();
+    const before = json(f.recordPath());
+    const piPid = json(join(f.d.workspace, 'started.json')).pid;
+    const persistenceError = new Error('synthetic-settlement-save-failure');
+    const save = WorkerLaneStore.prototype.save;
+    const injectedSave = t.mock.method(WorkerLaneStore.prototype, 'save', function(this: WorkerLaneStore, record: WorkerLaneRecord) {
+      if (record.request?.outcome === 'settled') throw persistenceError;
+      return save.call(this, record);
+    });
+    const stop = AgentRuntimePi.prototype.stop;
+    const injectedStop = t.mock.method(AgentRuntimePi.prototype, 'stop', async function(this: AgentRuntimePi) {
+      await stop.call(this);
+      if (cleanupFails) throw new Error('synthetic-cleanup-failure');
+    });
+    await assert.rejects(f.dispatch({ op: 'prompt', handle: opened.handle, requestId: 'write', text: 'WRITE saved-marker' }),
+      error => error === persistenceError);
+    await until(() => !alive(piPid), 4_000);
+    assert.equal(json(f.recordPath()).request.outcome, 'accepted', 'failed settlement save retains durable uncertainty');
+    assert.equal(f.messages.some(m => m.type === 'finished'), false);
+    await f.dispatch({ op: 'getState', handle: opened.handle });
+    const closed = (f.messages.at(-1) as { state: AgentLaneState }).state;
+    assert.equal(closed.phase, 'closed');
+    assert.equal(closed.request?.outcome, 'interrupted');
+    const lane = (f.worker as unknown as { lanes: Map<string, { owner?: Socket; pi?: AgentRuntimePi; promptDone?: Promise<void> }> }).lanes.get('lane')!;
+    assert.equal(lane.owner, undefined);
+    assert.equal(lane.pi, undefined);
+    assert.equal(lane.promptDone, undefined);
+    injectedSave.mock.restore();
+    injectedStop.mock.restore();
+    const reopened = await f.open(opened.handle.sessionId);
+    assert.equal(reopened.phase, 'ready');
+    assert.equal(reopened.handle.sessionId, opened.handle.sessionId);
+    assert.equal(reopened.handle.generation, opened.handle.generation + 1);
+    assert.equal(reopened.request?.outcome, 'interrupted');
+    assert.deepEqual(json(f.recordPath()).binding, before.binding);
+    await f.dispatch({ op: 'prompt', handle: reopened.handle, requestId: 'history', text: 'HISTORY' });
+    assert.equal(json(f.recordPath()).request.outcome, 'settled');
+    assert.ok(f.messages.some(m => m.type === 'event' && m.event.type === 'result' && JSON.stringify(m.event).includes('priorMarker') && JSON.stringify(m.event).includes('saved-marker')));
+  });
+}
 
 test('prepared worker Pi suppresses ambient SYSTEM.md while retaining its default provider prompt', { timeout: 20_000 }, async t => {
   const f = fixture(); t.after(() => f.worker.shutdown());
