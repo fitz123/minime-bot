@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 // Issue252 preparatory tooling; never import this module into the package runtime.
-import { lstatSync, readFileSync, realpathSync, mkdirSync, chmodSync, unlinkSync } from 'node:fs';
+import { lstatSync, readFileSync, realpathSync, mkdirSync, chmodSync } from 'node:fs';
 import { dirname, resolve, isAbsolute, join } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { spawn, execFileSync } from 'node:child_process';
 import net from 'node:net';
-import { createInterface } from 'node:readline';
+import { StringDecoder } from 'node:string_decoder';
 import { randomUUID } from 'node:crypto';
 import { userInfo } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -188,7 +188,6 @@ export async function serve(c) {
   }
   let active;
   let stopping = false;
-  let bound = false;
   const sockets = new Set();
   const server = net.createServer(async socket => {
     sockets.add(socket);
@@ -230,7 +229,6 @@ export async function serve(c) {
   process.once('SIGINT', shutdown);
   try {
     await new Promise((resolve, reject) => { server.once('error', reject); server.listen(c.socketPath, resolve); });
-    bound = true;
     chmodSync(c.socketPath, 0o600);
     if (!c.sameUidBaseline) provisionEndpointAcl(c.socketPath, c, 'write');
     validateEndpoint(c);
@@ -242,7 +240,6 @@ export async function serve(c) {
     if (active) await (active.stopped ?? stopChild(active.child));
     process.off('SIGTERM', shutdown);
     process.off('SIGINT', shutdown);
-    if (bound) { try { unlinkSync(c.socketPath); } catch (e) { if (e.code !== 'ENOENT') throw e; } }
   }
 }
 
@@ -260,8 +257,24 @@ export function attachRpc(socket) {
   let failure;
   socket.on('error', e => { failure = e; });
   socket.on('close', () => { ended = true; });
-  const lines = createInterface({ input: socket });
-  lines.on('line', line => { try { events.push(JSON.parse(line)); } catch { failure = new Error('Malformed Pi JSON'); } });
+  const decoder = new StringDecoder('utf8');
+  let buffer = '';
+  const record = line => { try { events.push(JSON.parse(line.endsWith('\r') ? line.slice(0, -1) : line)); } catch { failure = new Error('Malformed Pi JSON'); } };
+  // Match Pi's LF-only JSONL framing and retain split UTF-8 characters.
+  socket.on('data', chunk => {
+    buffer += typeof chunk === 'string' ? chunk : decoder.write(chunk);
+    let newline;
+    while ((newline = buffer.indexOf('\n')) !== -1) {
+      record(buffer.slice(0, newline));
+      buffer = buffer.slice(newline + 1);
+    }
+  });
+  socket.on('end', () => {
+    buffer += decoder.end();
+    if (buffer.length) record(buffer);
+    buffer = '';
+    ended = true;
+  });
   async function wait(predicate, start = 0, timeout = 10000) {
     const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
@@ -310,7 +323,7 @@ export async function probe(c, open = connectRpc) {
     client = await open(c);
     if (open === connectRpc) observe('endpoint_owner_and_ancestors', true, { workerUid: c.workerUid });
     const firstState = await client.rpc('get_state');
-    observe('exact_session_path', firstState.sessionFile === c.sessionFile, true);
+    observe('exact_session_path', firstState.sessionFile === c.sessionFile, { expected: c.sessionFile, actual: firstState.sessionFile });
     const marker = randomUUID();
     const inspect = await client.prompt(`CANARY_INSPECT ${marker}`);
     observe('worker_identity_home_and_paths', inspect.uid === c.workerUid && inspect.home === c.home && inspect.cwd === c.workspace && inspect.tmp === c.tmpDir && inspect.agentDir === join(c.home, 'agent') && Array.isArray(inspect.groups) && inspect.gid === c.workerGid && typeof inspect.nodeVersion === 'string', inspect);
@@ -324,12 +337,14 @@ export async function probe(c, open = connectRpc) {
       observe('same_uid_access_baseline', inspect.privateRead === 'allowed' && inspect.protectedWrite === 'allowed', { privateRead: inspect.privateRead, protectedWrite: inspect.protectedWrite, separationClaim: false });
     } else {
       observe('cross_uid_synthetic_denials', ['EACCES', 'EPERM'].includes(inspect.privateRead) && ['EACCES', 'EPERM'].includes(inspect.protectedWrite), { privateRead: inspect.privateRead, protectedWrite: inspect.protectedWrite });
-      observe('protected_fixture_unchanged', readFileSync(c.protectedFilePath, 'utf8') === PROTECTED_CONTENT, true);
+      const unchanged = readFileSync(c.protectedFilePath, 'utf8') === PROTECTED_CONTENT;
+      observe('protected_fixture_unchanged', unchanged, { unchanged });
     }
     await client.close();
     client = await open(c);
     const state = await client.rpc('get_state');
-    observe('same_session_reopened', state.sessionFile === c.sessionFile && state.sessionId === firstState.sessionId, true);
+    observe('same_session_reopened', state.sessionFile === c.sessionFile && state.sessionId === firstState.sessionId,
+      { expected: { sessionFile: c.sessionFile, sessionId: firstState.sessionId }, actual: { sessionFile: state.sessionFile, sessionId: state.sessionId } });
     const resumed = await client.prompt('CANARY_RESUME');
     const history = await client.rpc('get_messages');
     observe('persisted_tool_history_marker', resumed.piPid !== inspect.piPid && resumed.priorMarker === marker && resumed.historyToolReceipt === true && history.messages.some(m => m.role === 'toolResult' && JSON.stringify(m.content).includes(marker)), resumed);
@@ -352,7 +367,7 @@ export async function probe(c, open = connectRpc) {
   return report;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
   let config;
   try {
     const [mode, flag, path, ...extra] = process.argv.slice(2);

@@ -58,9 +58,52 @@ test('descriptor rejects root, implicit baseline, invalid paths and excessive li
   assert.throws(() => validateConfig({ ...cross, controllerHomeProbePath: undefined }), /requires controllerHomeProbePath/);
   for (const change of [{ workerUid: 0 }, { workerGid: 0 }, { workerGid: undefined }, { workerGid: 1.5 }, { sameUidBaseline: false }, { sameUidBaseline: undefined },
     { deadlineSeconds: 301 }, { deadlineSeconds: 0 }, { home: 'relative' }, { controllerName: 'everyone allow write' },
-    { socketPath: '/' + 'x'.repeat(104) }, { sessionFile: '/elsewhere/session.jsonl' },
+    { sessionFile: '/elsewhere/session.jsonl' },
     { privateFixturePath: join(c.workspace, 'private') }, { controllerHomeProbePath: join(c.home, 'controller') },
     { controllerHomeProbePath: c.workspace }, { controllerHomeProbePath: 'relative' }]) assert.throws(() => validateConfig({ ...c, ...change }));
+  const longSocketPath = join(c.socketDir, 'x'.repeat(104 - Buffer.byteLength(c.socketDir) - 1));
+  assert.equal(Buffer.byteLength(longSocketPath), 104);
+  assert.throws(() => validateConfig({ ...c, socketPath: longSocketPath }), /shorter than 104 bytes/);
+});
+
+test('symlink invocation runs CLI validation and descriptor symlinks fail loudly', async () => {
+  const { c, configPath, root } = fixture();
+  const entryLink = join(root, 'canary.mjs');
+  const configLink = join(root, 'descriptor-link.json');
+  symlinkSync(harness, entryLink);
+  symlinkSync(configPath, configLink);
+  for (const [args, error] of [
+    [['invalid'], /Usage:/],
+    [['probe', '--config', configLink], /nonsymlink file/],
+  ]) {
+    const child = spawn(c.nodePath, [entryLink, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    assert.equal((await once(child, 'close'))[0], 1);
+    const report = JSON.parse(stdout);
+    assert.equal(report.state, 'failed');
+    assert.equal(report.mode, 'descriptor_invalid');
+    assert.match(report.error, error);
+    assert.equal(stderr, '');
+  }
+});
+
+test('RPC framing preserves Unicode separators and multibyte characters across chunks', async () => {
+  const input = new Duplex({ read() {}, write(chunk, encoding, callback) { callback(); } });
+  const client = attachRpc(input);
+  const record = { type: 'unicode_receipt', text: 'before\u2028middle\u2029after 😀' };
+  // A bare CR is valid JSON whitespace, not a JSONL record boundary.
+  const bytes = Buffer.from(JSON.stringify(record).replace(',', ',\r') + '\r\n');
+  try {
+    // One-byte chunks split every multibyte character, including both separators.
+    for (const byte of bytes) input.push(Buffer.from([byte]));
+    assert.deepEqual(await client.wait(event => event.type === record.type), record);
+    assert.equal(client.events.length, 1);
+    input.push(JSON.stringify({ type: 'final_receipt' }));
+    input.push(null);
+    assert.deepEqual(await client.wait(event => event.type === 'final_receipt'), { type: 'final_receipt' });
+  } finally { await client.close(); }
 });
 
 test('descriptor and endpoint reject symlinks, wrong owners and writable staging', () => {
@@ -163,6 +206,63 @@ test('cross-UID receipts stop for failed metadata isolation, primary GID or staf
   }
 });
 
+test('cross-UID synthetic denials reject each allowed/missing result and check protected fixture evidence', async () => {
+  const scenarios = [
+    ...['allowed', 'ENOENT'].flatMap(value => [
+      { privateRead: value, protectedWrite: 'EPERM', failed: 'cross_uid_synthetic_denials' },
+      { privateRead: 'EACCES', protectedWrite: value, failed: 'cross_uid_synthetic_denials' },
+    ]),
+    { privateRead: 'EACCES', protectedWrite: 'EPERM', modified: false },
+    { privateRead: 'EPERM', protectedWrite: 'EACCES', modified: true, failed: 'protected_fixture_unchanged' },
+  ];
+  for (const scenario of scenarios) {
+    const { c } = fixture();
+    const cross = { ...c, sameUidBaseline: false, workerUid: c.workerUid + 1, workerGid: 12345 };
+    let opens = 0, closes = 0;
+    const report = await probe(cross, async () => {
+      if (++opens > 1) throw new Error('Stub stopped after protected fixture check');
+      return {
+        socket: { destroy() {} },
+        rpc: async () => ({ sessionFile: c.sessionFile, sessionId: 'synthetic-session' }),
+        prompt: async message => {
+          // This mutation happens after probe's sentinel preflight.
+          if (scenario.modified) writeFileSync(c.protectedFilePath, 'SYNTHETIC_MODIFIED\n');
+          return { uid: cross.workerUid, gid: cross.workerGid, groups: [12345, 61], nodeVersion: process.version,
+            home: c.home, cwd: c.workspace, tmp: c.tmpDir, agentDir: join(c.home, 'agent'), marker: message.split(' ')[1],
+            privateParentAccess: 'EACCES', controllerHomeAccess: 'EPERM',
+            privateRead: scenario.privateRead, protectedWrite: scenario.protectedWrite };
+        },
+        close: async () => { closes++; },
+      };
+    });
+    for (const name of ['worker_explicit_groups', 'private_parent_metadata_access', 'controller_home_metadata_access']) {
+      assert.equal(report.assertions.find(a => a.name === name)?.passed, true);
+    }
+    assert.deepEqual(report.assertions.find(a => a.name === 'exact_session_path').observed,
+      { expected: c.sessionFile, actual: c.sessionFile });
+    assert.equal(report.state, 'failed');
+    const last = report.assertions.at(-1);
+    if (scenario.failed) {
+      assert.equal(last.name, scenario.failed, JSON.stringify(scenario));
+      assert.equal(last.passed, false);
+      assert.match(report.error, new RegExp(`Assertion failed: ${scenario.failed}`));
+      assert.equal(opens, 1);
+      assert.equal(closes, 1);
+    } else {
+      assert.equal(last.name, 'protected_fixture_unchanged');
+      assert.equal(last.passed, true);
+      assert.match(report.error, /Stub stopped after protected fixture check/);
+      assert.equal(opens, 2);
+    }
+    if (last.name === 'protected_fixture_unchanged') {
+      assert.deepEqual(last.observed, { unchanged: !scenario.modified });
+      assert.equal(report.assertions.find(a => a.name === 'cross_uid_synthetic_denials').passed, true);
+    } else {
+      assert.deepEqual(last.observed, { privateRead: scenario.privateRead, protectedWrite: scenario.protectedWrite });
+    }
+  }
+});
+
 test('child environment is an explicit credential-free allowlist', () => {
   const { c } = fixture();
   process.env.CANARY_FAKE_SECRET = 'must-not-flow';
@@ -221,6 +321,13 @@ test('real package Pi 1.5.0 baseline: identity, tool results, disk resume, abort
     assert.equal(report.state, 'passed');
     assert.equal(report.mode, 'same_uid_baseline');
     assert.equal(report.assertions.find(a => a.name === 'worker_identity_home_and_paths').observed.nodeVersion, process.version);
+    assert.deepEqual(report.assertions.find(a => a.name === 'exact_session_path').observed,
+      { expected: c.sessionFile, actual: c.sessionFile });
+    const reopened = report.assertions.find(a => a.name === 'same_session_reopened').observed;
+    assert.deepEqual(reopened.actual, reopened.expected);
+    assert.equal(reopened.actual.sessionFile, c.sessionFile);
+    assert.equal(typeof reopened.actual.sessionId, 'string');
+    assert.ok(reopened.actual.sessionId.length > 0);
     for (const name of ['private_parent_metadata_access', 'controller_home_metadata_access']) {
       assert.equal(report.assertions.find(a => a.name === name).observed.actual, 'allowed');
     }
@@ -293,6 +400,13 @@ test('real Pi same-UID pipe baseline when Unix sockets are unavailable', { timeo
       assert.equal(report.assertions.find(a => a.name === name).observed.actual, 'allowed');
     }
     assert.equal(report.transport, 'test_pipe');
+    assert.deepEqual(report.assertions.find(a => a.name === 'exact_session_path').observed,
+      { expected: c.sessionFile, actual: c.sessionFile });
+    const reopened = report.assertions.find(a => a.name === 'same_session_reopened').observed;
+    assert.deepEqual(reopened.actual, reopened.expected);
+    assert.equal(reopened.actual.sessionFile, c.sessionFile);
+    assert.equal(typeof reopened.actual.sessionId, 'string');
+    assert.ok(reopened.actual.sessionId.length > 0);
     assert.equal(report.assertions.some(a => a.name === 'endpoint_owner_and_ancestors'), false);
     assert.equal(report.assertions.find(a => a.name === 'same_uid_access_baseline').observed.separationClaim, false);
     assert.equal(children.length, 2, 'Fresh real Pi process for resumed session');
