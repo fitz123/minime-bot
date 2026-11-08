@@ -57,7 +57,7 @@ import {
  *   4. For Knowledge v2 workspaces, `wiki/schema.md` and `wiki/index.md`.
  *   5. Legacy mode: sorted `.claude/rules/platform/*.md`, then sorted
  *      `.claude/rules/custom/*.md`, each as a `## <relpath>` section.
- *      Foundation mode: recursively collected local `.claude/rules/**/*.md`,
+ *      Foundation mode: local Markdown files recursively collected under `.claude/rules`,
  *      excluding platform rules and the publication owner's source identities.
  *      Those source identities are also excluded from expanded local imports.
  *   6. A fixed `## Knowledge access` directive (verbatim {@link KNOWLEDGE_ACCESS_DIRECTIVE}).
