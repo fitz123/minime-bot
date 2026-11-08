@@ -326,6 +326,10 @@ function runInstalledDeliver(
 function assertPackFiles(files: readonly string[]): void {
   for (const expected of [
     "dist/cli.js",
+    "dist/agent-runtime.js",
+    "dist/agent-runtime-worker.js",
+    "dist/agent-runtime-client.js",
+    "dist/agent-runtime-protocol.js",
     "dist/config.js",
     "dist/cron-runner.js",
     "dist/pi-rpc-protocol.js",
@@ -636,6 +640,12 @@ describe("package artifact install", () => {
       const samplerHelp = runInstalledSamplerBin(projectDir, ["--help"], workspace);
       assert.equal(samplerHelp.status, 0, samplerHelp.stderr || samplerHelp.stdout || String(samplerHelp.error));
       assert.match(samplerHelp.stdout, /minime-codex-quota-sampler|codex-quota-sampler/);
+
+      const runtimeHelp = spawnSync(join(projectDir, "node_modules", ".bin", "minime-agent-runtime"), ["--help"], {
+        cwd: projectDir, encoding: "utf8", env: commandEnv({ MINIME_CONTROL_WORKSPACE_ROOT: workspace }), timeout: 10_000,
+      });
+      assert.equal(runtimeHelp.status, 0, runtimeHelp.stderr || runtimeHelp.stdout || String(runtimeHelp.error));
+      assert.match(runtimeHelp.stdout, /minime-agent-runtime --descriptor/);
 
       const samplerDryRun = runInstalledSamplerBin(
         projectDir,

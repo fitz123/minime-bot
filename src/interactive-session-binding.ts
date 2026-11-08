@@ -219,6 +219,22 @@ export function resolveInteractiveSessionLocation(
   return { workspaceRealpath, sessionDirectory };
 }
 
+/** Explicit worker input: never consult settings, ambient environment, or home defaults. */
+export function resolveExplicitInteractiveSessionLocation(
+  workspace: string,
+  sessionDirectory: string,
+  uid: number,
+): InteractiveSessionLocation {
+  assertCanonicalWorkspace(workspace);
+  if (!isAbsolute(sessionDirectory) || normalize(sessionDirectory) !== sessionDirectory) {
+    throw new Error("Explicit session directory must be a normalized absolute path");
+  }
+  return {
+    workspaceRealpath: workspace,
+    sessionDirectory: privateSessionDirectory(sessionDirectory, true, uid),
+  };
+}
+
 function isInside(parent: string, child: string): boolean {
   const rel = relative(parent, child);
   return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));

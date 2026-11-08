@@ -17,6 +17,7 @@ import {
 import { createHash, randomUUID } from "node:crypto";
 import {
   loadRawMergedConfig,
+  validateBehavioralFoundation,
   loadTelegramToken,
   resolveConfigWorkspaceRoot,
   validateAgent,
@@ -47,7 +48,8 @@ import {
   shouldIncludePiChildEnvKey,
   type PiSpawnRuntimeEnvOptions,
 } from "./pi-rpc-protocol.js";
-import { assemblePiContext } from "./pi-context-assembler.js";
+import { assemblePiContext, piContextResourceArgs } from "./pi-context-assembler.js";
+import { MINIME_BEHAVIORAL_FOUNDATION_ROOT_ENV } from "./behavioral-foundation.js";
 import {
   formatPiRuntimeDiagnostic,
   resolvePackageOwnedPiInvocation,
@@ -98,6 +100,7 @@ type PiThinkingLevel = NonNullable<AgentConfig["thinking"]>;
 const PI_THINKING_LEVELS = new Set<PiThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh"]);
 export interface CronAgentData {
   id: string;
+  behavioralFoundationRoot?: string;
   workspaceCwd: string;
   model: string;
   systemPrompt?: string;
@@ -836,6 +839,7 @@ function isCronPiThinking(value: unknown): value is PiThinkingLevel {
 function resolveCronAgentData(agentId: string, configPath?: string): CronAgentData {
   const workspaceRoot = resolveConfigWorkspaceRoot(configPath);
   const raw = loadRawMergedConfig(configPath) as {
+    behavioralFoundation?: unknown;
     agents?: Record<string, unknown>;
     defaultModel?: unknown;
     defaultFallbackModel?: unknown;
@@ -870,6 +874,8 @@ function resolveCronAgentData(agentId: string, configPath?: string): CronAgentDa
     workspaceCwd: agent.workspaceCwd,
     model: normalizePiModel(agent.model),
   };
+  const foundation = validateBehavioralFoundation(raw.behavioralFoundation);
+  if (foundation) result.behavioralFoundationRoot = foundation.root;
   if (agent.systemPrompt !== undefined) {
     result.systemPrompt = agent.systemPrompt;
   }
@@ -890,6 +896,7 @@ function buildPiCronAgentConfigFromData(agent: CronAgentData): AgentConfig {
     provider: "pi",
     model: agent.model,
   };
+  if (agent.behavioralFoundationRoot !== undefined) result.behavioralFoundationRoot = agent.behavioralFoundationRoot;
   if (agent.systemPrompt !== undefined) {
     result.systemPrompt = agent.systemPrompt;
   }
@@ -1424,13 +1431,12 @@ function runPi(
       })
       : deps.assembleContext(agent);
     if (context) {
-      if (context.systemPromptPath) {
-        args.push("--system-prompt", context.systemPromptPath);
-      }
-      args.push("--append-system-prompt", context.appendSystemPromptPath);
-      args.push("--no-context-files");
+      args.push(...piContextResourceArgs(context));
+      if (!args.includes("--no-context-files")) args.push("--no-context-files");
+      if (context.behavioralFoundation) env[MINIME_BEHAVIORAL_FOUNDATION_ROOT_ENV] = context.behavioralFoundation.root;
     }
   } catch (err) {
+    if (agent.behavioralFoundationRoot !== undefined) throw err;
     log(cron.name, `Pi context assembly failed; suppressing flat context loading: ${(err as Error).message}`);
     args.push("--no-context-files");
   }

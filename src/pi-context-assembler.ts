@@ -21,6 +21,12 @@ import { resolveKnowledgeLayout } from "./knowledge/layout.js";
 import { loadRawMergedConfig, resolveConfigWorkspaceRoot } from "./config.js";
 import { MINIME_OUTBOX_ENV } from "./pi-runtime-env.js";
 import { resolveAgentWorkspaceCwd } from "./workspace-contract.js";
+import {
+  resolveBehavioralFoundation, renderBehavioralFoundation, resolveFoundationSkillPaths,
+  collectFoundationLocalRules, includeLocalFoundationRule,
+  type ResolvedBehavioralFoundation,
+  foundationSkillArgs,
+} from "./behavioral-foundation.js";
 
 /**
  * Spawn-time context assembler for the Pi (`pi --mode rpc`, OpenAI Codex) path.
@@ -31,23 +37,29 @@ import { resolveAgentWorkspaceCwd } from "./workspace-contract.js";
  * and rule files silently vanish under Pi. This module assembles the same
  * workspace context convention from the agent's LIVE workspace files (zero drift),
  * and hands it to Pi via CLI args:
- *   --system-prompt          → the persona (REPLACES Pi's base prompt)
+ *   --system-prompt          → the persona (REPLACES Pi's base prompt); foundation
+ *                              mode supplies an empty value when no persona resolves
  *   --append-system-prompt   → the context bundle (APPENDED)
  *   --no-context-files       → so Pi does not ALSO load CLAUDE.md/AGENTS.md (no double context)
+ *   --no-skills, --skill     → explicit pinned shared and local skills in foundation mode
  *
  * Normal callers warn and skip missing/unreadable sources. Security-sensitive
  * callers can select strict mode, which rejects unavailable or unsafe declared
- * sources. Artifact-write failures always throw. Wiring into the spawn path is
- * in pi-rpc-protocol.ts.
+ * sources. Artifact-write failures always throw; required foundation assembly
+ * failures are fatal to launch. Wiring into the spawn path is in pi-rpc-protocol.ts.
  *
  * Deterministic bundle order (see {@link assembleBundle}):
- *   1. CLAUDE.md body with every `@<path>` line removed.
- *   2. Each removed `@`-import expanded as a `## <relpath>` section, in the order
+ *   1. When configured, the pinned shared behavioral foundation.
+ *   2. CLAUDE.md body with every `@<path>` line removed.
+ *   3. Each removed `@`-import expanded as a `## <relpath>` section, in the order
  *      the `@`-lines appeared (read relative to the CLAUDE.md dir; 1 level only —
  *      a nested `@`-line in an imported file is NOT recursed, only warned).
- *   3. For Knowledge v2 workspaces, `wiki/schema.md` and `wiki/index.md`.
- *   4. Every `.claude/rules/platform/*.md` as a `## <relpath>` section, sorted.
- *   5. Every `.claude/rules/custom/*.md` as a `## <relpath>` section, sorted.
+ *   4. For Knowledge v2 workspaces, `wiki/schema.md` and `wiki/index.md`.
+ *   5. Legacy mode: sorted `.claude/rules/platform/*.md`, then sorted
+ *      `.claude/rules/custom/*.md`, each as a `## <relpath>` section.
+ *      Foundation mode: local Markdown files recursively collected under `.claude/rules`,
+ *      excluding platform rules and the publication owner's source identities.
+ *      Those source identities are also excluded from expanded local imports.
  *   6. A fixed `## Knowledge access` directive (verbatim {@link KNOWLEDGE_ACCESS_DIRECTIVE}).
  *   7. For interactive sessions, a fixed `## File delivery` directive (verbatim
  *      {@link FILE_DELIVERY_DIRECTIVE}).
@@ -55,6 +67,8 @@ import { resolveAgentWorkspaceCwd } from "./workspace-contract.js";
 
 /** Resolved artifact paths handed to the Pi spawn (paths, not inline content). */
 export interface PiContextArtifacts {
+  /** Pinned nonsecret resources for explicit native skill loading and child inheritance. */
+  behavioralFoundation?: { root: string; digest: string; skillPaths: string[] };
   /** Persona file for `--system-prompt`. Omitted when the agent has no persona. */
   systemPromptPath?: string;
   /** Context-bundle file for `--append-system-prompt`. Always present on success. */
@@ -74,6 +88,7 @@ export type PiContextSourceKind =
   | "custom-rule"
   | "output-style"
   | "agent-config"
+  | "shared-resource"
   | "package-directive";
 
 /** A content-redacted source identity. No absolute path or source body is retained. */
@@ -93,6 +108,8 @@ export interface PiContextManifest {
 }
 
 export interface PiContextAssemblyOptions {
+  /** Explicit publication input; workers and parent launchers need no central config. */
+  behavioralFoundationRoot?: string;
   /** Private artifact destination. The context source workspace remains read-only. */
   artifactWorkspaceCwd?: string;
   /** Include the package directive for sessions whose child environment has an outbox. */
@@ -100,6 +117,19 @@ export interface PiContextAssemblyOptions {
   telegramRichAnswers?: boolean;
   /** Reject unsafe, missing, or unreadable declared sources instead of skipping them. */
   strict?: boolean;
+}
+
+/** Native Pi resource arguments shared by launch adapters and external launchers. */
+export function piContextResourceArgs(context: PiContextArtifacts): string[] {
+  const args: string[] = [];
+  if (context.systemPromptPath !== undefined || context.behavioralFoundation) {
+    // An explicit empty value suppresses Pi's independent ambient SYSTEM.md lookup.
+    args.push("--system-prompt", context.systemPromptPath ?? "");
+  }
+  args.push("--append-system-prompt", context.appendSystemPromptPath);
+  if (context.suppressContextFiles !== false) args.push("--no-context-files");
+  if (context.behavioralFoundation) args.push(...foundationSkillArgs(context.behavioralFoundation.skillPaths));
+  return args;
 }
 
 /** Artifact-write failure annotated with the native-context decision already made by assembly. */
@@ -462,7 +492,7 @@ function isContainedImport(baseDir: string, relpath: string): boolean {
 export function expandImports(
   body: string,
   baseDir: string,
-  options: { strict?: boolean } = {},
+  options: { strict?: boolean; includeImport?: (relpath: string) => boolean } = {},
 ): {
   bodyWithoutImports: string;
   sections: ContextSection[];
@@ -485,6 +515,7 @@ export function expandImports(
       );
       continue;
     }
+    if (options.includeImport && !options.includeImport(relative(baseDir, resolve(baseDir, relpath)).split(sep).join("/"))) continue;
     const abs = resolve(baseDir, relpath);
     const { content, escaped } = safeReadContainedFile(abs, baseDir, {
       rejectSymlink: options.strict,
@@ -605,6 +636,8 @@ function assembleBundle(
   strict = false,
   includeFileDelivery = false,
   telegramRichAnswers = false,
+  foundation?: ResolvedBehavioralFoundation,
+  agentId = "",
 ): BundleResult {
   const claudeMdPath = join(workspaceCwd, "CLAUDE.md");
   if (strict) rejectDirectSymlink(claudeMdPath, "CLAUDE.md");
@@ -622,13 +655,19 @@ function assembleBundle(
   const { bodyWithoutImports, sections, importLineCount } = expandImports(
     rawBody ?? "",
     dirname(claudeMdPath),
-    { strict },
+    { strict, includeImport: foundation ? identity => includeLocalFoundationRule(foundation, agentId, identity) : undefined },
   );
   const knowledgeSections = collectKnowledgeSections(workspaceCwd, strict);
-  const rules = collectRules(workspaceCwd, { strict });
+  const rules = foundation
+    ? collectFoundationLocalRules(foundation, workspaceCwd, agentId, strict)
+    : collectRules(workspaceCwd, { strict });
 
   const parts: string[] = [];
   const sources: PiContextSourceManifest[] = [];
+  if (foundation) {
+    parts.push(renderBehavioralFoundation(foundation));
+    sources.push({ kind: "shared-resource", identity: "shared:behavioral-foundation-v1", contentHash: foundation.digest });
+  }
   if (rawBody !== null) {
     sources.push(contextSource("workspace", "workspace:CLAUDE.md", rawBody));
   }
@@ -671,6 +710,7 @@ function assembleBundle(
   // a bare spawn would flat-load the original CLAUDE.md with its literal `@<path>`
   // lines intact, so the stripped bundle + `--no-context-files` is strictly better.
   const suppressContextFiles =
+    foundation !== undefined ||
     trimmedBody !== "" ||
     sections.length > 0 ||
     knowledgeSections.length > 0 ||
@@ -739,7 +779,8 @@ export function buildBundle(workspaceCwd: string): string {
  *    `<workspaceCwd>/.claude/output-styles/<outputStyle>.md`; that file is the persona.
  *  - If `agent.systemPrompt` (config) is also set, append it AFTER the output-style
  *    content (blank-line separated).
- *  - If neither resolves → null → the caller passes NO `--system-prompt` (ride Pi base).
+ *  - If neither resolves → null. Legacy callers keep Pi's base prompt;
+ *    foundation callers pass an explicit empty `--system-prompt`.
  */
 export function resolvePersona(agent: AgentConfig): string | null {
   return resolvePersonaWithSources(agent).persona;
@@ -838,9 +879,11 @@ function readOutputStyleSource(
  * Atomically write a bundle/persona artifact to a STABLE per-agent path under
  * `<workspaceCwd>/.tmp/`: `pi-context-<safe-agent-id>[.<variant>].<kind>.md`.
  * Write a staging file then `renameSync` over the final path, so a concurrent
- * reader never sees a half-written file. Stable path ⇒ no accumulation, no
- * cleanup job. The `.tmp` dir and artifact files are private because they contain
- * assembled system context. Returns the final path. May throw (e.g. unwritable
+ * reader never sees a half-written file. Configured foundation callers include
+ * the context digest in agentId and retain prior artifacts so active reloads and
+ * parallel contexts keep their original bytes. Retention is intentionally unbounded;
+ * cleanup requires lifecycle knowledge outside this assembler. The `.tmp` dir and
+ * artifact files are private because they contain assembled system context. Returns the final path. May throw (e.g. unwritable
  * `.tmp/`) — the caller (assemblePiContext) wraps it in the fail-safe.
  */
 export function writeTempArtifact(
@@ -971,12 +1014,17 @@ export function assemblePiContext(
   agent: AgentConfig,
   options: PiContextAssemblyOptions = {},
 ): PiContextArtifacts | null {
+  const foundationRoot = options.behavioralFoundationRoot ?? agent.behavioralFoundationRoot;
+  const foundation = foundationRoot === undefined ? undefined : resolveBehavioralFoundation(foundationRoot);
+  const skillPaths = foundation ? resolveFoundationSkillPaths(foundation, agent.workspaceCwd, agent.id) : undefined;
   const strict = options.strict === true;
   const includeFileDelivery = options.includeFileDelivery === true;
   const telegramRichAnswers = includeFileDelivery && options.telegramRichAnswers === true;
-  const signature = strict ? null : computeManifestSignature(agent);
+  // Configured loads assemble afresh without the legacy signature walk, which
+  // can consult central Main config. Ordinary local error semantics stay intact.
+  const signature = strict || foundation ? null : computeManifestSignature(agent);
   const cacheKey = `${agent.id}\0${resolve(agent.workspaceCwd)}\0${strict}\0${includeFileDelivery}\0${telegramRichAnswers}`;
-  const cached = strict ? undefined : cache.get(cacheKey);
+  const cached = signature === null ? undefined : cache.get(cacheKey);
 
   let bundle: string;
   let persona: string | null;
@@ -992,7 +1040,7 @@ export function assemblePiContext(
     suppressContextFiles = cached.suppressContextFiles;
     manifest = cached.manifest;
   } else {
-    const assembled = assembleBundle(agent.workspaceCwd, strict, includeFileDelivery, telegramRichAnswers);
+    const assembled = assembleBundle(agent.workspaceCwd, strict, includeFileDelivery, telegramRichAnswers, foundation, agent.id);
     const resolvedPersona = resolvePersonaWithSources(agent, strict);
     if (!assembled.hasContent && resolvedPersona.persona === null) {
       // Empty workspace — let Pi fall back to its own (flat) context loading
@@ -1006,7 +1054,8 @@ export function assemblePiContext(
     manifest = buildContextManifest(
       bundle,
       persona,
-      [...assembled.sources, ...resolvedPersona.sources],
+      [...assembled.sources, ...resolvedPersona.sources,
+        ...(foundation ? [{ kind: "shared-resource" as const, identity: "shared:skill-selection-v1", contentHash: sha256(JSON.stringify(skillPaths)) }] : [])],
     );
   }
 
@@ -1014,18 +1063,21 @@ export function assemblePiContext(
   // bundle/persona faithful to the cached content even if a prior session or an
   // external process overwrote them, and recreates an artifact that was deleted.
   const artifactWorkspaceCwd = options.artifactWorkspaceCwd ?? agent.workspaceCwd;
+  // Configured sessions keep immutable artifact names too: a later load must not
+  // replace files still referenced by a running session.
+  const artifactAgentId = foundation ? `${agent.id}-${manifest.digest.slice(7)}` : agent.id;
   let appendSystemPromptPath: string;
   let systemPromptPath: string | undefined;
   try {
     appendSystemPromptPath = writeTempArtifact(
       artifactWorkspaceCwd,
-      agent.id,
+      artifactAgentId,
       "bundle",
       bundle,
       includeFileDelivery ? { variant: telegramRichAnswers ? "telegram-rich" : "file-delivery" } : undefined,
     );
     if (persona !== null) {
-      systemPromptPath = writeTempArtifact(artifactWorkspaceCwd, agent.id, "persona", persona);
+      systemPromptPath = writeTempArtifact(artifactWorkspaceCwd, artifactAgentId, "persona", persona);
     }
   } catch (err) {
     throw new PiContextArtifactWriteError(
@@ -1039,6 +1091,7 @@ export function assemblePiContext(
     systemPromptPath !== undefined
       ? { systemPromptPath, appendSystemPromptPath, suppressContextFiles, manifest }
       : { appendSystemPromptPath, suppressContextFiles, manifest };
+  if (foundation) result.behavioralFoundation = { root: foundation.root, digest: foundation.digest, skillPaths: skillPaths! };
   if (signature !== null) {
     cache.set(cacheKey, { signature, bundle, persona, suppressContextFiles, manifest });
   }
@@ -1048,4 +1101,24 @@ export function assemblePiContext(
 /** Test-only: clear the per-agent manifest cache. */
 export function _resetPiContextCache(): void {
   cache.clear();
+}
+
+/** Foundation + delegated role only: never reads the parent's companion workspace. */
+export function assemblePiSubagentFoundation(
+  root: string,
+  artifactWorkspaceCwd: string,
+  agentId: string,
+  rolePrompt: string,
+): PiContextArtifacts {
+  const foundation = resolveBehavioralFoundation(root);
+  const bundle = `${renderBehavioralFoundation(foundation)}\n\n## Delegated role\n\n${rolePrompt.trim()}\n`;
+  const manifest = buildContextManifest(bundle, null, [
+    { kind: "shared-resource", identity: "shared:behavioral-foundation-v1", contentHash: foundation.digest },
+    contextSource("agent-config", "agent:delegated-role", rolePrompt),
+  ]);
+  const appendSystemPromptPath = writeTempArtifact(artifactWorkspaceCwd, `${agentId}-${manifest.digest.slice(7)}`, "bundle", bundle);
+  return {
+    appendSystemPromptPath, suppressContextFiles: true, manifest,
+    behavioralFoundation: { root: foundation.root, digest: foundation.digest, skillPaths: foundation.skillPaths },
+  };
 }
