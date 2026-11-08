@@ -20,6 +20,8 @@
  * a real `pi` process.
  */
 
+import { piContextResourceArgs, type PiContextArtifacts } from "../pi-context-assembler.js";
+
 /** Provider every subagent child is spawned under (parity with the parent). */
 export const SUBAGENT_PROVIDER = "openai-codex";
 /** Default model when an agent definition pins none (parity with the parent). */
@@ -49,6 +51,8 @@ export interface SubagentSpawnAgent {
 }
 
 export interface BuildSubagentSpawnArgsOptions {
+  /** Foundation plus delegated role only; never the parent's companion bundle. */
+  foundationContext?: PiContextArtifacts;
   /**
    * Path to a temp file holding the agent's system prompt. When set, append it
    * via `--append-system-prompt <path>` (the vendor writes a 0600 temp file).
@@ -95,7 +99,9 @@ export function buildSubagentSpawnArgs(
     args.push("--tools", agent.tools.join(","));
   }
 
-  if (options?.systemPromptPath) {
+  if (options?.foundationContext) {
+    args.push(...piContextResourceArgs(options.foundationContext));
+  } else if (options?.systemPromptPath) {
     args.push("--append-system-prompt", options.systemPromptPath);
   }
 

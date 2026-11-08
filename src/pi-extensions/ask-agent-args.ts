@@ -4,7 +4,8 @@ import {
   PI_PROVIDER,
   normalizePiModel,
 } from "../pi-rpc-protocol.js";
-import type { PiContextArtifacts } from "../pi-context-assembler.js";
+import { piContextResourceArgs, type PiContextArtifacts } from "../pi-context-assembler.js";
+import { BehavioralFoundationError, MINIME_BEHAVIORAL_FOUNDATION_ROOT_ENV } from "../behavioral-foundation.js";
 import type { AgentConfig, BotConfig } from "../types.js";
 import { resolvePiInvocation, type PiInvocation } from "./pi-invocation.js";
 import {
@@ -224,11 +225,8 @@ export function buildAskAgentTargetSpawnArgs(
     args.push("--thinking", target.thinking);
   }
 
-  if (options.context.systemPromptPath) {
-    args.push("--system-prompt", options.context.systemPromptPath);
-  }
-  args.push("--append-system-prompt", options.context.appendSystemPromptPath);
-  args.push("--no-context-files");
+  args.push(...piContextResourceArgs(options.context));
+  if (!args.includes("--no-context-files")) args.push("--no-context-files");
 
   if (options.extensionArgs && options.extensionArgs.length > 0) {
     args.push(...options.extensionArgs);
@@ -407,7 +405,9 @@ export async function runAskAgentTargetChild(
       command: invocation.command,
       args: invocation.args,
       cwd: request.target.workspaceCwd,
-      env: deps.env,
+      env: request.context.behavioralFoundation
+        ? { ...deps.env, [MINIME_BEHAVIORAL_FOUNDATION_ROOT_ENV]: request.context.behavioralFoundation.root }
+        : deps.env,
       signal: timeout.signal,
       abortGraceMs: deps.abortGraceMs ?? ASK_AGENT_CHILD_ABORT_GRACE_MS,
       agentName: request.target.id,
@@ -570,8 +570,9 @@ export async function executeAskAgent(paramsLike: unknown, deps: ExecuteAskAgent
   let context: PiContextArtifacts | null;
   try {
     context = deps.assembleContext(validatedTarget);
-  } catch {
-    return finish(makeAskAgentError("context_failed", "ask-agent target context is unavailable", {
+  } catch (error) {
+    const message = error instanceof BehavioralFoundationError ? error.message : "ask-agent target context is unavailable";
+    return finish(makeAskAgentError("context_failed", message, {
       callerAgentId,
       targetAgentId,
     }));

@@ -21,7 +21,9 @@ import {
   PiContextArtifactWriteError,
   type PiContextAssemblyOptions,
   type PiContextArtifacts,
+  piContextResourceArgs,
 } from "./pi-context-assembler.js";
+import { MINIME_BEHAVIORAL_FOUNDATION_ROOT_ENV } from "./behavioral-foundation.js";
 import {
   formatPiRuntimeDiagnostic,
   resolvePackageOwnedPiInvocation,
@@ -176,6 +178,8 @@ export interface PiSpawnExtensionOptions extends PiExtensionResolveOptions {
 }
 
 export interface PiSpawnRuntimeEnvOptions {
+  /** Trusted adapter input captured by the same context load as the launch args. */
+  behavioralFoundationRoot?: string;
   collaborationSession?: string;
   collaborationSocket?: string;
   /** Trusted current agent id supplied by SessionManager for first-party tools. */
@@ -203,6 +207,7 @@ export interface PiSessionIdentity {
 type LegacyInteractiveSessionInput = PiSpawnPathBinding | string | undefined;
 
 const PI_CHILD_ENV_KEY_ALLOWLIST = new Set([
+  MINIME_BEHAVIORAL_FOUNDATION_ROOT_ENV,
   "CI",
   "COLORTERM",
   "FORCE_COLOR",
@@ -617,6 +622,7 @@ export function buildPiSpawnArgs(
   sessionBinding?: LegacyInteractiveSessionInput,
   extensionOptions?: PiSpawnExtensionOptions,
   runtimeEnvOptions?: PiSpawnRuntimeEnvOptions,
+  prepared?: { context: PiContextArtifacts | null },
 ): string[] {
   const args = [
     "--mode", "rpc",
@@ -647,20 +653,15 @@ export function buildPiSpawnArgs(
   // assembler could not safely deliver.
   const includeFileDelivery = Boolean(runtimeEnvOptions?.outboxPath?.trim());
   try {
-    const context = assemblePiContextForCurrentDeployment(agent, {
+    const context = prepared ? prepared.context : assemblePiContextForCurrentDeployment(agent, {
       includeFileDelivery,
       telegramRichAnswers: runtimeEnvOptions?.telegramRichAnswers,
     });
     if (context) {
-      if (context.systemPromptPath) {
-        args.push("--system-prompt", context.systemPromptPath);
-      }
-      args.push("--append-system-prompt", context.appendSystemPromptPath);
-      if (context.suppressContextFiles !== false) {
-        args.push("--no-context-files");
-      }
+      args.push(...piContextResourceArgs(context));
     }
   } catch (err) {
+    if (agent.behavioralFoundationRoot !== undefined) throw err;
     const suppressContextFiles =
       !(err instanceof PiContextArtifactWriteError) || err.suppressContextFiles;
     const contextLoadingOutcome = suppressContextFiles
@@ -791,6 +792,9 @@ function buildAllowedPiChildEnv(
   copyExplicitControlPathEnv(env, contract, MINIME_CONFIG_PATH_ENV, "configPath");
   copyExplicitControlPathEnv(env, contract, MINIME_CRONS_PATH_ENV, "cronsPath");
   env[MINIME_BOT_PI_SESSION_ENV] = "1";
+  if (runtimeEnvOptions?.behavioralFoundationRoot !== undefined) {
+    env[MINIME_BEHAVIORAL_FOUNDATION_ROOT_ENV] = runtimeEnvOptions.behavioralFoundationRoot;
+  }
   if (runtimeEnvOptions?.collaborationSession && runtimeEnvOptions.collaborationSocket) {
     env.MINIME_COLLABORATION_SOCKET = runtimeEnvOptions.collaborationSocket;
     env.MINIME_COLLABORATION_SESSION = runtimeEnvOptions.collaborationSession;
@@ -843,11 +847,12 @@ export function spawnPreparedPiRpcSession(options: {
   if (!inspection.valid) throw new Error(`Invalid prepared Pi binding: ${inspection.reason}`);
   const args = ["--mode", "rpc", "--model", options.model, "--thinking", options.thinking,
     "--session-dir", binding.sessionDirectory, "--session", binding.sessionFile,
-    "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files",
-    "--append-system-prompt", context.appendSystemPromptPath];
+    "--no-extensions", "--no-prompt-templates",
+    ...piContextResourceArgs(context)];
+  if (!context.behavioralFoundation) args.push("--no-skills");
   // Pi discovers SYSTEM.md independently of --no-context-files. Empty input
   // suppresses that discovery while retaining Pi's built-in default prompt.
-  args.push("--system-prompt", context.systemPromptPath ?? "");
+  if (!context.systemPromptPath && !context.behavioralFoundation) args.push("--system-prompt", "");
   if (options.tools.length) args.push("--tools", options.tools.join(","));
   else args.push("--no-tools");
   for (const extension of options.extensions) args.push("--extension", extension);
@@ -855,7 +860,11 @@ export function spawnPreparedPiRpcSession(options: {
   const invocation = resolvePackageOwnedPiInvocation("rpc", args);
   if (invocation.diagnostic.versionMismatch) throw new Error("Worker requires the pinned Pi runtime");
   return spawn(invocation.command, invocation.args, {
-    cwd: binding.workspaceRealpath, env: options.env,
+    cwd: binding.workspaceRealpath,
+    env: {
+      ...options.env,
+      ...(context.behavioralFoundation ? { [MINIME_BEHAVIORAL_FOUNDATION_ROOT_ENV]: context.behavioralFoundation.root } : {}),
+    },
     stdio: ["pipe", "pipe", "pipe"], detached: true,
   });
 }
@@ -868,7 +877,6 @@ export function spawnPiRpcSession(
 ): ChildProcess {
   const workspaceCwd = resolveValidatedPiAgentWorkspaceCwd(agent);
   const spawnAgent = { ...agent, workspaceCwd };
-  const env = buildPiSpawnEnv(workspaceCwd, runtimeEnvOptions);
   const exactPath = assertPiSpawnSessionBinding(sessionBinding);
   if (
     !sessionBinding
@@ -892,7 +900,17 @@ export function spawnPiRpcSession(
     throw new Error(`Interactive Pi session binding is not usable: ${inspection.reason}`);
   }
   const exactBinding = inspection.binding;
-  const args = buildPiSpawnArgs(spawnAgent, exactBinding, extensionOptions, runtimeEnvOptions);
+  const prepared = agent.behavioralFoundationRoot === undefined ? undefined : {
+    context: assemblePiContextForCurrentDeployment(spawnAgent, {
+      includeFileDelivery: Boolean(runtimeEnvOptions?.outboxPath?.trim()),
+      telegramRichAnswers: runtimeEnvOptions?.telegramRichAnswers,
+    }),
+  };
+  const args = buildPiSpawnArgs(spawnAgent, exactBinding, extensionOptions, runtimeEnvOptions, prepared);
+  const env = buildPiSpawnEnv(workspaceCwd, {
+    ...runtimeEnvOptions,
+    ...(prepared?.context?.behavioralFoundation ? { behavioralFoundationRoot: prepared.context.behavioralFoundation.root } : {}),
+  });
   const invocation = resolvePackageOwnedPiInvocation("rpc", args);
   log.info("pi-rpc", `package-owned runtime ${formatPiRuntimeDiagnostic(invocation.diagnostic)}`);
   const child = spawn(invocation.command, invocation.args, {

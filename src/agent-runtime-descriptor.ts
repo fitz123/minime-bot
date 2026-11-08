@@ -17,6 +17,8 @@ export interface AgentRuntimeDescriptor {
   stateRoot: string;
   sessionRoot: string;
   contextRoot: string;
+  /** Nonsecret publication input; workers never discover this via control config. */
+  behavioralFoundationRoot?: string;
   socketDirectory: string;
   socketPath: string;
   model: string;
@@ -32,7 +34,7 @@ export function validateAgentRuntimeDescriptor(input: unknown): AgentRuntimeDesc
   if (!d || d.version !== 1 || typeof d.agentId !== 'string' || !/^[a-zA-Z0-9_-]{1,80}$/.test(d.agentId)) throw new Error('Invalid worker descriptor identity/version');
   const fields = ['version', 'agentId', 'workerUid', 'workerGid', 'home', 'controllerUid', 'controllerName',
     'workspace', 'stateRoot', 'sessionRoot', 'contextRoot', 'socketDirectory', 'socketPath', 'model',
-    'thinking', 'knowledge', 'capabilities', 'tools', 'offline'];
+    'thinking', 'knowledge', 'capabilities', 'tools', 'offline', 'behavioralFoundationRoot'];
   if (Object.keys(d).some(k => !fields.includes(k))) throw new Error('Unsupported worker descriptor field');
   for (const value of [d.workerUid, d.workerGid]) {
     if (!Number.isSafeInteger(value) || value <= 0) throw new Error('Positive nonroot worker identity required');
@@ -42,6 +44,9 @@ export function validateAgentRuntimeDescriptor(input: unknown): AgentRuntimeDesc
   for (const p of [d.home, d.workspace, d.stateRoot, d.sessionRoot, d.contextRoot, d.socketDirectory, d.socketPath]) {
     if (typeof p !== 'string' || !isAbsolute(p) || resolve(p) !== p || /[\0\r\n]/.test(p)) throw new Error('Explicit canonical absolute worker paths required');
   }
+  if (d.behavioralFoundationRoot !== undefined && (typeof d.behavioralFoundationRoot !== 'string'
+    || !isAbsolute(d.behavioralFoundationRoot) || resolve(d.behavioralFoundationRoot) !== d.behavioralFoundationRoot
+    || /[\0\r\n]/.test(d.behavioralFoundationRoot))) throw new Error('Explicit absolute behavioral foundation root required');
   if (dirname(d.socketPath) !== d.socketDirectory || Buffer.byteLength(d.socketPath) >= 104) throw new Error('Invalid worker socket location');
   if (new Set([d.home, d.workspace, d.stateRoot, d.sessionRoot, d.contextRoot, d.socketDirectory]).size !== 6) throw new Error('Worker roots must be distinct');
   if (typeof d.model !== 'string' || !/^[^\s/]+\/\S+$/.test(d.model)

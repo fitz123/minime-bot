@@ -151,6 +151,12 @@ function validateInstanceOverlay(raw: unknown): Record<string, unknown> {
     if (key === "triggerInput" || key === "collaboration") {
       continue;
     }
+    if (key === "behavioralFoundation") {
+      if (!isConfigRecord(value) || Object.keys(value).some(k => k !== "root")) {
+        rejectInstancePath("behavioralFoundation");
+      }
+      continue;
+    }
     if (key === "discord") {
       if (value !== false) {
         rejectInstancePath(firstInstanceLeafPath(value, "discord"));
@@ -282,6 +288,13 @@ function mergeInstanceConfig(
   canonical: Record<string, unknown>,
   instance: Record<string, unknown>,
 ): Record<string, unknown> {
+  if (Object.hasOwn(instance, "behavioralFoundation")) {
+    const proposed = validateBehavioralFoundation(instance.behavioralFoundation);
+    const original = validateBehavioralFoundation(canonical.behavioralFoundation);
+    if (!proposed || !original || proposed.root !== original.root) {
+      throw new Error("Instance config cannot unset or replace canonical behavioralFoundation.root");
+    }
+  }
   requireAbsoluteCanonicalAgentWorkspaces(canonical);
   const withBindingIdentity = applyBindingIdentityOverrides(
     canonical,
@@ -330,6 +343,7 @@ export function loadRawMergedConfig(
 }
 
 interface RawConfig {
+  behavioralFoundation?: unknown;
   secrets?: {
     sopsFile?: string;
   };
@@ -445,6 +459,9 @@ export function validateAgent(
   }
   const obj = raw as Record<string, unknown>;
   const askAgent = validateAskAgentConfig(obj.askAgent, id, knownAgentIds);
+  if (Object.hasOwn(obj, "behavioralFoundation") || Object.hasOwn(obj, "behavioralFoundationRoot")) {
+    throw new Error(`Agent "${id}": behavioralFoundation.root is deployment-global, not a per-agent setting`);
+  }
   if (typeof obj.workspaceCwd !== "string") {
     throw new Error(`Agent "${id}" missing workspaceCwd`);
   }
@@ -952,6 +969,16 @@ export function validateCollaboration(raw: unknown): BotConfig["collaboration"] 
   return { socketPath: raw.socketPath };
 }
 
+/** Config schema: one optional deployment-global absolute publication root. */
+export function validateBehavioralFoundation(raw: unknown): BotConfig["behavioralFoundation"] {
+  if (raw === undefined) return undefined;
+  if (!isConfigRecord(raw) || Object.keys(raw).some(k => k !== "root") ||
+      typeof raw.root !== "string" || !isAbsolute(raw.root) || /[\0\r\n]/.test(raw.root)) {
+    throw new Error("behavioralFoundation must be { root: an absolute publication directory path }");
+  }
+  return { root: raw.root };
+}
+
 export function loadConfig(configPath?: string, options: LoadConfigOptions = {}): BotConfig {
   const raw: RawConfig = loadRawMergedConfig(configPath, options.instanceConfigPath) as RawConfig;
   const resolveSecrets = options.resolveSecrets !== false;
@@ -973,6 +1000,7 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
   const defaultModel = typeof raw.defaultModel === "string" ? raw.defaultModel : undefined;
   const piExtraExtensions = validatePiExtraExtensions(raw.piExtraExtensions);
   const collaboration = validateCollaboration(raw.collaboration);
+  const behavioralFoundation = validateBehavioralFoundation(raw.behavioralFoundation);
   const whisperModelPath = resolveWhisperModelPath(raw.whisperModel);
 
   // Validate agents (needed before validating bindings)
@@ -983,6 +1011,7 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
   const knownAgentIds = new Set(Object.keys(raw.agents));
   for (const [id, agentRaw] of Object.entries(raw.agents)) {
     agents[id] = { ...validateAgent(agentRaw, id, defaultModel, workspaceRoot, knownAgentIds), id };
+    if (behavioralFoundation) agents[id].behavioralFoundationRoot = behavioralFoundation.root;
   }
 
   // Resolve Telegram transport only when this process owns Telegram bindings.
@@ -1102,7 +1131,7 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
     defaultDeliveryThreadId = raw.defaultDeliveryThreadId;
   }
 
-  return { telegramToken, agents, bindings, sessionDefaults, whisperModelPath, piExtraExtensions, collaboration, logLevel, metricsPort, metricsHost, discord, adminChatId, defaultDeliveryChatId, defaultDeliveryThreadId, triggerInput };
+  return { telegramToken, agents, behavioralFoundation, bindings, sessionDefaults, whisperModelPath, piExtraExtensions, collaboration, logLevel, metricsPort, metricsHost, discord, adminChatId, defaultDeliveryChatId, defaultDeliveryThreadId, triggerInput };
 }
 
 function realpathOrResolve(path: string): string {

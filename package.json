@@ -3,6 +3,14 @@
   "version": "2026.11.3",
   "description": "Multi-agent Telegram and Discord bot powered by Pi/Codex sessions",
   "main": "./dist/main.js",
+  "exports": {
+    ".": "./dist/main.js",
+    "./shared-behavior": {
+      "types": "./dist/shared-behavior.d.ts",
+      "default": "./dist/shared-behavior.js"
+    },
+    "./*": "./*"
+  },
   "bin": {
     "minime-bot": "./dist/cli.js",
     "minime-codex-quota-sampler": "./dist/codex-quota-sampler.js",
@@ -51,7 +59,9 @@
     "docs/collaboration.md",
     "examples/monitoring/*",
     "docs/codex-fast.md",
-    "docs/agent-runtime.md"
+    "docs/agent-runtime.md",
+    "docs/shared-behavior.md",
+    "docs/shared-behavior.schema.json"
   ],
   "keywords": [
     "telegram",
@@ -76,6 +86,7 @@
     "@grammyjs/auto-retry": "^2.0.2",
     "discord.js": "^14.27.0",
     "grammy": "1.46.0",
+    "ignore": "7.0.8",
     "jiti": "2.7.0",
     "p-queue": "^9.3.3",
     "prom-client": "^15.1.3",

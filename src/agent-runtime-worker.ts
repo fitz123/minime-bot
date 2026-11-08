@@ -96,6 +96,7 @@ export class AgentRuntimeWorker {
       readFileSync(claude);
       // Reject before assembler's legacy external platform-rule resolver can read central config.
       for (const rel of ['.claude', '.claude/rules', '.claude/rules/platform', '.claude/rules/custom']) {
+        if (d.behavioralFoundationRoot !== undefined && rel === '.claude/rules/platform') continue;
         const p = join(d.workspace, rel);
         try {
           if (lstatSync(p).isSymbolicLink() || !inside(d.workspace, realpathSync(p))) throw new Error('External/symlink rule directories are unsupported');
@@ -112,10 +113,13 @@ export class AgentRuntimeWorker {
       const artifactRoot = join(d.contextRoot, createHash('sha256').update(laneId).digest('hex'));
       requirePrivateWorkerDirectory(artifactRoot, d.workerUid);
       const context = assemblePiContext({ id: d.agentId, workspaceCwd: d.workspace, model: d.model, thinking: d.thinking },
-        { strict: true, artifactWorkspaceCwd: artifactRoot });
+        { strict: true, artifactWorkspaceCwd: artifactRoot, behavioralFoundationRoot: d.behavioralFoundationRoot });
       if (!context) throw new Error('No worker context');
       return context;
-    } catch { return fail('context_invalid', 'Required local context/imports/rules are missing or unsupported; Pi was not started'); }
+    } catch (error) {
+      if (d.behavioralFoundationRoot !== undefined) return fail('context_invalid', `Required local context or behavioral foundation is invalid; Pi was not started. ${error instanceof Error ? error.message : 'Check descriptor and publication'}`);
+      return fail('context_invalid', 'Required local context/imports/rules are missing or unsupported; Pi was not started');
+    }
   }
 
   private environment(): NodeJS.ProcessEnv {
