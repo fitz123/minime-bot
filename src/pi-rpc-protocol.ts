@@ -636,21 +636,23 @@ export function buildPiSpawnArgs(
   }
 
   // Spawn-time context assembly. The assembler (pi-context-assembler.ts) gives
-  // workspace-context parity from the agent's LIVE workspace files, delivered as three CLI
-  // layers, REPLACING the old `agent.systemPrompt → --append-system-prompt` branch:
-  //   --system-prompt <persona>   REPLACES Pi's base prompt (omitted when no persona
-  //                               resolves — the agent then rides Pi's base prompt).
-  //   --append-system-prompt <bundle>  the CLAUDE.md + @-imports + rules bundle,
-  //                                    or inline file-delivery fallback text.
+  // workspace-context parity from the agent's LIVE workspace files via CLI args:
+  //   --system-prompt <persona>   REPLACES Pi's base prompt. With no persona,
+  //                               foundation mode emits an explicit empty prompt;
+  //                               legacy mode omits the flag and keeps Pi's base prompt.
+  //   --append-system-prompt <bundle>  the pinned foundation (when configured),
+  //                                    CLAUDE.md, @-imports and local rules bundle,
+  //                                    or legacy inline file-delivery fallback text.
   //   --no-context-files          when assembled workspace/persona layers replace
   //                               native context (omitted for delivery-only bundles
   //                               so Pi can still load an AGENTS.md from cwd).
   // At most ONE --system-prompt and ONE --append-system-prompt are emitted. The
-  // assembler is fail-safe for source reads (bad source → warn+skip; empty
-  // workspace without an interactive outbox → null → bare spawn), but artifact
-  // writes can throw after source content has been classified. A throw must fail
-  // closed with --no-context-files so Pi does not flat-load context files the
-  // assembler could not safely deliver.
+  // foundation mode also emits --no-skills and explicit --skill paths; its local
+  // rules are recursive and exclude platform rules and shared source identities.
+  // Required foundation assembly errors abort launch. Legacy source reads can
+  // warn+skip (an empty workspace without an outbox yields a bare spawn). Legacy
+  // assembly errors suppress flat context loading when classified layers require
+  // it; delivery-only artifact errors preserve native context loading.
   const includeFileDelivery = Boolean(runtimeEnvOptions?.outboxPath?.trim());
   try {
     const context = prepared ? prepared.context : assemblePiContextForCurrentDeployment(agent, {

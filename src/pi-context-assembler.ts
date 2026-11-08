@@ -37,14 +37,16 @@ import {
  * and rule files silently vanish under Pi. This module assembles the same
  * workspace context convention from the agent's LIVE workspace files (zero drift),
  * and hands it to Pi via CLI args:
- *   --system-prompt          → the persona (REPLACES Pi's base prompt)
+ *   --system-prompt          → the persona (REPLACES Pi's base prompt); foundation
+ *                              mode supplies an empty value when no persona resolves
  *   --append-system-prompt   → the context bundle (APPENDED)
  *   --no-context-files       → so Pi does not ALSO load CLAUDE.md/AGENTS.md (no double context)
+ *   --no-skills, --skill     → explicit pinned shared and local skills in foundation mode
  *
  * Normal callers warn and skip missing/unreadable sources. Security-sensitive
  * callers can select strict mode, which rejects unavailable or unsafe declared
- * sources. Artifact-write failures always throw. Wiring into the spawn path is
- * in pi-rpc-protocol.ts.
+ * sources. Artifact-write failures always throw; required foundation assembly
+ * failures are fatal to launch. Wiring into the spawn path is in pi-rpc-protocol.ts.
  *
  * Deterministic bundle order (see {@link assembleBundle}):
  *   1. When configured, the pinned shared behavioral foundation.
@@ -53,10 +55,13 @@ import {
  *      the `@`-lines appeared (read relative to the CLAUDE.md dir; 1 level only —
  *      a nested `@`-line in an imported file is NOT recursed, only warned).
  *   4. For Knowledge v2 workspaces, `wiki/schema.md` and `wiki/index.md`.
- *   5. Every `.claude/rules/platform/*.md` as a `## <relpath>` section, sorted.
- *   6. Every `.claude/rules/custom/*.md` as a `## <relpath>` section, sorted.
- *   7. A fixed `## Knowledge access` directive (verbatim {@link KNOWLEDGE_ACCESS_DIRECTIVE}).
- *   8. For interactive sessions, a fixed `## File delivery` directive (verbatim
+ *   5. Legacy mode: sorted `.claude/rules/platform/*.md`, then sorted
+ *      `.claude/rules/custom/*.md`, each as a `## <relpath>` section.
+ *      Foundation mode: recursively collected local `.claude/rules/**/*.md`,
+ *      excluding platform rules and the publication owner's source identities.
+ *      Those source identities are also excluded from expanded local imports.
+ *   6. A fixed `## Knowledge access` directive (verbatim {@link KNOWLEDGE_ACCESS_DIRECTIVE}).
+ *   7. For interactive sessions, a fixed `## File delivery` directive (verbatim
  *      {@link FILE_DELIVERY_DIRECTIVE}).
  */
 
@@ -774,7 +779,8 @@ export function buildBundle(workspaceCwd: string): string {
  *    `<workspaceCwd>/.claude/output-styles/<outputStyle>.md`; that file is the persona.
  *  - If `agent.systemPrompt` (config) is also set, append it AFTER the output-style
  *    content (blank-line separated).
- *  - If neither resolves → null → the caller passes NO `--system-prompt` (ride Pi base).
+ *  - If neither resolves → null. Legacy callers keep Pi's base prompt;
+ *    foundation callers pass an explicit empty `--system-prompt`.
  */
 export function resolvePersona(agent: AgentConfig): string | null {
   return resolvePersonaWithSources(agent).persona;
