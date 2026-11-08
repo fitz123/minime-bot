@@ -47,15 +47,16 @@ import {
  * in pi-rpc-protocol.ts.
  *
  * Deterministic bundle order (see {@link assembleBundle}):
- *   1. CLAUDE.md body with every `@<path>` line removed.
- *   2. Each removed `@`-import expanded as a `## <relpath>` section, in the order
+ *   1. When configured, the pinned shared behavioral foundation.
+ *   2. CLAUDE.md body with every `@<path>` line removed.
+ *   3. Each removed `@`-import expanded as a `## <relpath>` section, in the order
  *      the `@`-lines appeared (read relative to the CLAUDE.md dir; 1 level only —
  *      a nested `@`-line in an imported file is NOT recursed, only warned).
- *   3. For Knowledge v2 workspaces, `wiki/schema.md` and `wiki/index.md`.
- *   4. Every `.claude/rules/platform/*.md` as a `## <relpath>` section, sorted.
- *   5. Every `.claude/rules/custom/*.md` as a `## <relpath>` section, sorted.
- *   6. A fixed `## Knowledge access` directive (verbatim {@link KNOWLEDGE_ACCESS_DIRECTIVE}).
- *   7. For interactive sessions, a fixed `## File delivery` directive (verbatim
+ *   4. For Knowledge v2 workspaces, `wiki/schema.md` and `wiki/index.md`.
+ *   5. Every `.claude/rules/platform/*.md` as a `## <relpath>` section, sorted.
+ *   6. Every `.claude/rules/custom/*.md` as a `## <relpath>` section, sorted.
+ *   7. A fixed `## Knowledge access` directive (verbatim {@link KNOWLEDGE_ACCESS_DIRECTIVE}).
+ *   8. For interactive sessions, a fixed `## File delivery` directive (verbatim
  *      {@link FILE_DELIVERY_DIRECTIVE}).
  */
 
@@ -653,7 +654,7 @@ function assembleBundle(
   );
   const knowledgeSections = collectKnowledgeSections(workspaceCwd, strict);
   const rules = foundation
-    ? collectFoundationLocalRules(foundation, workspaceCwd, agentId)
+    ? collectFoundationLocalRules(foundation, workspaceCwd, agentId, strict)
     : collectRules(workspaceCwd, { strict });
 
   const parts: string[] = [];
@@ -872,9 +873,11 @@ function readOutputStyleSource(
  * Atomically write a bundle/persona artifact to a STABLE per-agent path under
  * `<workspaceCwd>/.tmp/`: `pi-context-<safe-agent-id>[.<variant>].<kind>.md`.
  * Write a staging file then `renameSync` over the final path, so a concurrent
- * reader never sees a half-written file. Stable path ⇒ no accumulation, no
- * cleanup job. The `.tmp` dir and artifact files are private because they contain
- * assembled system context. Returns the final path. May throw (e.g. unwritable
+ * reader never sees a half-written file. Configured foundation callers include
+ * the context digest in agentId and retain prior artifacts so active reloads and
+ * parallel contexts keep their original bytes. Retention is intentionally unbounded;
+ * cleanup requires lifecycle knowledge outside this assembler. The `.tmp` dir and
+ * artifact files are private because they contain assembled system context. Returns the final path. May throw (e.g. unwritable
  * `.tmp/`) — the caller (assemblePiContext) wraps it in the fail-safe.
  */
 export function writeTempArtifact(

@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
-import { loadSkillsFromDir } from "@earendil-works/pi-coding-agent";
+import { loadSkills, loadSkillsFromDir } from "../pi-native-skills.js";
 import { log } from "../logger.js";
 import { loadConfig, loadRawMergedConfig, validateAgent, validateBehavioralFoundation } from "../config.js";
 import { assemblePiContext } from "../pi-context-assembler.js";
@@ -108,7 +108,7 @@ test("native local skill additions stay contained and shared-first; same-name sh
   writeFileSync(join(f.workspace, ".claude/skills/flat.md"), "---\nname: flat\ndescription: Synthetic flat addition\n---\n");
   const context = assemblePiContext(f.agent)!;
   assert.deepEqual(context.behavioralFoundation!.skillPaths, [
-    join(f.first.root, "skills/example-workflow"), local, join(f.workspace, ".claude/skills/flat.md"),
+    join(f.first.root, "skills/example-workflow/SKILL.md"), local, join(f.workspace, ".claude/skills/flat.md"),
   ]);
   writeFileSync(local, "---\nname: example-workflow\ndescription: Synthetic shadow\n---\n");
   assert.throws(() => assemblePiContext(f.agent), /local skill name conflicts.*example-workflow/);
@@ -147,7 +147,7 @@ test("only source owners omit exact promoted skill directories before traversing
     writeFileSync(addition, "---\nname: addition\ndescription: Synthetic local addition\n---\n");
     const owner = { ...f.agent, id: "source-owner" };
     const before = assemblePiContext(owner)!;
-    assert.deepEqual(before.behavioralFoundation!.skillPaths, [join(f.first.root, "skills/example-workflow"), addition]);
+    assert.deepEqual(before.behavioralFoundation!.skillPaths, [join(f.first.root, "skills/example-workflow/SKILL.md"), addition]);
     assert.throws(() => assemblePiContext(f.agent), /local skill name conflicts/);
     // Unpublished WIP cannot be traversed, including a broken support link.
     symlinkSync(join(f.root, "unavailable-support"), join(dir, "promoted/support"));
@@ -177,7 +177,7 @@ test("legacy external or dangling skill-root symlinks visibly yield to required 
     mkdirSync(join(f.workspace, ".pi/skills/addition"), { recursive: true });
     const addition = join(f.workspace, ".pi/skills/addition/SKILL.md");
     writeFileSync(addition, "---\nname: addition\ndescription: Synthetic addition\n---\n");
-    assert.deepEqual(assemblePiContext(f.agent)!.behavioralFoundation!.skillPaths, [join(f.first.root, "skills/example-workflow"), addition]);
+    assert.deepEqual(assemblePiContext(f.agent)!.behavioralFoundation!.skillPaths, [join(f.first.root, "skills/example-workflow/SKILL.md"), addition]);
     assert.match(warn.mock.calls.at(-1)!.arguments.join(" "), /legacy shared skill-directory discovery.*\.claude\/skills.*replaced.*publication/i);
     renameSync(join(f.first.root, "manifest.json"), join(f.root, "unused-manifest.json"));
     assert.throws(() => assemblePiContext(f.agent), BehavioralFoundationError);
@@ -203,7 +203,7 @@ test("owner filtering preserves native skill discovery, ignore rules and metadat
   const expected = native.skills.filter(skill => !skill.filePath.includes("/promoted/"))
     .map(skill => skill.filePath).sort();
   const selected = assemblePiContext({ ...f.agent, id: "source-owner" })!.behavioralFoundation!.skillPaths;
-  assert.deepEqual(selected, [join(f.first.root, "skills/example-workflow"), ...expected]);
+  assert.deepEqual(selected, [join(f.first.root, "skills/example-workflow/SKILL.md"), ...expected]);
   assert.equal(expected.length, 3);
   assert.ok(warn.mock.calls.some(call => call.arguments.join(" ").includes(".claude/skills/addition/SKILL.md: native skill metadata portability warning")));
   // Ignored local trees follow native discovery, including their unused assets.
@@ -232,7 +232,7 @@ test("local skill assets skip native hidden, dependency and ignored runtime tree
       symlinkSync(join(f.root, "unavailable-python-runtime"), join(dir, runtime, "missing-python"));
     }
     const context = assemblePiContext({ ...f.agent, id })!;
-    assert.deepEqual(context.behavioralFoundation!.skillPaths, [join(f.first.root, "skills/example-workflow"), join(dir, "SKILL.md")]);
+    assert.deepEqual(context.behavioralFoundation!.skillPaths, [join(f.first.root, "skills/example-workflow/SKILL.md"), join(dir, "SKILL.md")]);
     assert.match(readFileSync(context.appendSystemPromptPath, "utf8"), /SYNTHETIC_SHARED_RULE/);
     symlinkSync(join(f.first.root, "skills/example-workflow/support.md"), join(dir, "assets/instructions.md"));
     assert.throws(() => assemblePiContext({ ...f.agent, id }), /resource resolves outside/);
@@ -264,7 +264,7 @@ test("native same-real-file aliases deduplicate across local skill roots before 
       mkdirSync(join(f.workspace, ".pi/skills/alias"), { recursive: true });
       symlinkSync(skill, join(f.workspace, ".pi/skills/alias/SKILL.md"));
     }
-    assert.deepEqual(assemblePiContext(f.agent)!.behavioralFoundation!.skillPaths, [join(f.first.root, "skills/example-workflow"), skill]);
+    assert.deepEqual(assemblePiContext(f.agent)!.behavioralFoundation!.skillPaths, [join(f.first.root, "skills/example-workflow/SKILL.md"), skill]);
     // A different file with the same name remains a fatal local shadow.
     mkdirSync(join(f.workspace, ".pi/skills/duplicate"));
     writeFileSync(join(f.workspace, ".pi/skills/duplicate/SKILL.md"), readFileSync(skill));
@@ -279,7 +279,7 @@ test("contained skill-root symlinks load additions while escaped child directori
   symlinkSync(join(f.workspace, "local-skills"), join(f.workspace, ".claude/skills"));
   const addition = join(f.workspace, ".claude/skills/addition/SKILL.md");
   writeFileSync(addition, "---\nname: addition\ndescription: Synthetic addition\n---\n");
-  assert.deepEqual(assemblePiContext(f.agent)!.behavioralFoundation!.skillPaths, [join(f.first.root, "skills/example-workflow"), addition]);
+  assert.deepEqual(assemblePiContext(f.agent)!.behavioralFoundation!.skillPaths, [join(f.first.root, "skills/example-workflow/SKILL.md"), addition]);
   mkdirSync(join(f.root, "outside-directory"));
   symlinkSync(join(f.root, "outside-directory"), join(f.workspace, ".claude/skills/escaped-child"));
   assert.throws(() => assemblePiContext(f.agent), /resource resolves outside/);
@@ -310,7 +310,7 @@ test("native loaded skills retain portability warnings; malformed local skills v
       }
       const before = warn.mock.calls.length;
       const context = assemblePiContext(f.agent)!;
-      assert.deepEqual(context.behavioralFoundation!.skillPaths, [join(f.first.root, "skills/example-workflow")]);
+      assert.deepEqual(context.behavioralFoundation!.skillPaths, [join(f.first.root, "skills/example-workflow/SKILL.md")]);
       assert.deepEqual(assemblePiContext(f.agent, { strict: true })!.behavioralFoundation!.skillPaths, context.behavioralFoundation!.skillPaths);
       assert.match(readFileSync(context.appendSystemPromptPath, "utf8"), /SYNTHETIC_SHARED_RULE/);
       assert.ok(skipped.diagnostics.length);
@@ -347,7 +347,7 @@ test("missing optional output-style retains ordinary warning/default persona sem
   const before = warn.mock.calls.length;
   const context = assemblePiContext(f.agent, { strict: false })!;
   assert.equal(context.systemPromptPath, undefined);
-  assert.deepEqual(context.behavioralFoundation!.skillPaths, [join(f.first.root, "skills/example-workflow")]);
+  assert.deepEqual(context.behavioralFoundation!.skillPaths, [join(f.first.root, "skills/example-workflow/SKILL.md")]);
   assert.match(readFileSync(context.appendSystemPromptPath, "utf8"), /SYNTHETIC_SHARED_RULE/);
   assert.ok(warn.mock.calls.slice(before).some(call => /output-style.*optional-missing.*not found/.test(call.arguments.join(" "))));
   assert.throws(() => assemblePiContext(f.agent, { strict: true }), /Output-style is not a readable regular source/);
@@ -391,7 +391,7 @@ test("deployment config enrolls existing and freshly added agents; instance over
   assert.equal(config.agents.fresh.behavioralFoundationRoot, f.current);
   const enrolled = assemblePiContext(config.agents.fresh)!;
   assert.match(readFileSync(enrolled.appendSystemPromptPath, "utf8"), /SYNTHETIC_SHARED_RULE/);
-  assert.deepEqual(enrolled.behavioralFoundation!.skillPaths, [join(f.first.root, "skills/example-workflow")]);
+  assert.deepEqual(enrolled.behavioralFoundation!.skillPaths, [join(f.first.root, "skills/example-workflow/SKILL.md")]);
   assert.deepEqual(config.behavioralFoundation, { root: f.current });
   const overlay = join(f.root, "instance.yaml");
   writeFileSync(overlay, JSON.stringify({ behavioralFoundation: { root: f.current } }));
@@ -405,4 +405,90 @@ test("deployment config enrolls existing and freshly added agents; instance over
   }
   assert.equal(validateBehavioralFoundation(undefined), undefined);
   assert.throws(() => validateBehavioralFoundation({ root: "relative" }), /absolute/);
+});
+
+test("ordinary local unavailable rules warn and skip; strict rules fail; irrelevant junk is ignored", t => {
+  const warn = t.mock.method(log, "warn", () => {});
+  for (const unavailable of ["dangling", "unreadable", "directory"]) {
+    const f = sharedBehaviorFixture();
+    const dir = join(f.workspace, ".claude/rules/custom");
+    mkdirSync(dir, {recursive:true});
+    writeFileSync(join(dir, "valid.md"), "SYNTHETIC_LOCAL_RULE");
+    const path = join(dir, unavailable === "directory" ? "blocked" : "optional.md");
+    if (unavailable === "dangling") symlinkSync(join(f.root, "missing"), path);
+    else {
+      if (unavailable === "directory") mkdirSync(path);
+      else writeFileSync(path, "SYNTHETIC_UNREADABLE");
+      chmodSync(path, 0);
+    }
+    try {
+      const context = assemblePiContext(f.agent)!;
+      assert.match(readFileSync(context.appendSystemPromptPath, "utf8"), /SYNTHETIC_LOCAL_RULE/);
+      assert.throws(() => assemblePiContext(f.agent, {strict:true}));
+      assert.ok(warn.mock.calls.some(c => c.arguments.join(" ").includes("optional local rule")));
+    } finally { if (unavailable !== "dangling") chmodSync(path, 0o700); }
+  }
+  const f = sharedBehaviorFixture();
+  const dir = join(f.workspace, ".claude/rules/custom");
+  mkdirSync(dir, {recursive:true});
+  writeFileSync(join(dir, "junk.bin"), "SYNTHETIC_JUNK");
+  chmodSync(join(dir, "junk.bin"), 0);
+  symlinkSync(join(f.root, "missing-junk"), join(dir, "junk-link.bin"));
+  try { assert.ok(assemblePiContext(f.agent)); }
+  finally { chmodSync(join(dir, "junk.bin"), 0o600); }
+});
+
+test("unrequired dangling and unreadable local skills follow native skip semantics", t => {
+  t.mock.method(log, "warn", () => {});
+  for (const owner of [false, true]) {
+    const f = sharedBehaviorFixture();
+    if (owner) { f.first.manifest.skills[0].source = ".claude/skills/promoted"; f.first.save(); }
+    const dir = join(f.workspace, ".claude/skills");
+    mkdirSync(join(dir, "unreadable"), {recursive:true});
+    symlinkSync(join(f.root, "missing-skill"), join(dir, "dangling"));
+    const skill = join(dir, "unreadable/SKILL.md");
+    writeFileSync(skill, "---\nname: unreadable\ndescription: Synthetic\n---\n");
+    chmodSync(skill, 0);
+    try {
+      assert.equal(loadSkillsFromDir({dir, source:"path"}).skills.length, 0);
+      const context = assemblePiContext({...f.agent, id:owner ? "source-owner" : f.agent.id})!;
+      assert.deepEqual(context.behavioralFoundation!.skillPaths, [join(f.first.root, "skills/example-workflow/SKILL.md")]);
+    } finally { chmodSync(skill, 0o600); }
+  }
+});
+
+test("published SKILL.md paths load natively even when publication gitignore excludes them", () => {
+  const f = sharedBehaviorFixture();
+  const path = "skills/example-workflow/.gitignore";
+  const body = "SKILL.md\n";
+  writeFileSync(join(f.first.root, path), body);
+  f.first.manifest.files[path] = createHash("sha256").update(body).digest("hex");
+  f.first.save();
+  const context = assemblePiContext(f.agent)!;
+  const native = loadSkills({cwd:f.workspace, agentDir:f.workspace, includeDefaults:false,
+    skillPaths:context.behavioralFoundation!.skillPaths});
+  assert.deepEqual(native.skills.map(skill => skill.name), ["example-workflow"]);
+  assert.equal(native.skills[0].filePath, join(f.first.root, "skills/example-workflow/SKILL.md"));
+});
+
+test("unreadable native ignore files and dangling root SKILL.md do not hide valid siblings", t => {
+  t.mock.method(log, "warn", () => {});
+  const f = sharedBehaviorFixture();
+  f.first.manifest.skills[0].source = ".claude/skills/promoted";
+  f.first.save();
+  const dir = join(f.workspace, ".claude/skills");
+  mkdirSync(join(dir, "addition"), {recursive:true});
+  const skill = join(dir, "addition/SKILL.md");
+  writeFileSync(skill, "---\nname: addition\ndescription: Synthetic\n---\n");
+  symlinkSync(join(f.root, "missing-root-skill"), join(dir, "SKILL.md"));
+  const ignored = join(dir, ".gitignore");
+  writeFileSync(ignored, "addition/\n");
+  chmodSync(ignored, 0);
+  try {
+    assert.equal(loadSkillsFromDir({dir, source:"path"}).skills.length, 1);
+    assert.equal(assemblePiContext({...f.agent, id:"source-owner"})!.behavioralFoundation!.skillPaths[1], skill);
+    symlinkSync(join(f.root, "outside"), join(dir, "escaped"));
+    mkdirSync(join(f.root, "outside"));
+    assert.throws(() => assemblePiContext({...f.agent, id:"source-owner"}), /resource resolves outside/);
+  } finally { chmodSync(ignored, 0o600); }
 });

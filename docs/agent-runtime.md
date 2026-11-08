@@ -22,6 +22,10 @@ The version 1 descriptor has no defaults for identity or roots. It requires:
 - `model` as `provider/model`, `thinking`, `knowledge` (`none` or `v2`),
   `capabilities`, `tools`, and explicit boolean `offline`.
 
+The optional `behavioralFoundationRoot` selects a required published foundation;
+each lane load pins its physical revision. Workers receive this path explicitly
+and never discover it through central control config.
+
 The worker refuses root execution or mismatched UID/GID/HOME. The descriptor file
 must be owned by root or the controller and must not be worker writable. In
 same-UID tests it must be readonly, for example mode 0444. Trusted in-memory
@@ -53,14 +57,18 @@ fallbacks.
 
 The workspace must contain a real local `CLAUDE.md`. Declared imports and rules
 are assembled strictly into private artifacts below
-`contextRoot/<sha256(laneId)>/.tmp` before Pi is spawned. Paths are stable within
-each lane; overlapping lane opens cannot replace another lane's pending context.
+`contextRoot/<sha256(laneId)>/.tmp` before Pi is spawned. With a foundation,
+artifact names include the context digest. Old artifacts are intentionally retained
+so active reloads and parallel contexts preserve their original bytes. This can
+accumulate artifacts without bound; lifecycle-aware cleanup remains outside this scope.
 With `knowledge: "v2"`, local marked `wiki/schema.md` and
 `wiki/index.md` are required. The binding record preserves the content-redacted
 context manifest; controller state exposes only its digest. External/symlink
-rule directories are rejected before the assembler's legacy shared-platform
-resolver can consult control configuration. An external shared-rules substrate
-remains pending policy approval.
+rule directories are rejected. With a configured publication, the exact
+`.claude/rules/platform` symlink is ignored without resolving its legacy target;
+other local rule escapes still fail. Without a publication, external rule
+directories are rejected before legacy central-config discovery. The approved
+publication contract is described in [shared-behavior.md](shared-behavior.md).
 
 The worker owns Pi, context artifacts, transcripts, and per-lane records. Private
 roots are canonical worker-owned 0700 directories; records/transcripts are 0600.
@@ -166,7 +174,7 @@ Unix-socket listen; a sandbox `listen EPERM` is not integration evidence and
 must not be converted to a passing skip.
 
 Remaining migration work includes adapted first-party wrappers and transport
-integration; collaboration/consultation, cron and outbox boundaries; approved
-external rules; explicit per-user auth provisioning; additional isolated agents;
+integration; collaboration/consultation, cron and outbox boundaries;
+explicit per-user auth provisioning; additional isolated agents;
 and representative production canaries with history preservation. No production
 readiness or parity claim follows from these source tests.

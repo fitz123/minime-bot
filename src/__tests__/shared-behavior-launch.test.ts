@@ -130,7 +130,7 @@ test("required foundation failure stops interactive, cron, ask-agent and delegat
   assert.equal(result.ok, false);
   if (!result.ok) {
     assert.equal(result.error.code, "context_failed");
-    assert.match(result.error.message, /Behavioral foundation.*hash mismatch/);
+    assert.match(result.error.message, /foundation\/context is unavailable/);
   }
   assert.throws(() => assemblePiSubagentFoundation(f.current, f.workspace, "role", "Synthetic role"), /hash mismatch/);
   assert.equal(spawned, false);

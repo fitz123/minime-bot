@@ -82,7 +82,8 @@ This replacement never makes the publication optional, and unconfigured behavior
 is unchanged.
 
 Configured native Pi loading disables ambient skill discovery and passes explicit
-shared skills first, followed by contained local additions from `.claude/skills`
+shared `SKILL.md` file paths first (so directory ignore files cannot hide a
+required skill), followed by contained local additions from `.claude/skills`
 and `.pi/skills`. Pi retains native skill metadata and progressive disclosure,
 including relative support files. Local asset traversal skips native hidden,
 `node_modules` and ignored trees; publication assets are always checked in full.
@@ -99,7 +100,9 @@ physical revision directory. Rule bytes and skill advertisements use that same
 revision. Publishers must never mutate a revision and must retain old revisions.
 A new managed load observes a new publication; active sessions retain their old
 files. Existing restart/update lifecycle owns refresh. There is no watcher, daemon,
-consumer database or garbage collection here.
+consumer database or garbage collection here. Digest-named context artifacts are
+also intentionally retained: deleting them could break active reloads or parallel
+contexts. Artifact accumulation remains an unbounded retention limitation.
 
 ## Parent launcher adaptation
 

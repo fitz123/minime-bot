@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { mkdirSync, readFileSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
 import { assemblePiContext, assemblePiSubagentFoundation, piContextResourceArgs, type PiContextArtifacts } from "../pi-context-assembler.js";
 import { resolvePackageOwnedPiInvocation } from "../pi-runtime.js";
@@ -10,7 +10,7 @@ import { publication, sharedBehaviorFixture } from "./shared-behavior-fixture.js
 test("pinned Pi offline: shared rule, private local context, native lazy skill/support reads and next-load revision", { timeout: 30_000 }, async () => {
   const f = sharedBehaviorFixture();
   const old = assemblePiContext(f.agent)!;
-  const oldSkill = join(old.behavioralFoundation!.skillPaths[0], "SKILL.md");
+  const oldSkill = old.behavioralFoundation!.skillPaths[0];
   const second = publication(f.root, "revision-two");
   symlinkSync(second.root, join(f.root, "next"));
   renameSync(join(f.root, "next"), f.current);
@@ -19,7 +19,7 @@ test("pinned Pi offline: shared rule, private local context, native lazy skill/s
   assert.notEqual(next.appendSystemPromptPath, old.appendSystemPromptPath);
   assert.match(readFileSync(old.appendSystemPromptPath, "utf8"), /SYNTHETIC_SHARED_RULE_revision-one/);
   assert.match(readFileSync(next.appendSystemPromptPath, "utf8"), /SYNTHETIC_SHARED_RULE_revision-two/);
-  assert.match(readFileSync(join(old.behavioralFoundation!.skillPaths[0], "support.md"), "utf8"), /revision-one/);
+  assert.match(readFileSync(join(dirname(old.behavioralFoundation!.skillPaths[0]), "support.md"), "utf8"), /revision-one/);
   assert.equal(oldSkill.includes("current"), false);
   const home = join(f.root, "home");
   mkdirSync(home);

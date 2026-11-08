@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { basename, isAbsolute, join, relative, sep } from "node:path";
-import { loadSkills, loadSkillsFromDir, parseFrontmatter, type LoadSkillsResult } from "@earendil-works/pi-coding-agent";
+import { loadSkills, loadSkillsFromDir, parseFrontmatter, type LoadSkillsResult } from "./pi-native-skills.js";
 import ignore, { type Ignore } from "ignore";
 import { log } from "./logger.js";
 
@@ -107,7 +107,7 @@ export function resolveBehavioralFoundation(root: string): ResolvedBehavioralFou
       for (const path of listContainedFiles(skillRoot, pinnedRoot)) required(`${skill.path}/${path}`);
       const metadata = skillMetadata(required(`${skill.path}/SKILL.md`).toString("utf8"), basename(skill.path));
       if (metadata !== skill.name) fail(`SKILL.md name differs from declared name: ${skill.path}`);
-      return join(pinnedRoot, skill.path);
+      return join(pinnedRoot, skill.path, "SKILL.md");
     });
     // Stable object-key ordering; arrays intentionally retain publisher order.
     const identity: BehavioralFoundationManifest = {
@@ -129,29 +129,40 @@ function listContainedFiles(
   dir: string, root: string, ancestors = new Set<string>(), excluded = new Set<string>(),
   localIgnore?: { root: string; matcher: Ignore },
 ): string[] {
-  const real = realpathSync(dir);
-  if (!contained(root, real)) fail(`resource resolves outside its root: ${relative(root, dir)}`);
-  if (ancestors.has(real)) fail(`resource directory cycle: ${relative(root, dir)}`);
-  const next = new Set([...ancestors, real]);
-  const files: string[] = [];
-  if (localIgnore) addSkillIgnoreRules(localIgnore.matcher, dir, localIgnore.root);
-  for (const name of readdirSync(dir).sort()) {
-    const path = join(dir, name);
-    if (excluded.has(path)) continue;
-    if (localIgnore) {
-      if (name.startsWith(".") || name === "node_modules") continue;
-      const rel = relative(localIgnore.root, path).split(sep).join("/");
-      if (localIgnore.matcher.ignores(rel) ||
-          (statSync(path).isDirectory() && localIgnore.matcher.ignores(`${rel}/`))) continue;
+  try {
+    const real = realpathSync(dir);
+    if (!contained(root, real)) fail(`resource resolves outside its root: ${relative(root, dir)}`);
+    if (ancestors.has(real)) fail(`resource directory cycle: ${relative(root, dir)}`);
+    const next = new Set([...ancestors, real]);
+    const files: string[] = [];
+    if (localIgnore) addSkillIgnoreRules(localIgnore.matcher, dir, localIgnore.root);
+    for (const name of readdirSync(dir).sort()) {
+      const path = join(dir, name);
+      if (excluded.has(path)) continue;
+      try {
+        if (localIgnore) {
+          if (name.startsWith(".") || name === "node_modules") continue;
+          const rel = relative(localIgnore.root, path).split(sep).join("/");
+          if (localIgnore.matcher.ignores(rel) ||
+              (statSync(path).isDirectory() && localIgnore.matcher.ignores(`${rel}/`))) continue;
+        }
+        const target = realpathSync(path);
+        if (!contained(root, target)) fail(`resource resolves outside its root: ${relative(root, path)}`);
+        const stat = statSync(target);
+        if (stat.isDirectory()) files.push(...listContainedFiles(path, root, next, excluded, localIgnore).map(p => `${name}/${p}`));
+        else if (stat.isFile()) files.push(name);
+        else fail(`resource is not a regular file: ${relative(root, path)}`);
+      } catch (error) {
+        if (!localIgnore || error instanceof BehavioralFoundationError) throw error;
+        log.warn("behavioral-foundation", `Cannot read optional local skill asset ${relative(root, path)}; skipped`);
+      }
     }
-    const target = realpathSync(path);
-    if (!contained(root, target)) fail(`resource resolves outside its root: ${relative(root, path)}`);
-    const stat = statSync(target);
-    if (stat.isDirectory()) files.push(...listContainedFiles(path, root, next, excluded, localIgnore).map(p => `${name}/${p}`));
-    else if (stat.isFile()) files.push(name);
-    else fail(`resource is not a regular file: ${relative(root, path)}`);
+    return files;
+  } catch (error) {
+    if (!localIgnore || error instanceof BehavioralFoundationError) throw error;
+    log.warn("behavioral-foundation", `Cannot read optional local skill directory ${relative(root, dir)}; skipped`);
+    return [];
   }
-  return files;
 }
 
 function skillMetadata(content: string, fallback: string): string {
@@ -169,35 +180,43 @@ export function includeLocalFoundationRule(foundation: ResolvedBehavioralFoundat
 }
 
 /** Configured rule discovery replaces the legacy external platform link exception. */
-export function collectFoundationLocalRules(foundation: ResolvedBehavioralFoundation, workspace: string, agentId: string): { relpath: string; content: string }[] {
+export function collectFoundationLocalRules(foundation: ResolvedBehavioralFoundation, workspace: string, agentId: string, strict = false): { relpath: string; content: string }[] {
   const root = realpathSync(workspace);
   const rules = join(root, ".claude/rules");
-  if (!existsSync(rules)) return [];
   const out: { relpath: string; content: string }[] = [];
   const walk = (dir: string, ancestors = new Set<string>()) => {
-    const real = realpathSync(dir);
-    if (!contained(root, real)) {
-      fail(`local rule directory escapes workspace: ${relative(root, dir)}`);
-    }
-    if (ancestors.has(real)) fail("local rule directory cycle");
-    const next = new Set([...ancestors, real]);
-    for (const name of readdirSync(dir).sort()) {
-      const path = join(dir, name);
-      const identity = relative(root, path).split(sep).join("/");
-      // Do not follow a legacy platform link at all: its target may be a private
-      // or unreadable source-owner home. The publication is the explicit source.
-      if (path === join(rules, "platform") && lstatSync(path).isSymbolicLink()) continue;
-      if (name.endsWith(".md") && !includeLocalFoundationRule(foundation, agentId, identity)) continue;
-      const target = realpathSync(path);
-      if (!contained(root, target)) {
-        fail(`local rule escapes workspace: ${identity}`);
+    try {
+      if (!lstatSync(dir, { throwIfNoEntry: false })) return;
+      const real = realpathSync(dir);
+      if (!contained(root, real)) fail(`local rule directory escapes workspace: ${relative(root, dir)}`);
+      if (ancestors.has(real)) fail("local rule directory cycle");
+      const next = new Set([...ancestors, real]);
+      for (const entry of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+        const { name } = entry;
+        const path = join(dir, name);
+        const identity = relative(root, path).split(sep).join("/");
+        // This exact legacy link is replaced without inspecting its target.
+        if (path === join(rules, "platform") && entry.isSymbolicLink()) continue;
+        if (!entry.isDirectory() && !entry.isSymbolicLink() && !name.endsWith(".md")) continue;
+        if (name.endsWith(".md") && !includeLocalFoundationRule(foundation, agentId, identity)) continue;
+        try {
+          const target = realpathSync(path);
+          const stat = statSync(target);
+          if (!stat.isDirectory() && !name.endsWith(".md")) continue;
+          if (!contained(root, target)) fail(`local rule escapes workspace: ${identity}`);
+          if (stat.isDirectory()) walk(path, next);
+          else {
+            if (!stat.isFile()) fail(`local rule is not a regular file: ${identity}`);
+            out.push({ relpath: identity, content: readFileSync(target, "utf8") });
+          }
+        } catch (error) {
+          if (strict || error instanceof BehavioralFoundationError) throw error;
+          log.warn("behavioral-foundation", `Cannot read optional local rule ${identity}; skipped`);
+        }
       }
-      const stat = statSync(target);
-      if (stat.isDirectory()) walk(path, next);
-      else if (name.endsWith(".md")) {
-        if (!stat.isFile()) fail(`local rule is not a regular file: ${identity}`);
-        out.push({ relpath: identity, content: readFileSync(target, "utf8") });
-      }
+    } catch (error) {
+      if (strict || error instanceof BehavioralFoundationError) throw error;
+      log.warn("behavioral-foundation", `Cannot read optional local rule directory ${relative(root, dir)}; skipped`);
     }
   };
   walk(rules);
@@ -217,22 +236,30 @@ function loadSkillsExcluding(dir: string, root: string, excluded: Set<string>): 
     result.diagnostics.push(...local.diagnostics);
   };
   const walk = (current: string, includeRootFiles: boolean) => {
-    addSkillIgnoreRules(ig, current, dir);
-    const entries = readdirSync(current).sort().filter(name => !excluded.has(join(current, name)));
-    const ignored = (path: string, directory = false) => ig.ignores(`${relative(dir, path).split(sep).join("/")}${directory ? "/" : ""}`);
-    const skill = join(current, "SKILL.md");
-    if (entries.includes("SKILL.md") && statSync(skill).isFile() && !ignored(skill)) {
-      load(skill);
-      return;
-    }
-    for (const name of entries) {
-      if (name.startsWith(".") || name === "node_modules") continue;
-      const path = join(current, name);
-      const stat = statSync(path);
-      if (ignored(path, stat.isDirectory())) continue;
-      if (stat.isDirectory()) walk(path, false);
-      else if (stat.isFile() && includeRootFiles && name.endsWith(".md")) load(path);
-    }
+    try {
+      addSkillIgnoreRules(ig, current, dir);
+      const entries = readdirSync(current).sort().filter(name => !excluded.has(join(current, name)));
+      const ignored = (path: string, directory = false) => ig.ignores(`${relative(dir, path).split(sep).join("/")}${directory ? "/" : ""}`);
+      const skill = join(current, "SKILL.md");
+      if (entries.includes("SKILL.md")) {
+        try {
+          if (statSync(skill).isFile() && !ignored(skill)) {
+            load(skill);
+            return;
+          }
+        } catch { log.warn("behavioral-foundation", "Cannot read optional local SKILL.md; skipped"); }
+      }
+      for (const name of entries) {
+        if (name.startsWith(".") || name === "node_modules") continue;
+        const path = join(current, name);
+        try {
+          const stat = statSync(path);
+          if (ignored(path, stat.isDirectory())) continue;
+          if (stat.isDirectory()) walk(path, false);
+          else if (stat.isFile() && includeRootFiles && name.endsWith(".md")) load(path);
+        } catch { log.warn("behavioral-foundation", "Cannot read optional local skill entry; skipped"); }
+      }
+    } catch { log.warn("behavioral-foundation", "Cannot read optional local skill directory; skipped"); }
   };
   walk(dir, true);
   return result;
@@ -244,14 +271,16 @@ function addSkillIgnoreRules(ig: Ignore, dir: string, root: string): void {
   for (const name of [".gitignore", ".ignore", ".fdignore"]) {
     const path = join(dir, name);
     if (!existsSync(path)) continue;
-    const patterns = readFileSync(path, "utf8").split(/\r?\n/).flatMap(line => {
-      if (!line.trim() || (line.trim().startsWith("#") && !line.trim().startsWith("\\#"))) return [];
-      const negated = line.startsWith("!");
-      let pattern = negated ? line.slice(1) : line.startsWith("\\!") ? line.slice(1) : line;
-      if (pattern.startsWith("/")) pattern = pattern.slice(1);
-      return [`${negated ? "!" : ""}${rel ? `${rel}/` : ""}${pattern}`];
-    });
-    ig.add(patterns);
+    try {
+      const patterns = readFileSync(path, "utf8").split(/\r?\n/).flatMap(line => {
+        if (!line.trim() || (line.trim().startsWith("#") && !line.trim().startsWith("\\#"))) return [];
+        const negated = line.startsWith("!");
+        let pattern = negated ? line.slice(1) : line.startsWith("\\!") ? line.slice(1) : line;
+        if (pattern.startsWith("/")) pattern = pattern.slice(1);
+        return [`${negated ? "!" : ""}${rel ? `${rel}/` : ""}${pattern}`];
+      });
+      ig.add(patterns);
+    } catch { log.warn("behavioral-foundation", `Cannot read optional local skill ignore file ${relative(root, path)}; skipped`); }
   }
 }
 
@@ -260,18 +289,23 @@ export function resolveFoundationSkillPaths(foundation: ResolvedBehavioralFounda
   const root = realpathSync(workspace);
   const paths = [...foundation.skillPaths];
   const names = new Set(foundation.manifest.skills.map(skill => skill.name));
-  const realPaths = new Set(foundation.skillPaths.map(path => realpathSync(join(path, "SKILL.md"))));
+  const realPaths = new Set(foundation.skillPaths.map(path => realpathSync(path)));
   const excluded = new Set(foundation.manifest.sourceOwnerAgentIds.includes(agentId)
     ? foundation.manifest.skills.flatMap(skill => skill.source === undefined ? [] : [join(root, skill.source)]) : []);
   for (const rel of [".claude/skills", ".pi/skills"]) {
     const dir = join(root, rel);
-    const entry = lstatSync(dir, { throwIfNoEntry: false });
+    let entry;
+    try { entry = lstatSync(dir, { throwIfNoEntry: false }); }
+    catch { log.warn("behavioral-foundation", `Cannot read optional local skill root ${rel}; skipped`); continue; }
     if (!entry) continue;
     if (entry.isSymbolicLink()) {
       let target: string | undefined;
       try { target = realpathSync(dir); }
       catch (error) {
-        if (!["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+        if (!["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+          log.warn("behavioral-foundation", `Cannot read optional local skill root ${rel}; skipped`);
+          continue;
+        }
       }
       if (target === undefined || !contained(root, target)) {
         log.warn("behavioral-foundation", `Legacy shared skill-directory discovery at ${rel} is replaced by the selected publication; legacy target contents were not read`);

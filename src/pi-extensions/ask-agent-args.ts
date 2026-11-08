@@ -1,3 +1,4 @@
+import { log } from "../logger.js";
 import { resolveAskAgentPolicy } from "../config.js";
 import {
   MINIME_BOT_PI_SESSION_AGENT_ID_ENV,
@@ -5,7 +6,7 @@ import {
   normalizePiModel,
 } from "../pi-rpc-protocol.js";
 import { piContextResourceArgs, type PiContextArtifacts } from "../pi-context-assembler.js";
-import { BehavioralFoundationError, MINIME_BEHAVIORAL_FOUNDATION_ROOT_ENV } from "../behavioral-foundation.js";
+import { MINIME_BEHAVIORAL_FOUNDATION_ROOT_ENV } from "../behavioral-foundation.js";
 import type { AgentConfig, BotConfig } from "../types.js";
 import { resolvePiInvocation, type PiInvocation } from "./pi-invocation.js";
 import {
@@ -571,7 +572,8 @@ export async function executeAskAgent(paramsLike: unknown, deps: ExecuteAskAgent
   try {
     context = deps.assembleContext(validatedTarget);
   } catch (error) {
-    const message = error instanceof BehavioralFoundationError ? error.message : "ask-agent target context is unavailable";
+    log.warn("ask-agent", `Target context assembly failed: ${error instanceof Error ? error.message : String(error)}`);
+    const message = "ask-agent target foundation/context is unavailable";
     return finish(makeAskAgentError("context_failed", message, {
       callerAgentId,
       targetAgentId,
