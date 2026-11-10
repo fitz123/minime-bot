@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 2026.11.4
+
+- Read Codex subscription quota with a bounded OAuth usage GET rather than an inference probe (#61, #256).
+- Display actual server-reported limit families, durations and resets; refresh `/status` on demand and clearly age cached data after refresh failures.
+- Export dynamic quota metrics without relabeling weekly usage as five-hour usage, preserve legacy cache readability and keep collector textfiles readable.
+
 ## 2026.11.3
 
 - Allow standalone read-only Knowledge CLI get/search commands through the Knowledge integrity guard (#254).
