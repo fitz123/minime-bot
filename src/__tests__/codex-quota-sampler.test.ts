@@ -1,9 +1,11 @@
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { parseCodexQuotaSamplerArgs, resolveCodexQuotaSamplerConfig, runCodexQuotaSampler, formatCodexQuotaSamplerHelp, isDirectCodexQuotaSamplerEntrypoint } from "../codex-quota-sampler.js";
+import { parseCodexQuotaSamplerArgs, resolveCodexQuotaSamplerConfig, runCodexQuotaSampler, formatCodexQuotaSamplerHelp, isDirectCodexQuotaSamplerEntrypoint, formatCodexQuotaSamplerError } from "../codex-quota-sampler.js";
 import { readCodexQuota, CODEX_USAGE_URL, type CodexQuotaReaderOptions } from "../codex-quota-reader.js";
 import { refreshCodexQuota, refreshQuotaStatus } from "../codex-quota-refresh.js";
 import { buildStatusReport } from "../status-report.js";
@@ -92,6 +94,31 @@ describe("GET quota acquisition", () => {
 });
 
 describe("sampler and shared status refresh", () => {
+  it("keeps metrics collector-readable and state private on success and failure", async () => {
+    const previousUmask = process.umask();
+    try {
+      for (const mask of [0o022, 0o077]) {
+        process.umask(mask);
+        const paths = target();
+        for (const fail of [false, true, false]) {
+          const result = await refreshCodexQuota({ ...paths, ...injected(fail ? {
+            fetch: async () => { throw new Error("private-provider-details"); },
+          } : {}) });
+          assert.equal(result.success, !fail);
+          for (const file of ["codex_usage.prom", "codex_usage_probe.prom"]) {
+            assert.equal(statSync(join(paths.textfileDir, file)).mode & 0o777, 0o644, `${file} permissions`);
+          }
+          assert.equal(statSync(paths.stateFile).mode & 0o777, 0o600, "state permissions");
+          assert.doesNotMatch(readFileSync(paths.stateFile, "utf8"), /private-provider-details|discard-this/);
+        }
+        const firstFailure = target();
+        await refreshCodexQuota({ ...firstFailure, ...injected({ fetch: async () => { throw new Error(); } }) });
+        assert.equal(statSync(firstFailure.stateFile).mode & 0o777, 0o600);
+        assert.equal(statSync(join(firstFailure.textfileDir, "codex_usage_probe.prom")).mode & 0o777, 0o644);
+      }
+    } finally { process.umask(previousUmask); }
+  });
+
   it("keeps CLI flags harmless and honors paths/deadlines without child configuration", async () => {
     const paths = target();
     const cli = parseCodexQuotaSamplerArgs(["--workspace", "/tmp/control", "--state-file", paths.stateFile, "--textfile-dir", paths.textfileDir, "--model", "obsolete-model", "--pi-bin", "unused", "--prompt", "unused", "--sampler-cwd", "unused", "--timeout", "100", "--dry-run"]);
@@ -176,5 +203,49 @@ describe("sampler and shared status refresh", () => {
     const result = await refreshCodexQuota({ ...paths, ...injected(), textfileDir: blocked });
     assert.equal(result.success, false);
     const after = JSON.parse(readFileSync(paths.stateFile, "utf8")); assert.equal(after.lastSuccess, before.lastSuccess); assert.deepEqual(after.families, before.families);
+  });
+});
+
+
+describe("safe sampler CLI diagnostics", () => {
+  it("classifies a missing collector directory with an actionable option and redacts arbitrary errors", () => {
+    let error: unknown;
+    try { resolveCodexQuotaSamplerConfig({ env: {}, isWritableDir: () => false }); }
+    catch (caught) { error = caught; }
+    assert.match(formatCodexQuotaSamplerError(error), /textfile_dir_missing:.*--textfile-dir/);
+    for (const raw of [new Error("private-provider-details"), "private-auth-details", { message: "private-metadata" }]) {
+      assert.equal(formatCodexQuotaSamplerError(raw), "[codex-quota-sampler] configuration_or_local_state_error");
+    }
+  });
+
+  it("gives the same safe actionable errors in source, development and compiled entrypoints", () => {
+    const paths = target();
+    const root = fileURLToPath(new URL("../../", import.meta.url));
+    const entrypoints = [
+      ["--import", "tsx", join(root, "src/codex-quota-sampler.ts")],
+      ["--import", "tsx", join(root, "scripts/codex-quota-sampler.ts")],
+      [join(root, "dist/codex-quota-sampler.js")],
+    ];
+    const cases: Array<{ args: string[]; env?: NodeJS.ProcessEnv; message: RegExp }> = [
+      { args: ["--private-argument-details"], message: /unknown_argument: Unknown argument; use --help/ },
+      { args: ["--timeout"], message: /missing_value: --timeout requires a value/ },
+      { args: ["--timeout", "private-timeout-details"], message: /invalid_timeout: --timeout must be a positive integer/ },
+      { args: [], env: { CODEX_QUOTA_TIMEOUT_MS: "private-timeout-details" }, message: /invalid_timeout: CODEX_QUOTA_TIMEOUT_MS must be a positive integer/ },
+      { args: [], env: { CODEX_QUOTA_DRY_RUN: "private-boolean-details" }, message: /invalid_boolean: CODEX_QUOTA_DRY_RUN must be boolean-like/ },
+    ];
+    for (const sample of cases) {
+      const errors = entrypoints.map(entrypoint => {
+        const result = spawnSync(process.execPath, [...entrypoint, "--textfile-dir", paths.textfileDir, ...sample.args], {
+          cwd: root, encoding: "utf8", timeout: 10000,
+          env: { ...process.env, CODEX_QUOTA_TIMEOUT_MS: "100", CODEX_QUOTA_DRY_RUN: "false", ...sample.env },
+        });
+        assert.equal(result.status, 1, result.stderr);
+        assert.equal(result.stdout, "");
+        assert.match(result.stderr, sample.message);
+        assert.doesNotMatch(result.stderr, /private-(?:argument|timeout|boolean)-details/);
+        return result.stderr;
+      });
+      assert.equal(new Set(errors).size, 1, "all entrypoints should use the same formatter");
+    }
   });
 });

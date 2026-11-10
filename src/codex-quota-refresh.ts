@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, unlinkSync, chmodSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { CodexQuotaReadError, readCodexQuota, type CodexQuotaReaderOptions } from "./codex-quota-reader.js";
 import { resolveCodexQuotaPaths, writeCodexQuotaSnapshot } from "./pi-extensions/codex-usage.js";
@@ -40,7 +40,7 @@ async function refresh(options: RefreshQuotaOptions & { stateFile: string }): Pr
   }
   if (options.textfileDir) {
     try {
-      atomicWriteQuotaFile(join(options.textfileDir, "codex_usage_probe.prom"), formatCodexQuotaProbePrometheus({ attemptedAt, probeSuccess: success }));
+      atomicWriteQuotaFile(join(options.textfileDir, "codex_usage_probe.prom"), formatCodexQuotaProbePrometheus({ attemptedAt, probeSuccess: success }), 0o644);
     } catch {
       success = false;
       failureReason ??= "attempt_metrics_write_failed";
@@ -51,7 +51,7 @@ async function refresh(options: RefreshQuotaOptions & { stateFile: string }): Pr
       const prior = existsSync(options.stateFile)
         ? parseQuotaSnapshot(JSON.parse(readFileSync(options.stateFile, "utf8")))
         : { provider: "codex", families: [] };
-      atomicWriteQuotaFile(options.stateFile, JSON.stringify({ ...prior, ...attempt, probeSuccess: false }, null, 2) + "\n");
+      atomicWriteQuotaFile(options.stateFile, JSON.stringify({ ...prior, ...attempt, probeSuccess: false }, null, 2) + "\n", 0o600);
     } catch { /* Preserve unreadable state; return an explicit failed refresh regardless. */ }
   }
   return { success, failureReason, status: { ...readQuotaStatus(options), refreshFailed: !success } };
@@ -72,11 +72,12 @@ export function formatCodexQuotaProbePrometheus(attempt: { attemptedAt: Date; pr
   ].join("\n");
 }
 
-function atomicWriteQuotaFile(path: string, content: string): void {
+function atomicWriteQuotaFile(path: string, content: string, mode: number): void {
   mkdirSync(dirname(path), { recursive: true });
   const temporary = `${path}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
   try {
-    writeFileSync(temporary, content, { encoding: "utf8", mode: 0o600 });
+    writeFileSync(temporary, content, { encoding: "utf8", mode });
+    chmodSync(temporary, mode);
     renameSync(temporary, path);
   } finally {
     try { unlinkSync(temporary); } catch { /* Already renamed or write failed. */ }

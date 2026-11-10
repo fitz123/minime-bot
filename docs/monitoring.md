@@ -75,9 +75,11 @@ also ignored. `--dry-run` resolves paths without OAuth or a request.
 Snapshots retain only plan/quota metadata and `families`, each with an `id`,
 optional name/metered feature and allowance flags, and `primary`/`secondary`
 windows containing actual `durationSeconds`, usage and reset time. Null or
-zero-filled empty windows are omitted. Upstream HTTP headers discover
-`x-{family}-primary/secondary-*` and `x-{family}-limit-name`. Legacy positional
-cache entries remain readable as primary/secondary with unknown durations;
+zero-filled empty windows are omitted. Acquisition parses the GET JSON response.
+The retained header parser discovers `x-{family}-primary/secondary-*` and
+`x-{family}-limit-name` for callers that explicitly load the compatibility
+`extensions/pi/codex-usage.ts` provider-response capture hook; the sampler does
+not load that hook. Legacy positional cache entries remain readable as primary/secondary with unknown durations;
 status never derives durations from position or plan.
 
 The `codex_usage.prom` textfile exposes these gauges:
@@ -94,7 +96,9 @@ updates attempt telemetry without advancing last success. The legacy
 `codex_usage_weekly_percent`/`codex_usage_weekly_reset_timestamp` gauges are emitted
 only when a default-family window actually reports 18,000 or 604,800 seconds,
 regardless of its slot. Missing windows/durations produce no legacy series,
-not a false zero. Consumers of those legacy series must tolerate absence and
+not a false zero. Both metrics textfiles are written with mode `0644` for
+collectors running under another UID; quota state is `0600` on both successful
+and failed refreshes. Consumers of those legacy series must tolerate absence and
 use the dynamic gauges for other families/durations. The package does not
 change external alert rules or alert policy.
 

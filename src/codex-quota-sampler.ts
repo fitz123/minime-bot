@@ -12,6 +12,18 @@ export const CODEX_QUOTA_TIMEOUT_MS_ENV = "CODEX_QUOTA_TIMEOUT_MS";
 export const CODEX_QUOTA_DRY_RUN_ENV = "CODEX_QUOTA_DRY_RUN";
 export const CODEX_QUOTA_PROBE_TEXTFILE_NAME = "codex_usage_probe.prom";
 
+class CodexQuotaSamplerConfigError extends Error {
+  constructor(readonly code: string, message: string) { super(message); }
+}
+
+/** Only errors constructed from controlled configuration messages may be printed. */
+export function formatCodexQuotaSamplerError(error: unknown): string {
+  const detail = error instanceof CodexQuotaSamplerConfigError
+    ? `${error.code}: ${error.message}`
+    : "configuration_or_local_state_error";
+  return `[codex-quota-sampler] ${detail}`;
+}
+
 export interface CodexQuotaSamplerCliOptions {
   workspace?: string;
   model?: string;
@@ -78,7 +90,7 @@ export function parseCodexQuotaSamplerArgs(argv: readonly string[]): CodexQuotaS
         parsed.prompt = readFlagValue(argv, ++i, arg);
         break;
       default:
-        throw new Error(`Unknown argument: ${arg}`);
+        throw new CodexQuotaSamplerConfigError("unknown_argument", "Unknown argument; use --help for supported options");
     }
   }
   return parsed;
@@ -89,7 +101,7 @@ export function resolveCodexQuotaSamplerConfig(options: ResolveCodexQuotaSampler
   const env = options.env ?? process.env;
   const stateFile = resolveQuotaStateFile({ ...options, stateFile: cli.stateFile, workspace: cli.workspace });
   const paths = resolveCodexQuotaPaths({ ...options, stateFile, textfileDir: cli.textfileDir });
-  if (!paths.textfileDir) throw new Error("Codex quota sampler requires a configured or writable Prometheus textfile directory");
+  if (!paths.textfileDir) throw new CodexQuotaSamplerConfigError("textfile_dir_missing", "Codex quota sampler requires a configured or writable Prometheus textfile directory; set --textfile-dir, CODEX_QUOTA_TEXTFILE_DIR or NODE_EXPORTER_TEXTFILE_DIR");
   return {
     stateFile, textfileDir: paths.textfileDir,
     timeoutMs: cli.timeoutMs ?? parseOptionalPositiveInteger(env[CODEX_QUOTA_TIMEOUT_MS_ENV], CODEX_QUOTA_TIMEOUT_MS_ENV) ?? 20_000,
@@ -133,7 +145,7 @@ export function formatCodexQuotaSamplerHelp(): string {
 function readFlagValue(argv: readonly string[], index: number, flag: string): string {
   const value = argv[index];
   if (value === undefined || value.startsWith("--")) {
-    throw new Error(`${flag} requires a value`);
+    throw new CodexQuotaSamplerConfigError("missing_value", `${flag} requires a value`);
   }
   return value;
 }
@@ -149,7 +161,7 @@ function parseOptionalPositiveInteger(raw: string | undefined, label: string): n
 function parsePositiveInteger(raw: string, label: string): number {
   const value = Number(raw);
   if (!Number.isSafeInteger(value) || value <= 0) {
-    throw new Error(`${label} must be a positive integer`);
+    throw new CodexQuotaSamplerConfigError("invalid_timeout", `${label} must be a positive integer`);
   }
   return value;
 }
@@ -165,7 +177,7 @@ function parseBooleanEnv(raw: string | undefined): boolean | undefined {
   if (["0", "false", "no", "off"].includes(trimmed)) {
     return false;
   }
-  throw new Error(`${CODEX_QUOTA_DRY_RUN_ENV} must be boolean-like`);
+  throw new CodexQuotaSamplerConfigError("invalid_boolean", `${CODEX_QUOTA_DRY_RUN_ENV} must be boolean-like (true/false, yes/no, on/off or 1/0)`);
 }
 
 function nonEmpty(raw: string | undefined): string | undefined { return raw?.trim() || undefined; }
@@ -179,8 +191,8 @@ export function isDirectCodexQuotaSamplerEntrypoint(
 }
 
 if (isDirectCodexQuotaSamplerEntrypoint()) {
-  runCodexQuotaSamplerFromCli().catch(() => {
-    console.error("[codex-quota-sampler] configuration or local state error");
+  runCodexQuotaSamplerFromCli().catch((error: unknown) => {
+    console.error(formatCodexQuotaSamplerError(error));
     process.exitCode = 1;
   });
 }

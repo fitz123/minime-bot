@@ -1,5 +1,6 @@
 import {
   accessSync,
+  chmodSync,
   constants,
   existsSync,
   mkdirSync,
@@ -298,8 +299,8 @@ export function writeCodexQuotaSnapshot(
   options: CodexQuotaWriteOptions = {},
 ): CodexQuotaWriteResult {
   const paths = resolveCodexQuotaPaths(options);
-  const writes: Array<{ path: string; content: string }> = [
-    { path: paths.stateFile, content: `${JSON.stringify(snapshot, null, 2)}\n` },
+  const writes: Array<{ path: string; content: string; mode: number }> = [
+    { path: paths.stateFile, content: `${JSON.stringify(snapshot, null, 2)}\n`, mode: 0o600 },
   ];
 
   if (!paths.textfileDir) {
@@ -308,7 +309,7 @@ export function writeCodexQuotaSnapshot(
   }
 
   const metricsFile = join(paths.textfileDir, options.textfileName ?? CODEX_USAGE_TEXTFILE_NAME);
-  writes.push({ path: metricsFile, content: formatCodexQuotaPrometheus(snapshot) });
+  writes.push({ path: metricsFile, content: formatCodexQuotaPrometheus(snapshot), mode: 0o644 });
   atomicWriteFiles(writes);
   return { stateFile: paths.stateFile, metricsFile };
 }
@@ -394,7 +395,7 @@ function atomicWriteFile(path: string, content: string): void {
     `.${basename(path)}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`,
   );
   try {
-    writeFileSync(tempPath, content, { encoding: "utf8" });
+    writeFileSync(tempPath, content, { encoding: "utf8", mode: 0o600 });
     renameSync(tempPath, path);
   } catch (error) {
     try {
@@ -409,16 +410,18 @@ function atomicWriteFile(path: string, content: string): void {
 interface AtomicWritePlan {
   path: string;
   content: string;
+  mode: number;
   tempPath: string;
   previousContent?: string;
   existed: boolean;
   committed: boolean;
 }
 
-function atomicWriteFiles(writes: Array<{ path: string; content: string }>): void {
-  const plans: AtomicWritePlan[] = writes.map(({ path, content }) => ({
+function atomicWriteFiles(writes: Array<{ path: string; content: string; mode: number }>): void {
+  const plans: AtomicWritePlan[] = writes.map(({ path, content, mode }) => ({
     path,
     content,
+    mode,
     tempPath: tempPathFor(path),
     ...readPreviousFile(path),
     committed: false,
@@ -427,7 +430,8 @@ function atomicWriteFiles(writes: Array<{ path: string; content: string }>): voi
   try {
     for (const plan of plans) {
       mkdirSync(dirname(plan.path), { recursive: true });
-      writeFileSync(plan.tempPath, plan.content, { encoding: "utf8" });
+      writeFileSync(plan.tempPath, plan.content, { encoding: "utf8", mode: plan.mode });
+      chmodSync(plan.tempPath, plan.mode);
     }
     for (const plan of plans) {
       renameSync(plan.tempPath, plan.path);

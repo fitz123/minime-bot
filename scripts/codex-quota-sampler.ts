@@ -1,7 +1,6 @@
-import { runCodexQuotaSamplerFromCli } from "../src/codex-quota-sampler.js";
+import { formatCodexQuotaSamplerError, runCodexQuotaSamplerFromCli } from "../src/codex-quota-sampler.js";
 
 runCodexQuotaSamplerFromCli().catch((error: unknown) => {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error(`[codex-quota-sampler] ${message}`);
+  console.error(formatCodexQuotaSamplerError(error));
   process.exitCode = 1;
 });

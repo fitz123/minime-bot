@@ -59,9 +59,12 @@ Direct managed writes stay blocked. Raw worktree-mutating Git commands including
 destructive `reset`, `restore`, and `clean` forms, also stay blocked in positively
 detected Knowledge v2 workspaces. Read-only Git commands remain available.
 
-The standalone `extensions/pi/codex-usage.ts` wrapper is different: it is used
-only by the out-of-band Codex quota sampler and must not be added to the normal
-`PI_EXTENSION_WRAPPER_RELPATHS` list. See
+The standalone `extensions/pi/codex-usage.ts` wrapper is an explicitly loaded
+compatibility hook for provider-header capture, separate from the quota
+sampler's GET JSON reader. It must not be added to the normal
+`PI_EXTENSION_WRAPPER_RELPATHS` list. The sampler launches no Pi child; former
+model, prompt, executable and sampler-cwd options are ignored, and its dry run
+prints configuration without OAuth or a request. See
 `docs/plans/completed/2026-06-01-pi-phase2-extensions.md` for A1-A3.
 
 `PI_EXTENSIONS_DISABLED=1` disables every explicit extension for that spawn:
@@ -95,8 +98,8 @@ There are TWO kinds of files in this feature, deliberately split:
 
 1. **Pure helpers — `bot/src/pi-extensions/*.ts`** (this directory).
    All real logic lives here: Codex web-search request/parse, ask-agent policy/result
-   helpers, subagent spawn-arg/result helpers, and the sampler-only Codex
-   quota cache/export helper. These files are:
+   helpers, subagent spawn-arg/result helpers, and the shared Codex
+   quota JSON/header parsing, cache and export helper. These files are:
    - **Type-checked by `tsc --noEmit`** (the `npm run lint` command) because the
      bot `tsconfig.json` `include` is `["src/**/*.ts"]`, which matches this path.
    - **Exercised by `npm test`** because the test glob is `src/__tests__/*.test.ts`

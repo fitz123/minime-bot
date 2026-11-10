@@ -164,10 +164,11 @@ Final delivery follows that bounded wait. Final requests retain existing bounded
 transport retries and their delivery ambiguity; later-chunk failures can leave
 partial delivery. This is not an exactly-once transport guarantee.
 
-The sampler uses the same packaged Pi CLI by default; override it explicitly
-with `--pi-bin` or `CODEX_QUOTA_PI_BIN`. Its probe passes `--approve` for the
-isolated sampler project settings, and `--dry-run` prints the resolved command
-without executing it.
+The quota sampler reads `GET https://chatgpt.com/backend-api/wham/usage`
+with the existing Pi OAuth; it sends no inference and launches no Pi child.
+The former `--model`, `--prompt`, `--pi-bin` and `--sampler-cwd` options remain
+accepted and ignored, as do their former environment settings. `--dry-run`
+prints the resolved configuration without resolving OAuth or making a request.
 
 ## Control Workspace
 
