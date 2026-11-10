@@ -1520,7 +1520,10 @@ describe("command handler wiring", () => {
     apiResult?: (method: string, payload: any) => unknown | Promise<unknown>,
     factory: typeof createTelegramBot = createTelegramBot,
   ) {
-    const result = factory(handlerConfig, mockSM, opts);
+    const result = factory(handlerConfig, mockSM, {
+      refreshQuotaStatus: async () => ({ state: "unavailable", stateFile: "/tmp/synthetic-quota.json", reason: "missing_file", staleMs: 1800000 }),
+      ...opts,
+    });
     const { bot } = result;
     // Intercept all API calls so nothing reaches Telegram
     bot.api.config.use(async (_prev, method, payload) => {
@@ -1906,15 +1909,22 @@ describe("command handler wiring", () => {
     assert.ok(!mockSM.calls.includes("closeSession"), "/clean handler calls destroySession, not closeSession directly");
   });
 
-  it("/status replies from local health/cache without opening a session", async () => {
+  it("/status refreshes quota once before replying without opening a session", async () => {
     const mockSM = createMockSessionManager();
     const apiCalls: Array<{ method: string; payload: any }> = [];
-    const { bot } = initBot(mockSM, apiCalls);
+    let refreshes = 0;
+    const { bot } = initBot(mockSM, apiCalls, { refreshQuotaStatus: async () => {
+      refreshes++;
+      assert.equal(apiCalls.length, 0, "refresh precedes rendering");
+      return { state: "unavailable", stateFile: "/tmp/synthetic-quota.json", reason: "no_success", staleMs: 1800000, refreshFailed: true };
+    } });
 
     await bot.handleUpdate(makeCommandUpdate("status", 3, Math.floor(Date.now() / 1000) - 60 * 60));
 
+    assert.equal(refreshes, 1);
     const reply = apiCalls.find((call) => call.method === "sendMessage");
     assert.ok(reply);
+    assert.match(String(reply.payload.text), /Codex quota: unavailable \(no successful sample\)/);
     assert.match(String(reply.payload.text), /Sessions: 1\/2/);
     assert.match(String(reply.payload.text), /Session ID: session-123/);
     assert.ok(mockSM.calls.includes("getSessionHealth:111111111"));

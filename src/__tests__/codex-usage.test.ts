@@ -19,6 +19,7 @@ import {
   formatCodexQuotaPrometheus,
   formatCodexQuotaWriteError,
   parseCodexQuotaHeaders,
+  parseCodexQuotaUsage,
   recordCodexQuotaFromHeaders,
   resolveCodexQuotaPaths,
   writeCodexQuotaSnapshot,
@@ -44,6 +45,8 @@ function sampleSnapshot(): CodexQuotaSnapshot {
     {
       "x-codex-primary-used-percent": "12.5",
       "x-codex-secondary-used-percent": "88",
+      "x-codex-primary-window-minutes": "300",
+      "x-codex-secondary-window-minutes": "10080",
       "x-codex-primary-reset-at": "2026-06-05T17:00:00.000Z",
       "x-codex-secondary-reset-at": "2026-06-12T00:00:00.000Z",
       "x-codex-plan-type": "Pro",
@@ -62,13 +65,15 @@ describe("codex usage header parsing", () => {
     assert.equal(snapshot.provider, "codex");
     assert.equal(snapshot.sampledAt, "2026-06-05T12:00:00.000Z");
     assert.equal(snapshot.lastSuccessTimestamp, 1780660800);
-    assert.deepEqual(snapshot.windows["5h"], {
+    assert.deepEqual(snapshot.families[0].windows.primary!, {
+      durationSeconds: 18000,
       usedPercent: 12.5,
       remainingPercent: 87.5,
       resetAt: "2026-06-05T17:00:00.000Z",
       resetTimestamp: 1780678800,
     });
-    assert.deepEqual(snapshot.windows.week, {
+    assert.deepEqual(snapshot.families[0].windows.secondary!, {
+      durationSeconds: 604800,
       usedPercent: 88,
       remainingPercent: 12,
       resetAt: "2026-06-12T00:00:00.000Z",
@@ -88,9 +93,9 @@ describe("codex usage header parsing", () => {
     );
 
     assert.ok(snapshot);
-    assert.equal(snapshot.windows["5h"].usedPercent, 7.25);
-    assert.equal(snapshot.windows["5h"].remainingPercent, 92.75);
-    assert.equal(snapshot.windows.week.resetAt, "2026-06-12T00:00:00.000Z");
+    assert.equal(snapshot.families[0].windows.primary!.usedPercent, 7.25);
+    assert.equal(snapshot.families[0].windows.primary!.remainingPercent, 92.75);
+    assert.equal(snapshot.families[0].windows.secondary, undefined);
   });
 
   it("skips malformed numeric and timestamp headers without throwing", () => {
@@ -105,10 +110,9 @@ describe("codex usage header parsing", () => {
     );
 
     assert.ok(snapshot);
-    assert.equal(snapshot.windows["5h"].usedPercent, undefined);
-    assert.equal(snapshot.windows["5h"].resetTimestamp, undefined);
-    assert.equal(snapshot.windows.week.usedPercent, 35.5);
-    assert.equal(snapshot.windows.week.remainingPercent, 64.5);
+    assert.equal(snapshot.families[0].windows.primary, undefined);
+    assert.equal(snapshot.families[0].windows.secondary!.usedPercent, 35.5);
+    assert.equal(snapshot.families[0].windows.secondary!.remainingPercent, 64.5);
     assert.equal(snapshot.planType, "Team Plan");
   });
 
@@ -261,7 +265,7 @@ describe("codex usage atomic writes", () => {
     assert.equal(existsSync(stateFile), false);
     const captured = JSON.parse(readFileSync(attemptFile, "utf8"));
     assert.equal(captured.provider, "codex");
-    assert.equal(captured.windows["5h"].usedPercent, 12.5);
+    assert.equal(captured.families[0].windows.primary.usedPercent, 12.5);
     assert.equal("version" in captured, false);
     assert.equal("responseStatus" in captured, false);
   });
@@ -282,7 +286,7 @@ describe("codex usage atomic writes", () => {
 
     const state = JSON.parse(readFileSync(stateFile, "utf8"));
     assert.equal(state.provider, "codex");
-    assert.equal(state.windows["5h"].usedPercent, 12.5);
+    assert.equal(state.families[0].windows.primary.usedPercent, 12.5);
 
     const metrics = readFileSync(result.metricsFile, "utf8");
     assert.match(metrics, /codex_usage_5h_percent 12\.5/);
@@ -302,6 +306,7 @@ describe("codex usage atomic writes", () => {
     const second = parseCodexQuotaHeaders(
       {
         "x-codex-primary-used-percent": "30",
+        "x-codex-primary-window-minutes": "300",
       },
       new Date("2026-06-05T13:00:00.000Z"),
     );
@@ -309,7 +314,7 @@ describe("codex usage atomic writes", () => {
     writeCodexQuotaSnapshot(second, { stateFile, textfileDir });
 
     const state = JSON.parse(readFileSync(stateFile, "utf8"));
-    assert.equal(state.windows["5h"].usedPercent, 30);
+    assert.equal(state.families[0].windows.primary.usedPercent, 30);
     assert.equal(state.lastSuccessTimestamp, 1780664400);
     assert.match(readFileSync(join(textfileDir, CODEX_USAGE_TEXTFILE_NAME), "utf8"), /codex_usage_5h_percent 30/);
   });
@@ -356,5 +361,69 @@ describe("codex usage atomic writes", () => {
       return;
     }
     assert.match(formatCodexQuotaWriteError(result.error), /^\[codex-usage\] failed to write quota cache:/);
+  });
+});
+
+
+describe("dynamic quota families and durations", () => {
+  it("discovers upstream family headers, limit names, durations and secondary slots", () => {
+    for (const headers of [
+      { "x-codex-primary-used-percent": "7", "x-codex-primary-window-minutes": "10080", "x-codex-other-secondary-used-percent": "42", "x-codex-other-secondary-window-minutes": "90", "x-codex-other-limit-name": "Other model" },
+      new Headers({ "x-codex-primary-used-percent": "7", "x-codex-primary-window-minutes": "10080", "x-codex-other-secondary-used-percent": "42", "x-codex-other-secondary-window-minutes": "90", "x-codex-other-limit-name": "Other model" }),
+    ]) {
+      const snapshot = parseCodexQuotaHeaders(headers)!;
+      assert.equal(snapshot.families.length, 2);
+      assert.equal(snapshot.families[0].windows.primary?.durationSeconds, 604800);
+      assert.equal(snapshot.families[0].windows.secondary, undefined);
+      assert.equal(snapshot.families[1].id, "codex_other");
+      assert.equal(snapshot.families[1].name, "Other model");
+      assert.equal(snapshot.families[1].windows.secondary?.durationSeconds, 5400);
+      const metrics = formatCodexQuotaPrometheus(snapshot);
+      assert.match(metrics, /codex_usage_weekly_percent 7/);
+      assert.doesNotMatch(metrics, /codex_usage_5h/);
+      assert.match(metrics, /codex_usage_window_duration_seconds\{family="codex_other",window="secondary"\} 5400/);
+    }
+  });
+
+  it("parses normal pairs and named backend families without retaining unrelated fields", () => {
+    const snapshot = parseCodexQuotaUsage({ plan_type: "plus", rate_limit: {
+      primary_window: { used_percent: 25, limit_window_seconds: 18000, reset_at: 1780678800 },
+      secondary_window: { used_percent: 0, limit_window_seconds: 604800 },
+    }, additional_rate_limits: [{ limit_name: "Named limit", metered_feature: "codex_other", rate_limit: {
+      allowed: true, limit_reached: false, primary_window: { used_percent: 5, limit_window_seconds: 12345 },
+    }, account_id: "discard" }], email: "discard", credits: "discard" })!;
+    assert.equal(snapshot.families.length, 2);
+    assert.equal(snapshot.families[0].windows.primary?.resetTimestamp, 1780678800);
+    assert.equal(snapshot.families[0].windows.secondary?.usedPercent, 0);
+    assert.equal(snapshot.families[1].name, "Named limit");
+    assert.equal(snapshot.families[1].meteredFeature, "codex_other");
+    assert.equal(snapshot.families[1].windows.primary?.durationSeconds, 12345);
+    assert.doesNotMatch(JSON.stringify(snapshot), /discard|email|credits|account_id/);
+    const metrics = formatCodexQuotaPrometheus(snapshot);
+    assert.match(metrics, /codex_usage_5h_percent 25/);
+    assert.match(metrics, /codex_usage_weekly_percent 0/);
+  });
+
+  it("keeps missing/invalid durations unknown, never producing legacy projections", () => {
+    for (const duration of [undefined, null, "18000", -1, NaN, Infinity]) {
+      const snapshot = parseCodexQuotaUsage({ rate_limit: { primary_window: { used_percent: 5, limit_window_seconds: duration, reset_at: 1e100 } } })!;
+      assert.equal(snapshot.families[0].windows.primary?.durationSeconds, undefined);
+      assert.equal(snapshot.families[0].windows.primary?.resetTimestamp, undefined);
+      assert.doesNotMatch(formatCodexQuotaPrometheus(snapshot), /codex_usage_5h|codex_usage_weekly/);
+    }
+    const headers = parseCodexQuotaHeaders({ "x-codex-primary-used-percent": "5", "x-codex-primary-window-minutes": "bad" })!;
+    assert.equal(headers.families[0].windows.primary?.durationSeconds, undefined);
+  });
+
+  it("omits zero empty windows and rejects malformed or empty usage payloads", () => {
+    for (const raw of [null, [], {}, { rate_limit: null }, { rate_limit: { primary_window: {} } },
+      { rate_limit: { primary_window: { used_percent: "" } } },
+      { rate_limit: { primary_window: { used_percent: false } } },
+      { rate_limit: { primary_window: { used_percent: -5 } } },
+      { rate_limit: { primary_window: { used_percent: 0, limit_window_seconds: 0, reset_at: 0, reset_after_seconds: 0 } } },
+      { additional_rate_limits: [null, {}, { limit_name: "", rate_limit: {} }] },
+    ]) assert.equal(parseCodexQuotaUsage(raw), null);
+    assert.equal(parseCodexQuotaHeaders({ "x-codex-primary-used-percent": "0", "x-codex-primary-window-minutes": "0", "x-codex-primary-reset-at": "0" }), null);
+    assert.equal(parseCodexQuotaHeaders({ "x-codex-primary-used-percent": "" }), null);
   });
 });

@@ -46,10 +46,57 @@ state, provider fallback, package concurrency quota, or provider-specific
 Prometheus metric family. After terminal failure or retry exhaustion, the
 calling model receives the last bounded classification and owns any alternative.
 
-The out-of-band `minime-codex-quota-sampler` remains the single quota source for
-interactive work and search. It writes the cached snapshot used by `/status`
-and the `codex_usage_*` node-exporter textfile metrics, including bounded probe
-success and timestamp series.
+`minime-codex-quota-sampler` and Telegram/Discord `/status` use one shared
+GET-only reader for `https://chatgpt.com/backend-api/wham/usage`, following the
+[official Codex backend client](https://github.com/openai/codex/blob/main/codex-rs/backend-client/src/client/rate_limit_resets.rs).
+It resolves the existing Pi `openai-codex` OAuth with `ModelRuntime.create`
+(`modelsPath: null`, `refreshOnCreate: false`, `allowModelNetwork: false`) and
+`getAuth`, requires the resolved source to be `OAuth`, and obtains the account
+claim from the resolved JWT. It does not launch Pi inference or Codex app-server.
+Exhausted allowance is valid quota data and does not block this GET.
+
+The whole read, including OAuth and response body, has a deadline: three seconds
+for status and 20 seconds by default for the sampler (`--timeout-ms` or
+`CODEX_QUOTA_TIMEOUT_MS` overrides the sampler deadline). Concurrent refreshes
+within a process share one in-flight read per cache/metrics target. Discord
+defers its interaction before awaiting the refresh. Status never opens an agent
+session. A failed read preserves the last successful sample and usage metrics;
+status explicitly shows cached age and refresh failure, even for a recent sample.
+Diagnostics contain fixed classifications, never provider bodies or auth errors.
+
+The existing state path (`CODEX_QUOTA_STATE_FILE`, otherwise the selected control
+workspace's `.tmp/codex-quota-state.json`) and textfile directory selection
+(`CODEX_QUOTA_TEXTFILE_DIR`, `NODE_EXPORTER_TEXTFILE_DIR`, then the writable
+node-exporter default) are retained. The sampler still requires a textfile
+directory. `--model`, `--prompt`, `--pi-bin`, and `--sampler-cwd` are accepted
+and ignored for invocation compatibility; their former environment settings are
+also ignored. `--dry-run` resolves paths without OAuth or a request.
+
+Snapshots retain only plan/quota metadata and `families`, each with an `id`,
+optional name/metered feature and allowance flags, and `primary`/`secondary`
+windows containing actual `durationSeconds`, usage and reset time. Null or
+zero-filled empty windows are omitted. Upstream HTTP headers discover
+`x-{family}-primary/secondary-*` and `x-{family}-limit-name`. Legacy positional
+cache entries remain readable as primary/secondary with unknown durations;
+status never derives durations from position or plan.
+
+The `codex_usage.prom` textfile exposes these gauges:
+
+- `codex_usage_window_percent{family,window}` for reported usage;
+- `codex_usage_window_duration_seconds{family,window}` only for known durations;
+- `codex_usage_window_reset_timestamp{family,window}` only for known resets;
+- existing `codex_usage_last_success_timestamp` and `codex_usage_info` metadata.
+
+The existing `codex_usage_probe.prom` retains
+`codex_usage_last_attempt_timestamp` and `codex_usage_probe_success`. Failure
+updates attempt telemetry without advancing last success. The legacy
+`codex_usage_5h_percent`/`codex_usage_5h_reset_timestamp` and
+`codex_usage_weekly_percent`/`codex_usage_weekly_reset_timestamp` gauges are emitted
+only when a default-family window actually reports 18,000 or 604,800 seconds,
+regardless of its slot. Missing windows/durations produce no legacy series,
+not a false zero. Consumers of those legacy series must tolerate absence and
+use the dynamic gauges for other families/durations. The package does not
+change external alert rules or alert policy.
 
 Direct URL reads and browser automation do not go through `web_search`.
 Bash-capable full agents use the host `agent-browser` executable (`read` for

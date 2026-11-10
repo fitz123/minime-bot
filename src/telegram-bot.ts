@@ -40,7 +40,8 @@ import { recordMessage, lookupMessage } from "./message-content-index.js";
 import type { MessageRecord } from "./message-content-index.js";
 import { logReaction } from "./reaction-log.js";
 import { EchoWatcher, ECHO_PREFIX } from "./echo-watcher.js";
-import { readQuotaStatus } from "./quota-status.js";
+import type { QuotaStatus } from "./quota-status.js";
+import { refreshQuotaStatus } from "./codex-quota-refresh.js";
 import { buildStatusReport } from "./status-report.js";
 import {
   createPollProgressProbe,
@@ -764,6 +765,7 @@ export function createTelegramBot(
     draftCoordinator?: ActiveDraftCoordinator;
     /** Fresh local-control config; defaults to the regular loader without secret resolution. */
     loadConfig?: () => BotConfig;
+    refreshQuotaStatus?: () => Promise<QuotaStatus>;
   },
 ): TelegramBotResult {
   if (!config.telegramToken) {
@@ -931,7 +933,7 @@ export function createTelegramBot(
     await ctx.reply("Session cleaned. Fresh start.");
   });
 
-  // /status command — compact local-only session and quota health.
+  // /status command — session health and a bounded quota refresh.
   bot.command("status", async (ctx) => {
     const topicId = ctx.message?.message_thread_id;
     if (ctx.message) setThread(ctx.chat.id, ctx.message.message_id, topicId);
@@ -948,13 +950,14 @@ export function createTelegramBot(
         fastStatusLine = "Fast: unknown (read error)";
       }
     }
+    const quotaStatus = await (opts?.refreshQuotaStatus ?? refreshQuotaStatus)();
     await ctx.reply(buildStatusReport({
       activeCount: sessionManager.getActiveCount(),
       maxSessions: config.sessionDefaults.maxConcurrentSessions,
       uptimeSeconds: Math.floor(process.uptime()),
       sessionHealth,
       fastStatusLine,
-      quotaStatus: readQuotaStatus(),
+      quotaStatus,
     }));
   });
 

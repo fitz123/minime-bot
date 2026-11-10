@@ -9,6 +9,7 @@ import {
   formatResetEta,
   formatSampleAge,
   readQuotaStatus,
+  parseQuotaSnapshot,
   resolveQuotaStateFile,
 } from "../quota-status.js";
 import { MINIME_CONTROL_WORKSPACE_ROOT_ENV } from "../workspace-contract.js";
@@ -80,10 +81,12 @@ describe("quota status reader", () => {
     assert.equal(status.staleMs, DEFAULT_CODEX_QUOTA_STALE_MS);
     assert.equal(status.sampleAge, "2m ago");
     assert.equal(status.snapshot.provider, "codex");
-    assert.equal(status.snapshot.windows["5h"].usedPercent, 12.5);
-    assert.equal(status.snapshot.windows["5h"].remainingPercent, 87.5);
-    assert.equal(status.snapshot.windows["5h"].resetTimestamp, 1780678800);
-    assert.equal(status.snapshot.windows.week.usedPercent, 88);
+    assert.equal(status.snapshot.families[0].windows.primary!.durationSeconds, undefined);
+    assert.equal(status.snapshot.families[0].windows.secondary!.durationSeconds, undefined);
+    assert.equal(status.snapshot.families[0].windows.primary!.usedPercent, 12.5);
+    assert.equal(status.snapshot.families[0].windows.primary!.remainingPercent, 87.5);
+    assert.equal(status.snapshot.families[0].windows.primary!.resetTimestamp, 1780678800);
+    assert.equal(status.snapshot.families[0].windows.secondary!.usedPercent, 88);
     assert.equal(status.snapshot.lastAttemptTimestamp, 1780660860);
     assert.equal(status.snapshot.probeSuccess, true);
     assert.equal(status.snapshot.planType, "Pro");
@@ -233,4 +236,17 @@ describe("quota status duration formatting", () => {
     assert.equal(formatSampleAge("2026-06-05T11:58:00.000Z", now), "2m ago");
     assert.equal(formatCompactDuration(30_000), "0m");
   });
+});
+
+
+it("reads canonical families while omitting malformed and zero empty windows", () => {
+  const snapshot = parseQuotaSnapshot({ provider: "codex", families: [null, {}, { id: "named", name: "Named", allowed: false, limitReached: true, windows: {
+    primary: { usedPercent: 0, durationSeconds: 0, resetTimestamp: 0 },
+    secondary: { usedPercent: 35, durationSeconds: "604800", resetTimestamp: "bad" },
+  } }] });
+  assert.equal(snapshot.families.length, 1);
+  assert.equal(snapshot.families[0].windows.primary, undefined);
+  assert.deepEqual(snapshot.families[0].windows.secondary, { usedPercent: 35 });
+  assert.equal(snapshot.families[0].name, "Named");
+  assert.equal(snapshot.families[0].limitReached, true);
 });
