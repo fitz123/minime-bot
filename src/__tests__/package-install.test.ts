@@ -643,13 +643,9 @@ describe("package artifact install", () => {
         workspace,
       );
       assert.equal(samplerDryRun.status, 0, samplerDryRun.stderr || samplerDryRun.stdout || String(samplerDryRun.error));
-      const samplerDryRunJson = JSON.parse(samplerDryRun.stdout) as { command: string; args: string[] };
-      assert.equal(samplerDryRunJson.command, process.execPath);
-      assert.match(
-        samplerDryRunJson.args[0],
-        /node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]bundle[\/\\]cli\.js$/,
-      );
-      assert.equal(samplerDryRunJson.args[1], "--approve");
+      const samplerDryRunJson = JSON.parse(samplerDryRun.stdout) as { method: string; dryRun: boolean };
+      assert.equal(samplerDryRunJson.method, "GET");
+      assert.equal(samplerDryRunJson.dryRun, true);
 
       const configValidate = runInstalledBin(projectDir, ["config", "validate", "--workspace", workspace], workspace);
       assert.equal(configValidate.status, 0, configValidate.stderr);
