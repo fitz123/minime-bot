@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 2026.11.5
+
+- Keep scheduled LLM and script jobs in normal mode independently of interactive Fast preferences (#258, #259).
+- Preserve cron Fast-off scope through cooperative Pi and Codex descendants without changing chat settings, models or reasoning; include executable CLI enforcement and offline packaged-request verification.
+
 ## 2026.11.4
 
 - Read Codex subscription quota with a bounded OAuth usage GET rather than an inference probe (#61, #256).
