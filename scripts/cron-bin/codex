@@ -3,4 +3,14 @@ if [[ -z "${MINIME_CRON_REAL_CODEX:-}" || "$MINIME_CRON_REAL_CODEX" == "$0" ]]; 
   echo "Cron Codex shim: MINIME_CRON_REAL_CODEX must name the real Codex executable" >&2
   exit 127
 fi
-exec "$MINIME_CRON_REAL_CODEX" -c 'service_tier="default"' "$@"
+# Codex restores explicit env settings after its login-shell snapshot is sourced.
+# Encode PATH as a TOML basic string without evaluating any shell metacharacters.
+cron_path=${PATH//\\/\\\\}
+cron_path=${cron_path//\"/\\\"}
+cron_path=${cron_path//$'\b'/\\b}
+cron_path=${cron_path//$'\t'/\\t}
+cron_path=${cron_path//$'\n'/\\n}
+cron_path=${cron_path//$'\f'/\\f}
+cron_path=${cron_path//$'\r'/\\r}
+exec "$MINIME_CRON_REAL_CODEX" -c 'service_tier="default"' \
+  -c "shell_environment_policy.set.PATH=\"$cron_path\"" "$@"

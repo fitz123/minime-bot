@@ -82,7 +82,7 @@ test("cron CLI shim preserves the real symlink, argv, stdin and exit status", t 
     const result = spawnSync(shim, passedArgs, { env, input: "stdin prompt\nsecond line\n", encoding: "utf8" });
     assert.equal(result.status, failure ? 23 : 0, result.stderr);
     assert.deepEqual(JSON.parse(result.stdout), {
-      args: ["-c", 'service_tier="default"', ...passedArgs], input: "stdin prompt\nsecond line\n", marker: "1",
+      args: ["-c", 'service_tier="default"', "-c", `shell_environment_policy.set.PATH=${JSON.stringify(env.PATH)}`, ...passedArgs], input: "stdin prompt\nsecond line\n", marker: "1",
     });
   }
   assert.deepEqual(buildCronFastEnv(env), env, "nested cron does not duplicate the shim");
@@ -93,6 +93,27 @@ test("cron CLI shim preserves the real symlink, argv, stdin and exit status", t 
   assert.equal(recursive.status, 127);
 });
 
+test("cron CLI shim captures exact PATH as a TOML string and preserves model, reasoning and argv order", t => {
+  const { bin } = fixture(t);
+  const args = ["--model", "gpt-6-astra", "-c", 'model_reasoning_effort="high"', "exec", "--json", "--", 'prompt with "quotes", $value and `literal`'];
+  for (const extra of [
+    ":/plain::/trailing/:",
+    String.raw`:/spaces and 'single' "double" quotes/with\backslashes/$value/$(literal)/\n/\"/é`,
+    ":/controls\b\t\n\f\r/end",
+  ]) {
+    const env = buildCronFastEnv({ PATH: `${bin}${extra}` });
+    const result = spawnSync(join(env[CRON_CODEX_SHIM_DIR_ENV], "codex"), args, { env, input: "", encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    const captured = JSON.parse(result.stdout);
+    assert.deepEqual(captured.args.slice(0, 3), ["-c", 'service_tier="default"', "-c"]);
+    const prefix = "shell_environment_policy.set.PATH=";
+    assert.ok(captured.args[3]?.startsWith(prefix));
+    // These JSON escapes are also TOML basic-string escapes; round-trip the value.
+    assert.equal(JSON.parse(captured.args[3].slice(prefix.length)), env.PATH);
+    assert.deepEqual(captured.args.slice(4), args);
+  }
+});
+
 test("script cron resolves the shim on PATH and leaves its parent untouched", t => {
   const { bin } = fixture(t);
   setEnv(t, { PATH: `${bin}:/usr/bin:/bin` });
@@ -100,7 +121,7 @@ test("script cron resolves the shim on PATH and leaves its parent untouched", t 
   const before = keys.map(key => process.env[key]);
   const output = runScript({ name: "cli-script", type: "script", command: "printf 'script input' | codex exec - 'script prompt'" } as CronJob);
   assert.deepEqual(JSON.parse(output), {
-    args: ["-c", 'service_tier="default"', "exec", "-", "script prompt"], input: "script input", marker: "1",
+    args: ["-c", 'service_tier="default"', "-c", `shell_environment_policy.set.PATH=${JSON.stringify(buildCronFastEnv({ PATH: process.env.PATH }).PATH)}`, "exec", "-", "script prompt"], input: "script input", marker: "1",
   });
   assert.deepEqual(keys.map(key => process.env[key]), before);
 });

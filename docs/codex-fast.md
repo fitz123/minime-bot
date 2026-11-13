@@ -89,7 +89,18 @@ processing by default.
 
 When Codex is available on the original PATH, cron prepends the package-owned
 `scripts/cron-bin/codex` shim. It executes the real CLI with
-`-c 'service_tier="default"'`, preserving arguments, stdin, and exit behavior.
+`-c 'service_tier="default"'` and a process-scoped
+`shell_environment_policy.set.PATH` override containing the exact inherited PATH,
+escaped as a TOML string. Both overrides precede the original arguments; model,
+reasoning, argument order, stdin, and exit behavior are preserved.
+The PATH override restores the inherited PATH after Codex sources its shell
+snapshot ([runtime source](https://github.com/openai/codex/blob/rust-v0.167.0/codex-rs/core/src/tools/runtimes/mod.rs)).
+This covers snapshot restoration only: in Codex CLI 0.167.2, the subsequent inner
+`zsh -c` runs the user's `.zshenv`, which can reorder PATH again. Host shell startup
+that reorders PATH must restore `MINIME_CRON_CODEX_SHIM_DIR` to the front after its
+normal PATH setup when `MINIME_CRON_FAST_OFF=1`. Keep this adjustment conditional
+so normal interactive defaults remain unchanged. The package does not edit host
+shell startup files or global Codex configuration.
 `MINIME_CRON_REAL_CODEX` retains the executable's symlink path, and
 `MINIME_CRON_CODEX_SHIM_DIR` tracks the temporary PATH entry. Missing Codex leaves
 PATH unchanged for Pi-only jobs; an unavailable executable shim produces an error.
@@ -97,6 +108,11 @@ No global CLI or model configuration is edited. This is a cooperative descendant
 contract, with no cron Fast-on option: generated direct absolute CLI calls must
 also pass `-c 'service_tier="default"'` and preserve the cron environment. Scripts
 that reset PATH or invoke an absolute CLI must follow the same rule.
+
+Pi explicitly sends `service_tier: "default"`. Codex CLI 0.167.0 instead omits
+the explicit default tier from provider request JSON; absence on the wire is
+expected and does not mean the CLI override was lost
+([request-tier source](https://github.com/openai/codex/blob/rust-v0.167.0/codex-rs/protocol/src/openai_models.rs)).
 
 Preferences are stored in control-workspace `data/codex-fast.json`, separately
 from session state, and survive `/clean` and restarts. Defaults and overrides
