@@ -193,5 +193,5 @@ test("offline verifier CLI executes through a current directory symlink", { time
   });
   assert.equal(result.error, undefined);
   assert.equal(result.status, 0, result.stderr || result.stdout);
-  assert.deepEqual(JSON.parse(result.stdout), { piVersion: "1.5.0", requestChecks: 24, commandsChecked: 28 });
+  assert.deepEqual(JSON.parse(result.stdout), { piVersion: "1.5.0", requestChecks: 53, commandsChecked: 93 });
 });

@@ -177,6 +177,7 @@ describe("subagent: wrapper spawn environment", () => {
     const wrapper = readFileSync(resolve(BOT_DIR, "extensions", "pi", "subagent", "index.ts"), "utf8");
 
     assert.match(wrapper, /buildPiSubagentChildSpawnEnv\(defaultCwd\)/);
+    assert.match(wrapper, /extensionArgs: resolvePiSubagentChildExtensionArgs\(\)/);
     assert.match(wrapper, /resolvePiInvocation\(args\)/);
     assert.doesNotMatch(wrapper, /env:\s*\{\s*\.{3}process\.env/);
   });

@@ -9,6 +9,7 @@ import { normalizeContext } from "@earendil-works/pi-ai";
 import { stream as buildCodexRequest } from "@earendil-works/pi-ai/api/openai-codex-responses";
 import { OPENAI_CODEX_MODELS } from "@earendil-works/pi-ai/providers/openai-codex.models";
 import { formatFastStatusLine, PI_FAST_THREAD_ENV } from "./codex-fast.js";
+import { CRON_FAST_OFF_ENV, isCronFastOff } from "./cron-fast-env.js";
 import { buildStatusReport } from "./status-report.js";
 import { EXPECTED_PI_PACKAGE_VERSION, resolvePackageOwnedPiInvocation } from "./pi-runtime.js";
 import { MINIME_CONFIG_PATH_ENV, MINIME_CONTROL_WORKSPACE_ROOT_ENV, MINIME_INSTANCE_CONFIG_PATH_ENV } from "./workspace-contract.js";
@@ -30,7 +31,7 @@ export async function verifyCodexFast(extensionPath?: string): Promise<{ piVersi
   }
   assert.equal(resolvePackageOwnedPiInvocation("rpc", []).diagnostic.versionMismatch, false);
   const root = mkdtempSync(join(tmpdir(), "minime-fast-verify-"));
-  const envKeys = ["HOME", "PI_CODING_AGENT_DIR", "PI_OFFLINE", "PI_SKIP_VERSION_CHECK", MINIME_CONTROL_WORKSPACE_ROOT_ENV, MINIME_CONFIG_PATH_ENV, MINIME_INSTANCE_CONFIG_PATH_ENV, "MINIME_BOT_PI_SESSION_AGENT_ID", PI_FAST_THREAD_ENV];
+  const envKeys = ["HOME", "PI_CODING_AGENT_DIR", "PI_OFFLINE", "PI_SKIP_VERSION_CHECK", MINIME_CONTROL_WORKSPACE_ROOT_ENV, MINIME_CONFIG_PATH_ENV, MINIME_INSTANCE_CONFIG_PATH_ENV, "MINIME_BOT_PI_SESSION_AGENT_ID", PI_FAST_THREAD_ENV, CRON_FAST_OFF_ENV];
   const previous = new Map(envKeys.map(key => [key, process.env[key]]));
   const originalFetch = globalThis.fetch;
   let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
@@ -46,6 +47,7 @@ export async function verifyCodexFast(extensionPath?: string): Promise<{ piVersi
     delete process.env[MINIME_INSTANCE_CONFIG_PATH_ENV];
     process.env.MINIME_BOT_PI_SESSION_AGENT_ID = "fixture-primary";
     process.env[PI_FAST_THREAD_ENV] = "fixture-chat:one";
+    delete process.env[CRON_FAST_OFF_ENV];
     globalThis.fetch = async () => { throw new Error("Offline verifier forbids provider/network calls"); };
     const agentDir = join(root, "agent");
     mkdirSync(agentDir);
@@ -76,7 +78,7 @@ export async function verifyCodexFast(extensionPath?: string): Promise<{ piVersi
       await session!.prompt(`/fast${args ? ` ${args}` : ""}`);
       assert.equal(notices.length, count + 1);
       assert.match(notices.at(-1)!, expected);
-      if (notices.at(-1)!.startsWith("Fast:")) {
+      if (!isCronFastOff(process.env) && notices.at(-1)!.startsWith("Fast:")) {
         assert.equal(notices.at(-1)!.split("\n").length, 4);
         assert.match(notices.at(-1)!, /Модель: Astra/);
         assert.match(notices.at(-1)!, /Общий режим fixture-primary\/Astra:/);
@@ -160,8 +162,9 @@ export async function verifyCodexFast(extensionPath?: string): Promise<{ piVersi
     // any transport. The token contains only synthetic fixture claims.
     const token = `fixture.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture" } })).toString("base64url")}.fixture`;
     const built: Record<string, unknown>[] = [];
-    for (const enabled of [true, false]) {
-      await command(`default ${enabled ? "on" : "off"}`, /Общий режим /);
+    for (const mode of ["on", "off", "cron"]) {
+      if (mode === "cron") process.env[CRON_FAST_OFF_ENV] = "1";
+      else await command(`default ${mode}`, /Общий режим /);
       const result = await buildCodexRequest(OPENAI_CODEX_MODELS["gpt-6-astra"], normalizeContext({ messages: [{ role: "user", content: "offline fixture", timestamp: 0 }] }), {
         apiKey: token, reasoningEffort: "high", transport: "sse",
         onPayload: async body => {
@@ -173,11 +176,46 @@ export async function verifyCodexFast(extensionPath?: string): Promise<{ piVersi
       assert.match(result.errorMessage!, /offline-verifier-stop-before-transport/);
       requestChecks++;
     }
-    assert.equal(built.length, 2);
+    delete process.env[CRON_FAST_OFF_ENV];
+    assert.equal(built.length, 3);
     assert.deepEqual(built[0], { ...built[1], service_tier: "priority" });
+    assert.deepEqual(built[2], { ...built[1], service_tier: "default" });
     assert.equal(built[1].model, "gpt-6-astra");
     assert.deepEqual(built[1].reasoning, { effort: "high", summary: "auto" });
     assert.equal("service_tier" in built[1], false);
+    // The loaded hook must bypass scope/config/preferences even for unopted or
+    // unidentified cron descendants, and must replace independently set tiers.
+    const checkCron = async () => {
+      for (const tier of [undefined, "priority", "auto", "default"]) {
+        const body = { ...payload, ...(tier === undefined ? {} : { service_tier: tier }) };
+        const original = structuredClone(body);
+        assert.deepEqual(await session!.extensionRunner.emitBeforeProviderRequest(body), { ...body, service_tier: "default" });
+        assert.deepEqual(body, original);
+        requestChecks++;
+      }
+      for (const args of ["", "status", "on", "off", "inherit", "default on", "default off", "default status", "help"]) {
+        await command(args, /Fast: off \(enforced for cron jobs\)/);
+      }
+    };
+    for (const enabled of [true, false]) {
+      await command(`default ${enabled ? "on" : "off"}`, /Общий режим /);
+      const beforeCron = readFileSync(preferencesPath, "utf8");
+      process.env[CRON_FAST_OFF_ENV] = "1";
+      for (const id of ["fixture-primary", "fixture-other", ""]) {
+        process.env.MINIME_BOT_PI_SESSION_AGENT_ID = id;
+        await checkCron();
+        assert.equal(readFileSync(preferencesPath, "utf8"), beforeCron);
+      }
+      delete process.env[CRON_FAST_OFF_ENV];
+      process.env.MINIME_BOT_PI_SESSION_AGENT_ID = "fixture-primary";
+    }
+    process.env[CRON_FAST_OFF_ENV] = "1";
+    writeFileSync(preferencesPath, "invalid fixture preferences");
+    writeFileSync(join(root, "config.yaml"), "invalid fixture config");
+    await checkCron();
+    assert.equal(readFileSync(preferencesPath, "utf8"), "invalid fixture preferences");
+    const mismatch = { ...payload, model: "other-model", service_tier: "priority" };
+    assert.deepEqual(await session.extensionRunner.emitBeforeProviderRequest(mismatch), mismatch);
     assert.deepEqual(errors, []);
     assert.equal(session.state.messages.length, 0);
     assert.equal(session.thinkingLevel, "high");
