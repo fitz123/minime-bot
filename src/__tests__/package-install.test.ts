@@ -9,6 +9,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  statSync,
   rmSync,
   unlinkSync,
   writeFileSync,
@@ -345,6 +346,8 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/extensions/pi/codex-fast.js",
     "dist/extensions/pi/codex-fast-LICENSE.md",
     "dist/pi-extensions/codex-fast-request.js",
+    "dist/pi-extensions/cron-fast-request.js",
+    "dist/cron-fast-env.js",
     "dist/codex-fast.js",
     "dist/verify-codex-fast.js",
     "dist/extensions/pi/acknowledged-steer.js",
@@ -362,6 +365,7 @@ function assertPackFiles(files: readonly string[]): void {
     "scripts/runtime_doctor.py",
     "scripts/restart-bot.sh",
     "scripts/run-cron.sh",
+    "scripts/cron-bin/codex",
     "scripts/start-bot.sh",
     "telegram-bot.plist.example",
     "docs/launchd-operations.md",
@@ -471,6 +475,7 @@ describe("package artifact install", () => {
       assert.equal(install.status, 0, install.stderr || install.stdout);
 
       const installedPackage = join(projectDir, "node_modules", "minime-bot");
+      assert.ok(statSync(join(installedPackage, "scripts/cron-bin/codex")).mode & 0o111, "packed cron shim must remain executable");
       for (const packageName of [
         "@earendil-works/pi-agent-core",
         "@earendil-works/pi-ai",
@@ -1284,10 +1289,7 @@ assertCanonicalWebWrapper("interactive parent", extensionPaths);
 assert.equal(extensionPaths.some((path) => path.endsWith("/recovery.js")), false);
 assertNoGuardContract("parent Pi extension args must not load the retired guard", parentExtensionArgs);
 
-const subagentChildExtensionArgs = piRpc.resolvePiExtensionArgs({
-  env: {},
-  relpaths: piRpc.PI_SUBAGENT_CHILD_WRAPPER_RELPATHS,
-});
+const subagentChildExtensionArgs = piRpc.resolvePiSubagentChildExtensionArgs({ env: {} });
 assert.deepEqual(
   extensionPathsFromArgs(subagentChildExtensionArgs).map((path) => relative(artifactDir, path)),
   ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js"],
@@ -1710,6 +1712,7 @@ writeFileSync(
 const askAgentWrapperArgvPath = join(askAgentSmokeRoot, "wrapper-argv.bin");
 const askAgentWrapperCwdPath = join(askAgentSmokeRoot, "wrapper-cwd.txt");
 const askAgentWrapperCallerEnvPath = join(askAgentSmokeRoot, "wrapper-caller-env.txt");
+const cronChildEnvPath = join(askAgentSmokeRoot, "cron-child-env.json");
 const globalPiMarkerPath = join(askAgentSmokeRoot, "global-pi-ran.txt");
 const askAgentWrapperJsonl = JSON.stringify({
   type: "message_end",
@@ -1741,6 +1744,7 @@ writeFileSync(
     "writeFileSync(" + JSON.stringify(askAgentWrapperCwdPath) + ", process.cwd() + '\\n');",
     "writeFileSync(" + JSON.stringify(askAgentWrapperArgvPath) + ", process.argv.slice(2).join('\\0') + '\\0');",
     "writeFileSync(" + JSON.stringify(askAgentWrapperCallerEnvPath) + ", (process.env.MINIME_BOT_PI_SESSION_AGENT_ID ?? '__unset__') + '\\n');",
+    "writeFileSync(" + JSON.stringify(cronChildEnvPath) + ", JSON.stringify({ marker: process.env.MINIME_CRON_FAST_OFF, real: process.env.MINIME_CRON_REAL_CODEX, shimDir: process.env.MINIME_CRON_CODEX_SHIM_DIR, path: process.env.PATH, thread: process.env.MINIME_BOT_PI_SESSION_THREAD_KEY }));",
     "console.log(" + JSON.stringify(askAgentWrapperJsonl) + ");",
     "",
   ].join("\n"),
@@ -1789,6 +1793,47 @@ try {
   assert.ok(!askAgentWrapperExtensions.some((path) => path.includes("subagent")));
   assert.ok(!askAgentWrapperExtensions.some((path) => path.includes("ask-agent")));
   assert.doesNotMatch(JSON.stringify(askAgentWrapperResult), /neutral wrapper smoke question|neutral wrapper smoke context/);
+  assert.equal(JSON.parse(readFileSync(cronChildEnvPath, "utf8")).marker, undefined);
+
+  const cronEnvMod = await importPackageFile("dist/cron-fast-env.js");
+  const fakeCodex = join(fakeBinDir, "codex");
+  writeFileSync(fakeCodex, "#!/bin/sh\nexit 0\n");
+  chmodSync(fakeCodex, 0o755);
+  const cronKeys = ["PATH", "MINIME_CRON_FAST_OFF", "MINIME_CRON_REAL_CODEX", "MINIME_CRON_CODEX_SHIM_DIR"];
+  const beforeCron = new Map(cronKeys.map(key => [key, process.env[key]]));
+  const cronEnv = cronEnvMod.buildCronFastEnv({ PATH: process.env.PATH });
+  try {
+    for (const key of cronKeys) process.env[key] = cronEnv[key];
+    const cronAsk = await askAgentTool.execute("cron-ask-wrapper-call", { agent: "agent-c", question: "cron fixture" });
+    assert.equal(cronAsk.details.ok, true, JSON.stringify(cronAsk));
+    const askCronEnv = JSON.parse(readFileSync(cronChildEnvPath, "utf8"));
+    assert.equal(askCronEnv.marker, "1");
+    assert.equal(askCronEnv.real, fakeCodex);
+    assert.equal(askCronEnv.path.split(":")[0], cronEnv.MINIME_CRON_CODEX_SHIM_DIR);
+    assert.equal(readFileSync(askAgentWrapperCallerEnvPath, "utf8").trim(), "agent-c");
+    const subagentTool = registeredToolDefs.find(tool => tool.name === "subagent");
+    assert.ok(subagentTool);
+    for (const marked of [true, false]) {
+      if (!marked) delete process.env.MINIME_CRON_FAST_OFF;
+      const subResult = await subagentTool.execute("cron-subagent-wrapper-call", {
+        agent: "worker", task: "cron fixture", agentScope: "user",
+      }, undefined, undefined, { cwd: agentWorkspace, hasUI: false });
+      assert.equal(subResult.isError, undefined, JSON.stringify(subResult));
+      const argv = readFileSync(askAgentWrapperArgvPath, "utf8").split("\0").filter(Boolean);
+      const wrappers = extensionPathsFromSpawnArgs(argv).map(path => relative(artifactDir, path));
+      assert.deepEqual(wrappers, ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js", ...(marked ? ["codex-fast.js"] : [])]);
+      const childEnv = JSON.parse(readFileSync(cronChildEnvPath, "utf8"));
+      assert.equal(childEnv.marker, marked ? "1" : undefined);
+      assert.equal(childEnv.real, marked ? fakeCodex : undefined);
+      assert.equal(childEnv.thread, undefined);
+      assert.equal(childEnv.path.split(":").includes(cronEnv.MINIME_CRON_CODEX_SHIM_DIR), marked);
+      assert.equal(readFileSync(askAgentWrapperCallerEnvPath, "utf8").trim(), "__unset__");
+    }
+  } finally {
+    for (const [key, value] of beforeCron) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
 } finally {
   if (oldAskAgentWorkspace === undefined) {
     delete process.env[controlWorkspaceEnv];

@@ -154,6 +154,7 @@ describe("cron-runner runPi", () => {
       },
     }));
     assert.equal(captures[0].options.env?.MINIME_BOT_PI_SESSION_AGENT_ID, "main");
+    assert.equal(captures[0].options.env?.MINIME_CRON_FAST_OFF, "1");
     assert.equal(captures[0].options.env?.MINIME_BOT_PI_SESSION_THREAD_KEY, undefined);
   });
 

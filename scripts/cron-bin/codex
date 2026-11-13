@@ -1,0 +1,6 @@
+#!/bin/bash
+if [[ -z "${MINIME_CRON_REAL_CODEX:-}" || "$MINIME_CRON_REAL_CODEX" == "$0" ]]; then
+  echo "Cron Codex shim: MINIME_CRON_REAL_CODEX must name the real Codex executable" >&2
+  exit 127
+fi
+exec "$MINIME_CRON_REAL_CODEX" -c 'service_tier="default"' "$@"

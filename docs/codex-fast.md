@@ -20,8 +20,8 @@ agents:
 The opt-in must match the agent's configured model exactly. Other agents,
 including those using the same model, are unchanged unless explicitly opted in.
 Changing the current model or provider makes the adapter inactive for that
-request. Generic delegated subagents never receive this adapter or an inherited
-primary-agent identity.
+request. Generic interactive delegated subagents do not receive this adapter or
+an inherited primary-agent identity.
 
 Authenticated Telegram commands use the actual chat/topic binding:
 
@@ -67,12 +67,36 @@ an active session, no session or Fast block is invented. Status and help do not
 write preferences or create sessions, models, or provider requests.
 
 A new thread inherits its default. Defaults also apply to identified non-chat
-consumers: native local Pi sessions, crons running as the agent, and `ask_agent`
+consumers: native local Pi sessions and `ask_agent`
 requests targeting that agent. Those consumers never inherit the caller's
 thread override. A native Pi session with the configured wrapper and trusted
 `MINIME_BOT_PI_SESSION_AGENT_ID` supports the same `/fast` command; without an
 identified chat it can change only the default. Missing or unknown agent
 identity leaves Fast inactive. The existing extension kill switch still applies.
+
+All cron jobs always run with Fast off, regardless of chat or agent defaults.
+Pi cron requests explicitly use `service_tier: "default"` (normal processing),
+overwriting existing `priority` or `auto` values without reading preferences or
+requiring agent opt-in. Cron `/fast` commands report enforced off and never change
+chat preferences. Model, reasoning, authentication, and history are unchanged.
+
+Both Pi and script crons set `MINIME_CRON_FAST_OFF=1`. Their allowed Pi descendants,
+including `ask_agent` targets and ordinary subagents, preserve this contract;
+ordinary subagents load the Fast wrapper only under cron. Interactive launches
+clear cron state. Native monitoring HTTP event triggers are not cron and retain
+their existing behavior. Direct web-search HTTP requests already use normal
+processing by default.
+
+When Codex is available on the original PATH, cron prepends the package-owned
+`scripts/cron-bin/codex` shim. It executes the real CLI with
+`-c 'service_tier="default"'`, preserving arguments, stdin, and exit behavior.
+`MINIME_CRON_REAL_CODEX` retains the executable's symlink path, and
+`MINIME_CRON_CODEX_SHIM_DIR` tracks the temporary PATH entry. Missing Codex leaves
+PATH unchanged for Pi-only jobs; an unavailable executable shim produces an error.
+No global CLI or model configuration is edited. This is a cooperative descendant
+contract, with no cron Fast-on option: generated direct absolute CLI calls must
+also pass `-c 'service_tier="default"'` and preserve the cron environment. Scripts
+that reset PATH or invoke an absolute CLI must follow the same rule.
 
 Preferences are stored in control-workspace `data/codex-fast.json`, separately
 from session state, and survive `/clean` and restarts. Defaults and overrides
@@ -82,7 +106,7 @@ again, so warm sessions see changes without restarting. A concurrent writer
 causes an explicit retry message; after a crashed writer, an operator may need to
 remove the stale `data/codex-fast.json.lock` before retrying.
 
-Independent provider `service_tier` settings are preserved. For example, an
+Outside cron, independent provider `service_tier` settings are preserved. For example, an
 existing `priority` value still requests priority while this adapter's preference
 is off; an existing `auto` value prevents this adapter from adding priority even
 when its preference is on. The compact Fast state describes this adapter's
@@ -104,7 +128,8 @@ The bounded offline verifier checks the resolved Pi versions, loads the real
 packaged wrapper, exercises compact native command output, read-only help even
 without valid opt-in configuration, session Fast status formatting, and a request-hook matrix,
 and executes Pi's Codex request builder with a synthetic token, stopping before
-transport. It checks unchanged model/reasoning and preserves independent tiers.
+transport. It checks unchanged model/reasoning, preserves interactive independent
+tiers, and verifies enforced cron off without preference reads or writes.
 All fixture writes go to a disposable temporary directory; configured preferences,
 credentials, sessions, and provider endpoints are not accessed. It exits nonzero
 on failed assertions. Set `TMPDIR` to select its scratch parent.

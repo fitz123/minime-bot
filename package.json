@@ -43,6 +43,7 @@
     "scripts/runtime_doctor.py",
     "scripts/restart-bot.sh",
     "scripts/run-cron.sh",
+    "scripts/cron-bin/codex",
     "scripts/start-bot.sh",
     "telegram-bot.plist.example",
     "docs/launchd-operations.md",

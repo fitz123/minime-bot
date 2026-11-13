@@ -41,8 +41,7 @@ import {
 import { resolvePiInvocation } from "../../../src/pi-extensions/pi-invocation.js";
 import {
 	buildPiSubagentChildSpawnEnv,
-	PI_SUBAGENT_CHILD_WRAPPER_RELPATHS,
-	resolvePiExtensionArgs,
+	resolvePiSubagentChildExtensionArgs,
 } from "../../../src/pi-rpc-protocol.js";
 
 const MAX_PARALLEL_TASKS = 8;
@@ -305,7 +304,7 @@ async function runSingleAgent(
 		// from the parent.
 		const args = buildSubagentSpawnArgs(agent, task, {
 			systemPromptPath: tmpPromptPath ?? undefined,
-			extensionArgs: resolvePiExtensionArgs({ relpaths: PI_SUBAGENT_CHILD_WRAPPER_RELPATHS }),
+			extensionArgs: resolvePiSubagentChildExtensionArgs(),
 		});
 		const invocation = resolvePiInvocation(args);
 
