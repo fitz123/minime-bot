@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 2026.11.6
+
+- Deliver explicitly marked detached agent results through the same native Telegram rich renderer as chat (#261, #262).
+- Preserve ordinary service messages, confirmed-result echoes, and fail-closed no-replay handling for uncertain or partial sends.
+
 ## 2026.11.5
 
 - Keep scheduled LLM and script jobs in normal mode independently of interactive Fast preferences (#258, #259).
