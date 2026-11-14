@@ -218,6 +218,9 @@ describe("deliver.sh agent-answer entry", () => {
   for (const args of [
     ["invalid", "--purpose", "agent-answer"],
     ["-123", "--purpose", "agent-answer", "--thread"],
+    ["-123", "--thread", "", "--purpose", "agent-answer"],
+    ["-123", "--thread", "--purpose", "agent-answer"],
+    ["-123", "--purpose", "agent-answer", "--thread", ""],
     ["-123", "--thread", "invalid", "--purpose", "agent-answer"],
     ["9007199254740992", "--purpose", "agent-answer"],
   ]) {
@@ -228,6 +231,20 @@ describe("deliver.sh agent-answer entry", () => {
       assert.deepEqual(h.calls, []);
     });
   }
+  it("does not parse purpose-like message arguments as options", () => {
+    const h = runShell("dist", ["-123", "A synthetic service notice.", "--purpose", "agent-answer"], "");
+    assert.equal(h.status, 0, h.stderr);
+    assert.equal(h.stdout, "");
+    assert.equal(h.calls.length, 1);
+    assert.equal(h.calls[0].method, "sendMessage");
+    assert.equal(h.calls[0].body.text, "A synthetic service notice. --purpose agent-answer");
+  });
+  it("stops purpose parsing at message arguments after a malformed thread", () => {
+    const h = runShell("dist", ["-123", "--thread", "", "A synthetic service notice.", "--purpose", "agent-answer"], "");
+    assert.equal(h.status, 1, h.stderr);
+    assert.equal(h.stdout, "");
+    assert.deepEqual(h.calls, []);
+  });
   for (const mode of ["dist", "source"] as const) {
     for (const options of [["--thread", "42", "--purpose", "agent-answer"], ["--purpose", "agent-answer", "--thread", "42"]]) {
       it(`runs the ${mode} CLI with options ${options[0]} first`, () => {

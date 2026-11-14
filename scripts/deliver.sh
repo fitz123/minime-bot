@@ -28,8 +28,18 @@ while [ $# -gt 0 ]; do
     --thread|--purpose)
       if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
         ARG_ERROR="option requires a value"
-        break
+        if [ $# -ge 2 ]; then shift 2; else shift; fi
+        continue
       fi
+      # Keep parsing leading options after a missing value, but never scan
+      # beyond the first message argument for a later purpose-like string.
+      case "$2" in
+        --thread|--purpose)
+          ARG_ERROR="option requires a value"
+          shift
+          continue
+          ;;
+      esac
       if [ "$1" = "--thread" ]; then THREAD_ID="$2"; else PURPOSE="$2"; fi
       shift 2
       ;;
