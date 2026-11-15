@@ -1161,7 +1161,7 @@ const PI_RPC_SETTLED_WITHOUT_OUTCOME_MESSAGE =
 const PI_RPC_AGENT_END_WITHOUT_OUTCOME_MESSAGE =
   "Pi agent_end arrived without a usable terminal outcome";
 const PI_RPC_REASONING_ONLY_LENGTH_MESSAGE =
-  "Pi response hit the length limit before producing visible text and could not continue after compaction";
+  "Pi response hit the length limit before producing visible text";
 const PI_RPC_EXIT_BEFORE_SETTLED_MESSAGE = "Pi subprocess exited before agent_settled";
 
 /**

@@ -2783,7 +2783,39 @@ describe("parsePiEvent", () => {
     assert.strictEqual(parsePiEvent({ type: "agent_settled" }, state), null);
   });
 
-  it("keeps reasoning-only stopReason=length as a distinct terminal error", () => {
+  it("settles reasoning-only stopReason=length once without compaction", () => {
+    const state: PiRpcParseState = {};
+    const events = [
+      {
+        type: "agent_end",
+        messages: [{
+          role: "assistant",
+          stopReason: "length",
+          content: [{ type: "thinking", thinking: "unfinished reasoning" }],
+        }],
+      },
+      { type: "agent_settled" },
+    ];
+    assert.strictEqual(
+      events.some((event) => event.type.startsWith("compaction_")),
+      false,
+    );
+    const lines = events.map((event) => parsePiEvent(event, state));
+    assert.strictEqual(lines[0], null);
+    assert.strictEqual(lines.filter((line) => line?.type === "result").length, 1);
+    assert.strictEqual(state.agentEndObserved, true);
+
+    const settled = lines[1];
+    assert.ok(settled);
+    assert.strictEqual((settled as { is_error?: boolean }).is_error, true);
+    assert.strictEqual(
+      (settled as { result: string }).result,
+      "Pi response hit the length limit before producing visible text",
+    );
+    assert.strictEqual(parsePiEvent({ type: "agent_settled" }, state), null);
+  });
+
+  it("preserves existing partial-visible length settlement for wording-only compatibility", () => {
     const state: PiRpcParseState = {};
     assert.strictEqual(
       parsePiEvent({
@@ -2791,20 +2823,21 @@ describe("parsePiEvent", () => {
         messages: [{
           role: "assistant",
           stopReason: "length",
-          content: [{ type: "thinking", thinking: "unfinished reasoning" }],
+          content: [
+            { type: "thinking", thinking: "unfinished reasoning" },
+            { type: "text", text: "partial answer" },
+          ],
         }],
       }, state),
       null,
     );
-    assert.strictEqual(state.agentEndObserved, true);
 
     const settled = parsePiEvent({ type: "agent_settled" }, state);
     assert.ok(settled);
-    assert.strictEqual((settled as { is_error?: boolean }).is_error, true);
-    assert.strictEqual(
-      (settled as { result: string }).result,
-      "Pi response hit the length limit before producing visible text and could not continue after compaction",
-    );
+    assert.strictEqual(settled.type, "result");
+    assert.strictEqual((settled as { result: string }).result, "partial answer");
+    assert.strictEqual((settled as { is_error?: boolean }).is_error, undefined);
+    assert.strictEqual(parsePiEvent({ type: "agent_settled" }, state), null);
   });
 
   it("keeps the length outcome until a meaningful continuation outcome replaces it", () => {
@@ -2836,7 +2869,7 @@ describe("parsePiEvent", () => {
     assert.ok(settled);
     assert.strictEqual(
       (settled as { result: string }).result,
-      "Pi response hit the length limit before producing visible text and could not continue after compaction",
+      "Pi response hit the length limit before producing visible text",
     );
     assert.strictEqual((settled as { is_error?: boolean }).is_error, true);
   });
@@ -3888,7 +3921,7 @@ describe("readPiStream", () => {
     assert.strictEqual(results.length, 1);
     assert.strictEqual(
       (results[0] as { result: string }).result,
-      "Pi response hit the length limit before producing visible text and could not continue after compaction",
+      "Pi response hit the length limit before producing visible text",
     );
     assert.strictEqual((results[0] as { session_id: string }).session_id, "length-session");
     assert.strictEqual((results[0] as { is_error?: boolean }).is_error, true);
@@ -3914,7 +3947,7 @@ describe("readPiStream", () => {
     assert.strictEqual(lines[0].type, "result");
     assert.strictEqual(
       (lines[0] as { result: string }).result,
-      "Pi response hit the length limit before producing visible text and could not continue after compaction",
+      "Pi response hit the length limit before producing visible text",
     );
     assert.strictEqual(
       (lines[0] as { session_id: string }).session_id,
