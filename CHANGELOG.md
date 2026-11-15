@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 2026.11.7
+
+- Report reasoning-only length outcomes without falsely assuming compaction occurred (#197, #264).
+- Preserve existing settlement, continuation, EOF and partial-visible behavior; broader incomplete-response handling remains open.
+
 ## 2026.11.6
 
 - Deliver explicitly marked detached agent results through the same native Telegram rich renderer as chat (#261, #262).
