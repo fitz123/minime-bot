@@ -20,6 +20,13 @@ whisperModel: /nonexistent/minime-bot/fixture-whisper-model.bin
 # absolute, and operator-approved.
 # piExtraExtensions:
 #   - /opt/minime/pi-extensions/approved-extension.ts
+# collaboration:
+#   socketPath: /tmp/minime-collaboration/router.sock
+# Optional private-topic presentation, disabled unless explicitly configured.
+# Applies to authorized private Telegram DMs with topics; groups and supergroups are excluded.
+# privateTopics:
+#   enabled: true
+#   maxNameGraphemes: 17
 bindings:
   - chatId: 111
     agentId: main

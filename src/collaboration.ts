@@ -1,7 +1,22 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, lstatSync, mkdirSync, unlinkSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import { createServer, createConnection, type Socket, type Server } from "node:net";
+import type { TopicApply } from "./private-topics.js";
+import type { BotConfig } from "./types.js";
+import { resolveWorkspaceContract } from "./workspace-contract.js";
+
+/** Fixed at startup, like the existing collaboration socket; workspace roots isolate instances. */
+export function collaborationTransport(config: BotConfig): { socketPath: string; topicOnly: boolean } | undefined {
+  if (config.collaboration) return { socketPath: config.collaboration.socketPath, topicOnly: false };
+  if (config.privateTopics?.enabled) {
+    const instance = createHash("sha256").update(`${process.getuid?.() ?? "user"}:${resolveWorkspaceContract().paths.dataDir}`).digest("hex").slice(0, 24);
+    const relative = join(`minime-topics-${instance}`, "router.sock");
+    const temporary = join(tmpdir(), relative);
+    return { socketPath: Buffer.byteLength(temporary) <= 100 ? temporary : join("/tmp", relative), topicOnly: true };
+  }
+}
 
 export type Address = { kind: "agent" | "thread" | "session" | "terminal"; id: string };
 export type ReceiptStatus = "accepted" | "consumed" | "rejected" | "disconnected" | "unknown" | "expired";
@@ -12,6 +27,8 @@ export interface Discovery { endpoints: Endpoint[]; nextOffset?: number }
 export interface CollaborationOwner {
   discover(): Endpoint[];
   deliver(message: Delivery, consumed: () => void): Promise<void>;
+  topicContext?(source: Address): Promise<unknown>;
+  topicApply?(source: Address, request: TopicApply): unknown;
 }
 export class CollaborationDeliveryError extends Error {
   constructor(readonly status: Exclude<ReceiptStatus, "accepted" | "consumed">, message: string) { super(message); }
@@ -87,15 +104,22 @@ export class CollaborationRouter {
   private sockets = new Set<Socket>();
   private messages = new Map<string, { delivery: Delivery; receipt: Receipt }>();
   private conversations = new Map<string, { count: number; expires: number }>();
-  constructor(private owner: CollaborationOwner) {}
-  async start(path: string): Promise<void> {
-    await prepareSocket(path);
-    this.server = createServer(socket => this.connect(socket));
-    await new Promise<void>((resolve, reject) => {
-      this.server!.once("error", reject);
-      this.server!.listen(path, () => { this.server!.removeListener("error", reject); resolve(); });
-    });
-    chmodSync(path, 0o600);
+  constructor(private owner: CollaborationOwner, private options: { topicOnly?: boolean } = {}) {}
+  async start(path: string): Promise<boolean> {
+    try {
+      await prepareSocket(path);
+      this.server = createServer(socket => this.connect(socket));
+      await new Promise<void>((resolve, reject) => {
+        this.server!.once("error", reject);
+        this.server!.listen(path, () => { this.server!.removeListener("error", reject); resolve(); });
+      });
+      chmodSync(path, 0o600);
+      return true;
+    } catch (error) {
+      if (!this.options.topicOnly) throw error;
+      await this.stop();
+      return false;
+    }
   }
   async stop(): Promise<void> {
     for (const entry of this.messages.values()) if (entry.receipt.status === "accepted") entry.receipt.status = "unknown";
@@ -128,7 +152,8 @@ export class CollaborationRouter {
       this.prune();
       const respond = (value: unknown) => write(socket, { request: frame.request, value });
       if (frame.op === "hello") {
-        if (source || !validAddress(frame.address) || !["terminal", "session"].includes(frame.address.kind) || this.peers.has(key(frame.address))) {
+        if (source || !validAddress(frame.address) || !["terminal", "session"].includes(frame.address.kind) ||
+            (this.options.topicOnly && frame.address.kind !== "session") || this.peers.has(key(frame.address))) {
           return void respond({ status: "rejected", reason: "invalid or duplicate endpoint" });
         }
         source = frame.address;
@@ -136,6 +161,17 @@ export class CollaborationRouter {
         return void respond({ status: "accepted" });
       }
       if (!source) return void respond({ status: "rejected", reason: "register first" });
+      if (frame.op === "topic_context" || frame.op === "topic_apply") {
+        if (source.kind !== "session") return void respond({ status: "rejected", reason: "current bot session required" });
+        const currentSource = source;
+        void Promise.resolve().then(() => frame.op === "topic_context"
+          ? this.owner.topicContext?.(currentSource)
+          : this.owner.topicApply?.(currentSource, frame as unknown as TopicApply))
+          .then(value => respond(value ?? { status: "unavailable" }))
+          .catch(() => respond({ status: "unavailable" }));
+        return;
+      }
+      if (this.options.topicOnly) return void respond({ status: "rejected", reason: "topic-only transport" });
       if (frame.op === "discover") {
         const offset = frame.offset ?? 0;
         if (!Number.isSafeInteger(offset) || offset < 0) return void respond({ status: "rejected", reason: "invalid discovery offset" });
@@ -248,15 +284,26 @@ export class CollaborationClient {
     if (!this.ready) socket.destroy();
     return this.ready;
   }
-  async request(frame: Record<string, unknown>): Promise<any> {
-    if (!await this.connect()) return { status: "disconnected" };
-    return this.exchange(frame);
+  async request(frame: Record<string, unknown>, timeoutMs?: number): Promise<any> {
+    if (timeoutMs === undefined) {
+      if (!await this.connect()) return { status: "disconnected" };
+      return this.exchange(frame);
+    }
+    // Optional deadline includes connection/registration, and never sends a late request.
+    const started = Date.now();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const connected = await Promise.race([this.connect(), new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), timeoutMs); })]);
+      const remaining = timeoutMs - (Date.now() - started);
+      if (!connected || remaining <= 0) return { status: "unavailable" };
+      return await this.exchange(frame, remaining);
+    } finally { clearTimeout(timer); }
   }
-  private exchange(frame: Record<string, unknown>): Promise<any> {
+  private exchange(frame: Record<string, unknown>, timeoutMs = 3000): Promise<any> {
     if (!this.socket || this.socket.destroyed) return Promise.resolve({ status: "disconnected" });
     const request = randomUUID();
     return new Promise(resolve => {
-      const timer = setTimeout(() => { this.pending.delete(request); resolve({ status: "unknown", reason: "receipt timeout; do not replay" }); }, 3000);
+      const timer = setTimeout(() => { this.pending.delete(request); resolve({ status: "unknown", reason: "receipt timeout; do not replay" }); }, timeoutMs);
       this.pending.set(request, { resolve, timer, hello: frame.op === "hello" });
       write(this.socket!, { ...frame, request });
     });

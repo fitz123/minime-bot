@@ -7,7 +7,10 @@ import { join } from "node:path";
 import { on } from "node:events";
 import PQueue from "p-queue";
 import { resolveBinding } from "./telegram-binding.js";
-import { CollaborationDeliveryError, collaborationPrompt, type Delivery, type Endpoint } from "./collaboration.js";
+import { CollaborationDeliveryError, collaborationPrompt, collaborationTransport, type Delivery, type Endpoint } from "./collaboration.js";
+import type { Address } from "./collaboration.js";
+import { topicScopeEnabled, type PrivateTopicController, type TopicApply } from "./private-topics.js";
+import type { TopicRecord, TopicTarget } from "./topic-store.js";
 import type { BoundSessionState, PendingSessionRecoveryNotice, PlatformContext, SessionRecoveryReason, SessionState, StreamLine, BotConfig, AgentConfig } from "./types.js";
 import { spawnPiRpcSession, sendPiPrompt, sendPiSteer, sendPiAcknowledgedSteer, sendPiGetState, readPiStream, parsePiStartupIdentityRecord, assertPiSessionIdentityMatchesBinding, PiStartupBlockingUiError, NewlineOnlyJsonlSplitter, normalizePiModel, PI_EXTENSIONS_DISABLED_ENV, type PiAcknowledgedSteerResult, type PiRpcEvent, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions, type PiStartupDiagnostics } from "./pi-rpc-protocol.js";
 import { SessionStore } from "./session-store.js";
@@ -311,7 +314,8 @@ export class SessionManager {
   private loadConfig: () => BotConfig;
   private logDir: string;
   private startupTimeoutMs: number;
-  private collaborationSocket?: string;
+  private transport?: ReturnType<typeof collaborationTransport>;
+  private topicController?: PrivateTopicController;
   private humanWorkPending: (chatId: string) => boolean = () => false;
   private humanInputs = new Map<string, number>();
 
@@ -324,7 +328,7 @@ export class SessionManager {
     this.loadConfig = loadConfig;
     // Validate config at boot — fail fast if config is broken
     const startupConfig = loadConfig();
-    this.collaborationSocket = startupConfig.collaboration?.socketPath;
+    this.transport = collaborationTransport(startupConfig);
     this.store = new SessionStore(storePath);
     this.store.migrateLegacySessions(startupConfig);
     this.logDir = logDir ?? LOG_DIR;
@@ -333,6 +337,64 @@ export class SessionManager {
 
   setHumanWorkPending(pending: (chatId: string) => boolean): void {
     this.humanWorkPending = pending;
+  }
+
+  setTopicController(controller: PrivateTopicController | undefined): void { this.topicController = controller; }
+
+  disableTopicTransport(): void {
+    if (this.transport?.topicOnly) this.transport = undefined;
+  }
+
+  /** Read-only inventory joined to current routing; no session identity is persisted in topic data. */
+  inspectKnownTopics(botId: number, chatId: number): Array<{ topic: TopicRecord; agentId?: string; session?: Pick<BoundSessionState, "sessionId" | "sessionFile"> }> {
+    const controller = this.topicController;
+    if (!controller || controller.currentBotId() !== botId) return [];
+    const config = this.getFreshConfig();
+    if (!config.privateTopics?.enabled) return [];
+    const sessions = this.store.getAllSessions();
+    return controller.store.list().flatMap(topic => {
+      if (topic.botId !== botId || topic.chatId !== chatId) return [];
+      const binding = resolveBinding(chatId, config.bindings, topic.topicId);
+      const agentId = binding?.kind === "dm" && config.agents[binding.agentId] ? binding.agentId : undefined;
+      const current = sessions[`${chatId}:${topic.topicId}`];
+      const session = agentId && current?.bindingState === "bound" && current.agentId === agentId
+        ? { sessionId: current.sessionId, sessionFile: current.sessionFile } : undefined;
+      return [{ topic, agentId, session }];
+    });
+  }
+
+  /** Join metadata to today's routed session; the inventory never copies session identity. */
+  resolveTopicSource(source: Address): (TopicTarget & { agentId: string; sessionId: string }) | undefined {
+    if (source.kind !== "session" || process.env.PI_EXTENSIONS_DISABLED === "1") return;
+    const config = this.getFreshConfig();
+    const botId = this.topicController?.currentBotId();
+    if (botId === undefined) return;
+    const entries = Object.entries(this.store.getAllSessions()).filter(([, state]) => state.bindingState === "bound" && state.sessionId === source.id);
+    if (entries.length !== 1) return;
+    const [lane, state] = entries[0];
+    const match = /^(\d+):(\d+)$/.exec(lane);
+    if (!match || !config.agents[state.agentId] || this.active.get(lane)?.internalTurn) return;
+    const target = { botId, chatId: Number(match[1]), topicId: Number(match[2]) };
+    if (!this.topicController?.eligible(target, config) || resolveBinding(target.chatId, config.bindings, target.topicId)?.agentId !== state.agentId) return;
+    return { ...target, agentId: state.agentId, sessionId: source.id };
+  }
+
+  async topicContext(source: Address): Promise<unknown> {
+    const target = this.resolveTopicSource(source);
+    if (!target) return { status: "unavailable" };
+    const context = await this.topicController!.context(target);
+    const current = this.resolveTopicSource(source);
+    return current && current.botId === target.botId && current.chatId === target.chatId && current.topicId === target.topicId && current.agentId === target.agentId
+      ? context : { status: "unavailable" };
+  }
+
+  topicApply(source: Address, request: TopicApply): unknown {
+    const target = this.resolveTopicSource(source);
+    if (!target) return { status: "unavailable" };
+    return this.topicController!.apply(target, request, () => {
+      const current = this.resolveTopicSource(source);
+      return !!current && current.botId === target.botId && current.chatId === target.chatId && current.topicId === target.topicId && current.agentId === target.agentId;
+    });
   }
 
   /** Reserve a lane while an incoming human message is staged (e.g. media download). */
@@ -1016,16 +1078,18 @@ export class SessionManager {
     ensureSessionMediaDir(chatId);
 
     const outboxPath = outboxDir(chatId);
-    const collaborationEnabled = Boolean(this.collaborationSocket);
-    const extensionOptions: PiSpawnExtensionOptions | undefined = collaborationEnabled
-      ? { extraExtensions: freshConfig.piExtraExtensions, collaboration: true }
-      : freshConfig.piExtraExtensions === undefined
-        ? undefined
-        : { extraExtensions: freshConfig.piExtraExtensions };
     const telegramLane = /^(-?\d+)(?::(\d+))?$/.exec(chatId);
     const telegramRichAnswers = !!telegramLane && !!resolveBinding(Number(telegramLane[1]), freshConfig.bindings,
       telegramLane[2] === undefined ? undefined : Number(telegramLane[2]));
-    const runtimeEnvOptions: PiSpawnRuntimeEnvOptions = { askCallerAgentId: agentId, fastThreadKey: chatId, outboxPath, ...(telegramRichAnswers ? { telegramRichAnswers: true } : {}) };
+    const topicBotId = this.topicController?.currentBotId();
+    const privateTopicPolicy = !!this.transport && process.env.PI_EXTENSIONS_DISABLED !== "1" && topicBotId !== undefined && !!telegramLane?.[2] &&
+      topicScopeEnabled(freshConfig, { botId: topicBotId, chatId: Number(telegramLane[1]), topicId: Number(telegramLane[2]) }) &&
+      resolveBinding(Number(telegramLane[1]), freshConfig.bindings, Number(telegramLane[2]))?.agentId === agentId;
+    const transportEnabled = !!this.transport && (!this.transport.topicOnly || privateTopicPolicy);
+    const extensionOptions: PiSpawnExtensionOptions | undefined = transportEnabled
+      ? { extraExtensions: freshConfig.piExtraExtensions, collaboration: true }
+      : freshConfig.piExtraExtensions === undefined ? undefined : { extraExtensions: freshConfig.piExtraExtensions };
+    const runtimeEnvOptions: PiSpawnRuntimeEnvOptions = { askCallerAgentId: agentId, fastThreadKey: chatId, outboxPath, ...(privateTopicPolicy ? { privateTopicPolicy: true } : {}), ...(telegramRichAnswers ? { telegramRichAnswers: true } : {}) };
     let prepared = this.prepareSessionBinding(chatId, agentId, agent, freshConfig, Boolean(expectedId));
     if (isStartupSuperseded()) {
       await abortSupersededStartup();
@@ -1034,8 +1098,8 @@ export class SessionManager {
     let child: ChildProcess | undefined;
     for (;;) {
       try {
-        child = spawnPiRpcSession(agent, prepared.binding, extensionOptions, collaborationEnabled
-          ? { ...runtimeEnvOptions, collaborationSession: prepared.binding.sessionId, collaborationSocket: this.collaborationSocket }
+        child = spawnPiRpcSession(agent, prepared.binding, extensionOptions, transportEnabled
+          ? { ...runtimeEnvOptions, collaborationSession: prepared.binding.sessionId, collaborationSocket: this.transport!.socketPath, ...(this.transport!.topicOnly ? { collaborationTopicOnly: true } : {}) }
           : runtimeEnvOptions);
         await waitForSpawn(child, this.startupTimeoutMs);
         if (isStartupSuperseded()) {
