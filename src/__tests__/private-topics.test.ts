@@ -170,7 +170,8 @@ test("service observations distinguish author/peer, implicit/unknown/manual prov
   assert.equal(f.inputs.length, 0, "service-only messages never start a model turn");
   assert.equal(topic.name.provenance, "implicit");
   assert.equal(topic.name.pinned, false);
-  assert.equal(topic.icon.pinned, false);
+  assert.equal(topic.icon.pinned, true);
+  assert.equal(topic.icon.provenance, "manual");
   await f.send({ forum_topic_edited: { icon_custom_emoji_id: "" } });
   topic = f.controller.store.get(target)!;
   assert.equal(topic.icon.value, "");
@@ -185,6 +186,34 @@ test("service observations distinguish author/peer, implicit/unknown/manual prov
   assert.deepEqual(f.controller.store.get(target)!.icon, topic.icon);
   assert.equal((await f.controller.context(target) as any).status, "complete");
   assert.deepEqual(f.api.map(call => call.method), ["getForumTopicIconStickers"]);
+});
+
+test("implicit names do not make icons implicit or release uncertain icons without a human icon observation", async t => {
+  const f = await fixture(t);
+  const implicit = { name: "Topic", is_name_implicit: true, icon_color: 0 };
+  for (const from of [undefined, { id: target.botId, is_bot: true, first_name: "Fixture" }]) {
+    await f.send({ from, forum_topic_created: { ...implicit, icon_custom_emoji_id: "catalog-code" } });
+    const topic = f.controller.store.get(target)!;
+    assert.equal(topic.name.provenance, "implicit");
+    assert.equal(topic.icon.provenance, "unknown");
+    assert.equal(topic.icon.pinned, false);
+  }
+  for (const icon of ["catalog-garden", ""]) {
+    await f.send({ forum_topic_edited: { icon_custom_emoji_id: "catalog-garden" } });
+    await f.send({ from: { id: target.botId, is_bot: true, first_name: "Fixture" },
+      forum_topic_created: { ...implicit, icon_custom_emoji_id: "catalog-code" } });
+    assert.deepEqual(f.controller.store.get(target)!.occupiedIconIds, ["catalog-code"]);
+    await f.send({ forum_topic_created: implicit });
+    assert.deepEqual(f.controller.store.get(target)!.occupiedIconIds, ["catalog-code"], "absent icon cannot release occupancy");
+    await f.send({ forum_topic_created: { ...implicit, icon_custom_emoji_id: icon } });
+    const topic = new TopicStore(f.controller.store.path).get(target)!;
+    assert.equal(topic.name.provenance, "implicit");
+    assert.equal(topic.name.pinned, false);
+    assert.equal(topic.icon.value, icon);
+    assert.equal(topic.icon.provenance, "manual");
+    assert.equal(topic.icon.pinned, true);
+    assert.equal(topic.occupiedIconIds, undefined, "explicit human icon resets occupancy even with an implicit name");
+  }
 });
 
 test("own creation/edits and missing authors never become manual pins; explicit creation does", async t => {
@@ -866,7 +895,7 @@ test("completed topics never auto-repeat; the same human turn can explicitly ren
 
 test("manual no-ops pin only requested fields, retain uncertain occupancy, and never invent receipts", async t => {
   const f = await fixture(t);
-  await f.send({ forum_topic_created: { name: "Compiler", is_name_implicit: true, icon_color: 0, icon_custom_emoji_id: "catalog-code" } });
+  await f.send({ from: undefined, forum_topic_created: { name: "Compiler", is_name_implicit: true, icon_color: 0, icon_custom_emoji_id: "catalog-code" } });
   const before = f.controller.store.get(target)!;
   before.occupiedIconIds = ["catalog-garden"];
   f.controller.store.put(before);

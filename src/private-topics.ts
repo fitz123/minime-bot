@@ -53,13 +53,14 @@ export class PrivateTopicController {
     topic.lastObservationSource = message.forum_topic_created ? "topic-created" : message.forum_topic_edited ? "topic-edited" : "message";
     const event = message.forum_topic_created ?? message.forum_topic_edited;
     if (event) {
-      const implicit = "is_name_implicit" in event && event.is_name_implicit;
-      const manual = !!message.from && message.from.id !== botId && !message.from.is_bot && !implicit;
+      const human = !!message.from && message.from.id !== botId && !message.from.is_bot;
       if (event.icon_custom_emoji_id !== undefined) {
-        if (manual) delete topic.occupiedIconIds;
+        if (human) delete topic.occupiedIconIds;
         else this.retainConflictingIcon(topic, event.icon_custom_emoji_id);
       }
       for (const [field, value] of [["name", event.name], ["icon", event.icon_custom_emoji_id]] as const) {
+        const implicit = field === "name" && "is_name_implicit" in event && event.is_name_implicit;
+        const manual = human && !implicit;
         if (value === undefined || (!manual && topic[field].pinned)) continue;
         // Echoes of our request never turn into manual pins or supersede a human edit.
         const policyEcho = message.from?.id === botId && (topic.pending?.[field] === value ||
