@@ -245,7 +245,8 @@ is the single writer: synchronous observation/reservation sections run serially
 on its event loop, with no await between checking occupancy and durable reservation.
 
 The optional `topic_context` IPC request has a one-second client deadline in the
-Pi hook. It returns a hidden context **message**, preserving the system prompt.
+Pi hook. The hook appends context to the current `event.systemPrompt` for that
+run only, preserving its existing text without adding a transcript message.
 Only an eligible human turn requests it; custom/internal collaboration turns do
 not. Icon candidates use short indices bound to a revision and catalog hash, not
 long custom emoji identifiers in the model context. `topic_apply` returns
@@ -280,8 +281,10 @@ existing context request, so current human steering can retry its explicit
 request against the new revision. Internal turns remain excluded. Both observed
 icons and pending icon targets reserve occupancy among
 known topics of the same bot/chat. Unavailable and deleted-unconfirmed records
-remain occupied. Exhaustion or no suitable free candidate returns an honest
-state, with no random fallback or knowingly duplicated icon.
+remain occupied. A live human message or human service event restores their
+availability to observed; the runtime never probes them. Exhaustion or no suitable
+free candidate returns an honest state, with no random fallback or knowingly
+duplicated icon.
 
 ### Bootstrap from a verified inventory
 

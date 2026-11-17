@@ -20,6 +20,7 @@ import { ensureSessionMediaDir, sessionMediaDir, allocateMediaPath, releaseMedia
 import { MINIME_BOT_PI_SESSION_AGENT_ID_ENV, NewlineOnlyJsonlSplitter, PiStartupBlockingUiError, assertPiSessionIdentityMatchesBinding, normalizePiModel, parsePiStartupIdentityRecord, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions } from "../pi-rpc-protocol.js";
 import PQueue from "p-queue";
 import { CURRENT_SESSION_VERSION } from "@earendil-works/pi-coding-agent";
+import { collaborationTransport } from "../collaboration.js";
 
 const TEST_DIR = join(tmpdir(), "minime-test-pi-spawn");
 const TEST_STORE_PATH = `${TEST_DIR}/sessions.json`;
@@ -636,7 +637,7 @@ describe("SessionManager exact Pi binding startup", () => {
       assert.equal(capture.extensionOptions?.collaboration, enabled ? true : undefined);
       assert.equal(capture.runtimeEnvOptions?.collaborationTopicOnly, enabled ? true : undefined);
       assert.equal(capture.runtimeEnvOptions?.collaborationSession, enabled ? capture.sessionBinding.sessionId : undefined);
-      if (enabled) assert.equal(capture.runtimeEnvOptions?.collaborationSocket, `${TEST_DIR}/control/data/private-topics/router.sock`);
+      if (enabled) assert.equal(capture.runtimeEnvOptions?.collaborationSocket, collaborationTransport(config)!.socketPath);
       else assert.equal(capture.runtimeEnvOptions?.collaborationSocket, undefined);
       await manager.closeSession(lane);
     };
@@ -649,6 +650,8 @@ describe("SessionManager exact Pi binding startup", () => {
       await check("collaboration:fixture:main", "main", false);
       botId = 901;
       await check("123:20", "main", true);
+      manager.disableTopicTransport();
+      await check("123:30", "main", false);
     } finally {
       await manager.closeAll();
       if (previousRoot === undefined) delete process.env.MINIME_CONTROL_WORKSPACE_ROOT;

@@ -23,7 +23,7 @@ export class PrivateTopicController {
   private catalogLoading?: Promise<void>;
   private running = new Set<Promise<void>>();
   private activeRequests = new Set<string>();
-  private inFlight = new Map<string, AbortController>();
+  private inFlight = new Map<string, { controller: AbortController; observedFields: Set<"name" | "icon"> }>();
   private storageFailed = false;
   constructor(
     private config: BotConfig,
@@ -46,6 +46,8 @@ export class PrivateTopicController {
       ...target, name: { provenance: "unknown", pinned: false }, icon: { provenance: "unknown", pinned: false },
       revision: 0, initialized: false, availability: "observed",
     };
+    const human = !!message.from && message.from.id !== botId && !message.from.is_bot;
+    if (human) topic.availability = "observed";
     topic.peerId = message.chat.id;
     topic.lastActor = message.from ? { actorId: message.from.id, isBot: message.from.is_bot } : undefined;
     topic.lastObservedAt = message.date * 1000;
@@ -54,18 +56,22 @@ export class PrivateTopicController {
     topic.lastObservationSource = message.forum_topic_created ? "topic-created" : message.forum_topic_edited ? "topic-edited" : "message";
     const event = message.forum_topic_created ?? message.forum_topic_edited;
     if (event) {
-      const human = !!message.from && message.from.id !== botId && !message.from.is_bot;
+      const flight = this.inFlight.get(this.targetKey(target));
       if (event.icon_custom_emoji_id !== undefined) {
+        const pendingManualEcho = message.from?.id === botId && topic.pending?.intent === "manual" &&
+          topic.pending.icon === event.icon_custom_emoji_id && flight && !flight.observedFields.has("icon");
         if (human) delete topic.occupiedIconIds;
-        else this.retainConflictingIcon(topic, event.icon_custom_emoji_id);
+        else if (!pendingManualEcho) this.retainConflictingIcon(topic, event.icon_custom_emoji_id);
       }
       for (const [field, value] of [["name", event.name], ["icon", event.icon_custom_emoji_id]] as const) {
         const implicit = field === "name" && "is_name_implicit" in event && event.is_name_implicit;
         const manual = human && !implicit;
-        if (value === undefined || (!manual && topic[field].pinned)) continue;
+        if (value === undefined) continue;
         // Echoes of our request never turn into manual pins or supersede a human edit.
         const policyEcho = message.from?.id === botId && (topic.pending?.[field] === value ||
           (topic[field].provenance === "policy-initialized" && topic[field].value === value));
+        if (!policyEcho) flight?.observedFields.add(field);
+        if (!manual && topic[field].pinned) continue;
         topic[field] = { value, pinned: manual, observedAt: topic.lastObservedAt,
           appliedAt: topic[field].value === value ? topic[field].appliedAt : undefined,
           provenance: manual ? "manual" : implicit ? "implicit" :
@@ -78,14 +84,14 @@ export class PrivateTopicController {
         (event.icon_custom_emoji_id === undefined || event.icon_custom_emoji_id === topic.pending.icon);
       if (!ownEcho) {
         topic.revision++;
-        this.inFlight.get(this.targetKey(target))?.abort();
+        flight?.controller.abort();
       }
     }
     this.save(topic);
     if (event) for (const other of this.occupied(target)) {
       const pending = other.pending;
       if (pending && event.icon_custom_emoji_id !== undefined && pending.icon === event.icon_custom_emoji_id) {
-        this.inFlight.get(this.targetKey(other))?.abort();
+        this.inFlight.get(this.targetKey(other))?.controller.abort();
       }
     }
   }
@@ -95,7 +101,7 @@ export class PrivateTopicController {
     try { this.store.put(topic); }
     catch (error) {
       this.storageFailed = true;
-      for (const controller of this.inFlight.values()) controller.abort();
+      for (const request of this.inFlight.values()) request.controller.abort();
       throw error;
     }
   }
@@ -177,8 +183,10 @@ export class PrivateTopicController {
     // Its icon might already be applied, so retain it even after the new receipt.
     if (topic.pending?.icon) topic.occupiedIconIds = [...new Set([...(topic.occupiedIconIds ?? []), topic.pending.icon])];
     // A no-op pins explicitly requested manual fields, or completes auto initialization.
-    if ((name === undefined || name === topic.name.value) && (icon === undefined || icon === topic.icon.value)) {
-      this.finish(topic, { name, icon, intent: manual ? "manual" : "auto", revision: topic.revision });
+    const uncertainRequestedField = (name !== undefined && topic.pending?.name !== undefined) ||
+      (icon !== undefined && topic.pending?.icon !== undefined);
+    if (!uncertainRequestedField && (name === undefined || name === topic.name.value) && (icon === undefined || icon === topic.icon.value)) {
+      this.finish(topic, { name, icon, intent: manual ? "manual" : "auto" });
       return { status: "complete" };
     }
     topic.revision++;
@@ -192,14 +200,13 @@ export class PrivateTopicController {
     this.running.add(work);
     return { status: "accepted", requestId: topic.pending.id, outcome: "reserved; Telegram edit has not completed" };
   }
-  private finish(topic: TopicRecord, target: { name?: string; icon?: string; intent?: "auto" | "manual"; revision: number }, receipt?: NonNullable<TopicRecord["lastReceipt"]>): void {
-    if (receipt && target.icon !== undefined) this.retainConflictingIcon(topic, target.icon);
+  private finish(topic: TopicRecord, target: { name?: string; icon?: string; intent?: "auto" | "manual" }, receipt?: NonNullable<TopicRecord["lastReceipt"]>, observedFields: ReadonlySet<"name" | "icon"> = new Set()): void {
     const manual = target.intent === "manual";
-    const unchanged = topic.revision === target.revision;
-    if (receipt && manual && !unchanged && target.icon && target.icon !== topic.icon.value) {
+    const canApply = (field: "name" | "icon") => manual ? !observedFields.has(field) : !topic[field].pinned;
+    if (receipt && !canApply("icon") && (manual || topic.icon.pinned) && target.icon && target.icon !== topic.icon.value) {
       topic.occupiedIconIds = [...new Set([...(topic.occupiedIconIds ?? []), target.icon])];
     }
-    for (const field of ["name", "icon"] as const) if ((manual ? unchanged : !topic[field].pinned) && target[field] !== undefined) {
+    for (const field of ["name", "icon"] as const) if (canApply(field) && target[field] !== undefined) {
       topic[field] = { value: target[field], pinned: manual, provenance: manual ? "manual" : "policy-initialized",
         observedAt: topic[field].value === target[field] ? topic[field].observedAt : undefined,
         appliedAt: receipt?.confirmedAt ?? (topic[field].value === target[field] ? topic[field].appliedAt : undefined) };
@@ -221,7 +228,9 @@ export class PrivateTopicController {
     }
     let receiptSource: NonNullable<TopicRecord["lastReceipt"]>["source"] | undefined;
     const abort = new AbortController();
-    this.inFlight.set(this.targetKey(target), abort);
+    // Only observations of a requested field supersede its eventual confirmation.
+    const observedFields = new Set<"name" | "icon">();
+    this.inFlight.set(this.targetKey(target), { controller: abort, observedFields });
     try {
       const result = await this.api.editForumTopic(target.chatId, target.topicId, {
         ...(pending.name !== undefined ? { name: pending.name } : {}),
@@ -234,7 +243,7 @@ export class PrivateTopicController {
     } finally { this.inFlight.delete(this.targetKey(target)); }
     topic = this.store.get(target)!;
     if (topic.pending?.id !== pending.id) return;
-    if (receiptSource) this.finish(topic, pending, { requestId: pending.id, confirmedAt: Date.now(), source: receiptSource });
+    if (receiptSource) this.finish(topic, pending, { requestId: pending.id, confirmedAt: Date.now(), source: receiptSource }, observedFields);
     else { topic.pending.state = "uncertain"; this.save(topic); }
   }
   /** For tests/operator shutdown inspection; no retries or replay on restart. */

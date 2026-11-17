@@ -123,13 +123,17 @@ async function extension(t: TestContext, socket: string, session = "fixture-sess
   const emit = async (name: string, ...args: any[]) => {
     const results = [];
     for (const handler of handlers.get(name) ?? []) results.push(await handler(...args));
-    return results.find(result => result?.message);
+    return results.find(result => result?.message || result?.systemPrompt !== undefined);
   };
   t.after(async () => { await emit("session_shutdown"); keys.forEach((key, i) => { if (previous[i] === undefined) delete process.env[key]; else process.env[key] = previous[i]; }); });
   await emit("session_start", {}, { sessionManager: { getSessionId: () => session } });
   return { tools, emit, async context(prompt: string) {
     const result = await emit("before_agent_start", { messageType: "user", prompt, systemPrompt: "unchanged" });
-    if (result) { assert.equal(result.systemPrompt, undefined); return JSON.parse(result.message.content); }
+    if (result) {
+      assert.equal(result.message, undefined, "topic context must never inject a transcript message");
+      assert.ok(result.systemPrompt.startsWith("unchanged\n\n"), "preserve the existing system prompt");
+      return JSON.parse(result.systemPrompt.slice("unchanged\n\nPrivate topic context:\n".length));
+    }
   } };
 }
 
@@ -1147,5 +1151,91 @@ test("review3: fresh name-only and no-op requests retire failed work without rep
     assert.deepEqual(stored.occupiedIconIds, ["catalog-garden"]);
     assert.equal(f.api.filter(call => call.method === "editForumTopic").length, previousCalls + (name === "Compiler" ? 0 : 1));
     if (name === "Parsing") assert.equal(f.api.at(-1)!.payload.icon_custom_emoji_id, undefined);
+  });
+});
+
+test("review4: uncertain edits cannot turn a requested restoration into a no-op", async t => {
+  for (const field of ["name", "icon"] as const) await t.test(field, async t => {
+    const f = await fixture(t);
+    await initialize(f);
+    let context = await f.controller.context(target) as any;
+    f.setEdit(async () => { throw new Error("response lost after possible effect"); });
+    f.controller.apply(target, { intent: "manual", revision: context.revision,
+      ...(field === "name" ? { name: "Parsing" } : { iconCandidates: [1] }) }, () => true);
+    await f.controller.waitForIdle();
+    context = await f.controller.context(target) as any;
+    f.setEdit(async () => true);
+    const calls = f.api.filter(call => call.method === "editForumTopic").length;
+    assert.equal((f.controller.apply(target, { intent: "manual", revision: context.revision,
+      ...(field === "name" ? { name: "Compiler" } : { iconCandidates: [0] }) }, () => true) as any).status, "accepted");
+    await f.controller.waitForIdle();
+    assert.equal(f.api.filter(call => call.method === "editForumTopic").length, calls + 1);
+    assert.deepEqual(f.api.at(-1)!.payload, { chat_id: 100, message_thread_id: 10,
+      ...(field === "name" ? { name: "Compiler" } : { icon_custom_emoji_id: "catalog-code" }) });
+    assert.equal(f.controller.store.get(target)![field].pinned, true);
+  });
+});
+
+test("review4: a receipt pins requested fields unaffected by a newer observation", async t => {
+  for (const field of ["name", "icon"] as const) for (const both of [false, true]) await t.test(`${field}, both=${both}`, async t => {
+    const f = await fixture(t);
+    await f.send({ text: "Compiler" });
+    const context = await f.controller.context(target) as any;
+    let release!: (value: unknown) => void;
+    f.setEdit(() => new Promise(resolve => { release = resolve; }));
+    f.controller.apply(target, { intent: "manual", revision: context.revision,
+      ...(both || field === "name" ? { name: "Parsing" } : {}),
+      ...(both || field === "icon" ? { iconCandidates: [1] } : {}) }, () => true);
+    await new Promise(done => setImmediate(done));
+    await f.send({ date: 1700000000, forum_topic_edited: field === "name" ? { icon_custom_emoji_id: "catalog-music" } : { name: "Human wins" } });
+    release(true);
+    await f.controller.waitForIdle();
+    const topic = f.controller.store.get(target)!;
+    assert.equal(topic.name.value, field === "name" ? "Parsing" : "Human wins");
+    assert.equal(topic.icon.value, field === "icon" ? "catalog-garden" : "catalog-music");
+    assert.equal(topic.name.pinned && topic.icon.pinned, true);
+    assert.equal(topic.pending, undefined);
+    assert.equal(topic.lastReceipt?.source, "telegram-true");
+  });
+});
+
+test("review4: confirmed manual icon replacements release normal icons and retain uncertain occupancy", async t => {
+  for (const echo of [false, true]) await t.test(`echo=${echo}`, async t => {
+    const f = await fixture(t);
+    await initialize(f);
+    // This distinct icon has uncertain prior occupancy and must survive all receipts.
+    const initial = f.controller.store.get(target)!;
+    initial.occupiedIconIds = ["uncertain-icon"];
+    f.controller.store.put(initial);
+    for (const index of [1, 2, 0]) {
+      const context = await f.controller.context(target) as any;
+      let release!: (value: unknown) => void;
+      f.setEdit(() => new Promise(resolve => { release = resolve; }));
+      f.controller.apply(target, { intent: "manual", revision: context.revision, iconCandidates: [index] }, () => true);
+      await new Promise(done => setImmediate(done));
+      if (echo) await f.send({ from: { id: target.botId, is_bot: true, first_name: "Fixture" },
+        forum_topic_edited: { icon_custom_emoji_id: icons[index].custom_emoji_id } });
+      release(true);
+      await f.controller.waitForIdle();
+      assert.deepEqual(f.controller.store.get(target)!.occupiedIconIds, ["uncertain-icon"]);
+    }
+    await f.send({ message_thread_id: 20, text: "Another topic" });
+    assert.deepEqual((await f.controller.context({ ...target, topicId: 20 }) as any).candidates,
+      [{ index: 1, emoji: "🌱" }, { index: 2, emoji: "🎵" }]);
+  });
+});
+
+test("review4: live human evidence restores imported unavailable topics without probing", async t => {
+  for (const availability of ["unavailable", "deleted-unconfirmed"] as const) await t.test(availability, async t => {
+    const f = await fixture(t);
+    f.controller.store.importSnapshot([{ ...target, availability,
+      name: { value: "Compiler", pinned: false, provenance: "unknown" },
+      icon: { value: "catalog-code", pinned: false, provenance: "unknown" } }]);
+    assert.equal((await f.controller.context(target) as any).status, "unavailable");
+    assert.equal(f.api.length, 0);
+    await f.send({ text: "Continue this topic" });
+    assert.equal(f.controller.store.get(target)!.availability, "observed");
+    assert.equal((await f.controller.context(target) as any).status, "needs_presentation");
+    assert.ok(f.api.every(call => call.method === "getForumTopicIconStickers"));
   });
 });

@@ -109,7 +109,7 @@ export function registerCollaboration(pi: ExtensionAPI): void {
       try {
         const value = await client?.request({ op: "topic_context" }, 1000);
         if (!value?.revision || value.status === "unavailable") return;
-        return { message: { customType: "minime-topic-context", content: JSON.stringify(value), display: false } };
+        return { systemPrompt: `${event.systemPrompt}\n\nPrivate topic context:\n${JSON.stringify(value)}` };
       } catch { /* Cosmetic context never prevents an ordinary turn. */ }
     });
     pi.registerTool({

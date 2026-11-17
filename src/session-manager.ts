@@ -341,6 +341,10 @@ export class SessionManager {
 
   setTopicController(controller: PrivateTopicController | undefined): void { this.topicController = controller; }
 
+  disableTopicTransport(): void {
+    if (this.transport?.topicOnly) this.transport = undefined;
+  }
+
   /** Read-only inventory joined to current routing; no session identity is persisted in topic data. */
   inspectKnownTopics(botId: number, chatId: number): Array<{ topic: TopicRecord; agentId?: string; session?: Pick<BoundSessionState, "sessionId" | "sessionFile"> }> {
     const controller = this.topicController;

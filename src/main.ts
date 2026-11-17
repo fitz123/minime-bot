@@ -227,6 +227,7 @@ async function main(): Promise<void> {
       log.info("main", transport.topicOnly ? "Private-topic router started" : "Same-host collaboration router started");
     } else {
       collaborationRouter = undefined;
+      sessionManager.disableTopicTransport();
       log.warn("main", "Private-topic router unavailable; continuing without cosmetic topic edits");
     }
   }
