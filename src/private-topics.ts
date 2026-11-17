@@ -56,6 +56,10 @@ export class PrivateTopicController {
     if (event) {
       const implicit = "is_name_implicit" in event && event.is_name_implicit;
       const manual = !!message.from && message.from.id !== botId && !message.from.is_bot && !implicit;
+      if (event.icon_custom_emoji_id !== undefined) {
+        if (manual) delete topic.occupiedIconIds;
+        else this.retainConflictingIcon(topic, event.icon_custom_emoji_id);
+      }
       for (const [field, value] of [["name", event.name], ["icon", event.icon_custom_emoji_id]] as const) {
         if (value === undefined || (!manual && topic[field].pinned)) continue;
         // Echoes of our request never turn into manual pins or supersede a human edit.
@@ -111,7 +115,12 @@ export class PrivateTopicController {
     return this.store.list().filter(topic => topic.botId === target.botId && topic.chatId === target.chatId && topic.topicId !== target.topicId);
   }
   private freeIcon(target: TopicTarget, id: string): boolean {
-    return !this.occupied(target).some(topic => topic.icon.value === id || topic.pending?.icon === id);
+    return !this.occupied(target).some(topic => topic.icon.value === id || topic.pending?.icon === id || topic.occupiedIconIds?.includes(id));
+  }
+  private retainConflictingIcon(topic: TopicRecord, icon: string): void {
+    if (icon && topic.icon.pinned && icon !== topic.icon.value) {
+      topic.occupiedIconIds = [...new Set([...(topic.occupiedIconIds ?? []), icon])];
+    }
   }
   async context(target: TopicTarget): Promise<unknown> {
     if (!this.eligible(target)) return { status: "unavailable" };
@@ -170,6 +179,7 @@ export class PrivateTopicController {
     return { status: "accepted", outcome: "reserved; Telegram edit has not completed" };
   }
   private finish(topic: TopicRecord, target: { name?: string; icon?: string }, receipt?: NonNullable<TopicRecord["lastReceipt"]>): void {
+    if (receipt && target.icon !== undefined) this.retainConflictingIcon(topic, target.icon);
     for (const field of ["name", "icon"] as const) if (!topic[field].pinned && target[field] !== undefined) {
       topic[field] = { value: target[field], pinned: false, provenance: "policy-initialized",
         observedAt: topic[field].value === target[field] ? topic[field].observedAt : undefined,

@@ -22,6 +22,8 @@ export interface TopicRecord extends TopicTarget {
   lastReceipt?: { confirmedAt: number; source: "telegram-true" | "telegram-not-modified" };
   name: TopicField;
   icon: TopicField;
+  /** Conflicting observed/applied icons remain occupied until a later explicit human icon event. */
+  occupiedIconIds?: string[];
   revision: number;
   initialized: boolean;
   availability: "observed" | "unavailable" | "deleted-unconfirmed";
@@ -42,6 +44,7 @@ const fieldValid = (field: TopicField) => field && typeof field.pinned === "bool
 function valid(record: TopicRecord): boolean {
   return record && [record.botId, record.chatId, record.topicId].every(Number.isSafeInteger) &&
     record.botId > 0 && record.topicId > 0 && fieldValid(record.name) && fieldValid(record.icon) &&
+    (record.occupiedIconIds === undefined || (Array.isArray(record.occupiedIconIds) && record.occupiedIconIds.every(id => typeof id === "string" && id.length > 0))) &&
     [record.peerId, record.lastObservedAt, record.lastMessageId, record.lastUpdateId].every(optionalInteger) &&
     (record.lastActor === undefined || (Number.isSafeInteger(record.lastActor.actorId) && typeof record.lastActor.isBot === "boolean")) &&
     (record.lastObservationSource === undefined || ["message", "topic-created", "topic-edited"].includes(record.lastObservationSource)) &&

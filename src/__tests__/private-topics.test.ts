@@ -719,3 +719,56 @@ test("known-topic inspection joins current route/session/file across clean, rota
   f.bot.botInfo = { ...f.bot.botInfo, id: 901 };
   assert.deepEqual(f.manager.inspectKnownTopics(900, 100), []);
 });
+
+test("pinned manual icons retain conflicting observed/applied bot icons across receipt/event ordering and restart", async t => {
+  for (const order of ["receipt-before-events", "manual-before-receipt", "echo-before-receipt", "conflicting-own-echoes"] as const) {
+    await t.test(order, async t => {
+      const f = await fixture(t);
+      await f.send({ text: "Compiler" });
+      const context = await f.controller.context(target) as any;
+      let resolve!: (value: boolean) => void;
+      f.setEdit(() => new Promise<boolean>(done => { resolve = done; }));
+      f.controller.apply(target, { revision: context.revision, name: "Compiler", iconCandidates: [0] }, () => true);
+      await new Promise(done => setImmediate(done));
+      const echo = (id: string) => f.send({ from: { id: target.botId, is_bot: true, first_name: "Fixture" },
+        forum_topic_edited: { icon_custom_emoji_id: id } });
+      if (order === "receipt-before-events" || order === "conflicting-own-echoes") {
+        resolve(true);
+        await f.controller.waitForIdle();
+      }
+      await f.send({ forum_topic_edited: { icon_custom_emoji_id: "catalog-garden" } });
+      if (order === "echo-before-receipt") await echo("catalog-code");
+      if (order === "manual-before-receipt" || order === "echo-before-receipt") {
+        resolve(true);
+        await f.controller.waitForIdle();
+        assert.ok(new TopicStore(f.controller.store.path).get(target)!.occupiedIconIds?.includes("catalog-code"), "confirmed applied icon stays occupied when its manual field was superseded");
+      }
+      await echo("catalog-code");
+      if (order === "conflicting-own-echoes") await echo("catalog-music");
+      const stored = new TopicStore(f.controller.store.path).get(target)!;
+      assert.equal(stored.icon.value, "catalog-garden");
+      assert.equal(stored.icon.pinned, true);
+      assert.equal(stored.icon.provenance, "manual");
+      assert.ok(stored.occupiedIconIds?.includes("catalog-code"), "an own echo must reserve its icon without replacing the manual choice");
+      const other = { ...target, topicId: 20 };
+      await f.send({ message_thread_id: 20, text: "Music" });
+      const { PrivateTopicController } = await import("../private-topics.js");
+      const restarted = new PrivateTopicController(f.config, new TopicStore(f.controller.store.path), f.bot.api, () => target.botId);
+      const occupied = await restarted.context(other) as any;
+      if (order === "conflicting-own-echoes") {
+        assert.ok(stored.occupiedIconIds?.includes("catalog-music"), "another conflicting own echo does not release the earlier observed icon");
+        assert.equal(occupied.status, "catalog_exhausted");
+      } else {
+        assert.deepEqual(occupied.candidates, [{ index: 2, emoji: "🎵" }]);
+        assert.deepEqual(restarted.apply(other, { revision: occupied.revision, name: "Music", iconCandidates: [0] }, () => true), { status: "no_suitable_free_icon" });
+      }
+      restarted.observe(message({ text: "Continue" }));
+      restarted.observe(message({ forum_topic_edited: { name: "Manual title" } }));
+      assert.ok(restarted.store.get(target)!.occupiedIconIds?.includes("catalog-code"), "ordinary input and absent icon fields do not prove release");
+      // A subsequent explicit human icon observation proves the conflicting icons released.
+      restarted.observe(message({ forum_topic_edited: { icon_custom_emoji_id: "catalog-garden" } }));
+      assert.equal(restarted.store.get(target)!.occupiedIconIds, undefined);
+      assert.deepEqual((await restarted.context(other) as any).candidates, [{ index: 0, emoji: "💻" }, { index: 2, emoji: "🎵" }]);
+    });
+  }
+});
