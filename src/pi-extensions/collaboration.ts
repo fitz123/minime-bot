@@ -114,11 +114,17 @@ export function registerCollaboration(pi: ExtensionAPI): void {
     });
     pi.registerTool({
       name: "topic_apply", label: "Set topic presentation",
-      description: "Initialize once after meaningful human content (intent=auto), or edit ONLY fields explicitly requested by the current human (intent=manual), pinning their choices. Completed topics are manual-only. Use the current context revision, name grapheme cap and thematic free catalog indices. Accepted means reserved, NOT applied: do not claim success until confirmed by a later context receipt/current fields. Never retry pending/uncertain edits.",
+      description: "Initialize once after meaningful human content (intent=auto), or edit ONLY fields explicitly requested by the current human (intent=manual), pinning their choices. Completed topics are manual-only. Use the current context revision, name grapheme cap and thematic free catalog indices. Accepted means reserved, NOT applied: do not claim success until confirmed by a later context receipt/current fields. Never replay pending/uncertain edits. A fresh explicit human request may supersede an inactive reservation when context.manualCanSupersede is true. On stale, use the returned refreshed context to retry the current explicit request.",
       parameters: Type.Object({ intent: Type.Optional(Type.Union([Type.Literal("auto"), Type.Literal("manual")])), revision: Type.String(), name: Type.Optional(Type.String()), iconCandidates: Type.Optional(Type.Array(Type.Integer({ minimum: 0 }))) }),
       execute: async (_id, p) => {
         if (!humanTurn) return result({ status: "unavailable" });
-        try { return result(await client?.request({ op: "topic_apply", ...p }) ?? { status: "unavailable" }); }
+        try {
+          const value = await client?.request({ op: "topic_apply", ...p }) ?? { status: "unavailable" };
+          if (value.status === "stale" && humanTurn) {
+            return result({ ...value, context: await client?.request({ op: "topic_context" }, 1000) ?? { status: "unavailable" } });
+          }
+          return result(value);
+        }
         catch { return result({ status: "unavailable" }); }
       },
     });

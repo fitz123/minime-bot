@@ -1,6 +1,7 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, lstatSync, mkdirSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import { createServer, createConnection, type Socket, type Server } from "node:net";
 import type { TopicApply } from "./private-topics.js";
 import type { BotConfig } from "./types.js";
@@ -9,7 +10,12 @@ import { resolveWorkspaceContract } from "./workspace-contract.js";
 /** Fixed at startup, like the existing collaboration socket; workspace roots isolate instances. */
 export function collaborationTransport(config: BotConfig): { socketPath: string; topicOnly: boolean } | undefined {
   if (config.collaboration) return { socketPath: config.collaboration.socketPath, topicOnly: false };
-  if (config.privateTopics?.enabled) return { socketPath: join(resolveWorkspaceContract().paths.dataDir, "private-topics", "router.sock"), topicOnly: true };
+  if (config.privateTopics?.enabled) {
+    const instance = createHash("sha256").update(`${process.getuid?.() ?? "user"}:${resolveWorkspaceContract().paths.dataDir}`).digest("hex").slice(0, 24);
+    const relative = join(`minime-topics-${instance}`, "router.sock");
+    const temporary = join(tmpdir(), relative);
+    return { socketPath: Buffer.byteLength(temporary) <= 100 ? temporary : join("/tmp", relative), topicOnly: true };
+  }
 }
 
 export type Address = { kind: "agent" | "thread" | "session" | "terminal"; id: string };
@@ -99,14 +105,21 @@ export class CollaborationRouter {
   private messages = new Map<string, { delivery: Delivery; receipt: Receipt }>();
   private conversations = new Map<string, { count: number; expires: number }>();
   constructor(private owner: CollaborationOwner, private options: { topicOnly?: boolean } = {}) {}
-  async start(path: string): Promise<void> {
-    await prepareSocket(path);
-    this.server = createServer(socket => this.connect(socket));
-    await new Promise<void>((resolve, reject) => {
-      this.server!.once("error", reject);
-      this.server!.listen(path, () => { this.server!.removeListener("error", reject); resolve(); });
-    });
-    chmodSync(path, 0o600);
+  async start(path: string): Promise<boolean> {
+    try {
+      await prepareSocket(path);
+      this.server = createServer(socket => this.connect(socket));
+      await new Promise<void>((resolve, reject) => {
+        this.server!.once("error", reject);
+        this.server!.listen(path, () => { this.server!.removeListener("error", reject); resolve(); });
+      });
+      chmodSync(path, 0o600);
+      return true;
+    } catch (error) {
+      if (!this.options.topicOnly) throw error;
+      await this.stop();
+      return false;
+    }
   }
   async stop(): Promise<void> {
     for (const entry of this.messages.values()) if (entry.receipt.status === "accepted") entry.receipt.status = "unknown";

@@ -223,8 +223,12 @@ async function main(): Promise<void> {
       topicContext: source => sessionManager.topicContext(source),
       topicApply: (source, request) => sessionManager.topicApply(source, request),
     }, { topicOnly: transport.topicOnly });
-    await collaborationRouter.start(transport.socketPath);
-    log.info("main", transport.topicOnly ? "Private-topic router started" : "Same-host collaboration router started");
+    if (await collaborationRouter.start(transport.socketPath)) {
+      log.info("main", transport.topicOnly ? "Private-topic router started" : "Same-host collaboration router started");
+    } else {
+      collaborationRouter = undefined;
+      log.warn("main", "Private-topic router unavailable; continuing without cosmetic topic edits");
+    }
   }
 
   // Telegram starts before Discord has finished connecting. Polling failures

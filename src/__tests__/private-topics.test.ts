@@ -812,7 +812,7 @@ test("every authorized private topic across two bot instances works, including t
     }, botId);
     instances.push(f);
     assert.equal(f.transport.topicOnly, botId === 901);
-    if (botId === 901) assert.ok(f.transport.socketPath.startsWith(join(f.root, "data")));
+    if (botId === 901) assert.ok(Buffer.byteLength(f.transport.socketPath) <= 100);
     for (const chatId of [100, 200]) {
       const session = `session-${botId}-${chatId}`;
       f.bind(`${chatId}:10`, session);
@@ -1016,5 +1016,136 @@ test("manual reservations are fenced before dispatch by a new observation or cur
     assert.equal(f.api.filter(call => call.method === "editForumTopic").length, edits);
     assert.equal(f.controller.store.get(target)!.pending, undefined);
     assert.equal(f.controller.store.get(target)!.name.value, change === "observation" ? "Human wins" : "Compiler");
+  });
+});
+
+test("review3: topic-only sockets stay bounded and stable across long instance roots", async t => {
+  const f = await fixture(t, config => { delete config.collaboration; });
+  const previous = process.env.MINIME_CONTROL_WORKSPACE_ROOT;
+  const previousTmp = process.env.TMPDIR;
+  try {
+    const paths = [];
+    for (const root of ["/tmp/" + "a".repeat(110), "/tmp/" + "b".repeat(110)]) {
+      process.env.MINIME_CONTROL_WORKSPACE_ROOT = root;
+      const transport = collaborationTransport(f.config)!;
+      assert.ok(Buffer.byteLength(transport.socketPath) <= 100);
+      assert.deepEqual(collaborationTransport(f.config), transport);
+      paths.push(transport.socketPath);
+    }
+    assert.notEqual(paths[0], paths[1]);
+    process.env.TMPDIR = "/tmp/" + "t".repeat(110);
+    const fallback = collaborationTransport(f.config)!;
+    assert.ok(fallback.socketPath.startsWith("/tmp/minime-topics-"));
+    assert.ok(Buffer.byteLength(fallback.socketPath) <= 100);
+  } finally {
+    process.env.MINIME_CONTROL_WORKSPACE_ROOT = previous;
+    if (previousTmp === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = previousTmp;
+  }
+});
+
+test("review3: topic-only startup failure is cosmetic; full collaboration still rejects", async t => {
+  const f = await fixture(t);
+  const blocked = join(f.root, "blocked");
+  writeFileSync(blocked, "fixture");
+  const owner = { discover: () => [], deliver: async () => {} };
+  const cosmetic = new CollaborationRouter(owner, { topicOnly: true });
+  t.after(() => cosmetic.stop());
+  assert.equal(await cosmetic.start(join(blocked, "router.sock")), false);
+  const full = new CollaborationRouter(owner);
+  t.after(() => full.stop());
+  await assert.rejects(full.start(join(blocked, "router.sock")));
+});
+
+test("review3: fresh manual requests supersede inactive reservations while preserving all uncertain icons", async t => {
+  for (const state of ["uncertain", "accepted"] as const) await t.test(state, async t => {
+    const f = await fixture(t);
+    await f.send({ text: "Compiler" });
+    const topic = f.controller.store.get(target)!;
+    topic.pending = { id: "old-request", revision: topic.revision, name: "Old name", icon: "catalog-code", state };
+    topic.occupiedIconIds = ["catalog-music"];
+    f.controller.store.put(topic);
+    const { PrivateTopicController } = await import("../private-topics.js");
+    const restarted = new PrivateTopicController(f.config, new TopicStore(f.controller.store.path), f.bot.api, () => target.botId);
+    const context = await restarted.context(target) as any;
+    assert.equal((restarted.apply(target, { revision: context.revision, name: "Old name", iconCandidates: [0] }, () => true) as any).status, "pending");
+    assert.equal((restarted.apply(target, { intent: "manual", revision: context.revision, name: "x".repeat(18) }, () => true) as any).status, "invalid_name");
+    assert.equal(restarted.store.get(target)!.pending!.id, "old-request");
+    const accepted = restarted.apply(target, { intent: "manual", revision: context.revision, name: "Parsing", iconCandidates: [1] }, () => true) as any;
+    assert.equal(accepted.status, "accepted");
+    await restarted.waitForIdle();
+    const stored = new TopicStore(f.controller.store.path).get(target)!;
+    assert.equal(stored.name.value, "Parsing");
+    assert.equal(stored.icon.value, "catalog-garden");
+    assert.deepEqual(new Set(stored.occupiedIconIds), new Set(["catalog-code", "catalog-music"]));
+    assert.equal(stored.pending, undefined);
+    assert.equal(stored.lastReceipt!.requestId, accepted.requestId);
+    assert.equal(f.api.filter(call => call.method === "editForumTopic").length, 1, "only the new explicit request is sent");
+    restarted.observe(message({ message_thread_id: 20, text: "Another topic" }));
+    assert.deepEqual((await restarted.context({ ...target, topicId: 20 }) as any).candidates, []);
+  });
+});
+
+test("review3: accepted work cannot be superseded before dispatch or while its abort settles", async t => {
+  const f = await fixture(t);
+  await f.send({ text: "Compiler" });
+  const context = await f.controller.context(target) as any;
+  let release!: (value: unknown) => void;
+  f.setEdit(() => new Promise(resolve => { release = resolve; }));
+  const accepted = f.controller.apply(target, { revision: context.revision, name: "Compiler", iconCandidates: [0] }, () => true) as any;
+  const request = { intent: "manual" as const, revision: context.revision, name: "Parsing" };
+  assert.equal((f.controller.apply(target, request, () => true) as any).status, "pending");
+  await new Promise(done => setImmediate(done));
+  await f.send({ forum_topic_edited: { name: "Human pin" } });
+  const fresh = await f.controller.context(target) as any;
+  assert.equal((f.controller.apply(target, { ...request, revision: fresh.revision }, () => true) as any).status, "pending");
+  assert.equal(f.controller.store.get(target)!.pending!.id, accepted.requestId);
+  release(false);
+  await f.controller.waitForIdle();
+});
+
+test("review3: a steered explicit request refreshes stale context through the retained tool", async t => {
+  const f = await fixture(t);
+  await f.send({ text: "Compiler" });
+  const pi = await extension(t, f.transport.socketPath);
+  const context = await pi.context("Design a compiler");
+  f.controller.apply(target, { revision: context.revision, name: "Compiler", iconCandidates: [0] }, () => true);
+  await f.controller.waitForIdle();
+  // Human steering stays within this turn: no second before_agent_start hook.
+  const apply = async (revision: string) => JSON.parse((await pi.tools.get("topic_apply").execute("steered", { intent: "manual", revision, name: "Parsing" })).content[0].text);
+  const stale = await apply(context.revision);
+  assert.equal(stale.status, "stale");
+  assert.equal(stale.context.name, "Compiler");
+  assert.notEqual(stale.context.revision, context.revision);
+  assert.equal((await apply(stale.context.revision)).status, "accepted");
+  await f.controller.waitForIdle();
+  assert.equal(f.controller.store.get(target)!.name.value, "Parsing");
+  await pi.emit("before_agent_start", { messageType: "custom", message: { customType: "minime-collaboration" } });
+  assert.equal((await apply(stale.context.revision)).status, "unavailable");
+});
+
+test("review3: fresh name-only and no-op requests retire failed work without replay or lost occupancy", async t => {
+  for (const name of ["Parsing", "Compiler"]) await t.test(name, async t => {
+    const f = await fixture(t);
+    await initialize(f);
+    let context = await f.controller.context(target) as any;
+    f.setEdit(async () => { throw new Error("uncertain transport after possible effect"); });
+    f.controller.apply(target, { intent: "manual", revision: context.revision, iconCandidates: [1] }, () => true);
+    await f.controller.waitForIdle();
+    assert.equal(f.controller.store.get(target)!.pending!.state, "uncertain");
+    context = await f.controller.context(target) as any;
+    assert.equal(context.manualCanSupersede, true);
+    f.setEdit(async () => true);
+    const previousIcon = new TopicStore(f.controller.store.path).get(target)!.icon;
+    const previousCalls = f.api.filter(call => call.method === "editForumTopic").length;
+    const result = f.controller.apply(target, { intent: "manual", revision: context.revision, name }, () => true) as any;
+    assert.equal(result.status, name === "Compiler" ? "complete" : "accepted");
+    await f.controller.waitForIdle();
+    const stored = new TopicStore(f.controller.store.path).get(target)!;
+    assert.equal(stored.pending, undefined);
+    assert.equal(stored.name.value, name);
+    assert.deepEqual(stored.icon, previousIcon);
+    assert.deepEqual(stored.occupiedIconIds, ["catalog-garden"]);
+    assert.equal(f.api.filter(call => call.method === "editForumTopic").length, previousCalls + (name === "Compiler" ? 0 : 1));
+    if (name === "Parsing") assert.equal(f.api.at(-1)!.payload.icon_custom_emoji_id, undefined);
   });
 });

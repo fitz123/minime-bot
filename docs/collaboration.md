@@ -193,9 +193,12 @@ on every context/apply request and before dispatch.
 
 When collaboration is enabled, topics reuse its configured `CollaborationRouter`
 and socket unchanged. With `collaboration: false`, startup creates the same
-router in **topic-only mode**, at `data/private-topics/router.sock` under that
-instance's control workspace. Existing instance roots isolate sockets and topic
-inventories. No global registry, worker, or extra lifecycle mechanism is added.
+router in **topic-only mode**, using a bounded socket path in OS temporary
+storage (falling back to `/tmp` for long temporary roots). A stable hash of the
+user ID and control-data root isolates instance sockets; inventories stay in
+the control workspace. A topic-only router startup failure disables cosmetics
+while ordinary startup continues. Full collaboration startup errors still fail.
+No global registry, worker, or extra lifecycle mechanism is added.
 Only eligible topic children load the existing collaboration wrapper and receive
 `MINIME_PRIVATE_TOPIC_POLICY=1`, `MINIME_COLLABORATION_TOPIC_ONLY=1`, the socket,
 and their exact session capability. This mode registers only `topic_apply`;
@@ -207,11 +210,12 @@ The host observes authorized private-topic Messages before content filtering,
 including topic-created/edited service messages. Service messages alone never
 start a model turn. An ordinary first observation with no metadata is eligible
 once under opt-in, with `unknown` provenance until policy initialization. An
-implicit creation is recorded as `implicit`, not manual. Explicit observed human
-edits pin only the fields present in the event; an absent icon leaves it unchanged,
-and an empty icon explicitly clears and pins it. Own bot echoes and implicit
-events never pin fields. Completed topics receive current-state context with a
-manual-only path; the server rejects further automatic initialization even when
+implicit creation name is recorded as `implicit`, not manual. Explicit observed
+human edits pin only the fields present in the event; an absent icon leaves it
+unchanged, and an empty icon explicitly clears and pins it. Own bot echoes never
+pin fields. `is_name_implicit` applies only to the name; an explicitly supplied
+human icon, including an empty icon, still becomes a manual pin. Completed topics
+receive current-state context with a manual-only path; the server rejects further automatic initialization even when
 old instructions remain in history. The trusted model classifies the current
 human's explicit rename/icon intent, and calls `topic_apply` with `intent: manual`
 and only the requested fields. Unrelated content never authorizes manual edits.
@@ -260,14 +264,21 @@ Telegram cannot be undone by local cancellation. The newer manual fields remain
 pinned in metadata, without an automatic repair edit. If a newer service event
 changes the revision during a manual edit, its receipt does not overwrite the
 newer observed fields; potentially applied icons remain occupied conservatively.
-A no-op manual pin does not release uncertain icon occupancy. Successful manual
-icon changes without an intervening event can release earlier occupancy evidence.
+Neither a no-op manual pin nor a later successful manual icon request releases
+earlier uncertain icon occupancy; an explicit human icon observation can do so.
 
 Cosmetic storage/API/IPC failures do not prevent ordinary replies. A storage
 failure disables topic edits in that controller until restart. An API failure
 or uncertain network outcome retains the pending reservation across restart;
 it is never interpreted as deletion, and pending requests are not automatically
-replayed. Both observed icons and pending icon targets reserve occupancy among
+replayed. A fresh explicit manual request with the current revision may supersede
+an inactive uncertain or startup-orphaned reservation, preserving all possibly
+applied icon targets as occupied history. Active work, including cancellation
+still settling, cannot be superseded. Context exposes `manualCanSupersede` for
+this distinction. A stale tool response includes refreshed context through the
+existing context request, so current human steering can retry its explicit
+request against the new revision. Internal turns remain excluded. Both observed
+icons and pending icon targets reserve occupancy among
 known topics of the same bot/chat. Unavailable and deleted-unconfirmed records
 remain occupied. Exhaustion or no suitable free candidate returns an honest
 state, with no random fallback or knowingly duplicated icon.
