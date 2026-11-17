@@ -469,7 +469,7 @@ test("catalog, API, persistence and optional IPC failures never prevent ordinary
     f.setCatalog(async () => { throw new Error("cosmetic catalog unavailable"); });
     const pi = await extension(t, f.config.collaboration!.socketPath);
     await f.send({ text: "Compiler" });
-    assert.equal(await pi.context("Compiler"), undefined);
+    assert.equal((await pi.context("Compiler")).catalogAvailable, false);
     assert.equal(f.inputs.length, 1);
     assert.equal(f.controller.store.get(target)!.initialized, false);
     await f.send({ text: "Continue" });
@@ -1237,5 +1237,107 @@ test("review4: live human evidence restores imported unavailable topics without 
     assert.equal(f.controller.store.get(target)!.availability, "observed");
     assert.equal((await f.controller.context(target) as any).status, "needs_presentation");
     assert.ok(f.api.every(call => call.method === "getForumTopicIconStickers"));
+  });
+});
+
+test("review5: omitted uncertain fields survive manual supersession and restart until confirmed", async t => {
+  for (const field of ["name", "icon"] as const) for (const noop of [false, true]) await t.test(`${field}, superseding noop=${noop}`, async t => {
+    const f = await fixture(t);
+    await initialize(f);
+    let context = await f.controller.context(target) as any;
+    f.setEdit(async () => { throw new Error("response lost after possible effect"); });
+    f.controller.apply(target, { intent: "manual", revision: context.revision,
+      ...(field === "name" ? { name: "Parsing" } : { iconCandidates: [1] }) }, () => true);
+    await f.controller.waitForIdle();
+    context = await f.controller.context(target) as any;
+    f.setEdit(async () => true);
+    f.controller.apply(target, { intent: "manual", revision: context.revision,
+      ...(field === "name" ? { iconCandidates: [noop ? 0 : 2] } : { name: noop ? "Compiler" : "Parsing" }) }, () => true);
+    await f.controller.waitForIdle();
+    const { PrivateTopicController } = await import("../private-topics.js");
+    const restarted = new PrivateTopicController(f.config, new TopicStore(f.controller.store.path), f.bot.api, () => target.botId);
+    const restore = field === "name" ? { name: "Compiler" } : { iconCandidates: [0] };
+    context = await restarted.context(target) as any;
+    const calls = f.api.filter(call => call.method === "editForumTopic").length;
+    assert.equal((restarted.apply(target, { intent: "manual", revision: context.revision, ...restore }, () => true) as any).status, "accepted");
+    await restarted.waitForIdle();
+    assert.equal(f.api.filter(call => call.method === "editForumTopic").length, calls + 1);
+    context = await restarted.context(target) as any;
+    assert.equal((restarted.apply(target, { intent: "manual", revision: context.revision, ...restore }, () => true) as any).status, "complete", "confirmed field can now be a no-op");
+  });
+});
+
+test("review5: superseding uncertain or orphaned auto work never permits another automatic attempt", async t => {
+  for (const field of ["name", "icon"] as const) for (const state of ["uncertain", "accepted"] as const) await t.test(`${field}, ${state}`, async t => {
+    const f = await fixture(t);
+    await f.send({ text: "Compiler" });
+    let context = await f.controller.context(target) as any;
+    f.setEdit(async () => { throw new Error("possibly applied auto initialization"); });
+    f.controller.apply(target, { revision: context.revision, name: "Compiler", iconCandidates: [0] }, () => true);
+    await f.controller.waitForIdle();
+    const stored = f.controller.store.get(target)!;
+    stored.pending!.state = state;
+    f.controller.store.put(stored);
+    const { PrivateTopicController } = await import("../private-topics.js");
+    const restart = () => new PrivateTopicController(f.config, new TopicStore(f.controller.store.path), f.bot.api, () => target.botId);
+    let restarted = restart();
+    context = await restarted.context(target) as any;
+    f.setEdit(async () => true);
+    assert.equal((restarted.apply(target, { intent: "manual", revision: context.revision,
+      ...(field === "name" ? { name: "Parsing" } : { iconCandidates: [1] }) }, () => true) as any).status, "accepted");
+    await restarted.waitForIdle();
+    restarted = restart();
+    restarted.observe(message({ text: "Continue with parsing" }));
+    context = await restarted.context(target) as any;
+    assert.equal(context.initialized, true);
+    assert.equal((restarted.apply(target, { revision: context.revision, name: "Repeat", iconCandidates: [2] }, () => true) as any).status, "complete");
+    await restarted.waitForIdle();
+    assert.equal(f.api.filter(call => call.method === "editForumTopic").length, 2);
+  });
+});
+
+test("review5: catalog failure supplies current human context for name-only manual edits", async t => {
+  for (const pinned of ["neither", "name", "icon"]) await t.test(`pinned=${pinned}`, async t => {
+    const f = await fixture(t);
+    f.setCatalog(async () => { throw new Error("catalog unavailable"); });
+    await f.send(pinned === "name" ? { forum_topic_created: { name: "Compiler", icon_color: 0 } } :
+      pinned === "icon" ? { forum_topic_edited: { icon_custom_emoji_id: "catalog-code" } } : { text: "Compiler" });
+    const pi = await extension(t, f.transport.socketPath);
+    const context = await pi.context("Rename this topic to Parsing");
+    assert.ok(context?.revision);
+    assert.equal(context.catalogAvailable, false);
+    const apply = async (request: any) => JSON.parse((await pi.tools.get("topic_apply").execute("offline", { revision: context.revision, ...request })).content[0].text);
+    assert.equal((await apply({ name: "Compiler", iconCandidates: [0] })).status, "unavailable");
+    assert.equal((await apply({ intent: "manual", iconCandidates: [0] })).status, "unavailable");
+    assert.equal((await apply({ intent: "manual", name: "Parsing" })).status, "accepted");
+    await f.controller.waitForIdle();
+    assert.equal(f.controller.store.get(target)!.name.value, "Parsing");
+    assert.equal(f.controller.store.get(target)!.initialized, false);
+    assert.deepEqual(f.api.filter(call => call.method === "editForumTopic").map(call => call.payload), [{ chat_id: 100, message_thread_id: 10, name: "Parsing" }]);
+    assert.equal(await pi.emit("before_agent_start", { messageType: "custom", message: { customType: "minime-collaboration" } }), undefined);
+  });
+});
+
+test("review5: only observations overlapping actual dispatched fields abort retries", async t => {
+  for (const field of ["name", "icon"] as const) for (const manual of [false, true]) await t.test(`${field}, manual=${manual}`, async t => {
+    const f = await fixture(t);
+    if (manual) await initialize(f);
+    else await f.send({ forum_topic_edited: field === "name" ? { icon_custom_emoji_id: "catalog-code" } : { name: "Compiler" } });
+    const context = await f.controller.context(target) as any;
+    let release!: (value: boolean) => void;
+    f.setEdit(() => new Promise(resolve => { release = resolve; }));
+    f.controller.apply(target, { intent: manual ? "manual" : "auto", revision: context.revision,
+      // Auto ignores the supplied value for the pinned field.
+      ...(manual ? {} : { name: "Parsing", iconCandidates: [1] }),
+      ...(field === "name" ? { name: "Parsing" } : { iconCandidates: [1] }) }, () => true);
+    await new Promise(done => setImmediate(done));
+    await f.send({ forum_topic_edited: field === "name" ? { icon_custom_emoji_id: "catalog-music" } : { name: "Human choice" } });
+    const call = f.api.filter(call => call.method === "editForumTopic").at(-1)!;
+    const aborted = call.signal?.aborted;
+    release(true);
+    await f.controller.waitForIdle();
+    assert.equal(aborted, false, "unrelated field must allow Telegram retry/confirmation");
+    assert.equal(f.controller.store.get(target)![field].value, field === "name" ? "Parsing" : "catalog-garden");
+    assert.equal(f.controller.store.get(target)!.pending, undefined);
   });
 });

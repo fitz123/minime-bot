@@ -108,7 +108,7 @@ export function registerCollaboration(pi: ExtensionAPI): void {
       if (!isHumanCollaborationTurn(event)) return;
       try {
         const value = await client?.request({ op: "topic_context" }, 1000);
-        if (!value?.revision || value.status === "unavailable") return;
+        if (!value?.revision) return;
         return { systemPrompt: `${event.systemPrompt}\n\nPrivate topic context:\n${JSON.stringify(value)}` };
       } catch { /* Cosmetic context never prevents an ordinary turn. */ }
     });

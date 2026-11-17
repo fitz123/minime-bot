@@ -72,6 +72,7 @@ export class PrivateTopicController {
           (topic[field].provenance === "policy-initialized" && topic[field].value === value));
         if (!policyEcho) flight?.observedFields.add(field);
         if (!manual && topic[field].pinned) continue;
+        topic.unknownFields = topic.unknownFields?.filter(unknown => unknown !== field);
         topic[field] = { value, pinned: manual, observedAt: topic.lastObservedAt,
           appliedAt: topic[field].value === value ? topic[field].appliedAt : undefined,
           provenance: manual ? "manual" : implicit ? "implicit" :
@@ -84,7 +85,8 @@ export class PrivateTopicController {
         (event.icon_custom_emoji_id === undefined || event.icon_custom_emoji_id === topic.pending.icon);
       if (!ownEcho) {
         topic.revision++;
-        flight?.controller.abort();
+        if (flight && ((topic.pending?.name !== undefined && flight.observedFields.has("name")) ||
+            (topic.pending?.icon !== undefined && flight.observedFields.has("icon")))) flight.controller.abort();
       }
     }
     this.save(topic);
@@ -149,7 +151,7 @@ export class PrivateTopicController {
       namePinned: topic.name.pinned, iconPinned: topic.icon.pinned, name: topic.name.value,
       icon: (this.catalog ?? []).find(icon => icon.id === topic.icon.value)?.emoji,
       iconIndex: (this.catalog ?? []).findIndex(icon => icon.id === topic.icon.value),
-      candidates, catalogAvailable, initialized: completed(topic), receipt: topic.lastReceipt,
+      candidates, catalogAvailable, initialized: completed(topic), receipt: topic.lastReceipt, unknownFields: topic.unknownFields,
       ...(topic.pending ? { outcome: topic.pending.state, requestId: topic.pending.id, manualCanSupersede: !this.activeRequests.has(topic.pending.id) } : {}),
       instruction: "Auto mode: after the first meaningful human content, silently call topic_apply once with a concise semantic topic name and ranked thematically suitable free icon indices. Greetings, empty content, commands, and internal messages must wait. Preserve pinned fields. Never auto-repeat on initialized topics, even with old instructions. Manual mode: only the current human's explicit ordinary-language request to rename/change this topic's icon authorizes intent=manual. Include ONLY requested fields, preserving all others; selected values become pinned. Do not infer manual intent from unrelated content. Names obey the grapheme cap; icons must be thematic, unique, and from this catalog, never status/arbitrary fallback icons. If no suitable icon exists, wait. Never replay pending/uncertain requests. A fresh explicit human request may supersede an inactive reservation only when manualCanSupersede is true; active work must wait. A stale tool result includes refreshed context: use its revision to retry only the current explicit human request. Accepted means reserved, NOT applied: never claim success from acceptance. A later context receipt and current fields can confirm the result. Automatic edits need no acknowledgement.",
     };
@@ -164,6 +166,7 @@ export class PrivateTopicController {
     if (!manual && completed(topic)) return { status: "complete" };
     if (topic.pending && (!manual || this.activeRequests.has(topic.pending.id))) return { status: "pending", outcome: topic.pending.state };
     if (!request || request.revision !== this.revision(topic)) return { status: "stale" };
+    if (!manual && !this.catalog) return { status: "unavailable" };
     let name: string | undefined;
     let icon: string | undefined;
     if (manual && request.name === undefined && request.iconCandidates === undefined) return { status: "no_requested_fields" };
@@ -180,11 +183,16 @@ export class PrivateTopicController {
       if (!icon) return { status: "no_suitable_free_icon" };
     }
     // Only a fresh, validated manual request may replace inactive uncertain/orphaned work.
-    // Its icon might already be applied, so retain it even after the new receipt.
+    // Omitted fields may already be applied; retain their uncertainty across receipts/restarts.
+    if (topic.pending) {
+      topic.unknownFields = [...new Set([...(topic.unknownFields ?? []),
+        ...(["name", "icon"] as const).filter(field => topic.pending![field] !== undefined)])];
+      if (topic.pending.intent !== "manual") topic.initialized = true;
+    }
     if (topic.pending?.icon) topic.occupiedIconIds = [...new Set([...(topic.occupiedIconIds ?? []), topic.pending.icon])];
     // A no-op pins explicitly requested manual fields, or completes auto initialization.
-    const uncertainRequestedField = (name !== undefined && topic.pending?.name !== undefined) ||
-      (icon !== undefined && topic.pending?.icon !== undefined);
+    const uncertainRequestedField = (name !== undefined && topic.unknownFields?.includes("name")) ||
+      (icon !== undefined && topic.unknownFields?.includes("icon"));
     if (!uncertainRequestedField && (name === undefined || name === topic.name.value) && (icon === undefined || icon === topic.icon.value)) {
       this.finish(topic, { name, icon, intent: manual ? "manual" : "auto" });
       return { status: "complete" };
@@ -207,6 +215,7 @@ export class PrivateTopicController {
       topic.occupiedIconIds = [...new Set([...(topic.occupiedIconIds ?? []), target.icon])];
     }
     for (const field of ["name", "icon"] as const) if (canApply(field) && target[field] !== undefined) {
+      topic.unknownFields = topic.unknownFields?.filter(unknown => unknown !== field);
       topic[field] = { value: target[field], pinned: manual, provenance: manual ? "manual" : "policy-initialized",
         observedAt: topic[field].value === target[field] ? topic[field].observedAt : undefined,
         appliedAt: receipt?.confirmedAt ?? (topic[field].value === target[field] ? topic[field].appliedAt : undefined) };

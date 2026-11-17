@@ -24,6 +24,8 @@ export interface TopicRecord extends TopicTarget {
   icon: TopicField;
   /** Conflicting observed/applied icons remain occupied until a later explicit human icon event. */
   occupiedIconIds?: string[];
+  /** Fields whose stored values may differ after superseding an unconfirmed request. */
+  unknownFields?: Array<"name" | "icon">;
   revision: number;
   initialized: boolean;
   availability: "observed" | "unavailable" | "deleted-unconfirmed";
@@ -46,6 +48,7 @@ function valid(record: TopicRecord): boolean {
   return record && [record.botId, record.chatId, record.topicId].every(Number.isSafeInteger) &&
     record.botId > 0 && record.topicId > 0 && fieldValid(record.name) && fieldValid(record.icon) &&
     (record.occupiedIconIds === undefined || (Array.isArray(record.occupiedIconIds) && record.occupiedIconIds.every(id => typeof id === "string" && id.length > 0))) &&
+    (record.unknownFields === undefined || (Array.isArray(record.unknownFields) && record.unknownFields.every(field => field === "name" || field === "icon"))) &&
     [record.peerId, record.lastObservedAt, record.lastMessageId, record.lastUpdateId].every(optionalInteger) &&
     (record.lastActor === undefined || (Number.isSafeInteger(record.lastActor.actorId) && typeof record.lastActor.isBot === "boolean")) &&
     (record.lastObservationSource === undefined || ["message", "topic-created", "topic-edited"].includes(record.lastObservationSource)) &&
