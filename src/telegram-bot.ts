@@ -790,7 +790,7 @@ export function createTelegramBot(
   bot.api.config.use(createTelegramAutoRetryTransformer());
 
   let topicController: PrivateTopicController | undefined;
-  if (config.privateTopics && config.collaboration) {
+  if (config.privateTopics?.enabled) {
     try {
       topicController = new PrivateTopicController(config, new TopicStore(opts?.topicStorePath), bot.api, () => {
         try { return bot.botInfo.id; } catch { return undefined; }

@@ -953,16 +953,14 @@ export function validateCollaboration(raw: unknown): BotConfig["collaboration"] 
   return { socketPath: raw.socketPath };
 }
 
-export function validatePrivateTopics(raw: unknown, collaboration: BotConfig["collaboration"]): BotConfig["privateTopics"] {
+export function validatePrivateTopics(raw: unknown): BotConfig["privateTopics"] {
   if (raw === undefined || raw === false) return undefined;
-  if (!collaboration) throw new Error("privateTopics requires collaboration");
-  if (!isConfigRecord(raw) || Object.keys(raw).some(key => !["expectedBotId", "chatIds", "maxNameGraphemes"].includes(key)) ||
-      !Number.isSafeInteger(raw.expectedBotId) || (raw.expectedBotId as number) <= 0 ||
-      !Array.isArray(raw.chatIds) || !raw.chatIds.length || !raw.chatIds.every(id => Number.isSafeInteger(id) && id > 0) ||
+  if (!isConfigRecord(raw) || Object.keys(raw).some(key => !["enabled", "maxNameGraphemes"].includes(key)) ||
+      typeof raw.enabled !== "boolean" ||
       (raw.maxNameGraphemes !== undefined && (!Number.isSafeInteger(raw.maxNameGraphemes) || (raw.maxNameGraphemes as number) < 1 || (raw.maxNameGraphemes as number) > 128))) {
-    throw new Error("privateTopics must be false or { expectedBotId: positive integer, chatIds: positive integer[], maxNameGraphemes?: 1..128 }");
+    throw new Error("privateTopics must be false or { enabled: boolean, maxNameGraphemes?: 1..128 }");
   }
-  return { expectedBotId: raw.expectedBotId as number, chatIds: [...new Set(raw.chatIds as number[])], maxNameGraphemes: raw.maxNameGraphemes as number ?? 17 };
+  return raw.enabled ? { enabled: true, maxNameGraphemes: raw.maxNameGraphemes as number ?? 17 } : undefined;
 }
 
 export function loadConfig(configPath?: string, options: LoadConfigOptions = {}): BotConfig {
@@ -986,7 +984,7 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
   const defaultModel = typeof raw.defaultModel === "string" ? raw.defaultModel : undefined;
   const piExtraExtensions = validatePiExtraExtensions(raw.piExtraExtensions);
   const collaboration = validateCollaboration(raw.collaboration);
-  const privateTopics = validatePrivateTopics(raw.privateTopics, collaboration);
+  const privateTopics = validatePrivateTopics(raw.privateTopics);
   const whisperModelPath = resolveWhisperModelPath(raw.whisperModel);
 
   // Validate agents (needed before validating bindings)

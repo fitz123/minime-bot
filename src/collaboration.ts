@@ -1,8 +1,16 @@
 import { randomUUID } from "node:crypto";
 import { chmodSync, lstatSync, mkdirSync, unlinkSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { createServer, createConnection, type Socket, type Server } from "node:net";
 import type { TopicApply } from "./private-topics.js";
+import type { BotConfig } from "./types.js";
+import { resolveWorkspaceContract } from "./workspace-contract.js";
+
+/** Fixed at startup, like the existing collaboration socket; workspace roots isolate instances. */
+export function collaborationTransport(config: BotConfig): { socketPath: string; topicOnly: boolean } | undefined {
+  if (config.collaboration) return { socketPath: config.collaboration.socketPath, topicOnly: false };
+  if (config.privateTopics?.enabled) return { socketPath: join(resolveWorkspaceContract().paths.dataDir, "private-topics", "router.sock"), topicOnly: true };
+}
 
 export type Address = { kind: "agent" | "thread" | "session" | "terminal"; id: string };
 export type ReceiptStatus = "accepted" | "consumed" | "rejected" | "disconnected" | "unknown" | "expired";
@@ -90,7 +98,7 @@ export class CollaborationRouter {
   private sockets = new Set<Socket>();
   private messages = new Map<string, { delivery: Delivery; receipt: Receipt }>();
   private conversations = new Map<string, { count: number; expires: number }>();
-  constructor(private owner: CollaborationOwner) {}
+  constructor(private owner: CollaborationOwner, private options: { topicOnly?: boolean } = {}) {}
   async start(path: string): Promise<void> {
     await prepareSocket(path);
     this.server = createServer(socket => this.connect(socket));
@@ -131,7 +139,8 @@ export class CollaborationRouter {
       this.prune();
       const respond = (value: unknown) => write(socket, { request: frame.request, value });
       if (frame.op === "hello") {
-        if (source || !validAddress(frame.address) || !["terminal", "session"].includes(frame.address.kind) || this.peers.has(key(frame.address))) {
+        if (source || !validAddress(frame.address) || !["terminal", "session"].includes(frame.address.kind) ||
+            (this.options.topicOnly && frame.address.kind !== "session") || this.peers.has(key(frame.address))) {
           return void respond({ status: "rejected", reason: "invalid or duplicate endpoint" });
         }
         source = frame.address;
@@ -149,6 +158,7 @@ export class CollaborationRouter {
           .catch(() => respond({ status: "unavailable" }));
         return;
       }
+      if (this.options.topicOnly) return void respond({ status: "rejected", reason: "topic-only transport" });
       if (frame.op === "discover") {
         const offset = frame.offset ?? 0;
         if (!Number.isSafeInteger(offset) || offset < 0) return void respond({ status: "rejected", reason: "invalid discovery offset" });

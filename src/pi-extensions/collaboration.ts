@@ -11,10 +11,13 @@ function isHumanCollaborationTurn(event: { messageType: string; prompt?: string 
 export function registerCollaboration(pi: ExtensionAPI): void {
   const path = process.env.MINIME_COLLABORATION_SOCKET;
   if (!path) return;
+  const topicOnly = process.env.MINIME_COLLABORATION_TOPIC_ONLY === "1";
+  let humanTurn = false;
   // Bash snapshots process.env when each tool starts. A background command from
   // an internal turn must retain a private outbox after human turns resume.
   const humanOutbox = process.env.MINIME_COLLABORATION_SESSION ? process.env.MINIME_OUTBOX : undefined;
   pi.on("before_agent_start", event => {
+    humanTurn = isHumanCollaborationTurn(event);
     if (humanOutbox) process.env.MINIME_OUTBOX = (event.messageType === "custom" ? event.message.customType === "minime-collaboration" : !isHumanCollaborationTurn(event))
       ? `${humanOutbox}.internal` : humanOutbox;
   });
@@ -85,6 +88,7 @@ export function registerCollaboration(pi: ExtensionAPI): void {
   pi.on("session_tree", connect);
   pi.on("session_shutdown", () => { clearInbox(); client?.close(); });
   pi.on("agent_settled", () => {
+    humanTurn = false;
     if (humanOutbox) process.env.MINIME_OUTBOX = humanOutbox;
     drain();
   });
@@ -104,20 +108,22 @@ export function registerCollaboration(pi: ExtensionAPI): void {
       if (!isHumanCollaborationTurn(event)) return;
       try {
         const value = await client?.request({ op: "topic_context" }, 1000);
-        if (value?.status !== "needs_presentation") return;
+        if (!value?.revision || value.status === "unavailable") return;
         return { message: { customType: "minime-topic-context", content: JSON.stringify(value), display: false } };
       } catch { /* Cosmetic context never prevents an ordinary turn. */ }
     });
     pi.registerTool({
       name: "topic_apply", label: "Set topic presentation",
-      description: "Silent one-time cosmetic topic initialization after meaningful human content. Use the current context revision, a semantic name within its grapheme cap, and ranked suitable free icon indices. Omit pinned fields. Accepted means reserved, not applied. Never retry uncertain effects or change completed topics.",
-      parameters: Type.Object({ revision: Type.String(), name: Type.Optional(Type.String()), iconCandidates: Type.Optional(Type.Array(Type.Integer({ minimum: 0 }))) }),
+      description: "Initialize once after meaningful human content (intent=auto), or edit ONLY fields explicitly requested by the current human (intent=manual), pinning their choices. Completed topics are manual-only. Use the current context revision, name grapheme cap and thematic free catalog indices. Accepted means reserved, NOT applied: do not claim success until confirmed by a later context receipt/current fields. Never retry pending/uncertain edits.",
+      parameters: Type.Object({ intent: Type.Optional(Type.Union([Type.Literal("auto"), Type.Literal("manual")])), revision: Type.String(), name: Type.Optional(Type.String()), iconCandidates: Type.Optional(Type.Array(Type.Integer({ minimum: 0 }))) }),
       execute: async (_id, p) => {
+        if (!humanTurn) return result({ status: "unavailable" });
         try { return result(await client?.request({ op: "topic_apply", ...p }) ?? { status: "unavailable" }); }
         catch { return result({ status: "unavailable" }); }
       },
     });
   }
+  if (topicOnly) return;
   const address = Type.Object({ kind: Type.Union([Type.Literal("agent"), Type.Literal("thread"), Type.Literal("session"), Type.Literal("terminal")]), id: Type.String() });
   pi.registerTool({ name: "collaboration_discover", label: "Discover collaborators", description: "List same-host collaborators (64 per page; pass nextOffset as offset). Internal conversations only; requires running bot router.", parameters: Type.Object({ offset: Type.Optional(Type.Integer({ minimum: 0 })) }), execute: async (_id, p) => result(await client?.request({ op: "discover", ...p }) ?? { status: "disconnected" }) });
   pi.registerTool({ name: "collaboration_send", label: "Send internal message", description: "Start an internal conversation. Returns a receipt without waiting for an answer. Finish the turn so replies can arrive. At most 32 messages / 10 minutes per conversation.", parameters: Type.Object({ to: address, text: Type.String() }), execute: async (_id, p) => result(await client?.request({ op: "send", ...p }) ?? { status: "disconnected" }) });

@@ -19,7 +19,7 @@ export interface TopicRecord extends TopicTarget {
   lastMessageId?: number;
   lastUpdateId?: number;
   lastObservationSource?: "message" | "topic-created" | "topic-edited";
-  lastReceipt?: { confirmedAt: number; source: "telegram-true" | "telegram-not-modified" };
+  lastReceipt?: { requestId?: string; confirmedAt: number; source: "telegram-true" | "telegram-not-modified" };
   name: TopicField;
   icon: TopicField;
   /** Conflicting observed/applied icons remain occupied until a later explicit human icon event. */
@@ -32,6 +32,7 @@ export interface TopicRecord extends TopicTarget {
     revision: number;
     name?: string;
     icon?: string;
+    intent?: "auto" | "manual";
     state: "accepted" | "uncertain";
   };
 }
@@ -49,11 +50,13 @@ function valid(record: TopicRecord): boolean {
     (record.lastActor === undefined || (Number.isSafeInteger(record.lastActor.actorId) && typeof record.lastActor.isBot === "boolean")) &&
     (record.lastObservationSource === undefined || ["message", "topic-created", "topic-edited"].includes(record.lastObservationSource)) &&
     (record.lastReceipt === undefined || (Number.isSafeInteger(record.lastReceipt.confirmedAt) && record.lastReceipt.confirmedAt >= 0 &&
-      ["telegram-true", "telegram-not-modified"].includes(record.lastReceipt.source))) &&
+      ["telegram-true", "telegram-not-modified"].includes(record.lastReceipt.source) &&
+      (record.lastReceipt.requestId === undefined || typeof record.lastReceipt.requestId === "string"))) &&
     Number.isSafeInteger(record.revision) && record.revision >= 0 && typeof record.initialized === "boolean" &&
     ["observed", "unavailable", "deleted-unconfirmed"].includes(record.availability) &&
     (!record.pending || (typeof record.pending.id === "string" && Number.isSafeInteger(record.pending.revision) &&
       ["accepted", "uncertain"].includes(record.pending.state) &&
+      (record.pending.intent === undefined || ["auto", "manual"].includes(record.pending.intent)) &&
       [record.pending.name, record.pending.icon].every(value => value === undefined || typeof value === "string")));
 }
 

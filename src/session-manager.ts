@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { on } from "node:events";
 import PQueue from "p-queue";
 import { resolveBinding } from "./telegram-binding.js";
-import { CollaborationDeliveryError, collaborationPrompt, type Delivery, type Endpoint } from "./collaboration.js";
+import { CollaborationDeliveryError, collaborationPrompt, collaborationTransport, type Delivery, type Endpoint } from "./collaboration.js";
 import type { Address } from "./collaboration.js";
 import { topicScopeEnabled, type PrivateTopicController, type TopicApply } from "./private-topics.js";
 import type { TopicRecord, TopicTarget } from "./topic-store.js";
@@ -314,7 +314,7 @@ export class SessionManager {
   private loadConfig: () => BotConfig;
   private logDir: string;
   private startupTimeoutMs: number;
-  private collaborationSocket?: string;
+  private transport?: ReturnType<typeof collaborationTransport>;
   private topicController?: PrivateTopicController;
   private humanWorkPending: (chatId: string) => boolean = () => false;
   private humanInputs = new Map<string, number>();
@@ -328,7 +328,7 @@ export class SessionManager {
     this.loadConfig = loadConfig;
     // Validate config at boot — fail fast if config is broken
     const startupConfig = loadConfig();
-    this.collaborationSocket = startupConfig.collaboration?.socketPath;
+    this.transport = collaborationTransport(startupConfig);
     this.store = new SessionStore(storePath);
     this.store.migrateLegacySessions(startupConfig);
     this.logDir = logDir ?? LOG_DIR;
@@ -346,7 +346,7 @@ export class SessionManager {
     const controller = this.topicController;
     if (!controller || controller.currentBotId() !== botId) return [];
     const config = this.getFreshConfig();
-    if (!config.collaboration || config.privateTopics?.expectedBotId !== botId || !config.privateTopics.chatIds.includes(chatId)) return [];
+    if (!config.privateTopics?.enabled) return [];
     const sessions = this.store.getAllSessions();
     return controller.store.list().flatMap(topic => {
       if (topic.botId !== botId || topic.chatId !== chatId) return [];
@@ -364,12 +364,12 @@ export class SessionManager {
     if (source.kind !== "session" || process.env.PI_EXTENSIONS_DISABLED === "1") return;
     const config = this.getFreshConfig();
     const botId = this.topicController?.currentBotId();
-    if (!config.collaboration || botId === undefined) return;
+    if (botId === undefined) return;
     const entries = Object.entries(this.store.getAllSessions()).filter(([, state]) => state.bindingState === "bound" && state.sessionId === source.id);
     if (entries.length !== 1) return;
     const [lane, state] = entries[0];
     const match = /^(\d+):(\d+)$/.exec(lane);
-    if (!match || !config.agents[state.agentId]) return;
+    if (!match || !config.agents[state.agentId] || this.active.get(lane)?.internalTurn) return;
     const target = { botId, chatId: Number(match[1]), topicId: Number(match[2]) };
     if (!this.topicController?.eligible(target, config) || resolveBinding(target.chatId, config.bindings, target.topicId)?.agentId !== state.agentId) return;
     return { ...target, agentId: state.agentId, sessionId: source.id };
@@ -1074,19 +1074,17 @@ export class SessionManager {
     ensureSessionMediaDir(chatId);
 
     const outboxPath = outboxDir(chatId);
-    const collaborationEnabled = Boolean(this.collaborationSocket);
-    const extensionOptions: PiSpawnExtensionOptions | undefined = collaborationEnabled
-      ? { extraExtensions: freshConfig.piExtraExtensions, collaboration: true }
-      : freshConfig.piExtraExtensions === undefined
-        ? undefined
-        : { extraExtensions: freshConfig.piExtraExtensions };
     const telegramLane = /^(-?\d+)(?::(\d+))?$/.exec(chatId);
     const telegramRichAnswers = !!telegramLane && !!resolveBinding(Number(telegramLane[1]), freshConfig.bindings,
       telegramLane[2] === undefined ? undefined : Number(telegramLane[2]));
     const topicBotId = this.topicController?.currentBotId();
-    const privateTopicPolicy = collaborationEnabled && process.env.PI_EXTENSIONS_DISABLED !== "1" && topicBotId !== undefined && !!telegramLane?.[2] &&
+    const privateTopicPolicy = !!this.transport && process.env.PI_EXTENSIONS_DISABLED !== "1" && topicBotId !== undefined && !!telegramLane?.[2] &&
       topicScopeEnabled(freshConfig, { botId: topicBotId, chatId: Number(telegramLane[1]), topicId: Number(telegramLane[2]) }) &&
       resolveBinding(Number(telegramLane[1]), freshConfig.bindings, Number(telegramLane[2]))?.agentId === agentId;
+    const transportEnabled = !!this.transport && (!this.transport.topicOnly || privateTopicPolicy);
+    const extensionOptions: PiSpawnExtensionOptions | undefined = transportEnabled
+      ? { extraExtensions: freshConfig.piExtraExtensions, collaboration: true }
+      : freshConfig.piExtraExtensions === undefined ? undefined : { extraExtensions: freshConfig.piExtraExtensions };
     const runtimeEnvOptions: PiSpawnRuntimeEnvOptions = { askCallerAgentId: agentId, fastThreadKey: chatId, outboxPath, ...(privateTopicPolicy ? { privateTopicPolicy: true } : {}), ...(telegramRichAnswers ? { telegramRichAnswers: true } : {}) };
     let prepared = this.prepareSessionBinding(chatId, agentId, agent, freshConfig, Boolean(expectedId));
     if (isStartupSuperseded()) {
@@ -1096,8 +1094,8 @@ export class SessionManager {
     let child: ChildProcess | undefined;
     for (;;) {
       try {
-        child = spawnPiRpcSession(agent, prepared.binding, extensionOptions, collaborationEnabled
-          ? { ...runtimeEnvOptions, collaborationSession: prepared.binding.sessionId, collaborationSocket: this.collaborationSocket }
+        child = spawnPiRpcSession(agent, prepared.binding, extensionOptions, transportEnabled
+          ? { ...runtimeEnvOptions, collaborationSession: prepared.binding.sessionId, collaborationSocket: this.transport!.socketPath, ...(this.transport!.topicOnly ? { collaborationTopicOnly: true } : {}) }
           : runtimeEnvOptions);
         await waitForSpawn(child, this.startupTimeoutMs);
         if (isStartupSuperseded()) {

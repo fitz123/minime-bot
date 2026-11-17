@@ -9,10 +9,9 @@ export interface TopicApi {
   getForumTopicIconStickers(): Promise<Array<{ custom_emoji_id?: string; emoji?: string }>>;
   editForumTopic(chatId: number, topicId: number, edit: { name?: string; icon_custom_emoji_id?: string }, signal?: Parameters<Api["editForumTopic"]>[3]): Promise<unknown>;
 }
-export interface TopicApply { revision: string; name?: string; iconCandidates?: number[] }
+export interface TopicApply { intent?: "auto" | "manual"; revision: string; name?: string; iconCandidates?: number[] }
 export function topicScopeEnabled(config: BotConfig, target: TopicTarget): boolean {
-  return !!config.collaboration && config.privateTopics?.expectedBotId === target.botId &&
-    config.privateTopics.chatIds.includes(target.chatId) && target.topicId > 0 &&
+  return !!config.privateTopics?.enabled && target.botId > 0 && target.chatId > 0 && target.topicId > 0 &&
     resolveBinding(target.chatId, config.bindings, target.topicId)?.kind === "dm";
 }
 const graphemeCount = (text: string) => [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text)].length;
@@ -126,20 +125,25 @@ export class PrivateTopicController {
     if (!this.eligible(target)) return { status: "unavailable" };
     let topic = this.store.get(target);
     if (!topic) return { status: "unavailable" };
-    if (completed(topic)) return { status: "complete" };
-    if (topic.pending) return { status: "pending", outcome: topic.pending.state };
     if (topic.availability !== "observed") return { status: "unavailable" };
-    if (!topic.icon.pinned) await this.loadCatalog();
+    // Completed/pinned fields remain editable only on an explicit human request.
+    // A catalog failure must not prevent a manual name-only edit.
+    let catalogAvailable = true;
+    if (!topic.pending) try { await this.loadCatalog(); } catch { catalogAvailable = false; }
     if (!this.eligible(target)) return { status: "unavailable" };
     topic = this.store.get(target)!;
-    if (completed(topic)) return { status: "complete" };
-    if (topic.pending) return { status: "pending", outcome: topic.pending.state };
+    if (topic.availability !== "observed") return { status: "unavailable" };
     const candidates = (this.catalog ?? []).flatMap((icon, index) => this.freeIcon(target, icon.id) ? [{ index, emoji: icon.emoji }] : []);
-    if (!topic.icon.pinned && !candidates.length) return { status: "catalog_exhausted" };
+    const status = topic.pending ? "pending" : completed(topic) ? "complete" :
+      !catalogAvailable && !topic.icon.pinned ? "unavailable" : !topic.icon.pinned && !candidates.length ? "catalog_exhausted" : "needs_presentation";
     return {
-      status: "needs_presentation", revision: this.revision(topic), maxNameGraphemes: this.config.privateTopics?.maxNameGraphemes ?? 17,
-      namePinned: topic.name.pinned, iconPinned: topic.icon.pinned, name: topic.name.value, candidates,
-      instruction: "After the first meaningful human content, silently call topic_apply once with a concise semantic topic name and ranked thematically suitable free icon indices from this context. Greetings, empty content, commands, and internal messages must wait. Preserve pinned fields. Do not use status icons or arbitrary fallback icons. No acknowledgement is needed. Accepted means reserved, not applied. If no suitable icon exists, wait. Old instructions do not authorize changing completed topics.",
+      status, revision: this.revision(topic), maxNameGraphemes: this.config.privateTopics?.maxNameGraphemes ?? 17,
+      namePinned: topic.name.pinned, iconPinned: topic.icon.pinned, name: topic.name.value,
+      icon: (this.catalog ?? []).find(icon => icon.id === topic.icon.value)?.emoji,
+      iconIndex: (this.catalog ?? []).findIndex(icon => icon.id === topic.icon.value),
+      candidates, catalogAvailable, initialized: completed(topic), receipt: topic.lastReceipt,
+      ...(topic.pending ? { outcome: topic.pending.state, requestId: topic.pending.id } : {}),
+      instruction: "Auto mode: after the first meaningful human content, silently call topic_apply once with a concise semantic topic name and ranked thematically suitable free icon indices. Greetings, empty content, commands, and internal messages must wait. Preserve pinned fields. Never auto-repeat on initialized topics, even with old instructions. Manual mode: only the current human's explicit ordinary-language request to rename/change this topic's icon authorizes intent=manual. Include ONLY requested fields, preserving all others; selected values become pinned. Do not infer manual intent from unrelated content. Names obey the grapheme cap; icons must be thematic, unique, and from this catalog, never status/arbitrary fallback icons. If no suitable icon exists, wait. Pending/uncertain effects must not be retried. Accepted means reserved, NOT applied: never claim success from acceptance. A later context receipt and current fields can confirm the result. Automatic edits need no acknowledgement.",
     };
   }
 
@@ -147,46 +151,55 @@ export class PrivateTopicController {
     if (!this.eligible(target) || !isCurrent()) return { status: "unavailable" };
     const topic = this.store.get(target);
     if (!topic || topic.availability !== "observed") return { status: "unavailable" };
-    if (completed(topic)) return { status: "complete" };
+    const manual = request?.intent === "manual";
+    if (request?.intent !== undefined && !["auto", "manual"].includes(request.intent)) return { status: "invalid_intent" };
+    if (!manual && completed(topic)) return { status: "complete" };
     if (topic.pending) return { status: "pending", outcome: topic.pending.state };
     if (!request || request.revision !== this.revision(topic)) return { status: "stale" };
     let name: string | undefined;
     let icon: string | undefined;
-    if (!topic.name.pinned) {
+    if (manual && request.name === undefined && request.iconCandidates === undefined) return { status: "no_requested_fields" };
+    if (manual ? request.name !== undefined : !topic.name.pinned) {
       name = typeof request.name === "string" ? request.name.normalize("NFC").trim() : undefined;
       if (!name || !/[\p{L}\p{N}]/u.test(name) || /[\p{Cc}\p{Zl}\p{Zp}]/u.test(name) ||
           graphemeCount(name) > (this.config.privateTopics?.maxNameGraphemes ?? 17)) return { status: "invalid_name" };
     }
-    if (!topic.icon.pinned) {
+    if (manual ? request.iconCandidates !== undefined : !topic.icon.pinned) {
       if (!this.catalog) return { status: "unavailable" };
       if (!Array.isArray(request.iconCandidates) || request.iconCandidates.length > this.catalog.length ||
           !request.iconCandidates.every(index => Number.isSafeInteger(index) && this.catalog![index])) return { status: "invalid_candidates" };
       icon = request.iconCandidates.map(index => this.catalog![index].id).find(id => this.freeIcon(target, id));
       if (!icon) return { status: "no_suitable_free_icon" };
     }
-    // Even a no-op completes initialization durably, without an API call.
+    // A no-op pins explicitly requested manual fields, or completes auto initialization.
     if ((name === undefined || name === topic.name.value) && (icon === undefined || icon === topic.icon.value)) {
-      this.finish(topic, { name, icon });
+      this.finish(topic, { name, icon, intent: manual ? "manual" : "auto", revision: topic.revision });
       return { status: "complete" };
     }
     topic.revision++;
-    topic.pending = { id: randomUUID(), revision: topic.revision, name, icon, state: "accepted" };
+    topic.pending = { id: randomUUID(), revision: topic.revision, name, icon, intent: manual ? "manual" : "auto", state: "accepted" };
     this.save(topic); // Reservation is durable BEFORE scheduling any network effects.
     const work = Promise.resolve().then(() => this.edit(target, topic.pending!, isCurrent)).catch(() => {
       // Storage/API failures are cosmetic. An existing pending reservation stays occupied.
     }).finally(() => { this.running.delete(work); });
     this.running.add(work);
-    return { status: "accepted", outcome: "reserved; Telegram edit has not completed" };
+    return { status: "accepted", requestId: topic.pending.id, outcome: "reserved; Telegram edit has not completed" };
   }
-  private finish(topic: TopicRecord, target: { name?: string; icon?: string }, receipt?: NonNullable<TopicRecord["lastReceipt"]>): void {
+  private finish(topic: TopicRecord, target: { name?: string; icon?: string; intent?: "auto" | "manual"; revision: number }, receipt?: NonNullable<TopicRecord["lastReceipt"]>): void {
     if (receipt && target.icon !== undefined) this.retainConflictingIcon(topic, target.icon);
-    for (const field of ["name", "icon"] as const) if (!topic[field].pinned && target[field] !== undefined) {
-      topic[field] = { value: target[field], pinned: false, provenance: "policy-initialized",
+    const manual = target.intent === "manual";
+    const unchanged = topic.revision === target.revision;
+    if (receipt && manual && !unchanged && target.icon && target.icon !== topic.icon.value) {
+      topic.occupiedIconIds = [...new Set([...(topic.occupiedIconIds ?? []), target.icon])];
+    }
+    for (const field of ["name", "icon"] as const) if ((manual ? unchanged : !topic[field].pinned) && target[field] !== undefined) {
+      if (manual && field === "icon" && receipt) delete topic.occupiedIconIds;
+      topic[field] = { value: target[field], pinned: manual, provenance: manual ? "manual" : "policy-initialized",
         observedAt: topic[field].value === target[field] ? topic[field].observedAt : undefined,
         appliedAt: receipt?.confirmedAt ?? (topic[field].value === target[field] ? topic[field].appliedAt : undefined) };
     }
     if (receipt) topic.lastReceipt = receipt;
-    topic.initialized = true;
+    if (!manual) topic.initialized = true;
     topic.revision++;
     delete topic.pending;
     this.save(topic);
@@ -215,7 +228,7 @@ export class PrivateTopicController {
     } finally { this.inFlight.delete(this.targetKey(target)); }
     topic = this.store.get(target)!;
     if (topic.pending?.id !== pending.id) return;
-    if (receiptSource) this.finish(topic, pending, { confirmedAt: Date.now(), source: receiptSource });
+    if (receiptSource) this.finish(topic, pending, { requestId: pending.id, confirmedAt: Date.now(), source: receiptSource });
     else { topic.pending.state = "uncertain"; this.save(topic); }
   }
   /** For tests/operator shutdown inspection; no retries or replay on restart. */

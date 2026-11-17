@@ -1,6 +1,6 @@
 import { loadConfig } from "./config.js";
 import { SessionManager } from "./session-manager.js";
-import { CollaborationRouter } from "./collaboration.js";
+import { CollaborationRouter, collaborationTransport } from "./collaboration.js";
 import {
   createTelegramBot,
   BOT_COMMANDS,
@@ -215,15 +215,16 @@ async function main(): Promise<void> {
     requestShutdown("unhandledRejection", 1);
   });
 
-  if (config.collaboration) {
+  const transport = collaborationTransport(config);
+  if (transport) {
     collaborationRouter = new CollaborationRouter({
       discover: () => sessionManager.collaborationEndpoints(),
       deliver: (message, consumed) => sessionManager.deliverCollaboration(message, consumed),
       topicContext: source => sessionManager.topicContext(source),
       topicApply: (source, request) => sessionManager.topicApply(source, request),
-    });
-    await collaborationRouter.start(config.collaboration.socketPath);
-    log.info("main", "Same-host collaboration router started");
+    }, { topicOnly: transport.topicOnly });
+    await collaborationRouter.start(transport.socketPath);
+    log.info("main", transport.topicOnly ? "Private-topic router started" : "Same-host collaboration router started");
   }
 
   // Telegram starts before Discord has finished connecting. Polling failures

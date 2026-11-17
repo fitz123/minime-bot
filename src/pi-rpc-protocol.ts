@@ -178,6 +178,7 @@ export interface PiSpawnExtensionOptions extends PiExtensionResolveOptions {
 
 export interface PiSpawnRuntimeEnvOptions {
   privateTopicPolicy?: boolean;
+  collaborationTopicOnly?: boolean;
   collaborationSession?: string;
   collaborationSocket?: string;
   /** Trusted current agent id supplied by SessionManager for first-party tools. */
@@ -794,10 +795,12 @@ function buildAllowedPiChildEnv(
   copyExplicitControlPathEnv(env, contract, MINIME_CRONS_PATH_ENV, "cronsPath");
   env[MINIME_BOT_PI_SESSION_ENV] = "1";
   delete env.MINIME_PRIVATE_TOPIC_POLICY;
+  delete env.MINIME_COLLABORATION_TOPIC_ONLY;
   if (runtimeEnvOptions?.privateTopicPolicy && runtimeEnvOptions.collaborationSession && runtimeEnvOptions.collaborationSocket) env.MINIME_PRIVATE_TOPIC_POLICY = "1";
   if (runtimeEnvOptions?.collaborationSession && runtimeEnvOptions.collaborationSocket) {
     env.MINIME_COLLABORATION_SOCKET = runtimeEnvOptions.collaborationSocket;
     env.MINIME_COLLABORATION_SESSION = runtimeEnvOptions.collaborationSession;
+    if (runtimeEnvOptions.collaborationTopicOnly) env.MINIME_COLLABORATION_TOPIC_ONLY = "1";
   }
 
   return inheritCron && isCronFastOff(parentEnv) ? buildCronFastEnv(env) : env;

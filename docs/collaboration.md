@@ -165,32 +165,43 @@ availability depends on the bot. A standalone terminal remains usable without it
 
 ## Private-topic presentation
 
-This separate opt-in uses the existing collaboration socket and package Pi
-extension to initialize private Telegram topics after their first meaningful
-human content. It adds no command, command-menu entry, scheduled job, topic
-creation/deletion, or extra model call. The ordinary model turn chooses a concise
-semantic name and ranked thematically suitable catalog icons. Greetings and empty
-content wait. The default name cap is 17 Unicode grapheme clusters, including
-spaces and punctuation; the icon is a separate custom emoji, not a status marker.
+This disabled-by-default opt-in initializes authorized private Telegram topics
+on every configured runtime bot after their first meaningful human content. It
+also supports explicit ordinary-language name/icon requests in the same model
+turn through the same tool. It adds no slash command, scheduled job, topic
+creation/deletion, history writes, synthetic turn, MTProto, or extra model call.
+Greetings and empty content wait for later meaningful content. The ordinary
+model chooses a concise semantic name and ranked thematically suitable catalog
+icons. The default name cap is 17 Unicode grapheme clusters, including spaces
+and punctuation; the icon is separate from the name.
 
 ```yaml
-collaboration:
-  socketPath: /tmp/minime-collaboration/router.sock
 privateTopics:
-  expectedBotId: 900
-  chatIds: [100]
+  enabled: true
   maxNameGraphemes: 17
 ```
 
-The numbers above are synthetic examples. Supply the actual bot's numeric identity
-and intended private chat peers. Both sections accept `false`; enabling
-`privateTopics` requires collaboration. Restart after changing this policy.
-`expectedBotId` is checked against grammY's current bot identity, so inherited
-configuration cannot opt a different bot into the policy. The chat must also have
-a resolved DM binding. Other bots, chats, groups, non-topic messages, Discord,
-consultations, and terminal sessions receive no topic tool. Disabled Pi extensions
-also disable the feature. The owner rechecks the current session and resolved
-agent binding on every context/apply request; a tool cannot select a target chat.
+The policy is reusable across instances: it has no bot/chat allowlist. Omission,
+`false`, or `enabled: false` disables it. Restart after changing policy or
+transport configuration. Existing chat access, resolved DM bindings, and agent
+authorization still apply. Groups and supergroups are excluded, as are non-topic
+messages, Discord, consultations, and terminal sessions. The actual grammY bot
+identity supplies the inventory namespace and current-session routing; callers
+cannot choose a target bot/chat/topic. Disabled Pi extensions disable the feature.
+The owner rechecks session capability, current binding, agent, and bot identity
+on every context/apply request and before dispatch.
+
+When collaboration is enabled, topics reuse its configured `CollaborationRouter`
+and socket unchanged. With `collaboration: false`, startup creates the same
+router in **topic-only mode**, at `data/private-topics/router.sock` under that
+instance's control workspace. Existing instance roots isolate sockets and topic
+inventories. No global registry, worker, or extra lifecycle mechanism is added.
+Only eligible topic children load the existing collaboration wrapper and receive
+`MINIME_PRIVATE_TOPIC_POLICY=1`, `MINIME_COLLABORATION_TOPIC_ONLY=1`, the socket,
+and their exact session capability. This mode registers only `topic_apply`;
+the server rejects terminal registration and all discover/send/reply/receipt and
+delivery-status operations. General collaboration remains disabled. Cron,
+subagent, and ask-agent environments do not inherit these capabilities.
 
 The host observes authorized private-topic Messages before content filtering,
 including topic-created/edited service messages. Service messages alone never
@@ -199,11 +210,18 @@ once under opt-in, with `unknown` provenance until policy initialization. An
 implicit creation is recorded as `implicit`, not manual. Explicit observed human
 edits pin only the fields present in the event; an absent icon leaves it unchanged,
 and an empty icon explicitly clears and pins it. Own bot echoes and implicit
-events never pin fields. Completed topics do not receive new naming instructions,
-and the server fences old instructions retained in model history. Later explicit
-manual edits still win. Semantic relevance and recognizing meaningful content are
-the ordinary model's responsibility; the owner validates the name cap, catalog,
-pins, revision, and known icon occupancy before accepting an effect. Semantic
+events never pin fields. Completed topics receive current-state context with a
+manual-only path; the server rejects further automatic initialization even when
+old instructions remain in history. The trusted model classifies the current
+human's explicit rename/icon intent, and calls `topic_apply` with `intent: manual`
+and only the requested fields. Unrelated content never authorizes manual edits.
+Requested values become manual pins on confirmation, including no-op choices
+without an API call. Other fields remain unchanged; a manual name-only request
+on an uninitialized topic leaves its initial icon eligible. Custom/internal turns
+cannot invoke retained topic tools, and owner-scheduled internal collaboration
+also fails the server-side session check. Semantic relevance and meaningful
+content remain the model's responsibility; the owner validates the name cap,
+catalog, pins, revision, and known icon occupancy before accepting an effect. Semantic
 names may repeat; only icons require uniqueness among known occupied topics.
 
 The inventory is `private-topics.json` in the control workspace's data directory.
@@ -229,15 +247,24 @@ not. Icon candidates use short indices bound to a revision and catalog hash, not
 long custom emoji identifiers in the model context. `topic_apply` returns
 `accepted` immediately after durable reservation; **accepted is not applied**.
 One combined Telegram edit runs asynchronously using the existing bounded retries.
+The acceptance includes a request ID and explicitly says the edit has not
+completed. Manual responses must not claim success from that reservation. Later
+human-turn context supplies current values/pins, revision, pending outcome, and
+the last confirmed receipt (including request ID); confirm both receipt and
+current fields when reporting an edit. No polling or extra turn is introduced.
 Identical presentation suppresses the API call. A successful `true` response or
 not-modified response completes that same pending target. A new observed edit or
 routing change fences a request before dispatch; an observed edit aborts an
 in-flight transport to prevent later retries. A request already accepted by
 Telegram cannot be undone by local cancellation. The newer manual fields remain
-pinned in metadata, without an automatic repair edit.
+pinned in metadata, without an automatic repair edit. If a newer service event
+changes the revision during a manual edit, its receipt does not overwrite the
+newer observed fields; potentially applied icons remain occupied conservatively.
+A no-op manual pin does not release uncertain icon occupancy. Successful manual
+icon changes without an intervening event can release earlier occupancy evidence.
 
 Cosmetic storage/API/IPC failures do not prevent ordinary replies. A storage
-failure disables automatic edits in that controller until restart. An API failure
+failure disables topic edits in that controller until restart. An API failure
 or uncertain network outcome retains the pending reservation across restart;
 it is never interpreted as deletion, and pending requests are not automatically
 replayed. Both observed icons and pending icon targets reserve occupancy among
