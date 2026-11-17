@@ -3,6 +3,11 @@ import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CollaborationClient, collaborationPrompt, type Delivery } from "../collaboration.js";
 
+/** Internal custom messages and collaboration prompts are never human topic content. */
+function isHumanCollaborationTurn(event: { messageType: string; prompt?: string }): boolean {
+  return event.messageType === "user" && !event.prompt?.startsWith("[Internal collaboration ");
+}
+
 export function registerCollaboration(pi: ExtensionAPI): void {
   const path = process.env.MINIME_COLLABORATION_SOCKET;
   if (!path) return;
@@ -10,7 +15,7 @@ export function registerCollaboration(pi: ExtensionAPI): void {
   // an internal turn must retain a private outbox after human turns resume.
   const humanOutbox = process.env.MINIME_COLLABORATION_SESSION ? process.env.MINIME_OUTBOX : undefined;
   pi.on("before_agent_start", event => {
-    if (humanOutbox) process.env.MINIME_OUTBOX = (event.messageType === "custom" ? event.message.customType === "minime-collaboration" : event.prompt.startsWith("[Internal collaboration "))
+    if (humanOutbox) process.env.MINIME_OUTBOX = (event.messageType === "custom" ? event.message.customType === "minime-collaboration" : !isHumanCollaborationTurn(event))
       ? `${humanOutbox}.internal` : humanOutbox;
   });
   let client: CollaborationClient | undefined;
@@ -94,6 +99,25 @@ export function registerCollaboration(pi: ExtensionAPI): void {
     item.client.consumed(id);
   });
   const result = (value: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(value) }], details: {} });
+  if (process.env.MINIME_PRIVATE_TOPIC_POLICY === "1" && process.env.MINIME_COLLABORATION_SESSION) {
+    pi.on("before_agent_start", async event => {
+      if (!isHumanCollaborationTurn(event)) return;
+      try {
+        const value = await client?.request({ op: "topic_context" }, 1000);
+        if (value?.status !== "needs_presentation") return;
+        return { message: { customType: "minime-topic-context", content: JSON.stringify(value), display: false } };
+      } catch { /* Cosmetic context never prevents an ordinary turn. */ }
+    });
+    pi.registerTool({
+      name: "topic_apply", label: "Set topic presentation",
+      description: "Silent one-time cosmetic topic initialization after meaningful human content. Use the current context revision, a semantic name within its grapheme cap, and ranked suitable free icon indices. Omit pinned fields. Accepted means reserved, not applied. Never retry uncertain effects or change completed topics.",
+      parameters: Type.Object({ revision: Type.String(), name: Type.Optional(Type.String()), iconCandidates: Type.Optional(Type.Array(Type.Integer({ minimum: 0 }))) }),
+      execute: async (_id, p) => {
+        try { return result(await client?.request({ op: "topic_apply", ...p }) ?? { status: "unavailable" }); }
+        catch { return result({ status: "unavailable" }); }
+      },
+    });
+  }
   const address = Type.Object({ kind: Type.Union([Type.Literal("agent"), Type.Literal("thread"), Type.Literal("session"), Type.Literal("terminal")]), id: Type.String() });
   pi.registerTool({ name: "collaboration_discover", label: "Discover collaborators", description: "List same-host collaborators (64 per page; pass nextOffset as offset). Internal conversations only; requires running bot router.", parameters: Type.Object({ offset: Type.Optional(Type.Integer({ minimum: 0 })) }), execute: async (_id, p) => result(await client?.request({ op: "discover", ...p }) ?? { status: "disconnected" }) });
   pi.registerTool({ name: "collaboration_send", label: "Send internal message", description: "Start an internal conversation. Returns a receipt without waiting for an answer. Finish the turn so replies can arrive. At most 32 messages / 10 minutes per conversation.", parameters: Type.Object({ to: address, text: Type.String() }), execute: async (_id, p) => result(await client?.request({ op: "send", ...p }) ?? { status: "disconnected" }) });

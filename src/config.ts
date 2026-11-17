@@ -148,7 +148,7 @@ function validateInstanceOverlay(raw: unknown): Record<string, unknown> {
       }
       continue;
     }
-    if (key === "triggerInput" || key === "collaboration") {
+    if (key === "triggerInput" || key === "collaboration" || key === "privateTopics") {
       continue;
     }
     if (key === "discord") {
@@ -340,6 +340,7 @@ interface RawConfig {
   sessionDefaults?: unknown;
   piExtraExtensions?: unknown;
   collaboration?: unknown;
+  privateTopics?: unknown;
   logLevel?: string;
   metricsPort?: number;
   metricsHost?: string;
@@ -952,6 +953,18 @@ export function validateCollaboration(raw: unknown): BotConfig["collaboration"] 
   return { socketPath: raw.socketPath };
 }
 
+export function validatePrivateTopics(raw: unknown, collaboration: BotConfig["collaboration"]): BotConfig["privateTopics"] {
+  if (raw === undefined || raw === false) return undefined;
+  if (!collaboration) throw new Error("privateTopics requires collaboration");
+  if (!isConfigRecord(raw) || Object.keys(raw).some(key => !["expectedBotId", "chatIds", "maxNameGraphemes"].includes(key)) ||
+      !Number.isSafeInteger(raw.expectedBotId) || (raw.expectedBotId as number) <= 0 ||
+      !Array.isArray(raw.chatIds) || !raw.chatIds.length || !raw.chatIds.every(id => Number.isSafeInteger(id) && id > 0) ||
+      (raw.maxNameGraphemes !== undefined && (!Number.isSafeInteger(raw.maxNameGraphemes) || (raw.maxNameGraphemes as number) < 1 || (raw.maxNameGraphemes as number) > 128))) {
+    throw new Error("privateTopics must be false or { expectedBotId: positive integer, chatIds: positive integer[], maxNameGraphemes?: 1..128 }");
+  }
+  return { expectedBotId: raw.expectedBotId as number, chatIds: [...new Set(raw.chatIds as number[])], maxNameGraphemes: raw.maxNameGraphemes as number ?? 17 };
+}
+
 export function loadConfig(configPath?: string, options: LoadConfigOptions = {}): BotConfig {
   const raw: RawConfig = loadRawMergedConfig(configPath, options.instanceConfigPath) as RawConfig;
   const resolveSecrets = options.resolveSecrets !== false;
@@ -973,6 +986,7 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
   const defaultModel = typeof raw.defaultModel === "string" ? raw.defaultModel : undefined;
   const piExtraExtensions = validatePiExtraExtensions(raw.piExtraExtensions);
   const collaboration = validateCollaboration(raw.collaboration);
+  const privateTopics = validatePrivateTopics(raw.privateTopics, collaboration);
   const whisperModelPath = resolveWhisperModelPath(raw.whisperModel);
 
   // Validate agents (needed before validating bindings)
@@ -1102,7 +1116,7 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
     defaultDeliveryThreadId = raw.defaultDeliveryThreadId;
   }
 
-  return { telegramToken, agents, bindings, sessionDefaults, whisperModelPath, piExtraExtensions, collaboration, logLevel, metricsPort, metricsHost, discord, adminChatId, defaultDeliveryChatId, defaultDeliveryThreadId, triggerInput };
+  return { telegramToken, agents, bindings, sessionDefaults, whisperModelPath, piExtraExtensions, collaboration, privateTopics, logLevel, metricsPort, metricsHost, discord, adminChatId, defaultDeliveryChatId, defaultDeliveryThreadId, triggerInput };
 }
 
 function realpathOrResolve(path: string): string {

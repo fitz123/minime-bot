@@ -171,6 +171,8 @@ export interface BotConfig {
   piExtraExtensions?: string[];
   /** Opt-in same-host collaboration; this bot owns the socket. Restart to change. */
   collaboration?: { socketPath: string };
+  /** Opt-in cosmetic presentation for scoped private Telegram topics. Restart to change. */
+  privateTopics?: { expectedBotId: number; chatIds: number[]; maxNameGraphemes: number };
   logLevel?: LogLevel;
   metricsPort?: number;
   metricsHost?: string;

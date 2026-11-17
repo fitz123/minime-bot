@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, lstatSync, mkdirSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 import { createServer, createConnection, type Socket, type Server } from "node:net";
+import type { TopicApply } from "./private-topics.js";
 
 export type Address = { kind: "agent" | "thread" | "session" | "terminal"; id: string };
 export type ReceiptStatus = "accepted" | "consumed" | "rejected" | "disconnected" | "unknown" | "expired";
@@ -12,6 +13,8 @@ export interface Discovery { endpoints: Endpoint[]; nextOffset?: number }
 export interface CollaborationOwner {
   discover(): Endpoint[];
   deliver(message: Delivery, consumed: () => void): Promise<void>;
+  topicContext?(source: Address): Promise<unknown>;
+  topicApply?(source: Address, request: TopicApply): unknown;
 }
 export class CollaborationDeliveryError extends Error {
   constructor(readonly status: Exclude<ReceiptStatus, "accepted" | "consumed">, message: string) { super(message); }
@@ -136,6 +139,16 @@ export class CollaborationRouter {
         return void respond({ status: "accepted" });
       }
       if (!source) return void respond({ status: "rejected", reason: "register first" });
+      if (frame.op === "topic_context" || frame.op === "topic_apply") {
+        if (source.kind !== "session") return void respond({ status: "rejected", reason: "current bot session required" });
+        const currentSource = source;
+        void Promise.resolve().then(() => frame.op === "topic_context"
+          ? this.owner.topicContext?.(currentSource)
+          : this.owner.topicApply?.(currentSource, frame as unknown as TopicApply))
+          .then(value => respond(value ?? { status: "unavailable" }))
+          .catch(() => respond({ status: "unavailable" }));
+        return;
+      }
       if (frame.op === "discover") {
         const offset = frame.offset ?? 0;
         if (!Number.isSafeInteger(offset) || offset < 0) return void respond({ status: "rejected", reason: "invalid discovery offset" });
@@ -248,15 +261,26 @@ export class CollaborationClient {
     if (!this.ready) socket.destroy();
     return this.ready;
   }
-  async request(frame: Record<string, unknown>): Promise<any> {
-    if (!await this.connect()) return { status: "disconnected" };
-    return this.exchange(frame);
+  async request(frame: Record<string, unknown>, timeoutMs?: number): Promise<any> {
+    if (timeoutMs === undefined) {
+      if (!await this.connect()) return { status: "disconnected" };
+      return this.exchange(frame);
+    }
+    // Optional deadline includes connection/registration, and never sends a late request.
+    const started = Date.now();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const connected = await Promise.race([this.connect(), new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), timeoutMs); })]);
+      const remaining = timeoutMs - (Date.now() - started);
+      if (!connected || remaining <= 0) return { status: "unavailable" };
+      return await this.exchange(frame, remaining);
+    } finally { clearTimeout(timer); }
   }
-  private exchange(frame: Record<string, unknown>): Promise<any> {
+  private exchange(frame: Record<string, unknown>, timeoutMs = 3000): Promise<any> {
     if (!this.socket || this.socket.destroyed) return Promise.resolve({ status: "disconnected" });
     const request = randomUUID();
     return new Promise(resolve => {
-      const timer = setTimeout(() => { this.pending.delete(request); resolve({ status: "unknown", reason: "receipt timeout; do not replay" }); }, 3000);
+      const timer = setTimeout(() => { this.pending.delete(request); resolve({ status: "unknown", reason: "receipt timeout; do not replay" }); }, timeoutMs);
       this.pending.set(request, { resolve, timer, hello: frame.op === "hello" });
       write(this.socket!, { ...frame, request });
     });

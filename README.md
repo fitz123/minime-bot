@@ -247,7 +247,7 @@ metricsPort: <deployment-metrics-port>
 
 `topicId` is optional. The overlay may also carry deployment delivery IDs,
 metrics host, the complete `triggerInput` section described below, and the
-`collaboration` socket configuration. It
+`collaboration` socket configuration and scoped `privateTopics` policy. It
 cannot override agents, models, thinking, prompts, session defaults,
 extensions, logging behavior, raw bindings, or `workspaceCwd`. Exact
 `discord: false` is the sole Discord entry allowed. Add it when the canonical
@@ -392,6 +392,11 @@ a user-only socket owned by the running bot. Sends/replies return receipts witho
 waiting for the peer; internal turns use separate output handling and never enter
 the normal human relays. See the guide for the configuration, package extension,
 address types, continuing conversations, receipt semantics, and trade-offs.
+
+The optional [private-topic presentation policy](docs/collaboration.md#private-topic-presentation)
+uses that same extension and the ordinary human turn to select a concise semantic
+name and a separate thematic catalog icon once. It requires explicit numeric bot
+and private-chat scopes; it adds no commands or extra model calls.
 
 Optional top-level `piExtraExtensions` entries allow operator-approved external
 Pi extension entrypoints in normal bot-created interactive RPC sessions:

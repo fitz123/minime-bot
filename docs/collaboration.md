@@ -162,3 +162,124 @@ with delivery files; do not cache a previous turn's outbox path.
 State is local and ephemeral at the router; Pi transcripts follow the existing
 session-store lifecycle and are not deleted or migrated by this feature. Router
 availability depends on the bot. A standalone terminal remains usable without it.
+
+## Private-topic presentation
+
+This separate opt-in uses the existing collaboration socket and package Pi
+extension to initialize private Telegram topics after their first meaningful
+human content. It adds no command, command-menu entry, scheduled job, topic
+creation/deletion, or extra model call. The ordinary model turn chooses a concise
+semantic name and ranked thematically suitable catalog icons. Greetings and empty
+content wait. The default name cap is 17 Unicode grapheme clusters, including
+spaces and punctuation; the icon is a separate custom emoji, not a status marker.
+
+```yaml
+collaboration:
+  socketPath: /tmp/minime-collaboration/router.sock
+privateTopics:
+  expectedBotId: 900
+  chatIds: [100]
+  maxNameGraphemes: 17
+```
+
+The numbers above are synthetic examples. Supply the actual bot's numeric identity
+and intended private chat peers. Both sections accept `false`; enabling
+`privateTopics` requires collaboration. Restart after changing this policy.
+`expectedBotId` is checked against grammY's current bot identity, so inherited
+configuration cannot opt a different bot into the policy. The chat must also have
+a resolved DM binding. Other bots, chats, groups, non-topic messages, Discord,
+consultations, and terminal sessions receive no topic tool. Disabled Pi extensions
+also disable the feature. The owner rechecks the current session and resolved
+agent binding on every context/apply request; a tool cannot select a target chat.
+
+The host observes authorized private-topic Messages before content filtering,
+including topic-created/edited service messages. Service messages alone never
+start a model turn. An ordinary first observation with no metadata is eligible
+once under opt-in, with `unknown` provenance until policy initialization. An
+implicit creation is recorded as `implicit`, not manual. Explicit observed human
+edits pin only the fields present in the event; an absent icon leaves it unchanged,
+and an empty icon explicitly clears and pins it. Own bot echoes and implicit
+events never pin fields. Completed topics do not receive new naming instructions,
+and the server fences old instructions retained in model history. Later explicit
+manual edits still win. Semantic relevance and recognizing meaningful content are
+the ordinary model's responsibility; the owner validates the name cap, catalog,
+pins, revision, and known icon occupancy before accepting an effect. Semantic
+names may repeat; only icons require uniqueness among known occupied topics.
+
+The inventory is `private-topics.json` in the control workspace's data directory.
+It contains bot/chat/topic keys, observed fields and provenance, per-field pins,
+revision, initialization state, availability, and at most one pending request per
+topic. Observation evidence records the private peer separately from the actual
+`message.from` actor and bot flag, with `lastObservedAt` from Telegram's message
+date in Unix milliseconds, message/update IDs, and the message/service-event source.
+A missing author stays unknown. Name/icon observations have their own timestamps;
+successful own receipts record confirmation time and `telegram-true` or
+`telegram-not-modified` source, with per-field application times. A suppressed
+no-op invents no receipt. Optional bootstrap evidence stays unknown when absent.
+It stores neither tokens nor a second session identity. Current agent and
+session identity are joined through SessionManager's routing store on read, so
+`/clean`, Pi rotation, and rebinding do not erase topic metadata. The runtime host
+is the single writer: synchronous observation/reservation sections run serially
+on its event loop, with no await between checking occupancy and durable reservation.
+
+The optional `topic_context` IPC request has a one-second client deadline in the
+Pi hook. It returns a hidden context **message**, preserving the system prompt.
+Only an eligible human turn requests it; custom/internal collaboration turns do
+not. Icon candidates use short indices bound to a revision and catalog hash, not
+long custom emoji identifiers in the model context. `topic_apply` returns
+`accepted` immediately after durable reservation; **accepted is not applied**.
+One combined Telegram edit runs asynchronously using the existing bounded retries.
+Identical presentation suppresses the API call. A successful `true` response or
+not-modified response completes that same pending target. A new observed edit or
+routing change fences a request before dispatch; an observed edit aborts an
+in-flight transport to prevent later retries. A request already accepted by
+Telegram cannot be undone by local cancellation. The newer manual fields remain
+pinned in metadata, without an automatic repair edit.
+
+Cosmetic storage/API/IPC failures do not prevent ordinary replies. A storage
+failure disables automatic edits in that controller until restart. An API failure
+or uncertain network outcome retains the pending reservation across restart;
+it is never interpreted as deletion, and pending requests are not automatically
+replayed. Both observed icons and pending icon targets reserve occupancy among
+known topics of the same bot/chat. Unavailable and deleted-unconfirmed records
+remain occupied. Exhaustion or no suitable free candidate returns an honest
+state, with no random fallback or knowingly duplicated icon.
+
+### Bootstrap from a verified inventory
+
+Before enabling the feature, stop the host writer and import an independently
+verified snapshot using the public `TopicStore` export. For example, an operator
+script can import `TopicStore` from `minime-bot/dist/topic-store.js`, construct it
+with the intended control-data inventory path, and call:
+
+```ts
+store.importSnapshot([
+  {
+    botId: 900, chatId: 100, topicId: 10, // synthetic example identities
+    name: { value: "Gardening", provenance: "manual", pinned: true },
+    icon: { value: "verified-custom-emoji-id", provenance: "manual", pinned: true },
+    availability: "observed",
+    initialized: true,
+  },
+]);
+```
+
+Use `unknown` provenance and `pinned: false` where an observation does not establish
+manual intent. Set `initialized: true` for verified existing presentations that
+should remain complete; leave it false for eligible uninitialized topics. Import
+unavailable or deletion-unconfirmed entries with their corresponding availability
+state to reserve them conservatively. Import makes no Telegram calls and refuses
+to replace an existing topic record. `list()`/`get()` return copies for inspection;
+`SessionManager.inspectKnownTopics(botId, chatId)` returns only scoped known topics,
+joined to the current configured agent and matching current bound session ID/file.
+After clean it still lists metadata with no session; rotation joins the replacement,
+and an agent rebind never attributes the old agent's session to the new agent.
+Session identity is not copied into the inventory. Offline import and the running
+host must not write the same inventory concurrently.
+
+This registry may be incomplete. Telegram offers no authoritative topic enumeration
+or get-topic operation here, and the feature does not promise deletion events or
+private-topic-close notifications. Missed historical manual edits are unknowable;
+a snapshot should preserve verified manual choices before opt-in. Existing
+duplicates require a separately authorized operator action; runtime does not repair
+them, probe unavailable topics, or infer that an unused icon has become free.

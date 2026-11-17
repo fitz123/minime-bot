@@ -20,6 +20,14 @@ whisperModel: /nonexistent/minime-bot/fixture-whisper-model.bin
 # absolute, and operator-approved.
 # piExtraExtensions:
 #   - /opt/minime/pi-extensions/approved-extension.ts
+# Optional private-topic presentation, disabled unless explicitly configured.
+# These are synthetic example identities; substitute the intended bot and peers.
+# collaboration:
+#   socketPath: /tmp/minime-collaboration/router.sock
+# privateTopics:
+#   expectedBotId: 900
+#   chatIds: [100]
+#   maxNameGraphemes: 17
 bindings:
   - chatId: 111
     agentId: main

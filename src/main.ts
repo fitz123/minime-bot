@@ -219,6 +219,8 @@ async function main(): Promise<void> {
     collaborationRouter = new CollaborationRouter({
       discover: () => sessionManager.collaborationEndpoints(),
       deliver: (message, consumed) => sessionManager.deliverCollaboration(message, consumed),
+      topicContext: source => sessionManager.topicContext(source),
+      topicApply: (source, request) => sessionManager.topicApply(source, request),
     });
     await collaborationRouter.start(config.collaboration.socketPath);
     log.info("main", "Same-host collaboration router started");
@@ -240,7 +242,7 @@ async function main(): Promise<void> {
     // Mutable reference so onUpdate callback can reach the watchdog
     // (watchdog needs bot.api, which doesn't exist until after createTelegramBot)
     let onUpdateFn: (() => void) | undefined;
-    const { bot, messageQueue, echoWatcher: ew, pollProgress, updateProcessing } = createTelegramBot(config, sessionManager, {
+    const { bot, messageQueue, echoWatcher: ew, pollProgress, updateProcessing, topicController } = createTelegramBot(config, sessionManager, {
       onUpdate: () => onUpdateFn?.(),
       // A failed generation disables this before grammY's final offset
       // confirmation, so cleanup cannot collapse the restart backoff.
@@ -248,6 +250,7 @@ async function main(): Promise<void> {
         if (!telegramFailureHandled && !shuttingDown) telegramPollingRestart?.reset();
       },
     });
+    sessionManager.setTopicController(topicController);
     telegramBot = bot;
     messageQueues.push(messageQueue);
     if (config.triggerInput) {
