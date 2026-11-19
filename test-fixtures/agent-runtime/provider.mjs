@@ -21,8 +21,14 @@ export default function(pi) {
           let content;
           if (last?.role === 'toolResult') {
             const value = receipt(last);
-            if (!value || last.isError) throw new Error('Missing real tool receipt');
-            content = [{ type: 'text', text: JSON.stringify(value) }];
+            if (last.toolName?.startsWith('knowledge_') || last.toolName === 'write'
+              || (last.isError && text(last).includes('knowledge_update'))) {
+              content = [{ type: 'text', text: JSON.stringify({ tool: last.toolName, isError: !!last.isError,
+                details: last.details, text: text(last) }) }];
+            } else {
+              if (!value || last.isError) throw new Error('Missing real tool receipt');
+              content = [{ type: 'text', text: JSON.stringify(value) }];
+            }
           } else {
             const prompt = text(last);
             let script;
@@ -34,6 +40,19 @@ export default function(pi) {
                 before: instructions.includes('SYNTHETIC_LANE_BEFORE'),
                 after: instructions.includes('SYNTHETIC_LANE_AFTER'),
               }) }];
+            } else if (prompt.startsWith('KNOWLEDGE ')) {
+              const calls = {
+                'KNOWLEDGE SEARCH': ['knowledge_search', { query: 'orbit' }],
+                'KNOWLEDGE GET': ['knowledge_get', { path: 'wiki/pages/project/offline-proof.md' }],
+                'KNOWLEDGE UPDATE': ['knowledge_update', { op: 'update', type: 'project', slug: 'offline-proof',
+                  frontmatter: { name: 'Offline proof', description: 'Synthetic offline fixture', type: 'project' },
+                  body: '# Offline proof\n\nSynthetic orbit updated by worker.\n' }],
+                'KNOWLEDGE DIRECT WRITE': ['write', { path: 'wiki/index.md', content: 'UNAUTHORIZED' }],
+                'KNOWLEDGE DIRECT BASH': ['bash', { command: "printf 'UNAUTHORIZED' > wiki/pages/project/offline-proof.md" }],
+              };
+              const call = calls[prompt];
+              if (!call) throw new Error('Unknown offline Knowledge prompt');
+              content = [{ type: 'toolCall', id: `worker-${context.messages.length}`, name: call[0], arguments: call[1] }];
             } else if (/^WRITE [a-z0-9-]+$/.test(prompt)) {
               const marker = prompt.slice(6);
               const instructions = JSON.stringify(context.messages.filter(m => m.role === 'system'));
@@ -78,7 +97,7 @@ export default function(pi) {
     const own = records.find(r => r.binding.sessionId === ctx.sessionManager.getSessionId());
     if (!own) throw new Error('Binding was not durable before Pi startup');
     writeFileSync(join(ctx.cwd, 'started.json'), JSON.stringify({ pid: process.pid, sessionId: own.binding.sessionId,
-      bindingVisible: true, generation: own.generation, uid: process.getuid(),
+      bindingVisible: true, generation: own.generation, uid: process.getuid(), tools: pi.getActiveTools(),
       privateHome: process.env.HOME !== process.env.MINIME_CONTROL_WORKSPACE_ROOT,
       noCentralEnv: !Object.keys(process.env).some(k => /MINIME_(CONFIG|INSTANCE|CONTROL|CRONS)/.test(k)),
     }));

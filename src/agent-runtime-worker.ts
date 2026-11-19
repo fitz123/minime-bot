@@ -6,7 +6,8 @@ import { assemblePiContext, type PiContextArtifacts } from './pi-context-assembl
 import { resolveKnowledgeLayout } from './knowledge/layout.js';
 import { inspectInteractiveSessionBinding, resolveExplicitInteractiveSessionLocation } from './interactive-session-binding.js';
 import { preseedInteractiveSessionBinding, assertInteractiveSessionBindingOpenable } from './interactive-session-seed.js';
-import { NewlineOnlyJsonlSplitter, spawnPreparedPiRpcSession } from './pi-rpc-protocol.js';
+import { NewlineOnlyJsonlSplitter, resolvePiExtensionArgs, spawnPreparedPiRpcSession } from './pi-rpc-protocol.js';
+import { resolveWorkspaceContract } from './workspace-contract.js';
 import { AgentRuntimePi } from './agent-runtime-pi.js';
 import { WorkerLaneStore, requirePrivateWorkerDirectory, type WorkerLaneRecord } from './agent-runtime-store.js';
 import {
@@ -59,9 +60,16 @@ export class AgentRuntimeWorker {
     this.descriptor = validateAgentRuntimeDescriptor(input);
     this.startupTimeoutMs = boundedTimeout(options.startupTimeoutMs, 10_000);
     this.promptTimeoutMs = boundedTimeout(options.promptTimeoutMs, AGENT_RUNTIME_PROMPT_TIMEOUT_MS);
-    this.extensions = [...options.trustedTestExtensions ?? []];
+    // Only the executing package owns capability wrappers. Ambient kill switches
+    // and control workspace settings cannot silently remove a required wrapper.
+    const packageExtensions = this.descriptor.capabilities.includes('knowledge-tools')
+      ? resolvePiExtensionArgs({ env: {}, relpaths: ['knowledge-tools.ts'],
+        extensionsDir: resolveWorkspaceContract({ env: {}, workspace: this.descriptor.workspace }).paths.piExtensionDir })
+        .filter((_, i) => i % 2 === 1)
+      : [];
+    this.extensions = [...packageExtensions, ...(options.trustedTestExtensions ?? [])];
     for (const p of this.extensions) {
-      if (!isAbsolute(p) || realpathSync(p) !== p || !lstatSync(p).isFile()) throw new Error('Test extension must be an explicit canonical file');
+      if (!isAbsolute(p) || realpathSync(p) !== p || !lstatSync(p).isFile()) throw new Error('Worker extension must be an explicit canonical file');
     }
     this.server = createServer(socket => this.accept(socket));
   }
@@ -162,7 +170,10 @@ export class AgentRuntimeWorker {
     if (this.stopping || lane.owner?.destroyed || lane.phase === 'closing') return fail('disconnected', 'Lane owner disconnected');
     const d = this.descriptor;
     const child = spawnPreparedPiRpcSession({ binding: lane.record.binding, context: lane.context!,
-      model: d.model, thinking: d.thinking, tools: d.tools, extensions: this.extensions,
+      model: d.model, thinking: d.thinking,
+      // Pi's explicit --tools list also filters registered extension tools.
+      tools: [...d.tools, ...(d.capabilities.includes('knowledge-tools')
+        ? ['knowledge_search', 'knowledge_get', 'knowledge_update'] : [])], extensions: this.extensions,
       env: this.environment(), offline: d.offline });
     const pi = new AgentRuntimePi(child, lane.record.binding, this.startupTimeoutMs, { model: d.model, thinking: d.thinking });
     lane.pi = pi;

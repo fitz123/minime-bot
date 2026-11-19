@@ -54,7 +54,10 @@ export function validateAgentRuntimeDescriptor(input: unknown): AgentRuntimeDesc
     || !['none', 'v2'].includes(d.knowledge) || typeof d.offline !== 'boolean') throw new Error('Explicit model, thinking, Knowledge and offline choices required');
   if (!Array.isArray(d.capabilities)) throw new Error('Explicit capabilities required');
   for (const capability of d.capabilities) {
-    if (capability !== 'local-tools') throw new AgentRuntimeError('unsupported_capability', `Unsupported worker capability: ${String(capability)}`);
+    if (capability !== 'local-tools' && capability !== 'knowledge-tools') throw new AgentRuntimeError('unsupported_capability', `Unsupported worker capability: ${String(capability)}`);
+  }
+  if (d.capabilities.includes('knowledge-tools') && d.knowledge !== 'v2') {
+    throw new AgentRuntimeError('unsupported_capability', 'Knowledge tools require knowledge: v2');
   }
   if (!Array.isArray(d.tools) || d.tools.some(t => !tools.has(t)) || (d.tools.length && !d.capabilities.includes('local-tools'))) {
     throw new AgentRuntimeError('unsupported_capability', 'Unsupported or undeclared worker tools');

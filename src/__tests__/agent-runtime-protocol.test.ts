@@ -104,12 +104,25 @@ test('worker rejects incomplete frames at a finite deadline', async t => {
 });
 
 test('descriptor explicitly rejects unsupported capabilities, ambient knobs and root worker', () => {
-  for (const capability of ['ask-agent', 'collaboration', 'fast', 'subagent', 'cron', 'media', 'outbox', 'web', 'knowledge-tools']) {
+  for (const capability of ['ask-agent', 'collaboration', 'fast', 'subagent', 'cron', 'media', 'outbox', 'web', 'unknown']) {
     assert.throws(() => validateAgentRuntimeDescriptor({ ...descriptor, capabilities: [capability] }), (e: AgentRuntimeError) => e.code === 'unsupported_capability');
   }
   assert.throws(() => validateAgentRuntimeDescriptor({ ...descriptor, workerUid: 0 }), /nonroot/);
   assert.throws(() => validateAgentRuntimeDescriptor({ ...descriptor, env: {} }), /Unsupported worker descriptor field/);
   assert.throws(() => validateAgentRuntimeDescriptor({ ...descriptor, model: '' }), /Explicit model/);
+});
+
+test('Knowledge tools require v2 and leave local tool declarations independent', () => {
+  const knowledge = { ...descriptor, knowledge: 'v2' as const, capabilities: ['knowledge-tools'] };
+  assert.deepEqual(validateAgentRuntimeDescriptor(knowledge), knowledge);
+  assert.throws(() => validateAgentRuntimeDescriptor({ ...knowledge, knowledge: 'none' }),
+    (e: AgentRuntimeError) => e.code === 'unsupported_capability');
+  assert.throws(() => validateAgentRuntimeDescriptor({ ...knowledge, tools: ['write'] }),
+    (e: AgentRuntimeError) => e.code === 'unsupported_capability');
+  const combined = { ...knowledge, capabilities: ['local-tools', 'knowledge-tools'], tools: ['write', 'bash'] };
+  assert.deepEqual(validateAgentRuntimeDescriptor(combined), combined);
+  assert.deepEqual(validateAgentRuntimeDescriptor({ ...knowledge, capabilities: [] }).capabilities, []);
+  assert.deepEqual(validateAgentRuntimeDescriptor(descriptor), descriptor);
 });
 
 test('descriptor identity fields require strings before regex validation', () => {

@@ -33,19 +33,28 @@ construction is also supported. The descriptor contains no auth material,
 control YAML, instance configuration, transport tokens, executable selection,
 or child environment overrides.
 
-The implemented capability is `local-tools`, with an explicit subset of Pi's
+The `local-tools` capability selects an explicit subset of Pi's
 `read`, `bash`, `edit`, `write`, `grep`, `find`, and `ls` tools. An empty tool list
-passes `--no-tools`. All other requested capabilities fail with
+selects no local tools. The optional `knowledge-tools` capability requires
+`knowledge: "v2"` and registers `knowledge_search`, `knowledge_get`, and
+`knowledge_update`, plus the existing managed Knowledge write protection.
+It can be used independently of `local-tools`. The worker resolves only the
+Knowledge wrapper bundled with its executing source/distribution; a missing or
+unloadable required wrapper fails before prompt execution. Ambient extension
+settings cannot disable a requested capability. All other capabilities fail with
 `unsupported_capability`. Ask-agent, cross-UID collaboration, Fast, subagents,
-cron, Web/provider wrappers, Knowledge tools, media, and outbox delivery are
+cron, Web/provider wrappers, media, and outbox delivery are
 not adapted in this slice. Knowledge v2 **context** can be required independently
-of Knowledge **tools**. There is no global extensions kill-switch workaround.
+of Knowledge **tools**. Without either capability the worker passes `--no-tools`.
+Knowledge calls use only the worker-local `MINIME_AGENT_WORKSPACE_ROOT`; no
+controller configuration or auth is passed over IPC.
 
 Ambient extensions, skills, prompt templates, and context discovery are disabled.
 Prepared worker spawns always pass `--system-prompt`: the explicit persona path
 when present, otherwise an empty string. In pinned Pi 1.5.0 this suppresses
 independent `SYSTEM.md` discovery while retaining Pi's built-in default prompt.
-Only the trusted constructor's `trustedTestExtensions` can add fixture code;
+Descriptor capabilities select package wrappers. The trusted constructor's
+`trustedTestExtensions` can also add fixture code;
 there is no extension-path, cwd, executable, environment, or transcript-path
 field in IPC. The standalone CLI does not load test extensions. Offline tests
 register a synthetic provider and execute real Pi tools without network or real
@@ -173,7 +182,7 @@ and synthetic local fixtures. The socket suite requires a host that permits
 Unix-socket listen; a sandbox `listen EPERM` is not integration evidence and
 must not be converted to a passing skip.
 
-Remaining migration work includes adapted first-party wrappers and transport
+Remaining migration work includes other first-party wrappers and transport
 integration; collaboration/consultation, cron and outbox boundaries;
 explicit per-user auth provisioning; additional isolated agents;
 and representative production canaries with history preservation. No production

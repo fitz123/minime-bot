@@ -12,7 +12,7 @@ import { AgentRuntimeError, type AgentLaneState, type AgentRuntimeMessage, type 
 import { generateKnowledgeV2Schema } from '../knowledge/layout.js';
 
 // Direct core tests also run in socket-restricted environments. They provide no endpoint evidence.
-function fixture(extension = 'provider.mjs', startupTimeoutMs = 10_000, model = 'worker-offline/fixture') {
+function fixture(extension = 'provider.mjs', startupTimeoutMs = 10_000, model = 'worker-offline/fixture', knowledgeTools: boolean | 'only' | 'no-tools' = false) {
   const root = realpathSync(mkdtempSync('/tmp/arc-'));
   for (const name of ['home', 'workspace', 'state', 'sessions', 'context', 'socket']) mkdirSync(join(root, name), { mode: 0o700 });
   const workspace = join(root, 'workspace');
@@ -27,7 +27,9 @@ function fixture(extension = 'provider.mjs', startupTimeoutMs = 10_000, model = 
     home: join(root, 'home'), controllerUid: process.getuid!(), controllerName: 'fixture-controller', workspace,
     stateRoot: join(root, 'state'), sessionRoot: join(root, 'sessions'), contextRoot: join(root, 'context'),
     socketDirectory: join(root, 'socket'), socketPath: join(root, 'socket', 'worker.sock'), model, thinking: 'off',
-    knowledge: 'v2', capabilities: ['local-tools'], tools: ['bash'], offline: true };
+    knowledge: 'v2', capabilities: knowledgeTools === 'no-tools' ? [] : knowledgeTools === 'only' ? ['knowledge-tools']
+      : knowledgeTools ? ['local-tools', 'knowledge-tools'] : ['local-tools'],
+    tools: knowledgeTools === 'only' || knowledgeTools === 'no-tools' ? [] : knowledgeTools ? ['bash', 'write'] : ['bash'], offline: true };
   const worker = new AgentRuntimeWorker(d, { trustedTestExtensions: [realpathSync(resolve('test-fixtures/agent-runtime', extension))], startupTimeoutMs });
   const messages: AgentRuntimeMessage[] = [];
   // A controller output sink, not a ChildProcess proxy or substitute Pi runtime.
@@ -54,6 +56,7 @@ test('direct worker core: real tools/context, durable binding, close/restart his
   const opened = await f.open();
   assert.equal(json(join(f.d.workspace, 'started.json')).bindingVisible, true);
   assert.equal(json(join(f.d.workspace, 'started.json')).noCentralEnv, true);
+  assert.deepEqual(json(join(f.d.workspace, 'started.json')).tools, ['bash']);
   const before = json(f.recordPath());
   assert.equal(before.contextManifest.digest, opened.contextDigest);
   assert.equal(JSON.stringify(before.contextManifest).includes(f.root), false);
@@ -79,6 +82,65 @@ test('direct worker core: real tools/context, durable binding, close/restart his
   await assert.rejects(dispatch({ op: 'getState', handle: opened.handle }), (e: AgentRuntimeError) => e.code === 'stale_handle');
   await dispatch({ op: 'prompt', handle: resumed.handle, requestId: 'history', text: 'HISTORY' });
   assert.ok(f.messages.some(m => m.type === 'event' && m.event.type === 'result' && JSON.stringify(m.event).includes('priorMarker') && JSON.stringify(m.event).includes('durable-marker')));
+});
+
+test('direct worker core: package Knowledge wrapper runs real offline tools and blocks managed writes', { timeout: 30_000 }, async t => {
+  const f = fixture('provider.mjs', 10_000, 'worker-offline/fixture', true); t.after(() => f.worker.shutdown());
+  const page = join(f.d.workspace, 'wiki/pages/project/offline-proof.md');
+  mkdirSync(join(f.d.workspace, 'wiki/pages/project'), { recursive: true });
+  writeFileSync(page, '---\nname: Offline proof\ndescription: Synthetic offline fixture\ntype: project\n---\n\n# Offline proof\n\nSynthetic orbit baseline.\n');
+  const opened = await f.open();
+  const startup = json(join(f.d.workspace, 'started.json'));
+  assert.equal(startup.noCentralEnv, true);
+  for (const name of ['knowledge_search', 'knowledge_get', 'knowledge_update', 'bash', 'write']) assert.ok(startup.tools.includes(name));
+  const binding = json(f.recordPath()).binding;
+  let request = 0;
+  const prompt = async (text: string) => {
+    await f.dispatch({ op: 'prompt', handle: opened.handle, requestId: `knowledge-${++request}`, text });
+    assert.equal(json(f.recordPath()).request.outcome, 'settled');
+    const result = [...f.messages].reverse().find(m => m.type === 'event' && m.event.type === 'result');
+    assert.ok(result?.type === 'event' && result.event.type === 'result' && !result.event.is_error, JSON.stringify(result));
+    return JSON.parse(result.event.result!);
+  };
+  const search = await prompt('KNOWLEDGE SEARCH');
+  assert.equal(search.tool, 'knowledge_search'); assert.equal(search.details.ok, true);
+  assert.match(search.text, /wiki\/pages\/project\/offline-proof\.md/);
+  const get = await prompt('KNOWLEDGE GET');
+  assert.equal(get.tool, 'knowledge_get'); assert.equal(get.details.ok, true);
+  assert.match(get.text, /Synthetic orbit baseline/);
+  const update = await prompt('KNOWLEDGE UPDATE');
+  assert.equal(update.tool, 'knowledge_update'); assert.equal(update.details.ok, true, update.text);
+  const beforePage = readFileSync(page, 'utf8');
+  const beforeIndex = readFileSync(join(f.d.workspace, 'wiki/index.md'), 'utf8');
+  assert.match(beforePage, /Synthetic orbit updated by worker/);
+  assert.match(beforeIndex, /offline-proof/);
+  assert.match(readFileSync(join(f.d.workspace, 'wiki/log.md'), 'utf8'), /offline-proof/);
+  for (const command of ['KNOWLEDGE DIRECT WRITE', 'KNOWLEDGE DIRECT BASH']) {
+    const blocked = await prompt(command);
+    assert.equal(blocked.isError, true); assert.match(blocked.text, /knowledge_update/);
+    assert.equal(readFileSync(page, 'utf8'), beforePage);
+    assert.equal(readFileSync(join(f.d.workspace, 'wiki/index.md'), 'utf8'), beforeIndex);
+  }
+  assert.match((await prompt('KNOWLEDGE GET')).text, /Synthetic orbit updated by worker/);
+  await prompt('WRITE local-after-knowledge');
+  assert.equal(readFileSync(join(f.d.workspace, 'marker.txt'), 'utf8'), 'local-after-knowledge');
+  assert.deepEqual(json(f.recordPath()).binding, binding);
+});
+
+test('direct worker core: Knowledge can run without local tools and no capabilities exposes no tools', { timeout: 20_000 }, async t => {
+  for (const capability of ['only', 'no-tools'] as const) {
+    const f = fixture('provider.mjs', 10_000, 'worker-offline/fixture', capability); t.after(() => f.worker.shutdown());
+    const opened = await f.open();
+    assert.deepEqual(json(join(f.d.workspace, 'started.json')).tools.sort(), capability === 'only'
+      ? ['knowledge_get', 'knowledge_search', 'knowledge_update'] : []);
+    if (capability === 'only') {
+      await f.dispatch({ op: 'prompt', handle: opened.handle, requestId: 'search', text: 'KNOWLEDGE SEARCH' });
+      const result = [...f.messages].reverse().find(m => m.type === 'event' && m.event.type === 'result');
+      assert.ok(result?.type === 'event' && result.event.type === 'result');
+      assert.equal(JSON.parse(result.event.result!).details.ok, true);
+    }
+    await f.worker.shutdown();
+  }
 });
 
 test('direct worker core: concurrency rejects, abort reaps owned Pi/tool and next prompt works', { timeout: 40_000 }, async t => {

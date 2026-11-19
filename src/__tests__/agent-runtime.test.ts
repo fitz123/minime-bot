@@ -167,6 +167,63 @@ test('active request rejects concurrency; abort reaps tools and next prompt uses
   assert.equal(next.state.request.outcome, 'settled');
 });
 
+test('descriptor-selected Knowledge wrapper executes real offline Pi tools over the worker socket', { timeout: 45_000 }, async t => {
+  const f = setup();
+  f.descriptor.capabilities = ['local-tools', 'knowledge-tools'];
+  f.descriptor.tools = ['bash', 'write'];
+  chmodSync(f.path, 0o600);
+  writeFileSync(f.path, JSON.stringify(f.descriptor));
+  chmodSync(f.path, 0o444);
+  const page = join(f.dirs.workspace, 'wiki/pages/project/offline-proof.md');
+  mkdirSync(dirname(page), { recursive: true });
+  writeFileSync(page, '---\nname: Offline proof\ndescription: Synthetic offline fixture\ntype: project\n---\n\n# Offline proof\n\nSynthetic orbit baseline.\n');
+  await launch(t, f);
+  const c = await controller(t, f);
+  const opened = await call(c, 'open').done();
+  assert.equal(opened.error, undefined);
+  const startup = json(join(f.dirs.workspace, 'started.json'));
+  assert.equal(startup.noCentralEnv, true);
+  for (const name of ['knowledge_search', 'knowledge_get', 'knowledge_update', 'bash', 'write']) assert.ok(startup.tools.includes(name));
+  const binding = json(records(f)[0]).binding;
+  async function prompt(text: string) {
+    const p = call(c, 'prompt', { requestId: `knowledge-${++sequence}`, text });
+    const done = await p.done();
+    assert.equal(done.error, undefined);
+    assert.equal(done.state.request.outcome, 'settled');
+    const result = c.messages.find(m => m.id === p.id && m.event?.type === 'result')?.event;
+    assert.ok(result && !result.is_error, JSON.stringify(result));
+    return JSON.parse(result.result);
+  }
+  const searched = await prompt('KNOWLEDGE SEARCH');
+  assert.equal(searched.tool, 'knowledge_search'); assert.equal(searched.details.ok, true);
+  assert.match(searched.text, /wiki\/pages\/project\/offline-proof\.md/);
+  const got = await prompt('KNOWLEDGE GET');
+  assert.equal(got.tool, 'knowledge_get'); assert.equal(got.details.ok, true);
+  assert.match(got.text, /Synthetic orbit baseline/);
+  const updated = await prompt('KNOWLEDGE UPDATE');
+  assert.equal(updated.tool, 'knowledge_update'); assert.equal(updated.details.ok, true, updated.text);
+  assert.match(readFileSync(page, 'utf8'), /Synthetic orbit updated by worker/);
+  assert.match(readFileSync(join(f.dirs.workspace, 'wiki/index.md'), 'utf8'), /offline-proof/);
+  assert.match(readFileSync(join(f.dirs.workspace, 'wiki/log.md'), 'utf8'), /offline-proof/);
+  const beforePage = readFileSync(page, 'utf8');
+  const beforeIndex = readFileSync(join(f.dirs.workspace, 'wiki/index.md'), 'utf8');
+  for (const command of ['KNOWLEDGE DIRECT WRITE', 'KNOWLEDGE DIRECT BASH']) {
+    const blocked = await prompt(command);
+    assert.equal(blocked.isError, true); assert.match(blocked.text, /knowledge_update/);
+    assert.equal(readFileSync(page, 'utf8'), beforePage);
+    assert.equal(readFileSync(join(f.dirs.workspace, 'wiki/index.md'), 'utf8'), beforeIndex);
+  }
+  await prompt('WRITE local-after-knowledge');
+  assert.equal(readFileSync(join(f.dirs.workspace, 'marker.txt'), 'utf8'), 'local-after-knowledge');
+  assert.deepEqual(json(records(f)[0]).binding, binding);
+  await call(c, 'close').done();
+
+  const without = setup(); await launch(t, without);
+  const noToolsClient = await controller(t, without);
+  assert.equal((await call(noToolsClient, 'open').done()).error, undefined);
+  assert.deepEqual(json(join(without.dirs.workspace, 'started.json')).tools, ['bash']);
+});
+
 test('disconnect aborts owned tool descendants, persists interrupted outcome, and never retries', { timeout: 40_000 }, async t => {
   const f = setup(); const worker = await launch(t, f); const c = await controller(t, f);
   const opened = await call(c, 'open').done();
