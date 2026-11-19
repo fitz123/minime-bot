@@ -116,12 +116,35 @@ test("cron CLI shim captures exact PATH as a TOML string and preserves model, re
 
 test("script cron resolves the shim on PATH and leaves its parent untouched", t => {
   const { bin } = fixture(t);
-  setEnv(t, { PATH: `${bin}:/usr/bin:/bin` });
+  setEnv(t, {
+    PATH: `${bin}:/usr/bin:/bin`,
+    [CRON_FAST_OFF_ENV]: undefined,
+    [CRON_REAL_CODEX_ENV]: undefined,
+    [CRON_CODEX_SHIM_DIR_ENV]: undefined,
+  });
   const keys = ["PATH", CRON_FAST_OFF_ENV, CRON_REAL_CODEX_ENV, CRON_CODEX_SHIM_DIR_ENV];
   const before = keys.map(key => process.env[key]);
   const output = runScript({ name: "cli-script", type: "script", command: "printf 'script input' | codex exec - 'script prompt'" } as CronJob);
   assert.deepEqual(JSON.parse(output), {
     args: ["-c", 'service_tier="default"', "-c", `shell_environment_policy.set.PATH=${JSON.stringify(buildCronFastEnv({ PATH: process.env.PATH }).PATH)}`, "exec", "-", "script prompt"], input: "script input", marker: "1",
+  });
+  assert.deepEqual(keys.map(key => process.env[key]), before);
+});
+
+test("script cron prefers a marked parent's Codex binding over PATH without changing the parent", t => {
+  const pathFixture = fixture(t);
+  const inheritedFixture = fixture(t);
+  writeFileSync(pathFixture.real, `#!${process.execPath}\nprocess.exit(23);\n`);
+  const parent = {
+    ...buildCronFastEnv({ PATH: `${inheritedFixture.bin}:/usr/bin:/bin` }),
+    PATH: `${pathFixture.bin}:/usr/bin:/bin`,
+  };
+  setEnv(t, parent);
+  const keys = Object.keys(parent);
+  const before = keys.map(key => process.env[key]);
+  const output = runScript({ name: "inherited-cli-script", type: "script", command: "printf 'inherited input' | codex exec - 'inherited prompt'" } as CronJob);
+  assert.deepEqual(JSON.parse(output), {
+    args: ["-c", 'service_tier="default"', "-c", `shell_environment_policy.set.PATH=${JSON.stringify(buildCronFastEnv(parent).PATH)}`, "exec", "-", "inherited prompt"], input: "inherited input", marker: "1",
   });
   assert.deepEqual(keys.map(key => process.env[key]), before);
 });
