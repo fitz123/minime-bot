@@ -33,6 +33,7 @@ import {
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
+import { buildCronFastEnv } from "./cron-fast-env.js";
 import { setTimeout as sleep } from "node:timers/promises";
 import { Api } from "grammy";
 import { CronResultPreparationError, deliverCronResult } from "./cron-rich-delivery.js";
@@ -1226,7 +1227,7 @@ function runScript(cron: CronJob): string {
   }
   const timeoutMs = cron.timeout ?? DEFAULT_TIMEOUT_MS;
 
-  const env = scrubLegacyRuntimeEnv(process.env);
+  const env = buildCronFastEnv(scrubLegacyRuntimeEnv(process.env));
 
   try {
     const output = execSync(cron.command, {
@@ -1267,6 +1268,7 @@ function buildCronSystemInstruction(): string {
   const today = new Date().toISOString().split("T")[0];
   return [
     `Today is ${today}. Respond concisely.`,
+    `Cron jobs always run with Fast off. Preserve the cron environment in child processes; direct absolute Codex CLI calls must include -c 'service_tier="default"'.`,
     `If your final report has an unresolved finding, add ${MINIME_CRON_UNRESOLVED_MARKER} as its exact standalone final non-empty line. Do not use this marker otherwise.`,
   ].join(" ");
 }
@@ -1408,7 +1410,7 @@ function runPi(
   const validatedWorkspaceCwd = resolveValidatedPiAgentWorkspaceCwd(agent);
   const thinking = isCronPiThinking(agent.thinking) ? agent.thinking : "medium";
   const systemInstruction = buildCronSystemInstruction();
-  const env = hardenPiCronEnv(deps.buildEnv(validatedWorkspaceCwd, { askCallerAgentId: cron.agentId }));
+  const env = buildCronFastEnv(hardenPiCronEnv(deps.buildEnv(validatedWorkspaceCwd, { askCallerAgentId: cron.agentId })));
   env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = validatedWorkspaceCwd;
   // Pi authenticates via ~/.pi/agent/auth.json, not legacy OAuth credentials.
   env.HOME ||= homedir();

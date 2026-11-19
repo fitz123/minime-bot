@@ -1,10 +1,10 @@
+import type { CodexQuotaFamily } from "./pi-extensions/codex-usage.js";
 import type { SessionHealth } from "./session-manager.js";
 import {
   formatCompactDuration,
   formatResetEta,
   formatSampleAge,
   type QuotaStatus,
-  type QuotaWindowName,
   type QuotaWindowSnapshot,
 } from "./quota-status.js";
 
@@ -150,20 +150,22 @@ function isPiCodexSession(health: SessionHealth | undefined): boolean {
 
 function formatAvailableQuota(quotaStatus: CachedQuotaStatus, now: Date): string[] {
   const snapshot = quotaStatus.snapshot;
-  const lines = [`Codex quota: fresh (sample ${quotaStatus.sampleAge})`];
+  const failed = quotaStatus.refreshFailed || snapshot.probeSuccess === false;
+  const lines = [failed
+    ? `Codex quota: cached (last success ${quotaStatus.sampleAge}; refresh failed)`
+    : `Codex quota: fresh (sample ${quotaStatus.sampleAge})`];
   appendQuotaMetadata(lines, snapshot.planType, snapshot.activeLimit);
-  appendQuotaWindow(lines, "5h", snapshot.windows["5h"], now);
-  appendQuotaWindow(lines, "week", snapshot.windows.week, now);
+  appendQuotaFamilies(lines, snapshot.families, now);
   appendAttemptLine(lines, snapshot.lastAttemptTimestamp ?? snapshot.lastAttempt, snapshot.probeSuccess, now);
   return lines;
 }
 
 function formatStaleQuota(quotaStatus: CachedQuotaStatus, now: Date): string[] {
   const snapshot = quotaStatus.snapshot;
-  const lines = [`Codex quota: stale (last success ${quotaStatus.sampleAge})`];
+  const failed = quotaStatus.refreshFailed || snapshot.probeSuccess === false;
+  const lines = [`Codex quota: stale (last success ${quotaStatus.sampleAge})${failed ? "; refresh failed" : ""}`];
   appendQuotaMetadata(lines, snapshot.planType, snapshot.activeLimit);
-  appendQuotaWindow(lines, "5h", snapshot.windows["5h"], now);
-  appendQuotaWindow(lines, "week", snapshot.windows.week, now);
+  appendQuotaFamilies(lines, snapshot.families, now);
   appendAttemptLine(lines, snapshot.lastAttemptTimestamp ?? snapshot.lastAttempt, snapshot.probeSuccess, now);
   return lines;
 }
@@ -191,9 +193,33 @@ function appendQuotaMetadata(lines: string[], planType: string | undefined, acti
   }
 }
 
+function appendQuotaFamilies(lines: string[], families: CodexQuotaFamily[], now: Date): void {
+  for (const family of families) {
+    if (family.id !== "codex") lines.push(`  ${family.name ?? family.id}:`);
+    if (family.limitReached === true) lines.push("  Limit reached");
+    else if (family.allowed === false) lines.push("  Allowed: no");
+    for (const [slot, window] of Object.entries(family.windows)) {
+      const seconds = window.durationSeconds;
+      const duration = seconds === undefined ? `${slot} (duration unknown)`
+        : formatQuotaDuration(seconds);
+      appendQuotaWindow(lines, duration, window, now);
+    }
+  }
+}
+
+function formatQuotaDuration(seconds: number): string {
+  if (seconds === 604800) return "week";
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainder = seconds % 60;
+  return [days ? `${days}d` : "", hours ? `${hours}h` : "", minutes ? `${minutes}m` : "", remainder ? `${remainder}s` : ""]
+    .filter(Boolean).join(" ");
+}
+
 function appendQuotaWindow(
   lines: string[],
-  name: QuotaWindowName,
+  name: string,
   window: QuotaWindowSnapshot,
   now: Date,
 ): void {

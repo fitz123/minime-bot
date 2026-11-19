@@ -1,24 +1,19 @@
 import { existsSync, readFileSync } from "node:fs";
-import { resolveCodexQuotaPaths } from "./pi-extensions/codex-usage.js";
+import { resolveCodexQuotaPaths, type CodexQuotaFamily, type CodexQuotaWindow } from "./pi-extensions/codex-usage.js";
 import { resolveWorkspaceContract } from "./workspace-contract.js";
 
 export const CODEX_QUOTA_STALE_MS_ENV = "CODEX_QUOTA_STALE_MS";
 export const DEFAULT_CODEX_QUOTA_STALE_MS = 30 * 60 * 1000;
 
 export type QuotaProvider = "codex";
-export type QuotaWindowName = "5h" | "week";
+export type QuotaWindowName = "primary" | "secondary";
 export type QuotaStatusState = "available" | "stale" | "unavailable" | "read_error";
 
-export interface QuotaWindowSnapshot {
-  usedPercent?: number;
-  remainingPercent?: number;
-  resetAt?: string;
-  resetTimestamp?: number;
-}
+export type QuotaWindowSnapshot = CodexQuotaWindow;
 
 export interface QuotaSnapshot {
   provider: QuotaProvider;
-  windows: Record<QuotaWindowName, QuotaWindowSnapshot>;
+  families: CodexQuotaFamily[];
   sampledAt?: string;
   lastSuccess?: string;
   lastSuccessTimestamp?: number;
@@ -39,7 +34,7 @@ export interface QuotaStatusOptions {
   staleMs?: number;
 }
 
-export type QuotaStatus =
+export type QuotaStatus = (
   | {
       state: "available" | "stale";
       stateFile: string;
@@ -60,7 +55,7 @@ export type QuotaStatus =
       stateFile: string;
       error: string;
       staleMs: number;
-    };
+    }) & { refreshFailed?: boolean };
 
 export function readQuotaStatus(options: QuotaStatusOptions = {}): QuotaStatus {
   const stateFile = resolveQuotaStateFile(options);
@@ -89,7 +84,7 @@ export function readQuotaStatus(options: QuotaStatusOptions = {}): QuotaStatus {
   try {
     const snapshot = parseQuotaSnapshot(JSON.parse(readFileSync(stateFile, "utf8")));
     const lastSuccessMs = lastSuccessMillis(snapshot);
-    if (lastSuccessMs === undefined) {
+    if (lastSuccessMs === undefined || snapshot.families.length === 0) {
       return {
         state: "unavailable",
         stateFile,
@@ -169,10 +164,10 @@ export function parseQuotaSnapshot(raw: unknown): QuotaSnapshot {
     throw new Error("quota state provider is unsupported");
   }
 
-  const windows = parseQuotaWindows(record.windows);
+  const families = parseQuotaFamilies(record);
   return {
     provider: "codex",
-    windows,
+    families,
     ...optionalStringField(record, "sampledAt"),
     ...optionalStringField(record, "lastSuccess"),
     ...optionalNumberField(record, "lastSuccessTimestamp"),
@@ -220,30 +215,46 @@ export function formatCompactDuration(durationMs: number): string {
   return `${minutes}m`;
 }
 
-function parseQuotaWindows(raw: unknown): Record<QuotaWindowName, QuotaWindowSnapshot> {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+function parseQuotaFamilies(record: Record<string, unknown>): CodexQuotaFamily[] {
+  if (Array.isArray(record.families)) {
+    return record.families.flatMap((raw) => {
+      if (!raw || typeof raw !== "object" || typeof raw.id !== "string" || !raw.id.trim()) return [];
+      const windows: CodexQuotaFamily["windows"] = {};
+      for (const slot of ["primary", "secondary"] as const) {
+        const window = parseQuotaWindow(raw.windows?.[slot]);
+        if (window.usedPercent !== undefined) windows[slot] = window;
+      }
+      if (!Object.keys(windows).length) return [];
+      return [{ id: raw.id, windows,
+        ...optionalStringField(raw, "name"), ...optionalStringField(raw, "meteredFeature"),
+        ...optionalBooleanField(raw, "allowed"), ...optionalBooleanField(raw, "limitReached"),
+      }];
+    });
+  }
+  if (!record.windows || typeof record.windows !== "object" || Array.isArray(record.windows)) {
     throw new Error("quota state windows must be an object");
   }
-
-  const windows = raw as Record<string, unknown>;
-  return {
-    "5h": parseQuotaWindow(windows["5h"]),
-    week: parseQuotaWindow(windows.week),
-  };
+  const legacy = record.windows as Record<string, unknown>;
+  const windows: CodexQuotaFamily["windows"] = {};
+  for (const [old, slot] of [["5h", "primary"], ["week", "secondary"]] as const) {
+    const window = parseQuotaWindow(legacy[old]);
+    delete window.durationSeconds; // Old positional labels do not establish a duration.
+    if (window.usedPercent !== undefined) windows[slot] = window;
+  }
+  return Object.keys(windows).length ? [{ id: "codex", windows }] : [];
 }
 
 function parseQuotaWindow(raw: unknown): QuotaWindowSnapshot {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-    return {};
-  }
-
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   const record = raw as Record<string, unknown>;
-  return {
-    ...optionalNumberField(record, "usedPercent"),
-    ...optionalNumberField(record, "remainingPercent"),
-    ...optionalStringField(record, "resetAt"),
-    ...optionalNumberField(record, "resetTimestamp"),
-  };
+  const window: QuotaWindowSnapshot = {};
+  for (const key of ["usedPercent", "remainingPercent", "resetTimestamp", "durationSeconds"] as const) {
+    const value = record[key];
+    if (isFiniteNumber(value) && value >= 0 && (key !== "durationSeconds" || value > 0)) window[key] = value;
+  }
+  Object.assign(window, optionalStringField(record, "resetAt"));
+  if (record.durationSeconds === 0 && window.usedPercent === 0 && !window.resetTimestamp && !window.resetAt) return {};
+  return window;
 }
 
 function optionalStringField<T extends string>(record: Record<string, unknown>, key: T): Partial<Record<T, string>> {

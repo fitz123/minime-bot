@@ -1,6 +1,6 @@
 import { loadConfig } from "./config.js";
 import { SessionManager } from "./session-manager.js";
-import { CollaborationRouter } from "./collaboration.js";
+import { CollaborationRouter, collaborationTransport } from "./collaboration.js";
 import {
   createTelegramBot,
   BOT_COMMANDS,
@@ -215,13 +215,21 @@ async function main(): Promise<void> {
     requestShutdown("unhandledRejection", 1);
   });
 
-  if (config.collaboration) {
+  const transport = collaborationTransport(config);
+  if (transport) {
     collaborationRouter = new CollaborationRouter({
       discover: () => sessionManager.collaborationEndpoints(),
       deliver: (message, consumed) => sessionManager.deliverCollaboration(message, consumed),
-    });
-    await collaborationRouter.start(config.collaboration.socketPath);
-    log.info("main", "Same-host collaboration router started");
+      topicContext: source => sessionManager.topicContext(source),
+      topicApply: (source, request) => sessionManager.topicApply(source, request),
+    }, { topicOnly: transport.topicOnly });
+    if (await collaborationRouter.start(transport.socketPath)) {
+      log.info("main", transport.topicOnly ? "Private-topic router started" : "Same-host collaboration router started");
+    } else {
+      collaborationRouter = undefined;
+      sessionManager.disableTopicTransport();
+      log.warn("main", "Private-topic router unavailable; continuing without cosmetic topic edits");
+    }
   }
 
   // Telegram starts before Discord has finished connecting. Polling failures
@@ -240,7 +248,7 @@ async function main(): Promise<void> {
     // Mutable reference so onUpdate callback can reach the watchdog
     // (watchdog needs bot.api, which doesn't exist until after createTelegramBot)
     let onUpdateFn: (() => void) | undefined;
-    const { bot, messageQueue, echoWatcher: ew, pollProgress, updateProcessing } = createTelegramBot(config, sessionManager, {
+    const { bot, messageQueue, echoWatcher: ew, pollProgress, updateProcessing, topicController } = createTelegramBot(config, sessionManager, {
       onUpdate: () => onUpdateFn?.(),
       // A failed generation disables this before grammY's final offset
       // confirmation, so cleanup cannot collapse the restart backoff.
@@ -248,6 +256,7 @@ async function main(): Promise<void> {
         if (!telegramFailureHandled && !shuttingDown) telegramPollingRestart?.reset();
       },
     });
+    sessionManager.setTopicController(topicController);
     telegramBot = bot;
     messageQueues.push(messageQueue);
     if (config.triggerInput) {

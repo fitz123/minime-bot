@@ -30,7 +30,9 @@ from upstream:
    dir is registered via a `resources_discover` handler in `index.ts`.
 3. **Child extension subset**: each child `pi -p` spawn passes `--no-extensions`,
    then explicitly loads the Codex transport overflow normalizer, web-tools, and
-   knowledge-tools/protection via `PI_SUBAGENT_CHILD_WRAPPER_RELPATHS`. Children
+   knowledge-tools/protection via `resolvePiSubagentChildExtensionArgs`. A marked
+   cron parent also loads `codex-fast` to enforce normal processing; interactive
+   children retain the original wrapper subset. Children
    do not load `subagent/index.ts`, so recursive subagent spawning stays
    disabled. Missing wrappers fail during spawn arg resolution; web search uses
    the child's active Codex subscription OAuth through Pi's model registry.

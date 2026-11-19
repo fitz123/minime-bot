@@ -45,6 +45,7 @@ import {
 } from "./pi-extensions/acknowledged-steer.js";
 import { isReasoningOnlyLengthAgentEnd } from "./pi-extensions/compaction-continuation.js";
 import { PI_FAST_THREAD_ENV } from "./codex-fast.js";
+import { buildCronFastEnv, CRON_FAST_OFF_ENV, CRON_REAL_CODEX_ENV, CRON_CODEX_SHIM_DIR_ENV, isCronFastOff, stripCronFastEnv } from "./cron-fast-env.js";
 import { MINIME_OUTBOX_ENV } from "./pi-runtime-env.js";
 import { RUNTIME_READINESS_PATH_ENV } from "./runtime-readiness.js";
 import {
@@ -98,7 +99,8 @@ export const PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS = [
  * isolated `pi -p` child to run a delegated task. Children load the transport
  * overflow normalizer, web tools, and knowledge tools/protection, but they do
  * NOT load the subagent wrapper: recursive spawning stays disabled in child
- * sessions.
+ * sessions. Marked cron children additionally load codex-fast through
+ * resolvePiSubagentChildExtensionArgs to enforce normal processing.
  */
 export const PI_SUBAGENT_CHILD_WRAPPER_RELPATHS = [
   "codex-transport-overflow.ts",
@@ -123,7 +125,7 @@ export const PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS = Object.freeze(
 
 /**
  * Wrappers a Pi print-mode cron must load. Crons receive the canonical search
- * wrapper, Knowledge wrapper and scoped Fast adapter, but no child-spawning tools.
+ * wrapper, Knowledge wrapper and enforced Fast-off adapter, but no child-spawning tools.
  */
 export const PI_CRON_WRAPPER_RELPATHS = ["codex-fast.ts", "web-tools.ts", "knowledge-tools.ts"] as const;
 
@@ -180,6 +182,8 @@ export interface PiSpawnExtensionOptions extends PiExtensionResolveOptions {
 export interface PiSpawnRuntimeEnvOptions {
   /** Trusted adapter input captured by the same context load as the launch args. */
   behavioralFoundationRoot?: string;
+  privateTopicPolicy?: boolean;
+  collaborationTopicOnly?: boolean;
   collaborationSession?: string;
   collaborationSocket?: string;
   /** Trusted current agent id supplied by SessionManager for first-party tools. */
@@ -223,6 +227,9 @@ const PI_CHILD_ENV_KEY_ALLOWLIST = new Set([
   MINIME_INSTANCE_CONFIG_PATH_ENV,
   MINIME_OUTBOX_ENV,
   PI_FAST_THREAD_ENV,
+  CRON_FAST_OFF_ENV,
+  CRON_REAL_CODEX_ENV,
+  CRON_CODEX_SHIM_DIR_ENV,
   "NO_COLOR",
   "PATH",
   "PI_CODING_AGENT_DIR",
@@ -300,6 +307,14 @@ export function resolvePiExtensionArgs(options?: PiExtensionResolveOptions): str
   }
 
   return args;
+}
+
+/** Ordinary subagents load the Fast adapter only to enforce a marked cron parent. */
+export function resolvePiSubagentChildExtensionArgs(options?: PiExtensionResolveOptions): string[] {
+  const relpaths = isCronFastOff(options?.env ?? process.env)
+    ? [...PI_SUBAGENT_CHILD_WRAPPER_RELPATHS, "codex-fast.ts"]
+    : PI_SUBAGENT_CHILD_WRAPPER_RELPATHS;
+  return resolvePiExtensionArgs({ ...options, relpaths });
 }
 
 function resolvePiExtraExtensionArgs(options?: PiSpawnExtensionOptions): string[] {
@@ -739,20 +754,22 @@ export function buildPiSpawnEnv(
 }
 
 export function buildPiSubagentChildSpawnEnv(agentWorkspaceRoot?: string): Record<string, string> {
-  return buildAllowedPiChildEnv(resolveWorkspaceContract(), agentWorkspaceRoot);
+  return buildAllowedPiChildEnv(resolveWorkspaceContract(), agentWorkspaceRoot, undefined, true);
 }
 
 export function buildPiAskAgentChildSpawnEnv(agentWorkspaceRoot?: string, targetAgentId?: string): Record<string, string> {
-  return buildAllowedPiChildEnv(resolveWorkspaceContract(), agentWorkspaceRoot, { askCallerAgentId: targetAgentId });
+  return buildAllowedPiChildEnv(resolveWorkspaceContract(), agentWorkspaceRoot, { askCallerAgentId: targetAgentId }, true);
 }
 
 function buildAllowedPiChildEnv(
   contract: ResolvedWorkspaceContract,
   agentWorkspaceRoot?: string,
   runtimeEnvOptions?: PiSpawnRuntimeEnvOptions,
+  inheritCron = false,
 ): Record<string, string> {
   const env: Record<string, string> = {};
-  for (const [key, val] of Object.entries(process.env)) {
+  const parentEnv = inheritCron && isCronFastOff(process.env) ? process.env : stripCronFastEnv(process.env);
+  for (const [key, val] of Object.entries(parentEnv)) {
     if (val !== undefined && shouldIncludePiChildEnvKey(key)) {
       env[key] = val;
     }
@@ -797,12 +814,16 @@ function buildAllowedPiChildEnv(
   if (runtimeEnvOptions?.behavioralFoundationRoot !== undefined) {
     env[MINIME_BEHAVIORAL_FOUNDATION_ROOT_ENV] = runtimeEnvOptions.behavioralFoundationRoot;
   }
+  delete env.MINIME_PRIVATE_TOPIC_POLICY;
+  delete env.MINIME_COLLABORATION_TOPIC_ONLY;
+  if (runtimeEnvOptions?.privateTopicPolicy && runtimeEnvOptions.collaborationSession && runtimeEnvOptions.collaborationSocket) env.MINIME_PRIVATE_TOPIC_POLICY = "1";
   if (runtimeEnvOptions?.collaborationSession && runtimeEnvOptions.collaborationSocket) {
     env.MINIME_COLLABORATION_SOCKET = runtimeEnvOptions.collaborationSocket;
     env.MINIME_COLLABORATION_SESSION = runtimeEnvOptions.collaborationSession;
+    if (runtimeEnvOptions.collaborationTopicOnly) env.MINIME_COLLABORATION_TOPIC_ONLY = "1";
   }
 
-  return env;
+  return inheritCron && isCronFastOff(parentEnv) ? buildCronFastEnv(env) : env;
 }
 
 function copyExplicitControlPathEnv(
@@ -1214,7 +1235,7 @@ const PI_RPC_SETTLED_WITHOUT_OUTCOME_MESSAGE =
 const PI_RPC_AGENT_END_WITHOUT_OUTCOME_MESSAGE =
   "Pi agent_end arrived without a usable terminal outcome";
 const PI_RPC_REASONING_ONLY_LENGTH_MESSAGE =
-  "Pi response hit the length limit before producing visible text and could not continue after compaction";
+  "Pi response hit the length limit before producing visible text";
 const PI_RPC_EXIT_BEFORE_SETTLED_MESSAGE = "Pi subprocess exited before agent_settled";
 
 /**

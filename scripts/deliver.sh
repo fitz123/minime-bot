@@ -2,7 +2,8 @@
 # deliver.sh — Send a message to Telegram via Bot API
 # Usage: deliver.sh <chat_id> [message]
 # Or:    deliver.sh <chat_id> --thread <thread_id> [message]
-# Or:    echo "message" | deliver.sh <chat_id> [--thread <thread_id>]
+# Or:    echo "message" | deliver.sh <chat_id> [--thread <thread_id>] [--purpose agent-answer]
+# Purpose defaults to service; --thread and --purpose may appear in either order.
 # Handles messages over 4096 UTF-16 code units by preferring paragraph/newline
 # boundaries and otherwise hard-splitting without breaking Unicode code points.
 # After each successful send, writes an echo JSON file to the private echo spool
@@ -17,21 +18,51 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-CHAT_ID="${1:?Usage: deliver.sh <chat_id> [--thread <thread_id>] [message]}"
-shift
-
-# Validate chat_id is numeric (prevents JSON injection)
-[[ "$CHAT_ID" =~ ^-?[0-9]+$ ]] || { echo "[deliver] Error: invalid chat_id: $CHAT_ID" >&2; exit 1; }
-
+CHAT_ID="${1:-}"
+[ $# -eq 0 ] || shift
 THREAD_ID=""
-if [ "${1:-}" = "--thread" ]; then
-  if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
-    echo "[deliver] Error: --thread requires a value" >&2
-    exit 1
+PURPOSE="service"
+ARG_ERROR=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --thread|--purpose)
+      if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+        ARG_ERROR="option requires a value"
+        if [ $# -ge 2 ]; then shift 2; else shift; fi
+        continue
+      fi
+      # Keep parsing leading options after a missing value, but never scan
+      # beyond the first message argument for a later purpose-like string.
+      case "$2" in
+        --thread|--purpose)
+          ARG_ERROR="option requires a value"
+          shift
+          continue
+          ;;
+      esac
+      if [ "$1" = "--thread" ]; then THREAD_ID="$2"; else PURPOSE="$2"; fi
+      shift 2
+      ;;
+    *) break ;;
+  esac
+done
+
+preflight_error() {
+  echo "[deliver] Error: $1" >&2
+  if [ "$PURPOSE" = "agent-answer" ]; then
+    printf '%s\n' 'FULL_CYCLE_DELIVERY_NOT_SENT'
   fi
-  THREAD_ID="$2"
-  shift 2
-  [[ "$THREAD_ID" =~ ^[0-9]+$ ]] || { echo "[deliver] Error: invalid thread_id: $THREAD_ID" >&2; exit 1; }
+  exit 1
+}
+
+[ -z "$ARG_ERROR" ] || preflight_error "$ARG_ERROR"
+case "$PURPOSE" in
+  service|agent-answer) ;;
+  *) preflight_error "unsupported purpose" ;;
+esac
+[[ "$CHAT_ID" =~ ^-?[0-9]+$ ]] || preflight_error "invalid chat_id"
+if [ -n "$THREAD_ID" ]; then
+  [[ "$THREAD_ID" =~ ^[0-9]+$ ]] || preflight_error "invalid thread_id"
 fi
 
 # Get message from args or stdin
@@ -42,8 +73,22 @@ else
 fi
 
 if [ -z "$MESSAGE" ]; then
-  echo "[deliver] Error: empty message" >&2
-  exit 1
+  preflight_error "empty message"
+fi
+
+# Explicit substantive agent output uses the packaged shared rich renderer.
+# The resolved token stays in the environment, never in command-line arguments.
+if [ "$PURPOSE" = "agent-answer" ]; then
+  rich_args=("$CHAT_ID")
+  [ -z "$THREAD_ID" ] || rich_args+=(--thread "$THREAD_ID")
+  if [ -f "$BOT_DIR/dist/agent-answer-delivery-cli.js" ]; then
+    printf '%s' "$MESSAGE" | "${NODE_BIN:-node}" "$BOT_DIR/dist/agent-answer-delivery-cli.js" "${rich_args[@]}"
+  elif [ -x "$BOT_DIR/node_modules/.bin/tsx" ] && [ -f "$BOT_DIR/src/agent-answer-delivery-cli.ts" ]; then
+    printf '%s' "$MESSAGE" | "$BOT_DIR/node_modules/.bin/tsx" "$BOT_DIR/src/agent-answer-delivery-cli.ts" "${rich_args[@]}"
+  else
+    preflight_error "rich delivery CLI is unavailable; build the package"
+  fi
+  exit $?
 fi
 
 # HTML converter setup (same converter as the bot's interactive path).

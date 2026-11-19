@@ -40,9 +40,23 @@ LLM empty/`NO_REPLY` suppression still happens before delivery; script output re
 | Fresh and replayed cron results, including script reports and unresolved LLM reports | Migrated to native rich delivery in this follow-up. |
 | Interactive DM drafts | Native rich drafts; `DRAFT_REFRESH_INTERVAL_MS = 15_000`, projection deduplication, and suspension unchanged. No issue 211 work. |
 | Terminal agent errors, command/status replies, queue/recovery/media errors, transcription echo | Error/service/input feedback; ordinary delivery retained. |
-| Cron admin notices, direct `scripts/deliver.sh` callers, monitoring/Alertmanager notifications | Ordinary service utilities retained; cron result routing no longer shells through them. External callers' intent is outside this package audit. |
+| Cron admin notices, default `scripts/deliver.sh` callers, monitoring/Alertmanager notifications | Ordinary service utilities retained; explicit detached agent answers opt into rich delivery as described below. |
 | Unreferenced outbox photos/documents | Standalone attachments retained; interactive inline photos still use existing rich custody. |
 | Discord adapter/relay | Existing Discord behavior retained. |
 | Pi collaboration, continuation, and acknowledged-steer extension `sendMessage` calls | Internal agent context, not Telegram posts. |
 
 Validation intercepts grammY's fetch transport through the existing cron `deliver` dependency, exercising routing, serialization, retained records, and echo consumption without production sends. Deployment smoke validation should inspect a genuine Telegram response's `rich_message.blocks`; a mocked API response is not evidence of server rendering.
+
+## Detached background agent results (issue 261)
+
+Substantive detached agent output opts into the same native rich renderer and Telegram adapter as interactive answers:
+
+```bash
+printf '%s' "$REPORT" | scripts/deliver.sh "$CHAT_ID" --purpose agent-answer --thread "$THREAD_ID"
+```
+
+The thread is optional; `--thread` and `--purpose` may appear in either order before message arguments. Omitting `--purpose` (or using `--purpose service`) preserves ordinary service delivery. The wrapper prefers the packaged `dist/agent-answer-delivery-cli.js`, with the existing tsx checkout fallback. `TELEGRAM_BOT_TOKEN` must already contain the caller's resolved sender token; the CLI does not load config or choose another sender.
+
+Rich delivery validates safe integer destinations, nonempty input, and the entire rich source before the first request. Like cron print-mode, it has no session outbox: local inline photo references reject preflight without consuming ambient files. Each API call has a 30-second timeout. There is one attempt per chunk, no automatic API retry, no ordinary-message fallback, and no replay. Only confirmed chunks enter the passive echo spool with origin `deliver.sh`, the original chat/thread destination, and the shared source projection. `ECHO_DIR_BASE` is honored; echo failure does not fail delivery.
+
+A proven local preflight rejection exits nonzero and emits exactly `FULL_CYCLE_DELIVERY_NOT_SENT` on stdout. Once sending starts, every API rejection, network failure, timeout, or later chunk failure exits nonzero without that marker, even when the first request returns a valid Telegram error. Such failures are uncertain and must not trigger automatic replay. A caller timeout or process interruption is likewise uncertain without the marker. Diagnostics are bounded fixed text and do not include tokens, transport URLs, or report contents. Cron's existing result retry and classification behavior is unchanged.

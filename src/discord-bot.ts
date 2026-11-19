@@ -20,7 +20,8 @@ import { allocateMediaPath, discardMediaPath, enforceMediaCap, releaseMediaPath 
 import { log } from "./logger.js";
 import { messagesReceived, recordMediaPipelineError } from "./metrics.js";
 import { isImageMimeType } from "./mime.js";
-import { readQuotaStatus } from "./quota-status.js";
+import type { QuotaStatus } from "./quota-status.js";
+import { refreshQuotaStatus } from "./codex-quota-refresh.js";
 import { buildStatusReport } from "./status-report.js";
 /** Check if a message is too old to process (same logic as telegram-bot.ts). */
 function isStaleMessage(messageTimestampMs: number, maxAgeMs: number): boolean {
@@ -158,9 +159,12 @@ interface DiscordCommandInteractionLike {
     parentId?: string | null;
   } | null;
   reply: (response: string | { content: string; ephemeral?: boolean }) => Promise<unknown>;
+  deferReply: () => Promise<unknown>;
+  editReply: (response: string) => Promise<unknown>;
 }
 
 interface DiscordCommandHandlerOptions {
+  refreshQuotaStatus?: () => Promise<QuotaStatus>;
   config: BotConfig;
   discordConfig: DiscordConfig;
   sessionManager: SessionManager;
@@ -207,12 +211,14 @@ export async function handleDiscordChatInputCommand(
       break;
     }
     case "status": {
-      await interaction.reply(buildStatusReport({
+      await interaction.deferReply();
+      const quotaStatus = await (options.refreshQuotaStatus ?? refreshQuotaStatus)();
+      await interaction.editReply(buildStatusReport({
         activeCount: sessionManager.getActiveCount(),
         maxSessions: config.sessionDefaults.maxConcurrentSessions,
         uptimeSeconds: Math.floor(process.uptime()),
         sessionHealth: sessionManager.getSessionHealth(key),
-        quotaStatus: readQuotaStatus(),
+        quotaStatus,
       }));
       break;
     }

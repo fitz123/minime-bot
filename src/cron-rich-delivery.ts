@@ -1,9 +1,6 @@
-import { chmodSync, lstatSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
-import { randomUUID } from "node:crypto";
-import { join } from "node:path";
 import { createTelegramApiAdapter, type TelegramAdapterApi } from "./telegram-adapter.js";
 import { prepareRichAnswer } from "./telegram-rich.js";
-import { resolveWorkspaceContract } from "./workspace-contract.js";
+import { writeResultEcho } from "./result-echo.js";
 import { sanitizePiProcessOutput } from "./pi-process-utils.js";
 
 /** Replaying the same source cannot fix a cron result preflight rejection. */
@@ -15,28 +12,6 @@ function sanitizeDescription(description: string): string {
   return sanitizePiProcessOutput(description)
     .replace(/https?:\/\/\S+/gi, "[URL redacted]")
     .replace(/\s+/g, " ").slice(0, 400);
-}
-
-/** Same passive-context spool as deliver.sh; echo failure must not resend a post. */
-function writeResultEcho(chatId: number, threadId: number | undefined, text: string): void {
-  try {
-    const base = resolveWorkspaceContract().paths.echoDir;
-    const dir = join(base, String(chatId));
-    for (const path of [base, dir]) {
-      mkdirSync(path, { recursive: true, mode: 0o700 });
-      if (lstatSync(path).isSymbolicLink()) return;
-      chmodSync(path, 0o700);
-    }
-    const name = `${Date.now()}-${process.pid}-${randomUUID()}.json`;
-    const temp = join(dir, `.${name}.tmp`);
-    writeFileSync(temp, JSON.stringify({
-      chatId: String(chatId), threadId: threadId == null ? null : String(threadId),
-      text, origin: "cron-runner", timestamp: Math.floor(Date.now() / 1000),
-    }), { mode: 0o600 });
-    renameSync(temp, join(dir, name));
-  } catch {
-    // Echo is best-effort, just as for ordinary service delivery.
-  }
 }
 
 /** Cron owns retries. No ordinary-message fallback or nested API retry layer. */

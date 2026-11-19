@@ -1,6 +1,6 @@
 {
   "name": "minime-bot",
-  "version": "2026.11.3",
+  "version": "2026.11.8",
   "description": "Multi-agent Telegram and Discord bot powered by Pi/Codex sessions",
   "main": "./dist/main.js",
   "exports": {
@@ -52,6 +52,7 @@
     "scripts/runtime_doctor.py",
     "scripts/restart-bot.sh",
     "scripts/run-cron.sh",
+    "scripts/cron-bin/codex",
     "scripts/start-bot.sh",
     "telegram-bot.plist.example",
     "docs/launchd-operations.md",

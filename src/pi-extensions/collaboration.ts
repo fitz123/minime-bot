@@ -3,14 +3,22 @@ import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CollaborationClient, collaborationPrompt, type Delivery } from "../collaboration.js";
 
+/** Internal custom messages and collaboration prompts are never human topic content. */
+function isHumanCollaborationTurn(event: { messageType: string; prompt?: string }): boolean {
+  return event.messageType === "user" && !event.prompt?.startsWith("[Internal collaboration ");
+}
+
 export function registerCollaboration(pi: ExtensionAPI): void {
   const path = process.env.MINIME_COLLABORATION_SOCKET;
   if (!path) return;
+  const topicOnly = process.env.MINIME_COLLABORATION_TOPIC_ONLY === "1";
+  let humanTurn = false;
   // Bash snapshots process.env when each tool starts. A background command from
   // an internal turn must retain a private outbox after human turns resume.
   const humanOutbox = process.env.MINIME_COLLABORATION_SESSION ? process.env.MINIME_OUTBOX : undefined;
   pi.on("before_agent_start", event => {
-    if (humanOutbox) process.env.MINIME_OUTBOX = (event.messageType === "custom" ? event.message.customType === "minime-collaboration" : event.prompt.startsWith("[Internal collaboration "))
+    humanTurn = isHumanCollaborationTurn(event);
+    if (humanOutbox) process.env.MINIME_OUTBOX = (event.messageType === "custom" ? event.message.customType === "minime-collaboration" : !isHumanCollaborationTurn(event))
       ? `${humanOutbox}.internal` : humanOutbox;
   });
   let client: CollaborationClient | undefined;
@@ -80,6 +88,7 @@ export function registerCollaboration(pi: ExtensionAPI): void {
   pi.on("session_tree", connect);
   pi.on("session_shutdown", () => { clearInbox(); client?.close(); });
   pi.on("agent_settled", () => {
+    humanTurn = false;
     if (humanOutbox) process.env.MINIME_OUTBOX = humanOutbox;
     drain();
   });
@@ -94,6 +103,33 @@ export function registerCollaboration(pi: ExtensionAPI): void {
     item.client.consumed(id);
   });
   const result = (value: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(value) }], details: {} });
+  if (process.env.MINIME_PRIVATE_TOPIC_POLICY === "1" && process.env.MINIME_COLLABORATION_SESSION) {
+    pi.on("before_agent_start", async event => {
+      if (!isHumanCollaborationTurn(event)) return;
+      try {
+        const value = await client?.request({ op: "topic_context" }, 1000);
+        if (!value?.revision) return;
+        return { systemPrompt: `${event.systemPrompt}\n\nPrivate topic context:\n${JSON.stringify(value)}` };
+      } catch { /* Cosmetic context never prevents an ordinary turn. */ }
+    });
+    pi.registerTool({
+      name: "topic_apply", label: "Set topic presentation",
+      description: "Initialize once after meaningful human content (intent=auto), or edit ONLY fields explicitly requested by the current human (intent=manual), pinning their choices. Completed topics are manual-only. Use the current context revision, name grapheme cap and thematic free catalog indices. Accepted means reserved, NOT applied: do not claim success until confirmed by a later context receipt/current fields. Never replay pending/uncertain edits. A fresh explicit human request may supersede an inactive reservation when context.manualCanSupersede is true. On stale, use the returned refreshed context to retry the current explicit request.",
+      parameters: Type.Object({ intent: Type.Optional(Type.Union([Type.Literal("auto"), Type.Literal("manual")])), revision: Type.String(), name: Type.Optional(Type.String()), iconCandidates: Type.Optional(Type.Array(Type.Integer({ minimum: 0 }))) }),
+      execute: async (_id, p) => {
+        if (!humanTurn) return result({ status: "unavailable" });
+        try {
+          const value = await client?.request({ op: "topic_apply", ...p }) ?? { status: "unavailable" };
+          if (value.status === "stale" && humanTurn) {
+            return result({ ...value, context: await client?.request({ op: "topic_context" }, 1000) ?? { status: "unavailable" } });
+          }
+          return result(value);
+        }
+        catch { return result({ status: "unavailable" }); }
+      },
+    });
+  }
+  if (topicOnly) return;
   const address = Type.Object({ kind: Type.Union([Type.Literal("agent"), Type.Literal("thread"), Type.Literal("session"), Type.Literal("terminal")]), id: Type.String() });
   pi.registerTool({ name: "collaboration_discover", label: "Discover collaborators", description: "List same-host collaborators (64 per page; pass nextOffset as offset). Internal conversations only; requires running bot router.", parameters: Type.Object({ offset: Type.Optional(Type.Integer({ minimum: 0 })) }), execute: async (_id, p) => result(await client?.request({ op: "discover", ...p }) ?? { status: "disconnected" }) });
   pi.registerTool({ name: "collaboration_send", label: "Send internal message", description: "Start an internal conversation. Returns a receipt without waiting for an answer. Finish the turn so replies can arrive. At most 32 messages / 10 minutes per conversation.", parameters: Type.Object({ to: address, text: Type.String() }), execute: async (_id, p) => result(await client?.request({ op: "send", ...p }) ?? { status: "disconnected" }) });

@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+## 2026.11.7
+
+- Report reasoning-only length outcomes without falsely assuming compaction occurred (#197, #264).
+- Preserve existing settlement, continuation, EOF and partial-visible behavior; broader incomplete-response handling remains open.
+
+## 2026.11.6
+
+- Deliver explicitly marked detached agent results through the same native Telegram rich renderer as chat (#261, #262).
+- Preserve ordinary service messages, confirmed-result echoes, and fail-closed no-replay handling for uncertain or partial sends.
+
+## 2026.11.5
+
+- Keep scheduled LLM and script jobs in normal mode independently of interactive Fast preferences (#258, #259).
+- Preserve cron Fast-off scope through cooperative Pi and Codex descendants without changing chat settings, models or reasoning; include executable CLI enforcement and offline packaged-request verification.
+
+## 2026.11.4
+
+- Read Codex subscription quota with a bounded OAuth usage GET rather than an inference probe (#61, #256).
+- Display actual server-reported limit families, durations and resets; refresh `/status` on demand and clearly age cached data after refresh failures.
+- Export dynamic quota metrics without relabeling weekly usage as five-hour usage, preserve legacy cache readability and keep collector textfiles readable.
+
 ## 2026.11.3
 
 - Allow standalone read-only Knowledge CLI get/search commands through the Knowledge integrity guard (#254).

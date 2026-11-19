@@ -164,10 +164,11 @@ Final delivery follows that bounded wait. Final requests retain existing bounded
 transport retries and their delivery ambiguity; later-chunk failures can leave
 partial delivery. This is not an exactly-once transport guarantee.
 
-The sampler uses the same packaged Pi CLI by default; override it explicitly
-with `--pi-bin` or `CODEX_QUOTA_PI_BIN`. Its probe passes `--approve` for the
-isolated sampler project settings, and `--dry-run` prints the resolved command
-without executing it.
+The quota sampler reads `GET https://chatgpt.com/backend-api/wham/usage`
+with the existing Pi OAuth; it sends no inference and launches no Pi child.
+The former `--model`, `--prompt`, `--pi-bin` and `--sampler-cwd` options remain
+accepted and ignored, as do their former environment settings. `--dry-run`
+prints the resolved configuration without resolving OAuth or making a request.
 
 ## Control Workspace
 
@@ -246,7 +247,7 @@ metricsPort: <deployment-metrics-port>
 
 `topicId` is optional. The overlay may also carry deployment delivery IDs,
 metrics host, the complete `triggerInput` section described below, and the
-`collaboration` socket configuration. It
+`collaboration` socket configuration and `privateTopics` policy. It
 cannot override agents, models, thinking, prompts, session defaults,
 extensions, logging behavior, raw bindings, or `workspaceCwd`. Exact
 `discord: false` is the sole Discord entry allowed. Add it when the canonical
@@ -391,6 +392,12 @@ a user-only socket owned by the running bot. Sends/replies return receipts witho
 waiting for the peer; internal turns use separate output handling and never enter
 the normal human relays. See the guide for the configuration, package extension,
 address types, continuing conversations, receipt semantics, and trade-offs.
+
+The optional [private-topic presentation policy](docs/collaboration.md#private-topic-presentation)
+uses that same extension and the ordinary human turn to select a concise semantic
+name and a separate thematic catalog icon for one automatic initialization, plus
+explicit manual edits. It opts in all authorized private DM topics using the
+actual bot identity; it adds no commands or extra model calls.
 
 Optional top-level `piExtraExtensions` entries allow operator-approved external
 Pi extension entrypoints in normal bot-created interactive RPC sessions:

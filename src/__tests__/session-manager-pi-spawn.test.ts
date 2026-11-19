@@ -20,6 +20,7 @@ import { ensureSessionMediaDir, sessionMediaDir, allocateMediaPath, releaseMedia
 import { MINIME_BOT_PI_SESSION_AGENT_ID_ENV, NewlineOnlyJsonlSplitter, PiStartupBlockingUiError, assertPiSessionIdentityMatchesBinding, normalizePiModel, parsePiStartupIdentityRecord, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions } from "../pi-rpc-protocol.js";
 import PQueue from "p-queue";
 import { CURRENT_SESSION_VERSION } from "@earendil-works/pi-coding-agent";
+import { collaborationTransport } from "../collaboration.js";
 
 const TEST_DIR = join(tmpdir(), "minime-test-pi-spawn");
 const TEST_STORE_PATH = `${TEST_DIR}/sessions.json`;
@@ -567,6 +568,95 @@ describe("SessionManager exact Pi binding startup", () => {
       await manager.getOrCreateSession("218", "pi");
       assert.ok(existsSync(reserved));
     } finally { await manager.closeAll(); }
+  });
+
+  it("passes the private-topic flag only to eligible private Telegram topic spawns", async () => {
+    const previousRoot = process.env.MINIME_CONTROL_WORKSPACE_ROOT;
+    process.env.MINIME_CONTROL_WORKSPACE_ROOT = `${TEST_DIR}/control`;
+    const config = makeConfig({
+      collaboration: { socketPath: `${TEST_DIR}/router.sock` },
+      privateTopics: { enabled: true, maxNameGraphemes: 17 },
+      bindings: [
+        { chatId: 123, agentId: "main", kind: "dm" },
+        { chatId: 456, agentId: "pi", kind: "dm" },
+        { chatId: 789, agentId: "main", kind: "group" },
+      ],
+    });
+    const manager = new SessionManager(() => config, TEST_STORE_PATH, TEST_DIR);
+    const { PrivateTopicController } = await import("../private-topics.js");
+    const { TopicStore } = await import("../topic-store.js");
+    let botId = 900;
+    manager.setTopicController(new PrivateTopicController(config, new TopicStore(`${TEST_DIR}/topics.json`), {
+      getForumTopicIconStickers: async () => [], editForumTopic: async () => true,
+    }, () => botId));
+    const check = async (lane: string, agentId: string, enabled: boolean) => {
+      await manager.getOrCreateSession(lane, agentId);
+      assert.equal(piSpawnCaptures.at(-1)?.runtimeEnvOptions?.privateTopicPolicy, enabled ? true : undefined);
+      assert.equal(piSpawnCaptures.at(-1)?.extensionOptions?.collaboration, true);
+      await manager.closeSession(lane);
+    };
+    try {
+      await check("123:10", "main", true);
+      await check("123", "main", false);
+      await check("456:10", "pi", true);
+      await check("789:10", "main", false);
+      await check("discord:fixture", "main", false);
+      await check("collaboration:fixture:main", "main", false);
+      botId = 901;
+      await check("123:20", "main", true);
+    } finally {
+      await manager.closeAll();
+      if (previousRoot === undefined) delete process.env.MINIME_CONTROL_WORKSPACE_ROOT;
+      else process.env.MINIME_CONTROL_WORKSPACE_ROOT = previousRoot;
+    }
+  });
+
+  it("uses the instance topic-only socket/env only for private topic spawns when collaboration is disabled", async () => {
+    const previousRoot = process.env.MINIME_CONTROL_WORKSPACE_ROOT;
+    process.env.MINIME_CONTROL_WORKSPACE_ROOT = `${TEST_DIR}/control`;
+    const config = makeConfig({
+      collaboration: undefined,
+      privateTopics: { enabled: true, maxNameGraphemes: 17 },
+      bindings: [
+        { chatId: 123, agentId: "main", kind: "dm" },
+        { chatId: 456, agentId: "pi", kind: "dm" },
+        { chatId: 789, agentId: "main", kind: "group" },
+      ],
+    });
+    const manager = new SessionManager(() => config, TEST_STORE_PATH, TEST_DIR);
+    const { PrivateTopicController } = await import("../private-topics.js");
+    const { TopicStore } = await import("../topic-store.js");
+    let botId = 900;
+    manager.setTopicController(new PrivateTopicController(config, new TopicStore(`${TEST_DIR}/topics.json`), {
+      getForumTopicIconStickers: async () => [], editForumTopic: async () => true,
+    }, () => botId));
+    const check = async (lane: string, agentId: string, enabled: boolean) => {
+      await manager.getOrCreateSession(lane, agentId);
+      assert.equal(piSpawnCaptures.at(-1)?.runtimeEnvOptions?.privateTopicPolicy, enabled ? true : undefined);
+      const capture = piSpawnCaptures.at(-1)!;
+      assert.equal(capture.extensionOptions?.collaboration, enabled ? true : undefined);
+      assert.equal(capture.runtimeEnvOptions?.collaborationTopicOnly, enabled ? true : undefined);
+      assert.equal(capture.runtimeEnvOptions?.collaborationSession, enabled ? capture.sessionBinding.sessionId : undefined);
+      if (enabled) assert.equal(capture.runtimeEnvOptions?.collaborationSocket, collaborationTransport(config)!.socketPath);
+      else assert.equal(capture.runtimeEnvOptions?.collaborationSocket, undefined);
+      await manager.closeSession(lane);
+    };
+    try {
+      await check("123:10", "main", true);
+      await check("123", "main", false);
+      await check("456:10", "pi", true);
+      await check("789:10", "main", false);
+      await check("discord:fixture", "main", false);
+      await check("collaboration:fixture:main", "main", false);
+      botId = 901;
+      await check("123:20", "main", true);
+      manager.disableTopicTransport();
+      await check("123:30", "main", false);
+    } finally {
+      await manager.closeAll();
+      if (previousRoot === undefined) delete process.env.MINIME_CONTROL_WORKSPACE_ROOT;
+      else process.env.MINIME_CONTROL_WORKSPACE_ROOT = previousRoot;
+    }
   });
 
   it("pre-seeds, persists, and asserts one exact Pi binding before spawn", async () => {

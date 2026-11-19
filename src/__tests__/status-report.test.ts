@@ -35,20 +35,22 @@ function quotaSnapshot(overrides: Partial<QuotaSnapshot> = {}): QuotaSnapshot {
     lastSuccessTimestamp: ts("2026-06-05T11:58:00.000Z"),
     planType: "Pro",
     activeLimit: "primary",
-    windows: {
-      "5h": {
+    families: [{ id: "codex", windows: {
+      primary: {
+        durationSeconds: 18000,
         usedPercent: 12.5,
         remainingPercent: 87.5,
         resetAt: "2026-06-05T16:52:00.000Z",
         resetTimestamp: ts("2026-06-05T16:52:00.000Z"),
       },
-      week: {
+      secondary: {
+        durationSeconds: 604800,
         usedPercent: 88,
         remainingPercent: 12,
         resetAt: "2026-06-12T11:00:00.000Z",
         resetTimestamp: ts("2026-06-12T11:00:00.000Z"),
       },
-    },
+    } }],
     ...overrides,
   };
 }
@@ -253,4 +255,15 @@ describe("buildStatusReport", () => {
     assert.match(text, /Codex quota: unavailable \(state file missing\)/);
   });
 
+});
+
+
+it("renders weekly-only, arbitrary, named and unknown durations without positional fiction", () => {
+  const snapshot = quotaSnapshot({ families: [
+    { id: "codex", windows: { primary: { usedPercent: 25, durationSeconds: 604800 } } },
+    { id: "other", name: "Named limit", windows: { primary: { usedPercent: 50, durationSeconds: 12345 }, secondary: { usedPercent: 10 } } },
+  ] });
+  const text = baseReport({ quotaStatus: { state: "available", stateFile: "/tmp/quota.json", snapshot, ageMs: 0, sampleAge: "0m ago", staleMs: 1800000 } });
+  assert.match(text, /week: 25%/); assert.match(text, /Named limit:/); assert.match(text, /3h 25m 45s: 50%/);
+  assert.match(text, /secondary \(duration unknown\): 10%/); assert.doesNotMatch(text, /5h:/);
 });

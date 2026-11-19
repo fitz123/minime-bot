@@ -40,7 +40,8 @@ import { recordMessage, lookupMessage } from "./message-content-index.js";
 import type { MessageRecord } from "./message-content-index.js";
 import { logReaction } from "./reaction-log.js";
 import { EchoWatcher, ECHO_PREFIX } from "./echo-watcher.js";
-import { readQuotaStatus } from "./quota-status.js";
+import type { QuotaStatus } from "./quota-status.js";
+import { refreshQuotaStatus } from "./codex-quota-refresh.js";
 import { buildStatusReport } from "./status-report.js";
 import {
   createPollProgressProbe,
@@ -50,6 +51,8 @@ import {
 } from "./poll-progress.js";
 import { ActiveDraftCoordinator } from "./active-draft-coordinator.js";
 import { resolveBinding } from "./telegram-binding.js";
+import { PrivateTopicController } from "./private-topics.js";
+import { TopicStore } from "./topic-store.js";
 // Re-export for backward compatibility (tests import from here)
 export { isImageMimeType, imageExtensionForMime };
 export { resolveBinding } from "./telegram-binding.js";
@@ -666,6 +669,7 @@ export interface TelegramBotResult {
   echoWatcher: EchoWatcher;
   pollProgress: PollProgressProbe;
   updateProcessing: UpdateProcessingProbe;
+  topicController?: PrivateTopicController;
 }
 
 /** autoRetry options — exported so tests can assert the rethrowHttpErrors value. */
@@ -764,6 +768,9 @@ export function createTelegramBot(
     draftCoordinator?: ActiveDraftCoordinator;
     /** Fresh local-control config; defaults to the regular loader without secret resolution. */
     loadConfig?: () => BotConfig;
+    refreshQuotaStatus?: () => Promise<QuotaStatus>;
+    /** Optional inventory location for an isolated host/test. */
+    topicStorePath?: string;
   },
 ): TelegramBotResult {
   if (!config.telegramToken) {
@@ -781,6 +788,15 @@ export function createTelegramBot(
   // retries after inner errors). Polling uses grammY's own retry loop, while
   // cosmetic drafts and typing remain excluded from retries.
   bot.api.config.use(createTelegramAutoRetryTransformer());
+
+  let topicController: PrivateTopicController | undefined;
+  if (config.privateTopics?.enabled) {
+    try {
+      topicController = new PrivateTopicController(config, new TopicStore(opts?.topicStorePath), bot.api, () => {
+        try { return bot.botInfo.id; } catch { return undefined; }
+      });
+    } catch { log.warn("telegram-bot", "Private-topic inventory unavailable; cosmetic policy disabled"); }
+  }
 
   // Outermost transformer: observe completion of each logical getUpdates call,
   // including grammY polling calls, without retaining request/response data.
@@ -852,6 +868,10 @@ export function createTelegramBot(
   // cosmetic updates for the active relay before commands, media processing,
   // or message ownership/steering logic runs.
   bot.use(async (ctx, next) => {
+    if (ctx.message && topicController) {
+      try { topicController.observe(ctx.message, ctx.update.update_id); }
+      catch { log.warn("telegram-bot", "Private-topic observation unavailable; continuing message routing"); }
+    }
     const key = ctx.message ? sessionKey(ctx.message.chat.id, ctx.message.message_thread_id) : undefined;
     const releaseInput = key === undefined ? undefined : sessionManager.holdHumanInput?.(key);
     try {
@@ -931,7 +951,7 @@ export function createTelegramBot(
     await ctx.reply("Session cleaned. Fresh start.");
   });
 
-  // /status command — compact local-only session and quota health.
+  // /status command — session health and a bounded quota refresh.
   bot.command("status", async (ctx) => {
     const topicId = ctx.message?.message_thread_id;
     if (ctx.message) setThread(ctx.chat.id, ctx.message.message_id, topicId);
@@ -948,13 +968,14 @@ export function createTelegramBot(
         fastStatusLine = "Fast: unknown (read error)";
       }
     }
+    const quotaStatus = await (opts?.refreshQuotaStatus ?? refreshQuotaStatus)();
     await ctx.reply(buildStatusReport({
       activeCount: sessionManager.getActiveCount(),
       maxSessions: config.sessionDefaults.maxConcurrentSessions,
       uptimeSeconds: Math.floor(process.uptime()),
       sessionHealth,
       fastStatusLine,
-      quotaStatus: readQuotaStatus(),
+      quotaStatus,
     }));
   });
 
@@ -1334,5 +1355,5 @@ export function createTelegramBot(
     },
   });
 
-  return { bot, messageQueue, echoWatcher, pollProgress, updateProcessing };
+  return { bot, messageQueue, echoWatcher, pollProgress, updateProcessing, topicController };
 }

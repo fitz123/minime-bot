@@ -43,8 +43,7 @@ import { assemblePiSubagentFoundation } from "../../../src/pi-context-assembler.
 import { MINIME_BEHAVIORAL_FOUNDATION_ROOT_ENV } from "../../../src/behavioral-foundation.js";
 import {
 	buildPiSubagentChildSpawnEnv,
-	PI_SUBAGENT_CHILD_WRAPPER_RELPATHS,
-	resolvePiExtensionArgs,
+	resolvePiSubagentChildExtensionArgs,
 } from "../../../src/pi-rpc-protocol.js";
 
 const MAX_PARALLEL_TASKS = 8;
@@ -311,7 +310,7 @@ async function runSingleAgent(
 		const args = buildSubagentSpawnArgs(agent, task, {
 			foundationContext,
 			systemPromptPath: tmpPromptPath ?? undefined,
-			extensionArgs: resolvePiExtensionArgs({ relpaths: PI_SUBAGENT_CHILD_WRAPPER_RELPATHS }),
+			extensionArgs: resolvePiSubagentChildExtensionArgs(),
 		});
 		const invocation = resolvePiInvocation(args);
 		const env = buildPiSubagentChildSpawnEnv(defaultCwd);

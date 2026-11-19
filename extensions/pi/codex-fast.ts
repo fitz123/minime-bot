@@ -3,6 +3,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "../../src/config.js";
 import { formatFastCommandError, handleFastCommand, isFastEligible, PI_FAST_THREAD_ENV, readFastStatus, type FastScope } from "../../src/codex-fast.js";
 import { applyFastToRequest } from "../../src/pi-extensions/codex-fast-request.js";
+import { isCronFastOff } from "../../src/cron-fast-env.js";
+import { applyCronFastOffToRequest } from "../../src/pi-extensions/cron-fast-request.js";
 
 function currentScope(model?: { provider: string; id: string }): FastScope | undefined {
   const id = process.env.MINIME_BOT_PI_SESSION_AGENT_ID;
@@ -15,6 +17,10 @@ function currentScope(model?: { provider: string; id: string }): FastScope | und
 
 export default function codexFast(pi: ExtensionAPI): void {
   pi.on("before_provider_request", (event, ctx) => {
+    if (isCronFastOff(process.env)) {
+      if (ctx.model?.provider === "openai-codex") return applyCronFastOffToRequest(event.payload, ctx.model.id);
+      return;
+    }
     const scope = currentScope(ctx.model);
     if (!scope || !ctx.model) return;
     return applyFastToRequest(event.payload, ctx.model.id, readFastStatus(scope).enabled);
@@ -22,6 +28,10 @@ export default function codexFast(pi: ExtensionAPI): void {
   pi.registerCommand("fast", {
     description: "Show/set scoped Fast; /fast help for scopes and priority details",
     handler: async (args, ctx) => {
+      if (isCronFastOff(process.env)) {
+        ctx.ui.notify("Fast: off (enforced for cron jobs). Chat preferences are unchanged.", "info");
+        return;
+      }
       try { ctx.ui.notify(handleFastCommand(args, args.trim() === "help" ? undefined : currentScope(ctx.model)), "info"); }
       catch (error) { ctx.ui.notify(formatFastCommandError(error), "error"); }
     },
