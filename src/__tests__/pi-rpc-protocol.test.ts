@@ -95,6 +95,7 @@ import {
   MINIME_INSTANCE_CONFIG_PATH_ENV,
 } from "../workspace-contract.js";
 import { RUNTIME_READINESS_PATH_ENV } from "../runtime-readiness.js";
+import { CRON_FAST_OFF_ENV, CRON_REAL_CODEX_ENV, CRON_CODEX_SHIM_DIR_ENV } from "../cron-fast-env.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const packageRoot = resolve(__dirname, "..", "..");
@@ -2054,6 +2055,9 @@ describe("spawnPiRpcSession workspace validation", () => {
 describe("buildPiSubagentChildSpawnEnv", () => {
   it("uses the same credential-scrubbed env as Pi spawns", () => {
     const envKeys = [
+      CRON_FAST_OFF_ENV,
+      CRON_REAL_CODEX_ENV,
+      CRON_CODEX_SHIM_DIR_ENV,
       "ANTHROPIC_API_KEY",
       "GITHUB_TOKEN",
       "LC_CTYPE",
@@ -2073,6 +2077,10 @@ describe("buildPiSubagentChildSpawnEnv", () => {
     const oldValues = new Map(envKeys.map((key) => [key, process.env[key]]));
 
     try {
+      // This fixture exercises a non-cron parent even when the test runner is marked.
+      delete process.env[CRON_FAST_OFF_ENV];
+      delete process.env[CRON_REAL_CODEX_ENV];
+      delete process.env[CRON_CODEX_SHIM_DIR_ENV];
       process.env.ANTHROPIC_API_KEY = "fixture";
       process.env.GITHUB_TOKEN = "fixture";
       process.env.LC_CTYPE = "UTF-8";
@@ -2116,6 +2124,7 @@ describe("buildPiSubagentChildSpawnEnv", () => {
         }
       }
     }
+    assert.deepStrictEqual(new Map(envKeys.map((key) => [key, process.env[key]])), oldValues);
   });
 
   it("propagates explicit control config and crons path overrides", () => {

@@ -1753,7 +1753,11 @@ writeFileSync(
 
 const oldAskAgentWorkspace = process.env[controlWorkspaceEnv];
 const oldAskAgentCaller = process.env[piRpc.MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
+const askAgentCronKeys = ["MINIME_CRON_FAST_OFF", "MINIME_CRON_REAL_CODEX", "MINIME_CRON_CODEX_SHIM_DIR"];
+const oldAskAgentCronEnv = new Map(askAgentCronKeys.map(key => [key, process.env[key]]));
 try {
+  // The first wrapper call exercises a non-cron parent regardless of the launcher.
+  for (const key of askAgentCronKeys) delete process.env[key];
   process.env[controlWorkspaceEnv] = askAgentSmokeRoot;
   process.env[piRpc.MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = "agent-b";
   const askAgentTool = registeredToolDefs.find((tool) => tool.name === "ask_agent");
@@ -1845,7 +1849,11 @@ try {
   } else {
     process.env[piRpc.MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = oldAskAgentCaller;
   }
+  for (const [key, value] of oldAskAgentCronEnv) {
+    if (value === undefined) delete process.env[key]; else process.env[key] = value;
+  }
 }
+assert.deepEqual(new Map(askAgentCronKeys.map(key => [key, process.env[key]])), oldAskAgentCronEnv);
 
 try {
   const searchTool = registeredToolDefs.find((tool) => tool.name === "web_search");
