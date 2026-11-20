@@ -1,3 +1,5 @@
+import { log } from "../logger.js";
+import { BehavioralFoundationError } from "../behavioral-foundation.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -508,11 +510,12 @@ describe("ask-agent helper", () => {
     }
   });
 
-  it("returns context_failed when context assembly is null or throws, without spawn", async () => {
+  it("returns context_failed when context assembly is null or throws, without spawn", async t => {
+    const warn = t.mock.method(log, "warn", () => {});
     for (const assembleContext of [
       () => null,
       () => {
-        throw new Error("assembly failed");
+        throw new BehavioralFoundationError("local skill name conflicts with SYNTHETIC_TARGET_PRIVATE_SKILL");
       },
     ]) {
       let runTargetCalled = false;
@@ -530,8 +533,10 @@ describe("ask-agent helper", () => {
       );
 
       assertError(result, "context_failed");
+      assert.doesNotMatch(JSON.stringify(result), /SYNTHETIC_TARGET_PRIVATE_SKILL/);
       assert.equal(runTargetCalled, false);
     }
+    assert.ok(warn.mock.calls.some(call => call.arguments.join(" ").includes("SYNTHETIC_TARGET_PRIVATE_SKILL")));
   });
 
   it("validates the target workspace before context assembly and target spawn", async () => {

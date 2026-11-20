@@ -14,6 +14,8 @@ export interface AskAgentConfig {
 
 export interface AgentConfig {
   id: string;
+  /** Resolved deployment input, injected for every agent; not a per-agent setting. */
+  behavioralFoundationRoot?: string;
   /** Resolved agent workspace root used as the Pi session cwd and context source. */
   workspaceCwd: string;
   model: string;
@@ -164,6 +166,7 @@ export interface SessionDefaults {
 
 export interface BotConfig {
   telegramToken?: string;
+  behavioralFoundation?: { root: string };
   agents: Record<string, AgentConfig>;
   bindings: TelegramBinding[];
   sessionDefaults: SessionDefaults;
