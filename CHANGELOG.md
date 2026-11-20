@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 2026.11.9
+
+- Add opt-in immutable shared behavioral resources across managed Pi entrypoints, keeping private context separate (#252, #253).
+- Prepare isolated execution workers with durable session bindings, bounded lifecycle handling and explicitly selected local/Knowledge capabilities; existing routing stays unchanged by default.
+- Preserve current cron, private-topic, collaboration and quota behavior; strengthen fixture isolation (#271, #273).
+
 ## 2026.11.7
 
 - Report reasoning-only length outcomes without falsely assuming compaction occurred (#197, #264).
