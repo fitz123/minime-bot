@@ -592,5 +592,87 @@ class BotSlotPruneTests(unittest.TestCase):
             self.assertFalse(abandoned.exists())
 
 
+class BotSlotReaderTests(unittest.TestCase):
+    def test_reader_lifecycle_under_private_umask(self) -> None:
+        import grp
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            slots = root / "slots"
+            slots.mkdir()
+            os.chown(slots, -1, os.getgid())  # only the invoking user's own group
+            slots.chmod(0o750)
+            gid = slots.stat().st_gid
+            group = grp.getgrgid(gid).gr_name
+            source = source_tree(root, "source")
+            def call(command: str, *args: str) -> dict[str, object]:
+                code, stdout, stderr = call_cli(command, "--slots-root", str(slots),
+                    "--reader-group", group, *args)
+                self.assertEqual((code, stderr), (0, ""))
+                return json.loads(stdout)
+            old_umask = os.umask(0o077)
+            try:
+                call("stage", "--source", str(source), "--release-id", "one")
+                self.assertIsNone(call("status", "--json")["currentReleaseId"])
+                self.assertFalse((slots / "current").is_symlink())
+                call("activate", "--release-id", "one")
+                (source / "dist/main.js").write_bytes(b"second\n")
+                call("stage", "--source", str(source), "--release-id", "two")
+                call("activate", "--release-id", "two")
+                call("rollback")
+                self.assertEqual(call("status", "--json")["currentReleaseId"], "one")
+                call("prune")
+            finally:
+                os.umask(old_umask)
+            for path in [slots / "releases", *(slots / "releases").rglob("*")]:
+                mode = stat.S_IMODE(path.stat().st_mode)
+                self.assertEqual(path.stat().st_gid, gid)
+                expected = 0o750 if path.is_dir() or path.name == "start-bot.sh" else 0o640
+                if path.name == bot_slots.MANIFEST_NAME:
+                    expected = 0o600
+                self.assertEqual(mode, expected, path)
+            self.assertEqual(stat.S_IMODE((slots / "state").stat().st_mode), 0o700)
+            for path in (slots / "state").iterdir():
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            # Neither mode converts an existing tree implicitly.
+            self.assertEqual(call_cli("status", "--slots-root", str(slots), "--json")[0], 3)
+            payload = slots / "releases/one/dist/main.js"
+            for unsafe in (0o600, 0o644, 0o660, 0o740):
+                payload.chmod(unsafe)
+                code, stdout, _ = call_cli("status", "--slots-root", str(slots),
+                    "--reader-group", group, "--json")
+                self.assertEqual(code, 3)
+                self.assertFalse(json.loads(stdout)["currentManifestVerified"])
+            payload.chmod(0o640)
+            (slots / "releases/one" / bot_slots.MANIFEST_NAME).chmod(0o640)
+            self.assertEqual(call_cli("status", "--slots-root", str(slots),
+                "--reader-group", group, "--json")[0], 3)
+
+    def test_reader_root_missing_wrong_mode_and_gid_are_refused(self) -> None:
+        import grp
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            slots = root / "slots"
+            source = source_tree(root, "source")
+            group = grp.getgrgid(os.getgid()).gr_name
+            args = ("stage", "--slots-root", str(slots), "--source", str(source),
+                    "--release-id", "one", "--reader-group", group)
+            self.assertEqual(call_cli(*args)[0], 3)
+            self.assertFalse(slots.exists())
+            slots.mkdir(); slots.chmod(0o700)
+            self.assertEqual(call_cli(*args)[0], 3)
+            self.assertEqual(stat.S_IMODE(slots.stat().st_mode), 0o700)
+            slots.chmod(0o750)
+            with mock.patch.object(bot_slots.grp, "getgrnam",
+                    return_value=SimpleNamespace(gr_gid=slots.stat().st_gid + 1)):
+                self.assertEqual(call_cli(*args)[0], 3)
+            self.assertFalse((slots / "releases").exists())
+            with self.assertRaises(bot_slots.VerificationError):
+                bot_slots._safe_mode(SimpleNamespace(st_uid=os.getuid(), st_gid=os.getgid() + 1,
+                    st_mode=stat.S_IFREG | 0o640), source=False, directory=False, reader_gid=os.getgid())
+            with mock.patch.object(bot_slots.grp, "getgrnam", side_effect=KeyError):
+                self.assertEqual(call_cli(*args)[0], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

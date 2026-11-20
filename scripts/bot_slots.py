@@ -7,6 +7,8 @@ import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
+import grp
+from functools import partial
 import hashlib
 import json
 import os
@@ -104,11 +106,44 @@ def _private_dir(path: Path, *, create: bool) -> Path:
     return path
 
 
-def _layout(root: Path, *, create: bool) -> tuple[Path, Path, Path]:
-    root = _private_dir(root, create=create)
+def _reader_dir(path: Path, *, create: bool, reader_gid: int) -> Path:
+    try:
+        if create and not path.exists() and not path.is_symlink():
+            path.mkdir(mode=0o750)
+            path.chmod(0o750)  # mkdir is masked by the controller's private umask.
+        details = path.lstat()
+    except OSError as exc:
+        raise VerificationError("reader slot directory is unavailable") from exc
+    if (
+        not stat.S_ISDIR(details.st_mode)
+        or stat.S_ISLNK(details.st_mode)
+        or not _same_owner(details)
+        or details.st_gid != reader_gid
+        or stat.S_IMODE(details.st_mode) != 0o750
+    ):
+        raise VerificationError("reader slot directory requires owner, reader gid and mode 0750")
+    return path
+
+
+def _reader_gid(name: str | None) -> int | None:
+    if name is None:
+        return None
+    try:
+        return grp.getgrnam(name).gr_gid
+    except KeyError as exc:
+        raise UsageError("reader group is unavailable") from exc
+
+
+def _layout(root: Path, *, create: bool, reader_gid: int | None = None) -> tuple[Path, Path, Path]:
+    if reader_gid is None:
+        root = _private_dir(root, create=create)
+        releases = _private_dir(root / "releases", create=create)
+    else:
+        root = _reader_dir(root, create=False, reader_gid=reader_gid)
+        releases = _reader_dir(root / "releases", create=create, reader_gid=reader_gid)
     return (
         root,
-        _private_dir(root / "releases", create=create),
+        releases,
         _private_dir(root / "state", create=create),
     )
 
@@ -146,7 +181,7 @@ def _lock(state_dir: Path) -> Iterator[None]:
                 os.close(descriptor)
 
 
-def _safe_mode(details: os.stat_result, *, source: bool, directory: bool) -> None:
+def _safe_mode(details: os.stat_result, *, source: bool, directory: bool, reader_gid: int | None = None) -> None:
     if not _same_owner(details):
         raise VerificationError("runtime tree owner is unsafe")
     mode = stat.S_IMODE(details.st_mode)
@@ -156,14 +191,16 @@ def _safe_mode(details: os.stat_result, *, source: bool, directory: bool) -> Non
             raise VerificationError("runtime source mode is unsafe")
         if mode & required != required:
             raise VerificationError("runtime source mode is unsafe")
-    elif mode != (0o700 if directory else mode) or (
-        not directory and mode not in {0o600, 0o700}
-    ):
-        raise VerificationError("release mode is unsafe")
+    else:
+        allowed = ({0o750} if directory else {0o640, 0o750}) if reader_gid is not None else (
+            {0o700} if directory else {0o600, 0o700}
+        )
+        if mode not in allowed or (reader_gid is not None and details.st_gid != reader_gid):
+            raise VerificationError("release mode or reader gid is unsafe")
 
 
 def _hash_file(
-    path: Path, expected: os.stat_result, *, source: bool
+    path: Path, expected: os.stat_result, *, source: bool, reader_gid: int | None = None
 ) -> tuple[str, int, bool]:
     descriptor = -1
     try:
@@ -187,7 +224,7 @@ def _hash_file(
             )
         ):
             raise VerificationError("runtime tree changed during verification")
-        _safe_mode(opened, source=source, directory=False)
+        _safe_mode(opened, source=source, directory=False, reader_gid=reader_gid)
         digest = hashlib.sha256()
         size = 0
         while True:
@@ -227,7 +264,7 @@ def _hash_file(
             os.close(descriptor)
 
 
-def _inventory(root: Path, *, source: bool) -> dict[str, Any]:
+def _inventory(root: Path, *, source: bool, reader_gid: int | None = None) -> dict[str, Any]:
     files: dict[str, str] = {}
     directories: list[str] = []
     executable_files: list[str] = []
@@ -236,7 +273,7 @@ def _inventory(root: Path, *, source: bool) -> dict[str, Any]:
         root_details = root.lstat()
         if not stat.S_ISDIR(root_details.st_mode) or stat.S_ISLNK(root_details.st_mode):
             raise VerificationError("runtime tree root is unsafe")
-        _safe_mode(root_details, source=source, directory=True)
+        _safe_mode(root_details, source=source, directory=True, reader_gid=reader_gid)
         for directory, child_dirs, child_files in os.walk(
             root, topdown=True, followlinks=False
         ):
@@ -244,7 +281,7 @@ def _inventory(root: Path, *, source: bool) -> dict[str, Any]:
             details = current.lstat()
             if not stat.S_ISDIR(details.st_mode) or stat.S_ISLNK(details.st_mode):
                 raise VerificationError("runtime tree contains a symlink")
-            _safe_mode(details, source=source, directory=True)
+            _safe_mode(details, source=source, directory=True, reader_gid=reader_gid)
             child_dirs.sort()
             child_files.sort()
             for name in child_dirs:
@@ -252,7 +289,7 @@ def _inventory(root: Path, *, source: bool) -> dict[str, Any]:
                 child = path.lstat()
                 if not stat.S_ISDIR(child.st_mode) or stat.S_ISLNK(child.st_mode):
                     raise VerificationError("runtime tree contains a symlink or special file")
-                _safe_mode(child, source=source, directory=True)
+                _safe_mode(child, source=source, directory=True, reader_gid=reader_gid)
                 directories.append(path.relative_to(root).as_posix())
             for name in child_files:
                 path = current / name
@@ -264,10 +301,12 @@ def _inventory(root: Path, *, source: bool) -> dict[str, Any]:
                     if source:
                         raise VerificationError("runtime source uses a reserved path")
                     _safe_mode(child, source=False, directory=False)
+                    if stat.S_IMODE(child.st_mode) != 0o600:
+                        raise VerificationError("release manifest is not owner-only")
                     continue
                 if len(files) >= _MAX_FILE_COUNT:
                     raise VerificationError("runtime tree exceeds the file bound")
-                digest, size, executable = _hash_file(path, child, source=source)
+                digest, size, executable = _hash_file(path, child, source=source, reader_gid=reader_gid)
                 total += size
                 if total > _MAX_TOTAL_BYTES:
                     raise VerificationError("runtime tree exceeds the byte bound")
@@ -287,7 +326,7 @@ def _inventory(root: Path, *, source: bool) -> dict[str, Any]:
     }
 
 
-def _copy_file(source: str, destination: str) -> str:
+def _copy_file(source: str, destination: str, *, reader_gid: int | None = None) -> str:
     source_path = Path(source)
     destination_path = Path(destination)
     source_descriptor = -1
@@ -349,7 +388,13 @@ def _copy_file(source: str, destination: str) -> str:
             )
         ):
             raise VerificationError("runtime source changed while staging")
-        os.fchmod(destination_descriptor, 0o700 if expected.st_mode & stat.S_IXUSR else 0o600)
+        executable = bool(expected.st_mode & stat.S_IXUSR)
+        mode = (0o750 if executable else 0o640) if reader_gid is not None else (
+            0o700 if executable else 0o600
+        )
+        os.fchmod(destination_descriptor, mode)
+        if reader_gid is not None and os.fstat(destination_descriptor).st_gid != reader_gid:
+            raise VerificationError("release file did not inherit reader gid")
         os.fsync(destination_descriptor)
         return destination
     except OSError as exc:
@@ -361,15 +406,15 @@ def _copy_file(source: str, destination: str) -> str:
             os.close(destination_descriptor)
 
 
-def _normalize_dirs(root: Path) -> None:
+def _normalize_dirs(root: Path, *, reader_gid: int | None = None) -> None:
     for directory, child_dirs, _files in os.walk(root, topdown=False, followlinks=False):
         current = Path(directory)
         for name in child_dirs:
             path = current / name
             if path.is_symlink():
                 raise VerificationError("runtime source contains a symlink")
-            path.chmod(0o700)
-        current.chmod(0o700)
+            path.chmod(0o750 if reader_gid is not None else 0o700)
+        current.chmod(0o750 if reader_gid is not None else 0o700)
 
 
 def _read_json(path: Path, *, max_bytes: int) -> dict[str, Any]:
@@ -443,7 +488,7 @@ def _valid_relative_path(value: Any) -> str:
     return value
 
 
-def _verify_release_path(path: Path, release_id: str) -> dict[str, Any]:
+def _verify_release_path(path: Path, release_id: str, *, reader_gid: int | None = None) -> dict[str, Any]:
     identifier = _safe_id(release_id)
     manifest = _read_json(path / MANIFEST_NAME, max_bytes=_MAX_MANIFEST_BYTES)
     files = manifest.get("files")
@@ -497,15 +542,15 @@ def _verify_release_path(path: Path, release_id: str) -> dict[str, Any]:
         manifest["fileCount"] != len(files)
         or not 0 <= manifest["fileCount"] <= _MAX_FILE_COUNT
         or not 0 <= manifest["totalBytes"] <= _MAX_TOTAL_BYTES
-        or _inventory(path, source=False) != expected
+        or _inventory(path, source=False, reader_gid=reader_gid) != expected
     ):
         raise VerificationError("release contents do not match the manifest")
     return manifest
 
 
-def _verify_release(releases: Path, release_id: str) -> dict[str, Any]:
+def _verify_release(releases: Path, release_id: str, *, reader_gid: int | None = None) -> dict[str, Any]:
     identifier = _safe_id(release_id)
-    return _verify_release_path(releases / identifier, identifier)
+    return _verify_release_path(releases / identifier, identifier, reader_gid=reader_gid)
 
 
 def _atomic_private_json(path: Path, value: dict[str, Any]) -> None:
@@ -571,7 +616,7 @@ def _transition(state_dir: Path) -> dict[str, Any] | None:
     return value
 
 
-def _selector(root: Path, name: str) -> str | None:
+def _selector(root: Path, name: str, *, reader_gid: int | None = None) -> str | None:
     path = root / name
     try:
         details = path.lstat()
@@ -597,7 +642,8 @@ def _selector(root: Path, name: str) -> str | None:
         not stat.S_ISDIR(release_details.st_mode)
         or stat.S_ISLNK(release_details.st_mode)
         or not _same_owner(release_details)
-        or stat.S_IMODE(release_details.st_mode) != 0o700
+        or stat.S_IMODE(release_details.st_mode) != (0o750 if reader_gid is not None else 0o700)
+        or (reader_gid is not None and release_details.st_gid != reader_gid)
     ):
         raise VerificationError("slot selector target is unsafe")
     return identifier
@@ -724,7 +770,7 @@ def _reconcile_transition(root: Path, state_dir: Path) -> None:
     _remove_private_file(state_dir / TRANSITION_NAME)
 
 
-def stage(slots_root: Path, source: Path, release_id: str) -> dict[str, Any]:
+def stage(slots_root: Path, source: Path, release_id: str, *, reader_gid: int | None = None) -> dict[str, Any]:
     identifier = _safe_id(release_id, usage=True)
     try:
         source_details = source.lstat()
@@ -742,7 +788,7 @@ def stage(slots_root: Path, source: Path, release_id: str) -> dict[str, Any]:
     ):
         raise VerificationError("runtime source and slot storage overlap")
 
-    _root, releases, state_dir = _layout(slots_root, create=True)
+    _root, releases, state_dir = _layout(slots_root, create=True, reader_gid=reader_gid)
     with _lock(state_dir):
         destination = releases / identifier
         try:
@@ -750,7 +796,7 @@ def stage(slots_root: Path, source: Path, release_id: str) -> dict[str, Any]:
         except FileNotFoundError:
             pass
         else:
-            _verify_release(releases, identifier)
+            _verify_release(releases, identifier, reader_gid=reader_gid)
             return {"ok": True, "releaseId": identifier, "idempotent": True}
 
         temporary = releases / f"{identifier}.tmp.{os.getpid()}"
@@ -758,17 +804,18 @@ def stage(slots_root: Path, source: Path, release_id: str) -> dict[str, Any]:
         try:
             before = _inventory(source, source=True)
             temporary.mkdir(mode=0o700)
+            temporary.chmod(0o700)
             shutil.copytree(
                 source,
                 temporary,
                 symlinks=True,
                 dirs_exist_ok=True,
-                copy_function=_copy_file,
+                copy_function=partial(_copy_file, reader_gid=reader_gid),
             )
-            _normalize_dirs(temporary)
+            _normalize_dirs(temporary, reader_gid=reader_gid)
             if _inventory(source, source=True) != before:
                 raise VerificationError("runtime source changed while staging")
-            copied = _inventory(temporary, source=False)
+            copied = _inventory(temporary, source=False, reader_gid=reader_gid)
             if copied != before:
                 raise VerificationError("staged release differs from its source")
             manifest = {
@@ -782,11 +829,11 @@ def stage(slots_root: Path, source: Path, release_id: str) -> dict[str, Any]:
                 raise VerificationError("release manifest exceeds the JSON byte bound")
             _write_new(temporary / MANIFEST_NAME, encoded)
             _fsync_dir(temporary)
-            _verify_release_path(temporary, identifier)
+            _verify_release_path(temporary, identifier, reader_gid=reader_gid)
             os.replace(temporary, destination)
             published = True
             _fsync_dir(releases)
-            _verify_release(releases, identifier)
+            _verify_release(releases, identifier, reader_gid=reader_gid)
             return {"ok": True, "releaseId": identifier, "idempotent": False}
         except (OSError, shutil.Error) as exc:
             raise VerificationError("release cannot be staged safely") from exc
@@ -795,14 +842,14 @@ def stage(slots_root: Path, source: Path, release_id: str) -> dict[str, Any]:
                 shutil.rmtree(temporary)
 
 
-def activate(slots_root: Path, release_id: str) -> dict[str, Any]:
+def activate(slots_root: Path, release_id: str, *, reader_gid: int | None = None) -> dict[str, Any]:
     identifier = _safe_id(release_id, usage=True)
-    root, releases, state_dir = _layout(slots_root, create=False)
+    root, releases, state_dir = _layout(slots_root, create=False, reader_gid=reader_gid)
     with _lock(state_dir):
         _reconcile_transition(root, state_dir)
-        _verify_release(releases, identifier)
-        current = _selector(root, "current")
-        previous = _selector(root, "previous")
+        _verify_release(releases, identifier, reader_gid=reader_gid)
+        current = _selector(root, "current", reader_gid=reader_gid)
+        previous = _selector(root, "previous", reader_gid=reader_gid)
         if current == identifier:
             active = _state(state_dir)
             if (
@@ -827,7 +874,7 @@ def activate(slots_root: Path, release_id: str) -> dict[str, Any]:
         if current is None and previous is not None:
             raise VerificationError("slot selectors are inconsistent")
         if current is not None:
-            _verify_release(releases, current)
+            _verify_release(releases, current, reader_gid=reader_gid)
         _begin_transition(
             state_dir,
             current=current,
@@ -851,15 +898,15 @@ def activate(slots_root: Path, release_id: str) -> dict[str, Any]:
         }
 
 
-def rollback(slots_root: Path) -> dict[str, Any]:
-    root, releases, state_dir = _layout(slots_root, create=False)
+def rollback(slots_root: Path, *, reader_gid: int | None = None) -> dict[str, Any]:
+    root, releases, state_dir = _layout(slots_root, create=False, reader_gid=reader_gid)
     with _lock(state_dir):
         _reconcile_transition(root, state_dir)
-        current = _selector(root, "current")
-        previous = _selector(root, "previous")
+        current = _selector(root, "current", reader_gid=reader_gid)
+        previous = _selector(root, "previous", reader_gid=reader_gid)
         if current is None or previous is None:
             raise VerificationError("rollback requires current and previous releases")
-        _verify_release(releases, previous)
+        _verify_release(releases, previous, reader_gid=reader_gid)
         _begin_transition(
             state_dir,
             current=current,
@@ -881,13 +928,13 @@ def rollback(slots_root: Path) -> dict[str, Any]:
         }
 
 
-def prune(slots_root: Path) -> dict[str, Any]:
-    root, releases, state_dir = _layout(slots_root, create=False)
+def prune(slots_root: Path, *, reader_gid: int | None = None) -> dict[str, Any]:
+    root, releases, state_dir = _layout(slots_root, create=False, reader_gid=reader_gid)
     with _lock(state_dir):
         _reconcile_transition(root, state_dir)
         referenced = {
             value
-            for value in (_selector(root, "current"), _selector(root, "previous"))
+            for value in (_selector(root, "current", reader_gid=reader_gid), _selector(root, "previous", reader_gid=reader_gid))
             if value is not None
         }
         active = _state(state_dir)
@@ -907,7 +954,8 @@ def prune(slots_root: Path) -> dict[str, Any]:
                     not stat.S_ISDIR(details.st_mode)
                     or stat.S_ISLNK(details.st_mode)
                     or not _same_owner(details)
-                    or stat.S_IMODE(details.st_mode) != 0o700
+                    or stat.S_IMODE(details.st_mode) not in ({0o700, 0o750} if reader_gid is not None else {0o700})
+                    or (reader_gid is not None and details.st_gid != reader_gid)
                 ):
                     raise VerificationError("abandoned staging directory is unsafe")
                 shutil.rmtree(temporary)
@@ -917,7 +965,7 @@ def prune(slots_root: Path) -> dict[str, Any]:
             if identifier in referenced:
                 continue
             release = Path(entry.path)
-            _inventory(release, source=False)
+            _inventory(release, source=False, reader_gid=reader_gid)
             shutil.rmtree(release)
             removed.append(identifier)
         _fsync_dir(releases)
@@ -928,19 +976,19 @@ def prune(slots_root: Path) -> dict[str, Any]:
         }
 
 
-def status(slots_root: Path) -> tuple[dict[str, Any], bool]:
-    root, releases, state_dir = _layout(slots_root, create=False)
+def status(slots_root: Path, *, reader_gid: int | None = None) -> tuple[dict[str, Any], bool]:
+    root, releases, state_dir = _layout(slots_root, create=False, reader_gid=reader_gid)
     with _lock(state_dir):
         _reconcile_transition(root, state_dir)
-        current = _selector(root, "current")
-        previous = _selector(root, "previous")
+        current = _selector(root, "current", reader_gid=reader_gid)
+        previous = _selector(root, "previous", reader_gid=reader_gid)
         _state(state_dir)
 
         def verified(identifier: str | None) -> bool | None:
             if identifier is None:
                 return None
             try:
-                _verify_release(releases, identifier)
+                _verify_release(releases, identifier, reader_gid=reader_gid)
             except VerificationError:
                 return False
             return True
@@ -975,6 +1023,8 @@ def _parser() -> argparse.ArgumentParser:
     item = commands.add_parser("status")
     item.add_argument("--slots-root", required=True)
     item.add_argument("--json", action="store_true", required=True)
+    for command in commands.choices.values():
+        command.add_argument("--reader-group", help="explicit reader group; requires a prepared 0750 root")
     return parser
 
 
@@ -982,16 +1032,17 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         root = Path(args.slots_root)
+        reader_gid = _reader_gid(args.reader_group)
         if args.command == "stage":
-            result, success = stage(root, Path(args.source), args.release_id), True
+            result, success = stage(root, Path(args.source), args.release_id, reader_gid=reader_gid), True
         elif args.command == "activate":
-            result, success = activate(root, args.release_id), True
+            result, success = activate(root, args.release_id, reader_gid=reader_gid), True
         elif args.command == "rollback":
-            result, success = rollback(root), True
+            result, success = rollback(root, reader_gid=reader_gid), True
         elif args.command == "prune":
-            result, success = prune(root), True
+            result, success = prune(root, reader_gid=reader_gid), True
         else:
-            result, success = status(root)
+            result, success = status(root, reader_gid=reader_gid)
         print(_canonical_json(result).decode("ascii"), end="")
         return 0 if success else EXIT_VERIFICATION_FAILED
     except UsageError as exc:
