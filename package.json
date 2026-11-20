@@ -1,6 +1,6 @@
 {
   "name": "minime-bot",
-  "version": "2026.11.8",
+  "version": "2026.11.9",
   "description": "Multi-agent Telegram and Discord bot powered by Pi/Codex sessions",
   "main": "./dist/main.js",
   "exports": {
