@@ -48,7 +48,7 @@ const KNOWLEDGE_DIRECTIVE = [
 
 const FILE_DELIVERY_DIRECTIVE = [
   `To share a file with the user, write or copy it to the directory specified by the \`${MINIME_OUTBOX_ENV}\` environment variable.`,
-  "Files placed there will be automatically sent to the user after your response completes.",
+  "Files placed there will be automatically sent after your response completes, unless it is suppressed with NO_REPLY; NO_REPLY suppresses both text and outbox files.",
 ].join(" ");
 
 const created: string[] = [];
