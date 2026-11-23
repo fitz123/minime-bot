@@ -781,6 +781,28 @@ calls, including the signal-less final update-offset confirmation, are bounded
 at 45 seconds. A successful polling-loop request resets that delay. A started
 transport counts only when it has conversational bindings.
 
+### Reload Telegram group bindings
+
+On a release that documents Telegram group binding reload, first confirm that
+the running Telegram poller is using that release and verify its PID. Save the
+group binding edits, including any instance identity overrides, then send
+`kill -HUP <verified-bot-pid>` to that process. Older releases can terminate on
+this signal. Check the bot log for the reload result.
+
+Reload reads the same base config, local overlay, and instance overlay as
+startup and verifies the running transport's Telegram credential. A rejected
+reload preserves the previous routes. Use
+`minime-bot config validate` with the same workspace and instance environment
+to check the config schema. Retry once any in-flight update and accepted work
+on a group being removed have finished.
+
+Reload supports adding and removing group bindings for agents configured at
+startup. Use a restart for edits to existing bindings, including reassignment
+of a chat or topic, and for changes to DM bindings, worker routes, the global
+mention policy, or the running trigger input's target. Group chat/topic routes
+must be unique. Removing the last Telegram binding requires another running
+transport with conversational bindings.
+
 ## Launchd Operations
 
 The packaged restart script is self-safe by default when the bot runs under

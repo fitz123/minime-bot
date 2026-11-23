@@ -326,13 +326,16 @@ function mergeInstanceConfig(
 export function loadRawMergedConfig(
   configPath?: string,
   instanceConfigPath?: string,
+  checkRootTypes = false,
 ): Record<string, unknown> {
   const path = resolveConfigPath(configPath);
   const base = (parseYaml(readFileSync(path, "utf8")) as Record<string, unknown>) ?? {};
+  if (checkRootTypes && !isConfigRecord(base)) throw new Error("Config must be an object");
   const localPath = deriveLocalConfigPath(path);
   let canonical = base;
   if (existsSync(localPath)) {
     const local = (parseYaml(readFileSync(localPath, "utf8")) as Record<string, unknown>) ?? {};
+    if (checkRootTypes && !isConfigRecord(local)) throw new Error("Local config must be an object");
     canonical = mergeDeep(base, local);
   }
   const resolvedInstanceConfigPath = instanceConfigPath
@@ -377,6 +380,8 @@ interface RawConfig {
 
 interface LoadConfigOptions {
   resolveSecrets?: boolean;
+  /** Explicit reload validates group edits and resolves the Telegram credential alone. */
+  telegramBindingReload?: boolean;
   secretExecFileSync?: ExecFileSyncLike;
   workspaceRoot?: string;
   instanceConfigPath?: string;
@@ -561,7 +566,7 @@ export function validateAgent(
   };
 }
 
-function validateBinding(raw: unknown, index: number): TelegramBinding {
+function validateBinding(raw: unknown, index: number, telegramBindingReload = false): TelegramBinding {
   if (typeof raw !== "object" || raw === null) {
     throw new Error(`Binding[${index}] must be an object`);
   }
@@ -582,6 +587,18 @@ function validateBinding(raw: unknown, index: number): TelegramBinding {
   if (obj.topicId !== undefined && obj.topics !== undefined) {
     throw new Error(`Binding[${index}] cannot have both topicId and topics`);
   }
+  const strictGroup = telegramBindingReload && kind === "group";
+  if (strictGroup) {
+    if (!Number.isSafeInteger(obj.chatId) || obj.chatId >= 0) {
+      throw new Error(`Binding[${index}].chatId must be a negative safe integer for a Telegram group`);
+    }
+    if (obj.topicId !== undefined && (!Number.isSafeInteger(obj.topicId) || (obj.topicId as number) < 0)) {
+      throw new Error(`Binding[${index}].topicId must be a non-negative safe integer`);
+    }
+    if (obj.requireMention !== undefined && typeof obj.requireMention !== "boolean") {
+      throw new Error(`Binding[${index}].requireMention must be a boolean`);
+    }
+  }
   return {
     chatId: obj.chatId,
     agentId: obj.agentId,
@@ -589,13 +606,13 @@ function validateBinding(raw: unknown, index: number): TelegramBinding {
     topicId: typeof obj.topicId === "number" ? obj.topicId : undefined,
     label: typeof obj.label === "string" ? obj.label : undefined,
     requireMention: typeof obj.requireMention === "boolean" ? obj.requireMention : undefined,
-    topics: validateTopics(obj.topics, index),
+    topics: validateTopics(obj.topics, index, strictGroup),
     voiceTranscriptEcho: typeof obj.voiceTranscriptEcho === "boolean" ? obj.voiceTranscriptEcho : undefined,
     typingIndicator: typeof obj.typingIndicator === "boolean" ? obj.typingIndicator : undefined,
   };
 }
 
-function validateTopics(raw: unknown, bindingIndex: number): TopicOverride[] | undefined {
+function validateTopics(raw: unknown, bindingIndex: number, strictGroup: boolean): TopicOverride[] | undefined {
   if (raw === undefined || raw === null) return undefined;
   if (!Array.isArray(raw)) {
     throw new Error(`Binding[${bindingIndex}].topics must be an array`);
@@ -605,8 +622,20 @@ function validateTopics(raw: unknown, bindingIndex: number): TopicOverride[] | u
       throw new Error(`Binding[${bindingIndex}].topics[${i}] must be an object`);
     }
     const obj = t as Record<string, unknown>;
+    const path = `Binding[${bindingIndex}].topics[${i}]`;
     if (typeof obj.topicId !== "number") {
-      throw new Error(`Binding[${bindingIndex}].topics[${i}] missing topicId (number)`);
+      throw new Error(`${path} missing topicId (number)`);
+    }
+    if (strictGroup) {
+      if (!Number.isSafeInteger(obj.topicId) || obj.topicId < 0) {
+        throw new Error(`${path}.topicId must be a non-negative safe integer`);
+      }
+      if (obj.agentId !== undefined && (typeof obj.agentId !== "string" || !obj.agentId)) {
+        throw new Error(`${path}.agentId must be a non-empty string`);
+      }
+      if (obj.requireMention !== undefined && typeof obj.requireMention !== "boolean") {
+        throw new Error(`${path}.requireMention must be a boolean`);
+      }
     }
     return {
       topicId: obj.topicId,
@@ -1014,8 +1043,8 @@ export function validatePrivateTopics(raw: unknown): BotConfig["privateTopics"] 
 }
 
 export function loadConfig(configPath?: string, options: LoadConfigOptions = {}): BotConfig {
-  const raw: RawConfig = loadRawMergedConfig(configPath, options.instanceConfigPath) as RawConfig;
-  const resolveSecrets = options.resolveSecrets !== false;
+  const raw: RawConfig = loadRawMergedConfig(configPath, options.instanceConfigPath, options.telegramBindingReload) as RawConfig;
+  const resolveTelegramToken = options.telegramBindingReload || options.resolveSecrets !== false;
   const workspaceRoot = resolveConfigWorkspaceRoot(configPath, options.workspaceRoot);
 
   if (!raw || typeof raw !== "object") {
@@ -1049,7 +1078,7 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
     if (behavioralFoundation) agents[id].behavioralFoundationRoot = behavioralFoundation.root;
   }
 
-  // Resolve Telegram transport only when this process owns Telegram bindings.
+  // Reload also verifies the credential when the candidate removes every Telegram binding.
   const legacyTelegramKey = findLegacyConfigKey(raw, LEGACY_TELEGRAM_SERVICE_KEY_RE);
   if (legacyTelegramKey) {
     throw new Error(
@@ -1059,11 +1088,14 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
   const telegramTokenSopsKey = optionalConfigString(raw.telegramTokenSopsKey, "telegramTokenSopsKey");
   const telegramTokenEnv = optionalConfigString(raw.telegramTokenEnv, "telegramTokenEnv");
   validateConfiguredSopsSource(sopsFile, telegramTokenSopsKey, "telegramTokenSopsKey");
+  if (options.telegramBindingReload && raw.bindings !== undefined && !Array.isArray(raw.bindings)) {
+    throw new Error("bindings must be an array");
+  }
   const rawTelegramBindings = Array.isArray(raw.bindings) ? raw.bindings : [];
   const hasTelegramBindings = rawTelegramBindings.length > 0;
   let telegramToken: string | undefined;
-  if (hasTelegramBindings && (telegramTokenSopsKey || telegramTokenEnv)) {
-    telegramToken = resolveSecrets
+  if ((hasTelegramBindings || options.telegramBindingReload) && (telegramTokenSopsKey || telegramTokenEnv)) {
+    telegramToken = resolveTelegramToken
       ? resolveSecret({
         sopsFile,
         sopsKey: telegramTokenSopsKey,
@@ -1081,7 +1113,7 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
       throw new Error("Telegram bindings require a token source (telegramTokenSopsKey with secrets.sopsFile, or telegramTokenEnv)");
     }
     bindings = rawTelegramBindings.map((b, i) => {
-      const binding = validateBinding(b, i);
+      const binding = validateBinding(b, i, options.telegramBindingReload);
       if (!agents[binding.agentId]) {
         throw new Error(`Binding[${i}] references unknown agent "${binding.agentId}"`);
       }
@@ -1097,7 +1129,8 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
   }
 
   // Validate Discord config (optional)
-  const discord = validateDiscordConfig(raw.discord, agents, sopsFile, options);
+  const otherSecretOptions = options.telegramBindingReload ? { ...options, resolveSecrets: false } : options;
+  const discord = validateDiscordConfig(raw.discord, agents, sopsFile, otherSecretOptions);
 
   const triggerInput = validateTriggerInput(
     raw.triggerInput,
@@ -1105,7 +1138,7 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
     agents,
     telegramToken,
     sopsFile,
-    options,
+    otherSecretOptions,
   );
 
   // At least one platform must be configured
