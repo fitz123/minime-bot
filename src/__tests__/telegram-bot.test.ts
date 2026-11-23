@@ -1463,6 +1463,7 @@ describe("command handler wiring", () => {
     const calls: string[] = [];
     return {
       calls,
+      isWorkerLane: () => false,
       closeSession: async (_chatId: string) => { calls.push("closeSession"); },
       destroySession: async (_chatId: string) => { calls.push("destroySession"); },
       sendSessionMessage: () => { calls.push("sendSessionMessage"); throw new Error("unexpected"); },

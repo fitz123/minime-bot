@@ -742,6 +742,10 @@ export interface DeliveryDefaults {
   defaultDeliveryThreadId?: number;
 }
 
+interface CronConfigDefaults extends DeliveryDefaults {
+  workerRoutedAgents?: ReadonlySet<string>;
+}
+
 function loadCronTask(taskName: string, cronsPath?: string, defaults?: DeliveryDefaults): CronJob {
   const crons = loadMergedCrons(cronsPath);
   const found = crons.find(
@@ -866,6 +870,9 @@ function resolveCronAgentData(agentId: string, configPath?: string): CronAgentDa
   const defaultModel = typeof raw.defaultModel === "string" ? raw.defaultModel : undefined;
   const knownAgentIds = new Set(Object.keys(raw.agents));
   const agent = validateAgent(rawAgent, agentId, defaultModel, workspaceRoot, knownAgentIds);
+  if (agent.workerRuntime) {
+    throw new Error(`Cron execution is unavailable for worker-routed agent "${agentId}"`);
+  }
   if (!agent.workspaceCwd.trim()) {
     throw new Error(`Agent "${agentId}" missing workspaceCwd`);
   }
@@ -925,12 +932,17 @@ export function loadAdminChatId(configPath?: string): number | undefined {
   return undefined;
 }
 
-export function loadDefaultDelivery(configPath?: string): DeliveryDefaults {
+export function loadDefaultDelivery(configPath?: string): CronConfigDefaults {
   const raw = loadRawMergedConfig(configPath) as {
     defaultDeliveryChatId?: unknown;
     defaultDeliveryThreadId?: unknown;
+    agents?: Record<string, unknown>;
   };
-  const result: DeliveryDefaults = {};
+  const result: CronConfigDefaults = {};
+  const workerRoutedAgents = Object.entries(raw?.agents ?? {}).filter(([, agent]) =>
+    agent !== null && typeof agent === "object" && Object.hasOwn(agent, "workerRuntime")
+  ).map(([id]) => id);
+  if (workerRoutedAgents.length) result.workerRoutedAgents = new Set(workerRoutedAgents);
   if (raw?.defaultDeliveryChatId !== undefined) {
     if (typeof raw.defaultDeliveryChatId === "number" && Number.isInteger(raw.defaultDeliveryChatId) && raw.defaultDeliveryChatId !== 0) {
       result.defaultDeliveryChatId = raw.defaultDeliveryChatId;
@@ -1540,7 +1552,7 @@ export interface CronRunnerMainDeps {
   consoleError: (message?: unknown, ...optionalParams: unknown[]) => void;
   exit: (code: number) => never;
   log: (taskName: string, msg: string) => void;
-  loadDefaultDelivery: (configPath?: string) => DeliveryDefaults;
+  loadDefaultDelivery: (configPath?: string) => CronConfigDefaults;
   loadCronTask: (taskName: string, cronsPath?: string, defaults?: DeliveryDefaults) => CronJob;
   loadAdminChatId: (configPath?: string) => number | undefined;
   resolveCronAgentData: (agentId: string, configPath?: string) => CronAgentData;
@@ -1730,7 +1742,7 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
 
   deps.log(taskName, `Starting cron task: ${taskName}`);
 
-  let defaults: DeliveryDefaults = {};
+  let defaults: CronConfigDefaults = {};
   try {
     defaults = deps.loadDefaultDelivery();
   } catch (err) {
@@ -1740,6 +1752,9 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
   let cron: CronJob;
   try {
     cron = deps.loadCronTask(taskName, undefined, defaults);
+    if (defaults.workerRoutedAgents?.has(cron.agentId)) {
+      throw new Error(`Cron execution is unavailable for worker-routed agent "${cron.agentId}"`);
+    }
   } catch (err) {
     try {
       deps.log(taskName, `FAIL: ${(err as Error).message}`);

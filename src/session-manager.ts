@@ -1,7 +1,7 @@
 import { RICH_RESERVED_DIR } from "./telegram-rich.js";
 import { type ChildProcess } from "node:child_process";
 import { chmodSync, createWriteStream, existsSync, lstatSync, mkdirSync, readdirSync, renameSync, rmSync, type Stats, unlinkSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { on } from "node:events";
@@ -14,6 +14,8 @@ import type { TopicRecord, TopicTarget } from "./topic-store.js";
 import type { BoundSessionState, PendingSessionRecoveryNotice, PlatformContext, SessionRecoveryReason, SessionState, StreamLine, BotConfig, AgentConfig } from "./types.js";
 import { spawnPiRpcSession, sendPiPrompt, sendPiSteer, sendPiAcknowledgedSteer, sendPiGetState, readPiStream, parsePiStartupIdentityRecord, assertPiSessionIdentityMatchesBinding, PiStartupBlockingUiError, NewlineOnlyJsonlSplitter, normalizePiModel, PI_EXTENSIONS_DISABLED_ENV, type PiAcknowledgedSteerResult, type PiRpcEvent, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions, type PiStartupDiagnostics } from "./pi-rpc-protocol.js";
 import { SessionStore } from "./session-store.js";
+import { AgentRuntimeClient } from "./agent-runtime-client.js";
+import { AgentRuntimeError, AgentRuntimeUncertainError, type AgentLaneState } from "./agent-runtime-protocol.js";
 import { log } from "./logger.js";
 import { recordResultMetrics, recordPiRetry, recordPiTurnDuration, sessionsActive, sessionCrashes, piSessionResumeDiscarded } from "./metrics.js";
 import { ensureSessionMediaDir, cleanupSessionMediaDir, cleanupStaleSessionMedia } from "./media-store.js";
@@ -38,6 +40,7 @@ const RESPONSE_LIVENESS_PROBE_TIMEOUT_MS = 10_000;
 const CRASH_BACKOFF_BASE_MS = 5_000; // Base delay for crash backoff
 const MAX_CRASH_BACKOFF_MS = 60_000; // Maximum backoff delay (1 minute)
 export const MAX_CRASH_RESTARTS = 5; // Block session after this many consecutive crashes
+export const WORKER_MEDIA_UNSUPPORTED = "Attachments and voice messages are unavailable for worker-routed agents.";
 
 class HumanInputPendingError extends Error {}
 
@@ -297,6 +300,8 @@ export function waitForSpawn(child: ChildProcess, timeoutMs: number = STARTUP_TI
 
 export class SessionManager {
   private active: Map<string, ActiveSession> = new Map();
+  private readonly workerRoutes = new Map<string, NonNullable<AgentConfig["workerRuntime"]>>();
+  private readonly workerTurns = new Map<string, { client?: AgentRuntimeClient }>();
   private acceptingSessionWork = true;
   /** Restart counts survive crash recovery (active.delete) so they accumulate. */
   private restartCounts: Map<string, number> = new Map();
@@ -323,12 +328,15 @@ export class SessionManager {
     loadConfig: () => BotConfig,
     storePath?: string,
     logDir?: string,
-    options?: { startupTimeoutMs?: number },
+    options?: { startupTimeoutMs?: number; initialConfig?: BotConfig },
   ) {
     this.loadConfig = loadConfig;
     // Validate config at boot — fail fast if config is broken
-    const startupConfig = loadConfig();
+    const startupConfig = options?.initialConfig ?? loadConfig();
     this.transport = collaborationTransport(startupConfig);
+    for (const [agentId, agent] of Object.entries(startupConfig.agents)) {
+      if (agent.workerRuntime) this.workerRoutes.set(agentId, { ...agent.workerRuntime });
+    }
     this.store = new SessionStore(storePath);
     this.store.migrateLegacySessions(startupConfig);
     this.logDir = logDir ?? LOG_DIR;
@@ -345,6 +353,19 @@ export class SessionManager {
     if (this.transport?.topicOnly) this.transport = undefined;
   }
 
+  isWorkerLane(chatId: string, agentId?: string): boolean {
+    const stored = this.store.getSession(chatId);
+    return (agentId !== undefined && this.workerRoutes.has(agentId))
+      || this.workerTurns.has(chatId)
+      || (stored !== undefined && (stored.bindingState === "worker" || this.workerRoutes.has(stored.agentId)));
+  }
+
+  private assertLocalLane(chatId: string, agentId?: string): void {
+    if (this.isWorkerLane(chatId, agentId)) {
+      throw new AgentRuntimeError("unsupported_route", "This operation is unavailable for worker-routed sessions. The existing binding was retained.");
+    }
+  }
+
   /** Read-only inventory joined to current routing; no session identity is persisted in topic data. */
   inspectKnownTopics(botId: number, chatId: number): Array<{ topic: TopicRecord; agentId?: string; session?: Pick<BoundSessionState, "sessionId" | "sessionFile"> }> {
     const controller = this.topicController;
@@ -356,8 +377,10 @@ export class SessionManager {
       if (topic.botId !== botId || topic.chatId !== chatId) return [];
       const binding = resolveBinding(chatId, config.bindings, topic.topicId);
       const agentId = binding?.kind === "dm" && config.agents[binding.agentId] ? binding.agentId : undefined;
-      const current = sessions[`${chatId}:${topic.topicId}`];
-      const session = agentId && current?.bindingState === "bound" && current.agentId === agentId
+      const lane = `${chatId}:${topic.topicId}`;
+      const current = sessions[lane];
+      const session = agentId && !this.isWorkerLane(lane, agentId) && !config.agents[agentId]?.workerRuntime
+        && current?.bindingState === "bound" && current.agentId === agentId
         ? { sessionId: current.sessionId, sessionFile: current.sessionFile } : undefined;
       return [{ topic, agentId, session }];
     });
@@ -373,7 +396,8 @@ export class SessionManager {
     if (entries.length !== 1) return;
     const [lane, state] = entries[0];
     const match = /^(\d+):(\d+)$/.exec(lane);
-    if (!match || !config.agents[state.agentId] || this.active.get(lane)?.internalTurn) return;
+    if (!match || !config.agents[state.agentId] || config.agents[state.agentId].workerRuntime
+      || this.isWorkerLane(lane, state.agentId) || this.active.get(lane)?.internalTurn) return;
     const target = { botId, chatId: Number(match[1]), topicId: Number(match[2]) };
     if (!this.topicController?.eligible(target, config) || resolveBinding(target.chatId, config.bindings, target.topicId)?.agentId !== state.agentId) return;
     return { ...target, agentId: state.agentId, sessionId: source.id };
@@ -439,13 +463,16 @@ export class SessionManager {
     const threads = this.configuredCollaborationThreads(config);
     const sessions: Endpoint[] = [];
     for (const [lane, state] of Object.entries(this.store.getAllSessions())) {
-      if (!config.agents[state.agentId]) continue;
+      if (!config.agents[state.agentId] || config.agents[state.agentId].workerRuntime || this.isWorkerLane(lane, state.agentId)) continue;
       if (!lane.startsWith("collaboration:")) threads.set(lane, state.agentId);
       if (state.bindingState === "bound") sessions.push({ address: { kind: "session", id: state.sessionId }, label: state.agentId });
     }
     return [
-      ...Object.keys(config.agents).map(id => ({ address: { kind: "agent" as const, id }, label: id })),
-      ...[...threads].map(([id, agentId]) => ({ address: { kind: "thread" as const, id }, label: agentId })),
+      ...Object.keys(config.agents)
+        .filter(id => !this.workerRoutes.has(id) && !config.agents[id].workerRuntime)
+        .map(id => ({ address: { kind: "agent" as const, id }, label: id })),
+      ...[...threads].filter(([id, agentId]) => !this.isWorkerLane(id, agentId) && !config.agents[agentId]?.workerRuntime)
+        .map(([id, agentId]) => ({ address: { kind: "thread" as const, id }, label: agentId })),
       ...sessions,
     ];
   }
@@ -482,6 +509,9 @@ export class SessionManager {
         agentId = entry[1].agentId;
       } else throw new Error("Terminal delivery belongs to its extension");
       if (!agentId || !config.agents[agentId]) throw new Error("Target agent unavailable");
+      if (config.agents[agentId].workerRuntime || this.isWorkerLane(lane, agentId)) {
+        throw new CollaborationDeliveryError("rejected", "collaboration is unavailable for worker-routed sessions");
+      }
       const stored = states[lane];
       if (stored && stored.bindingState !== "bound") throw new Error("Target requires owner recovery");
       expected = stored?.sessionId;
@@ -820,6 +850,7 @@ export class SessionManager {
       return this.publishPreseededBinding(chatId, agentId, agent, undefined, location);
     }
 
+    if (stored.bindingState === "worker") throw new Error("Worker binding requires its exact worker route");
     if (strict && (stored.bindingState !== "bound" || stored.agentId !== agentId)) throw new Error("Exact target changed");
     if (stored.bindingState === "legacy-unresolved") {
       return this.publishPreseededBinding(
@@ -918,6 +949,7 @@ export class SessionManager {
    * Enforces maxConcurrentSessions via LRU eviction.
    */
   async getOrCreateSession(chatId: string, agentId: string, expectedId?: string, internal = false): Promise<ActiveSession> {
+    this.assertLocalLane(chatId, agentId);
     if (expectedId) {
       const state = this.store.getSession(chatId);
       if (state?.bindingState !== "bound" || state.sessionId !== expectedId) throw new Error("Exact target reset");
@@ -975,6 +1007,12 @@ export class SessionManager {
       freshConfig ??= this.getFreshConfig();
       return freshConfig;
     };
+    const assertUnchangedRoute = (config: BotConfig): void => {
+      const stored = this.store.getSession(chatId);
+      if (config.agents[agentId]?.workerRuntime || (stored && config.agents[stored.agentId]?.workerRuntime)) {
+        throw new AgentRuntimeError("route_changed", "Worker routing changed. Restart the controller before sending more messages to this lane.");
+      }
+    };
     const tryGetFreshConfigForActiveSession = (): BotConfig | undefined => {
       try {
         return getFreshConfig();
@@ -992,6 +1030,7 @@ export class SessionManager {
         if (expectedId && existing.sessionId === expectedId) return existing;
         const activeConfig = tryGetFreshConfigForActiveSession();
         const activeAgent = activeConfig?.agents[agentId];
+        if (activeConfig) assertUnchangedRoute(activeConfig);
         if (!activeConfig || (activeAgent && !runtimeSignatureChanged(existing, activeAgent))) {
           existing.lastActivity = Date.now();
           this.resetIdleTimer(chatId);
@@ -1008,6 +1047,8 @@ export class SessionManager {
         }
         existing = undefined;
       } else {
+        const activeConfig = tryGetFreshConfigForActiveSession();
+        if (activeConfig) assertUnchangedRoute(activeConfig);
         log.warn(
           "session-manager",
           `Closing active session for chat ${chatId}: agentId changed from "${existing.agentId}" to "${agentId}"`,
@@ -1043,6 +1084,7 @@ export class SessionManager {
 
     // Reload config fresh — pick up any changes to agents/sessionDefaults
     freshConfig = getFreshConfig();
+    assertUnchangedRoute(freshConfig);
     const agent = freshConfig.agents[agentId];
     if (!agent) {
       throw new Error(`Unknown agent: ${agentId}`);
@@ -1270,6 +1312,14 @@ export class SessionManager {
     text: string,
     options?: { internal?: boolean; expectedSession?: ActiveSession; expires?: number; consumed?: () => void; outputDone?: Promise<void>; imagePaths?: string[] },
   ): AsyncGenerator<StreamLine> {
+    if (this.isWorkerLane(chatId, agentId)) {
+      if (options?.internal || options?.expectedSession) {
+        throw new AgentRuntimeError("unsupported_route", "Internal delivery is unavailable for worker-routed sessions.");
+      }
+      if (options?.imagePaths?.length) throw new AgentRuntimeError("unsupported_media", WORKER_MEDIA_UNSUPPORTED);
+      yield* this.sendWorkerMessage(chatId, agentId, text);
+      return;
+    }
     const session = options?.expectedSession ?? await this.getOrCreateSession(chatId, agentId);
 
     // Async channel: queue task pushes lines, generator yields them in real-time
@@ -1556,6 +1606,90 @@ export class SessionManager {
     }
   }
 
+  private async *sendWorkerMessage(chatId: string, agentId: string, text: string): AsyncGenerator<StreamLine> {
+    if (!this.acceptingSessionWork) throw new AgentRuntimeError("shutting_down", "Session manager is shutting down.");
+    const route = this.workerRoutes.get(agentId);
+    const stored = this.store.getSession(chatId);
+    if (stored && (stored.bindingState !== "worker" || stored.agentId !== agentId)) {
+      throw new AgentRuntimeError("binding_conflict", "This chat has an existing session binding. Moving its history to a worker is unsupported.");
+    }
+    if (!route) throw new AgentRuntimeError("route_missing", "This chat requires its configured worker route.");
+    if (this.workerTurns.has(chatId) || this.active.has(chatId) || this.sessionStartups.has(chatId)
+      || this.sessionTeardowns.has(chatId)) {
+      throw new AgentRuntimeError("busy", "This session is already processing or changing state.");
+    }
+    if (!text.trim()) throw new AgentRuntimeError("invalid_request", "The worker requires a nonempty text message.");
+
+    const turn: { client?: AgentRuntimeClient } = {};
+    this.workerTurns.set(chatId, turn);
+    const laneId = `chat-${createHash("sha256").update(chatId).digest("hex")}`;
+    try {
+      let client: AgentRuntimeClient;
+      let opened: AgentLaneState;
+      try {
+        client = turn.client = await AgentRuntimeClient.connect(route.socketPath, undefined, route);
+        if (!this.acceptingSessionWork) throw new AgentRuntimeError("shutting_down", "Session manager is shutting down.");
+        opened = await client.open(laneId, stored?.sessionId, agentId);
+      } catch (error) {
+        const code = error instanceof AgentRuntimeError ? error.code : "connection_failed";
+        throw new AgentRuntimeError(code, `The worker session could not be opened (${code}). This message was not submitted.`);
+      }
+      const handle = opened.handle;
+      if (opened.phase !== "ready" || handle.agentId !== agentId || handle.laneId !== laneId
+        || (stored && handle.sessionId !== stored.sessionId)) {
+        throw new AgentRuntimeError("binding_conflict", "The worker did not open the expected session. This message was not submitted.");
+      }
+      if (!stored && !this.store.compareAndSetSession(chatId, undefined, {
+        bindingState: "worker", agentId, chatId, sessionId: handle.sessionId, lastActivity: Date.now(),
+      })) {
+        throw new AgentRuntimeError("binding_conflict", "The session binding changed before the message could be submitted.");
+      }
+      if (opened.request && opened.request.outcome !== "settled") {
+        await client.close(handle);
+        throw new AgentRuntimeError("prior_interruption", "A previous worker turn was interrupted. The worker session requires operator inspection before more messages can run.");
+      }
+
+      const lines: StreamLine[] = [];
+      let wake: (() => void) | undefined;
+      let terminal: StreamLine | undefined;
+      let outcome: { state?: AgentLaneState; error?: unknown } | undefined;
+      const requestId = randomUUID();
+      const prompt = client.prompt(handle, requestId, text, line => {
+        // The relay stops at result. Hold it until the worker confirms settlement.
+        if (line.type === "result") terminal = line;
+        else lines.push(line);
+        wake?.();
+      });
+      const finish = (result: NonNullable<typeof outcome>) => {
+        outcome = result;
+        wake?.();
+      };
+      void prompt.completed.then(state => finish({ state }), error => finish({ error }));
+      while (!outcome || lines.length) {
+        if (lines.length) yield lines.shift()!;
+        else await new Promise<void>(resolve => { wake = resolve; });
+      }
+      if (outcome.error instanceof AgentRuntimeError && outcome.error.code === "busy") {
+        throw new AgentRuntimeError("busy", "The worker was busy and rejected this message before processing.");
+      }
+      if (outcome.state?.request?.outcome === "interrupted") {
+        throw new AgentRuntimeError("uncertain_outcome", "The worker reported an interrupted turn. The message may have been partially processed. Operator inspection is required before continuing.");
+      }
+      if (outcome.state?.request?.requestId !== requestId || outcome.state.request.outcome !== "settled" || !terminal) {
+        throw new AgentRuntimeUncertainError();
+      }
+      try {
+        await client.close(handle);
+      } catch {
+        throw new AgentRuntimeError("cleanup_unconfirmed", "The worker completed this turn, but cleanup could not be confirmed. The message was already processed.");
+      }
+      yield terminal;
+    } finally {
+      turn.client?.disconnect();
+      this.workerTurns.delete(chatId);
+    }
+  }
+
   /**
    * Attempt first-party Pi steering for an active turn. The returned promise is
    * true only after the existing stdout reader observes the exact correlated
@@ -1570,6 +1704,7 @@ export class SessionManager {
     onEnqueued?: () => void,
     imagePaths?: string[],
   ): Promise<boolean> {
+    if (this.isWorkerLane(chatId, agentId)) return Promise.resolve(false);
     const session = this.active.get(chatId);
     if (
       session?.internalTurn ||
@@ -1790,6 +1925,7 @@ export class SessionManager {
   beginShutdown(): void {
     if (!this.acceptingSessionWork) return;
     this.acceptingSessionWork = false;
+    for (const turn of this.workerTurns.values()) turn.client?.disconnect();
     for (const chatId of this.sessionStartups.keys()) {
       this.sessionGenerations.set(chatId, (this.sessionGenerations.get(chatId) ?? 0) + 1);
     }
@@ -1804,6 +1940,7 @@ export class SessionManager {
    * transcript during the child-exit await window.
    */
   async destroySession(chatId: string): Promise<void> {
+    this.assertLocalLane(chatId);
     const hadActiveSession = this.active.has(chatId);
     // Bump the startup generation BEFORE deleting store state so any in-flight
     // getOrCreateSession for this chat is superseded and cannot re-persist state.
@@ -1897,12 +2034,13 @@ export class SessionManager {
     agentId: string,
     config?: BotConfig,
   ): { resume: false } | { resume: true; sessionId: string; sessionFile: string } {
+    this.assertLocalLane(chatId, agentId);
     const stored = this.store.getSession(chatId);
     if (!stored) {
       return { resume: false };
     }
 
-    if (stored.bindingState === "legacy-unresolved") {
+    if (stored.bindingState !== "bound") {
       return { resume: false };
     }
 

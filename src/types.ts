@@ -27,6 +27,7 @@ export interface AgentConfig {
    */
   provider?: "pi";
   askAgent?: AskAgentConfig;
+  workerRuntime?: { socketPath: string; workerUid: number; controllerName: string };
   /** Explicit eligibility only; preferences start off and live in control data. */
   codexFast?: { provider: "openai-codex"; model: string };
 }
@@ -154,7 +155,17 @@ export interface UnresolvedLegacySessionState extends SessionStateBase {
   pendingRecoveryNotice?: never;
 }
 
-export type SessionState = BoundSessionState | UnresolvedLegacySessionState;
+export interface WorkerSessionState extends SessionStateBase {
+  bindingState: "worker";
+  sessionId: string;
+  sessionFile?: never;
+  workspaceRealpath?: never;
+  pendingRecoveryNotice?: never;
+  failedSessionId?: never;
+  legacyFailure?: never;
+}
+
+export type SessionState = BoundSessionState | UnresolvedLegacySessionState | WorkerSessionState;
 
 export interface SessionDefaults {
   idleTimeoutMs: number;

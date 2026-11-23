@@ -128,7 +128,7 @@ async function main(): Promise<void> {
   restoreThreadCache();
   restoreMessageIndex();
 
-  const sessionManager = new SessionManager(loadConfig);
+  const sessionManager = new SessionManager(loadConfig, undefined, undefined, { initialConfig: config });
   log.info("main", "Session manager initialized");
 
   // Track resources for shutdown

@@ -23,7 +23,7 @@ export interface AgentLaneState {
   contextDigest?: string;
 }
 export type AgentRuntimeOperation =
-  | { op: 'open'; laneId: string; expectedSessionId?: string }
+  | { op: 'open'; laneId: string; expectedSessionId?: string; expectedAgentId?: string }
   | { op: 'prompt'; handle: AgentLaneHandle; requestId: string; text: string }
   | { op: 'getState'; handle: AgentLaneHandle }
   | { op: 'abort'; handle: AgentLaneHandle; requestId: string }
