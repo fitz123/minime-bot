@@ -21,6 +21,8 @@ import { MINIME_BOT_PI_SESSION_AGENT_ID_ENV, NewlineOnlyJsonlSplitter, PiStartup
 import PQueue from "p-queue";
 import { CURRENT_SESSION_VERSION } from "@earendil-works/pi-coding-agent";
 import { collaborationTransport } from "../collaboration.js";
+import { loadConfig } from "../config.js";
+import { createTelegramBindingReload } from "../telegram-binding-reload.js";
 
 const TEST_DIR = join(tmpdir(), "minime-test-pi-spawn");
 const TEST_STORE_PATH = `${TEST_DIR}/sessions.json`;
@@ -568,6 +570,73 @@ describe("SessionManager exact Pi binding startup", () => {
       await manager.getOrCreateSession("218", "pi");
       assert.ok(existsSync(reserved));
     } finally { await manager.closeAll(); }
+  });
+
+  it("keeps a group spawn on the applied binding and last usable settings when disk is invalid", async t => {
+    const previousRoot = process.env.MINIME_CONTROL_WORKSPACE_ROOT;
+    process.env.MINIME_CONTROL_WORKSPACE_ROOT = TEST_DIR;
+    t.after(() => {
+      if (previousRoot === undefined) delete process.env.MINIME_CONTROL_WORKSPACE_ROOT;
+      else process.env.MINIME_CONTROL_WORKSPACE_ROOT = previousRoot;
+    });
+    const configPath = join(TEST_DIR, "config.yaml");
+    const instanceConfigPath = join(TEST_DIR, "instance.yaml");
+    writeFileSync(instanceConfigPath, "{}");
+    const initial = {
+      telegramTokenEnv: "SYNTHETIC_TELEGRAM_TOKEN",
+      agents: makeConfig().agents,
+      bindings: [{ chatId: -219, agentId: "pi", kind: "group" }, ...makeConfig().bindings],
+    };
+    writeFileSync(configPath, JSON.stringify(initial));
+    const readConfig = () => loadConfig(configPath, { instanceConfigPath, resolveSecrets: false });
+    const startup = readConfig();
+    const readCandidate = () => loadConfig(configPath, { instanceConfigPath, telegramBindingReload: true });
+    const telegramBindingReload = createTelegramBindingReload(startup, readConfig, readCandidate);
+    const manager = new SessionManager(readConfig, TEST_STORE_PATH, TEST_DIR, { initialConfig: startup, telegramBindingReload });
+
+    try {
+      writeFileSync(configPath, JSON.stringify({
+        ...initial,
+        bindings: makeConfig().bindings,
+        agents: { ...initial.agents, pi: { ...initial.agents.pi, model: "gpt-5.6-sol" } },
+      }));
+      await manager.getOrCreateSession("-219", "pi");
+      assert.equal(piSpawnCaptures.at(-1)?.agent.model, "gpt-5.6-sol");
+      assert.equal(piSpawnCaptures.at(-1)?.runtimeEnvOptions?.telegramRichAnswers, true);
+      await manager.closeSession("-219");
+
+      writeFileSync(configPath, "bindings: [");
+      assert.throws(() => telegramBindingReload.reload(() => {}), /Effective config or Telegram credential is invalid/);
+      await manager.getOrCreateSession("-219", "pi");
+      assert.equal(piSpawnCaptures.length, 2);
+      assert.equal(piSpawnCaptures.at(-1)?.agent.model, "gpt-5.6-sol");
+      assert.equal(piSpawnCaptures.at(-1)?.runtimeEnvOptions?.telegramRichAnswers, true);
+      await assert.rejects(manager.getOrCreateSession("discord:fixture", "pi"), /Flow sequence/);
+
+      const { pi, ...remainingAgents } = initial.agents;
+      const remainingBindings = makeConfig().bindings.filter(binding => binding.agentId !== "pi");
+      const workerRuntime = {
+        socketPath: "/synthetic/worker/socket",
+        workerUid: process.getuid?.() === 60001 ? 60002 : 60001,
+        controllerName: "fixture-controller",
+      };
+      writeFileSync(configPath, JSON.stringify({
+        ...initial,
+        bindings: remainingBindings,
+        agents: { ...remainingAgents, pi: { ...pi, workerRuntime } },
+      }));
+      await assert.rejects(manager.getOrCreateSession("-219", "pi"), /Worker routing changed/);
+      writeFileSync(configPath, "bindings: [");
+      await assert.rejects(manager.getOrCreateSession("-219", "pi"), /Worker routing changed/);
+
+      writeFileSync(configPath, JSON.stringify({
+        ...initial, bindings: remainingBindings, agents: remainingAgents,
+      }));
+      await assert.rejects(manager.getOrCreateSession("-219", "pi"), /Unknown agent: pi/);
+      assert.equal(piSpawnCaptures.length, 2);
+    } finally {
+      await manager.closeAll();
+    }
   });
 
   it("passes the private-topic flag only to eligible private Telegram topic spawns", async () => {

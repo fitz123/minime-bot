@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { on } from "node:events";
 import PQueue from "p-queue";
 import { resolveBinding } from "./telegram-binding.js";
+import type { TelegramBindingReload } from "./telegram-binding-reload.js";
 import { CollaborationDeliveryError, collaborationPrompt, collaborationTransport, type Delivery, type Endpoint } from "./collaboration.js";
 import type { Address } from "./collaboration.js";
 import { topicScopeEnabled, type PrivateTopicController, type TopicApply } from "./private-topics.js";
@@ -317,6 +318,7 @@ export class SessionManager {
   private sessionStartups: Map<string, SessionStartup> = new Map();
   private store: SessionStore;
   private loadConfig: () => BotConfig;
+  private telegramBindingReload?: TelegramBindingReload;
   private logDir: string;
   private startupTimeoutMs: number;
   private transport?: ReturnType<typeof collaborationTransport>;
@@ -328,9 +330,10 @@ export class SessionManager {
     loadConfig: () => BotConfig,
     storePath?: string,
     logDir?: string,
-    options?: { startupTimeoutMs?: number; initialConfig?: BotConfig },
+    options?: { startupTimeoutMs?: number; initialConfig?: BotConfig; telegramBindingReload?: TelegramBindingReload },
   ) {
     this.loadConfig = loadConfig;
+    this.telegramBindingReload = options?.telegramBindingReload;
     // Validate config at boot — fail fast if config is broken
     const startupConfig = options?.initialConfig ?? loadConfig();
     this.transport = collaborationTransport(startupConfig);
@@ -459,7 +462,8 @@ export class SessionManager {
   }
 
   collaborationEndpoints(): Endpoint[] {
-    const config = this.getFreshConfig();
+    const fresh = this.getFreshConfig();
+    const config = this.telegramBindingReload?.withGroupBindings(fresh) ?? fresh;
     const threads = this.configuredCollaborationThreads(config);
     const sessions: Endpoint[] = [];
     for (const [lane, state] of Object.entries(this.store.getAllSessions())) {
@@ -485,7 +489,8 @@ export class SessionManager {
     let session: ActiveSession;
     let generation: number;
     try {
-      const config = this.getFreshConfig();
+      const fresh = this.getFreshConfig();
+      const config = this.telegramBindingReload?.withGroupBindings(fresh) ?? fresh;
       const states = this.store.getAllSessions();
       if (message.to.kind === "agent") {
         agentId = message.to.id;
@@ -551,11 +556,11 @@ export class SessionManager {
     }
   }
 
-  /**
-   * Load fresh config for use at each decision point (spawn, eviction, idle timer).
-   * On failure, propagates the error — no cache fallback.
-   */
-  private getFreshConfig(): BotConfig {
+  /** Group session startup can use the last usable config from the running transport. */
+  private getFreshConfig(chatId?: string): BotConfig {
+    if (this.telegramBindingReload && chatId && /^-\d+(?::\d+)?$/.test(chatId)) {
+      return this.telegramBindingReload.loadGroupConfig();
+    }
     try {
       const config = this.loadConfig();
       log.debug("session-manager", "config: reload ok");
@@ -1004,7 +1009,7 @@ export class SessionManager {
 
     let freshConfig: BotConfig | undefined;
     const getFreshConfig = (): BotConfig => {
-      freshConfig ??= this.getFreshConfig();
+      freshConfig ??= this.getFreshConfig(chatId);
       return freshConfig;
     };
     const assertUnchangedRoute = (config: BotConfig): void => {

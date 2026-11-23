@@ -569,6 +569,13 @@ export class MessageQueue {
     return this.queues.get(chatId)?.collectEntries.length ?? 0;
   }
 
+  hasWorkWhere(matches: (chatId: string) => boolean): boolean {
+    for (const [chatId, state] of this.queues) {
+      if ((state.busy || state.pendingTexts.length > 0 || state.collectEntries.length > 0) && matches(chatId)) return true;
+    }
+    return false;
+  }
+
   /** Clear a chat's queue state (e.g., on /reconnect). */
   clear(chatId: string): void {
     const state = this.queues.get(chatId);

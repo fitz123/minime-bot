@@ -9,8 +9,9 @@ import { loadConfig, resolveAskAgentPolicy, validateAgent } from "../config.js";
 import { loadDefaultDelivery, main as runCron } from "../cron-runner.js";
 import { SessionManager } from "../session-manager.js";
 import { SessionStore } from "../session-store.js";
+import { createTelegramBindingReload } from "../telegram-binding-reload.js";
 import { createTelegramBot } from "../telegram-bot.js";
-import type { BotConfig } from "../types.js";
+import type { BotConfig, TelegramBinding } from "../types.js";
 
 const workerChat = 10001;
 const localChat = 10002;
@@ -44,8 +45,8 @@ function setup(t: TestContext) {
   return { root, storePath, config };
 }
 
-function transport(t: TestContext, config: BotConfig, manager: SessionManager) {
-  const { bot, messageQueue } = createTelegramBot(config, manager);
+function transport(t: TestContext, config: BotConfig, manager: SessionManager, options?: Parameters<typeof createTelegramBot>[2]) {
+  const { bot, messageQueue, reloadGroupBindings } = createTelegramBot(config, manager, options);
   t.after(() => { messageQueue.clearAll(); });
   bot.botInfo = { id: 100, is_bot: true, first_name: "Fixture", username: "fixture_bot" } as UserFromGetMe;
   const sent: string[] = [];
@@ -58,19 +59,21 @@ function transport(t: TestContext, config: BotConfig, manager: SessionManager) {
     return Promise.resolve({ ok: true, result: { message_id: 1 } }) as never;
   });
   let updateId = 0;
-  async function receive(text: string, chat = workerChat, extra = {}) {
+  async function receive(text: string, chat = workerChat, extra = {}, flush = true) {
     const id = ++updateId;
     await bot.handleUpdate({
       update_id: id,
       message: {
-        message_id: id, chat: { id: chat, type: "private", first_name: "Fixture" },
-        from: { id: chat, is_bot: false, first_name: "Fixture" },
+        message_id: id, chat: chat < 0
+          ? { id: chat, type: "supergroup", title: "Fixture group" }
+          : { id: chat, type: "private", first_name: "Fixture" },
+        from: { id: Math.abs(chat), is_bot: false, first_name: "Fixture" },
         date: Math.floor(Date.now() / 1000), text, ...extra,
       },
     });
-    messageQueue.flushPending();
+    if (flush) messageQueue.flushPending();
   }
-  return { receive, waitForIdle: () => messageQueue.waitForIdle(), sent };
+  return { receive, reloadGroupBindings, messageQueue, waitForIdle: () => messageQueue.waitForIdle(), sent };
 }
 
 function workerClient(t: TestContext, hooks: Partial<Pick<AgentRuntimeClient, "open" | "prompt" | "close" | "disconnect">> = {}) {
@@ -140,6 +143,219 @@ test("ordinary Telegram text uses the bound worker and reopens its exact session
   assert.equal(second.sent[0], "Worker reply");
   assert.equal(calls[6], `open:${workerSession}`);
   assert.deepEqual(new SessionStore(storePath).getSession(String(workerChat)), saved);
+});
+
+test("a running Telegram handler applies only validated effective group routes", async t => {
+  const { root, storePath, config } = setup(t);
+  const configPath = join(root, "config.yaml");
+  const localPath = join(root, "config.local.yaml");
+  const instanceConfigPath = join(root, "instance.yaml");
+  const sopsFile = join(root, "fixture-secrets.yaml");
+  writeFileSync(sopsFile, "{}");
+  let telegramCredential = "1:synthetic";
+  const secretExecFileSync = t.mock.fn((_file: string, args: readonly string[]) => {
+    return args[2] === '["telegram"]["token"]' ? telegramCredential : "synthetic-trigger-bearer";
+  });
+  const keep = { chatId: -101, agentId: "satellite", kind: "group", label: "keep" } as const;
+  const remove = { ...keep, chatId: -102, label: "remove" };
+  const add = { ...keep, chatId: -103, label: "add" };
+  const triggerGroup = { ...keep, chatId: -104, label: "trigger", agentId: "local", topicId: 0 };
+  const dm = config.bindings[1];
+  const triggerInput = { chatId: triggerGroup.chatId, threadId: 0, port: 31001, bearerSopsKey: "trigger.bearer" };
+  const initial = [keep, remove, triggerGroup, dm];
+  const next = [keep, add, triggerGroup, dm];
+  const staged = { ...keep, chatId: -105, label: "staged" };
+  const effectiveAdd = -203;
+  const topic = { message_thread_id: 7, is_topic_message: true };
+  writeFileSync(configPath, JSON.stringify({
+    agents: config.agents, bindings: initial, sessionDefaults: config.sessionDefaults,
+    secrets: { sopsFile }, telegramTokenSopsKey: "telegram.token", triggerInput,
+  }));
+  writeFileSync(instanceConfigPath, "{}");
+  const loadOptions = { instanceConfigPath, secretExecFileSync };
+  const readConfig = t.mock.fn(() => loadConfig(configPath, { ...loadOptions, resolveSecrets: false }));
+  const readCandidate = t.mock.fn(() => loadConfig(configPath, { ...loadOptions, telegramBindingReload: true }));
+  const startup = loadConfig(configPath, loadOptions);
+  const bindingReload = createTelegramBindingReload(startup, readConfig, readCandidate);
+  const manager = new SessionManager(readConfig, storePath, undefined, { initialConfig: startup, telegramBindingReload: bindingReload });
+  t.after(() => manager.closeAll());
+  const { calls, connect } = workerClient(t);
+  const prepareLocal = t.mock.method(manager, "getOrCreateSession");
+  const holdInput = t.mock.method(manager, "holdHumanInput");
+  const chat = transport(t, startup, manager, { bindingReload });
+  const reload = chat.reloadGroupBindings!;
+
+  async function expectWorker(text: string, id: number, extra = {}) {
+    const replied = chat.sent.length;
+    const connections = connect.mock.callCount();
+    const configReads = readConfig.mock.callCount();
+    const candidateReads = readCandidate.mock.callCount();
+    const secretReads = secretExecFileSync.mock.callCount();
+    await chat.receive(text, id, extra);
+    await chat.waitForIdle();
+    assert.equal(connect.mock.callCount(), connections + 1);
+    assert.equal(chat.sent.length, replied + 1);
+    assert.equal(chat.sent.at(-1), "Worker reply");
+    assert.equal(readConfig.mock.callCount(), configReads);
+    assert.equal(readCandidate.mock.callCount(), candidateReads);
+    assert.equal(secretExecFileSync.mock.callCount(), secretReads);
+    assert.ok(calls.filter(call => call.startsWith("prompt:")).at(-1)?.endsWith(text));
+  }
+  async function expectDrop(id: number, extra = {}, admitted = false) {
+    const replied = chat.sent.length;
+    const connections = connect.mock.callCount();
+    const admittedUpdates = holdInput.mock.callCount();
+    await chat.receive("ordinary dropped message", id, extra);
+    await chat.waitForIdle();
+    assert.equal(holdInput.mock.callCount(), admittedUpdates + Number(admitted));
+    assert.equal(connect.mock.callCount(), connections);
+    assert.equal(chat.sent.length, replied);
+    assert.equal(chat.messageQueue.getPendingCount(String(id)), 0);
+  }
+  function writeCandidate(bindings: TelegramBinding[], extra = {}) {
+    writeFileSync(localPath, JSON.stringify({ bindings, ...extra }));
+  }
+
+  await expectWorker("initial unchanged group", keep.chatId);
+  await expectWorker("initial group to remove", remove.chatId);
+  writeCandidate(next);
+  writeFileSync(instanceConfigPath, JSON.stringify({
+    bindingIdentityOverrides: { add: { chatId: effectiveAdd, topicId: topic.message_thread_id } },
+  }));
+  await expectDrop(effectiveAdd, topic);
+  await expectWorker("removed only after explicit reload", remove.chatId);
+  secretExecFileSync.mock.resetCalls();
+  assert.equal(reload(), 3);
+  assert.deepEqual(secretExecFileSync.mock.calls.map(call => call.arguments[1][2]), ['["telegram"]["token"]']);
+  await expectWorker("new effective topic", effectiveAdd, topic);
+  assert.equal(new SessionStore(storePath).getSession(`${effectiveAdd}:7`)?.bindingState, "worker");
+  await expectWorker("unchanged after reload", keep.chatId);
+  await expectDrop(effectiveAdd, {}, true);
+  await expectDrop(add.chatId, topic);
+  await expectDrop(remove.chatId);
+
+  const command = { entities: [{ type: "bot_command", offset: 0, length: 6 }] };
+  const handling = chat.receive("/start", effectiveAdd, { ...topic, ...command });
+  assert.throws(reload, /Telegram is processing an update/);
+  await handling;
+  assert.match(chat.sent.at(-1) ?? "", /route text to the worker for "satellite"/);
+  const replies = chat.sent.length;
+  await chat.receive("/start", remove.chatId, command);
+  assert.equal(chat.sent.length, replies);
+
+  const invalidConfig = /Effective config or Telegram credential is invalid/;
+  const invalidCandidates: Array<[string, () => void, RegExp]> = [
+    ["malformed YAML", () => writeFileSync(localPath, "bindings: ["), invalidConfig],
+    ["non-list bindings", () => writeFileSync(localPath, "bindings: { kind: group }"), invalidConfig],
+    ["malformed topic", () => writeFileSync(localPath, JSON.stringify({
+      bindings: [...next, { ...staged, topicId: "7" }],
+    })), invalidConfig],
+    ["private chat ID in a group route", () => writeCandidate([...next, {
+      ...staged, chatId: -staged.chatId,
+    }]), invalidConfig],
+    ["unknown topic agent", () => writeCandidate([...next, {
+      ...staged, topics: [{ topicId: 7, agentId: "missing" }],
+    }]), invalidConfig],
+    ["disk-only topic agent", () => writeCandidate([...next, {
+      ...staged, topics: [{ topicId: 7, agentId: "diskOnly" }],
+    }], { agents: { diskOnly: config.agents.local } }), /unavailable in the running process/],
+    ["changed worker route", () => writeCandidate([...next, staged], {
+      agents: { satellite: { workerRuntime: { socketPath: "/synthetic/worker/replacement" } } },
+    }), /worker route changed since startup/],
+    ["changed running trigger route", () => writeCandidate([keep, add, dm, staged], {
+      triggerInput: { ...triggerInput, chatId: dm.chatId },
+    }), /running trigger input binding requires a restart/],
+    ["changed global mention policy", () => writeCandidate([...next, staged], {
+      sessionDefaults: { requireMention: true },
+    }), /global mention policy requires a restart/],
+    ["duplicate chat binding", () => writeCandidate([...next, staged, { ...staged, label: "duplicate" }]),
+      /Duplicate Telegram group chat\/topic route/],
+    ["duplicate nested and direct topic", () => writeCandidate([...next,
+      { ...staged, topics: [{ topicId: 9 }] }, { ...staged, label: "duplicate", topicId: 9 },
+    ]), /Duplicate Telegram group chat\/topic route/],
+    ["direct reassignment", () => writeCandidate([
+      ...next.map(binding => binding === keep ? { ...keep, agentId: "local" } : binding), staged,
+    ]), /reassigning an existing Telegram group binding requires a restart/],
+    ["topic addition reassigns an existing fallback", () => writeCandidate([
+      ...next, staged, { ...keep, label: "override", topicId: 9, agentId: "local" },
+    ]), /Reassigning an existing Telegram group chat\/topic route requires a restart/],
+    ["changed DM", () => writeCandidate([...next.filter(binding => binding.kind === "group"), staged, {
+      ...dm, chatId: dm.chatId + 1,
+    }]), /DM binding changes require a restart/],
+  ];
+  for (const [name, write, error] of invalidCandidates) {
+    write();
+    assert.throws(reload, error, name);
+    await expectWorker(`unchanged after ${name}`, keep.chatId);
+    await expectDrop(staged.chatId);
+  }
+  writeCandidate([...next, staged]);
+  telegramCredential = "2:synthetic-replacement";
+  assert.throws(reload, { message: "Telegram credential differs from the running transport" });
+  await expectDrop(staged.chatId);
+  await expectWorker("unchanged after credential mismatch", keep.chatId);
+  telegramCredential = "1:synthetic";
+
+  const instance = readFileSync(instanceConfigPath);
+  writeFileSync(instanceConfigPath, JSON.stringify({
+    bindingIdentityOverrides: { add: { chatId: effectiveAdd }, absent: { chatId: -299 } },
+  }));
+  assert.throws(reload, invalidConfig);
+  await expectDrop(staged.chatId);
+  await expectWorker("added route survives rejected reloads", effectiveAdd, topic);
+  await expectDrop(remove.chatId);
+  assert.equal(prepareLocal.mock.callCount(), 0);
+  writeFileSync(instanceConfigPath, instance);
+
+  await chat.receive("work already queued for the worker", keep.chatId, topic, false);
+  writeCandidate(next.filter(binding => binding !== keep));
+  assert.throws(reload, /removed Telegram lane still has accepted work/);
+  chat.messageQueue.flushPending();
+  await chat.waitForIdle();
+  assert.ok(calls.filter(call => call.startsWith("prompt:")).at(-1)?.endsWith("work already queued for the worker"));
+  assert.equal(reload(), 2);
+  await expectDrop(keep.chatId, topic);
+  writeCandidate([...next.filter(binding => binding !== keep), { ...keep, agentId: "local" }]);
+  assert.throws(reload, /reassigning an existing Telegram group binding requires a restart/);
+  await expectDrop(keep.chatId, topic);
+});
+
+test("the running Telegram handler requires another ready conversational transport before removing its last binding", t => {
+  const { root, storePath, config } = setup(t);
+  const configPath = join(root, "config.yaml");
+  const instanceConfigPath = join(root, "instance.yaml");
+  const sopsFile = join(root, "fixture-secrets.yaml");
+  writeFileSync(instanceConfigPath, "{}");
+  writeFileSync(sopsFile, "{}");
+  const base = {
+    agents: config.agents,
+    secrets: { sopsFile },
+    telegramTokenSopsKey: "telegram.token",
+    discord: { tokenEnv: "SYNTHETIC_DISCORD_TOKEN", bindings: [
+      { guildId: "fixture", channelId: "fixture", agentId: "local", kind: "channel" },
+    ] },
+  };
+  const group = { chatId: -108, agentId: "satellite", kind: "group" };
+  writeFileSync(configPath, JSON.stringify({ ...base, bindings: [group] }));
+  const readConfig = () => loadConfig(configPath, { instanceConfigPath, resolveSecrets: false });
+  const readCandidate = () => loadConfig(configPath, {
+    instanceConfigPath,
+    telegramBindingReload: true,
+    secretExecFileSync: () => "1:synthetic",
+  });
+  const startup = readCandidate();
+  const bindingReload = createTelegramBindingReload(startup, readConfig, readCandidate);
+  const manager = new SessionManager(readConfig, storePath, undefined, { initialConfig: startup, telegramBindingReload: bindingReload });
+  t.after(() => manager.closeAll());
+  let otherReady = false;
+  const chat = transport(t, startup, manager, { bindingReload, hasOtherActivePlatform: () => otherReady });
+  writeFileSync(configPath, JSON.stringify({ ...base, bindings: [] }));
+
+  assert.throws(chat.reloadGroupBindings!, /last binding without another running conversational transport/);
+  assert.equal(bindingReload.getBindings()[0].chatId, group.chatId);
+  otherReady = true;
+  assert.equal(chat.reloadGroupBindings!(), 0);
+  assert.deepEqual(bindingReload.getBindings(), []);
 });
 
 test("worker connection failure cannot call local Pi, and another agent still follows local preparation and relay", async t => {
