@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 2026.11.11
+
+- Support opt-in worker routing for new text conversations; local routing stays the default (#279).
+- Clarify outbox delivery for suppressed responses (#278).
+
 ## 2026.11.9
 
 - Add opt-in immutable shared behavioral resources across managed Pi entrypoints, keeping private context separate (#252, #253).
