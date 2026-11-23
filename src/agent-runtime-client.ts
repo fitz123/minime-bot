@@ -70,9 +70,9 @@ export class AgentRuntimeClient {
     } catch (error) { socket.destroy(); throw error; }
   }
 
-  open(laneId: string, expectedSessionId?: string): Promise<AgentLaneState> {
+  open(laneId: string, expectedSessionId?: string, expectedAgentId?: string): Promise<AgentLaneState> {
     if (expectedSessionId !== undefined && !expectedSessionId.trim()) throw new AgentRuntimeError('invalid_request', 'Expected session identity must be nonempty');
-    return this.call({ op: 'open', laneId, ...(expectedSessionId !== undefined ? { expectedSessionId } : {}) }) as Promise<AgentLaneState>;
+    return this.call({ op: 'open', laneId, expectedSessionId, expectedAgentId }) as Promise<AgentLaneState>;
   }
   getState(handle: AgentLaneHandle): Promise<AgentLaneState> {
     return this.call({ op: 'getState', handle }) as Promise<AgentLaneState>;

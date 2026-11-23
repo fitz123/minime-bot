@@ -338,6 +338,9 @@ export class AgentRuntimeWorker {
       void this.shutdown().catch(() => { process.exitCode = 1; }); return;
     }
     if (r.op === 'open') {
+      if (r.expectedAgentId !== undefined && r.expectedAgentId !== this.descriptor.agentId) {
+        return fail('agent_mismatch', 'Endpoint belongs to a different agent');
+      }
       const state = await this.open(r.laneId, r.expectedSessionId, socket);
       this.send(socket, { version: 1, type: 'response', id: r.id, state }); return;
     }
@@ -381,12 +384,13 @@ function validateRequest(value: unknown): AgentRuntimeRequest {
   const r = value as AgentRuntimeRequest;
   if (!r || r.version !== 1 || typeof r.id !== 'string' || !r.id || r.id.length > 100) throw new Error('Invalid request');
   const fields: Record<string, string[]> = {
-    open: ['laneId', 'expectedSessionId'], prompt: ['handle', 'requestId', 'text'],
+    open: ['laneId', 'expectedSessionId', 'expectedAgentId'], prompt: ['handle', 'requestId', 'text'],
     getState: ['handle'], abort: ['handle', 'requestId'], close: ['handle'], shutdown: [],
   };
   if (!Object.hasOwn(fields, r.op) || Object.keys(r).some(k => !['version', 'id', 'op', ...fields[r.op]].includes(k))) throw new Error('Unsupported request field');
   if (r.op === 'open') {
     if (typeof r.laneId !== 'string' || !r.laneId || r.laneId.length > 200
+      || (r.expectedAgentId !== undefined && (typeof r.expectedAgentId !== 'string' || !/^[a-zA-Z0-9_-]{1,80}$/.test(r.expectedAgentId)))
       || (r.expectedSessionId !== undefined && (typeof r.expectedSessionId !== 'string' || !r.expectedSessionId.trim() || r.expectedSessionId.length > 200))) throw new Error('Invalid lane');
   } else if (r.op !== 'shutdown') {
     const h = r.handle;

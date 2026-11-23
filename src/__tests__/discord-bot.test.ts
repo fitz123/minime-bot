@@ -75,6 +75,7 @@ describe("Discord media failure handling", () => {
       bindings: [{ channelId: "channel-1", guildId: "guild-1", agentId: "main", kind: "channel", requireMention: false }],
     };
     const sessionManager = {
+      isWorkerLane: () => false,
       sendSessionMessage: () => { throw new Error("unexpected"); },
     } as unknown as SessionManager;
 
@@ -162,6 +163,7 @@ describe("Discord shutdown", () => {
       bindings: [{ channelId: "channel-1", guildId: "guild-1", agentId: "main", kind: "channel", requireMention: false }],
     };
     const sessionManager = {
+      isWorkerLane: () => false,
       sendSessionMessage: () => { throw new Error("unexpected"); },
     } as unknown as SessionManager;
     let ready: DiscordBotResult | undefined;
@@ -227,6 +229,7 @@ describe("Discord shutdown", () => {
       bindings: [{ channelId: "channel-1", guildId: "guild-1", agentId: "main", kind: "channel", requireMention: false }],
     };
     const sessionManager = {
+      isWorkerLane: () => false,
       sendSessionMessage: () => { throw new Error("unexpected"); },
     } as unknown as SessionManager;
     let created: DiscordBotResult | undefined;
@@ -282,6 +285,7 @@ describe("Discord shutdown", () => {
       bindings: [{ channelId: "channel-1", guildId: "guild-1", agentId: "main", kind: "channel", requireMention: false }],
     };
     const sessionManager = {
+      isWorkerLane: () => false,
       sendSessionMessage: () => { throw new Error("unexpected"); },
     } as unknown as SessionManager;
     let resolveReply!: () => void;
@@ -364,6 +368,7 @@ describe("Discord recovery notice delivery", () => {
     };
     const events: string[] = [];
     const sessionManager = {
+      isWorkerLane: () => false,
       getOrCreateSession: async () => {
         events.push("prepare");
         return {};
@@ -444,6 +449,7 @@ describe("Discord stale-message handling", () => {
     };
     let sessionCalls = 0;
     const sessionManager = {
+      isWorkerLane: () => false,
       sendSessionMessage: () => { sessionCalls++; throw new Error("unexpected"); },
     } as unknown as SessionManager;
 
@@ -636,6 +642,7 @@ describe("Discord slash command status wiring", () => {
       ],
     };
     const sessionManager = {
+      isWorkerLane: () => false,
       getActiveCount: () => 1,
       getSessionHealth: (key: string) => {
         calls.push(`getSessionHealth:${key}`);

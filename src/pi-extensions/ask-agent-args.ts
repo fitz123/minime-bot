@@ -67,6 +67,7 @@ export type AskAgentErrorCode =
   | "context_failed"
   | "not_enabled"
   | "denied"
+  | "unsupported_runtime"
   | "invalid_request"
   | "config_unavailable"
   | "spawn_unavailable";

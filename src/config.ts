@@ -1,6 +1,6 @@
 import { readFileSync, existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { resolve, dirname, isAbsolute } from "node:path";
+import { resolve, dirname, isAbsolute, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import type { BotConfig, AgentConfig, AskAgentConfig, TelegramBinding, TopicOverride, SessionDefaults, DiscordBinding, DiscordChannelOverride, DiscordConfig, TriggerInputConfig } from "./types.js";
@@ -19,7 +19,7 @@ const ASK_AGENT_WILDCARD = "*";
 
 export type AskAgentPolicyDecision =
   | { allowed: true }
-  | { allowed: false; code: "not_enabled" | "denied"; reason: string };
+  | { allowed: false; code: "not_enabled" | "denied" | "unsupported_runtime"; reason: string };
 
 function askAgentListMatches(list: readonly string[] | undefined, agentId: string): boolean {
   return list?.includes(ASK_AGENT_WILDCARD) === true || list?.includes(agentId) === true;
@@ -29,6 +29,9 @@ export function resolveAskAgentPolicy(
   caller: AgentConfig,
   target: AgentConfig,
 ): AskAgentPolicyDecision {
+  if (caller.workerRuntime || target.workerRuntime) {
+    return { allowed: false, code: "unsupported_runtime", reason: "Ask-agent is unavailable for worker-routed agents" };
+  }
   if (caller.askAgent?.enabled !== true) {
     return {
       allowed: false,
@@ -460,6 +463,22 @@ export function validateAgent(
   }
   const obj = raw as Record<string, unknown>;
   const askAgent = validateAskAgentConfig(obj.askAgent, id, knownAgentIds);
+  let workerRuntime: AgentConfig["workerRuntime"];
+  if (obj.workerRuntime !== undefined) {
+    const worker = obj.workerRuntime;
+    if (!isConfigRecord(worker)
+      || Object.keys(worker).some(key => !["socketPath", "workerUid", "controllerName"].includes(key))
+      || typeof worker.socketPath !== "string" || !isAbsolute(worker.socketPath)
+      || normalize(worker.socketPath) !== worker.socketPath || /[\u0000-\u001f\u007f]/u.test(worker.socketPath)
+      || Buffer.byteLength(worker.socketPath) >= 104
+      || typeof worker.workerUid !== "number" || !Number.isSafeInteger(worker.workerUid)
+      || worker.workerUid <= 0 || worker.workerUid === process.getuid?.()
+      || typeof worker.controllerName !== "string" || !/^[a-zA-Z_][a-zA-Z0-9_.-]*$/.test(worker.controllerName)
+      || !/^[a-zA-Z0-9_-]{1,80}$/.test(id)) {
+      throw new Error(`Agent "${id}" workerRuntime requires a canonical socketPath, a distinct nonroot workerUid, and a controllerName`);
+    }
+    workerRuntime = { socketPath: worker.socketPath, workerUid: worker.workerUid, controllerName: worker.controllerName };
+  }
   if (Object.hasOwn(obj, "behavioralFoundation") || Object.hasOwn(obj, "behavioralFoundationRoot")) {
     throw new Error(`Agent "${id}": behavioralFoundation.root is deployment-global, not a per-agent setting`);
   }
@@ -538,6 +557,7 @@ export function validateAgent(
     provider: "pi",
     askAgent,
     codexFast,
+    ...(workerRuntime ? { workerRuntime } : {}),
   };
 }
 
@@ -842,6 +862,7 @@ const TRIGGER_INPUT_KEYS = new Set([
 function validateTriggerInput(
   raw: unknown,
   bindings: TelegramBinding[],
+  agents: BotConfig["agents"],
   telegramToken: string | undefined,
   sopsFile: string | undefined,
   options: LoadConfigOptions,
@@ -902,9 +923,11 @@ function validateTriggerInput(
   if (!telegramToken) {
     throw new Error("triggerInput requires a resolved Telegram token");
   }
-  if (!resolveBinding(chatId, bindings, threadId)) {
+  const binding = resolveBinding(chatId, bindings, threadId);
+  if (!binding) {
     throw new Error("triggerInput chatId/threadId does not match a configured Telegram binding");
   }
+  if (agents[binding.agentId]?.workerRuntime) throw new Error("Trigger input cannot target a worker-routed agent");
 
   const bearer = options.resolveSecrets === false
     ? CONFIGURED_SECRET_PLACEHOLDER
@@ -1079,6 +1102,7 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
   const triggerInput = validateTriggerInput(
     raw.triggerInput,
     bindings,
+    agents,
     telegramToken,
     sopsFile,
     options,

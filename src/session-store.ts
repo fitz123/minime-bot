@@ -86,6 +86,7 @@ const UNRESOLVED_STATE_KEYS = new Set([
   "failedSessionId",
   "legacyFailure",
 ]);
+const WORKER_STATE_KEYS = new Set([...BASE_STATE_KEYS, "sessionId"]);
 const LEGACY_STATE_KEYS = new Set([
   "sessionId",
   "chatId",
@@ -275,6 +276,14 @@ function parsePendingRecoveryNotice(value: unknown): PendingSessionRecoveryNotic
 
 function parseSessionState(value: unknown, key: string): SessionState {
   const state = record(value, `session "${key}"`);
+  if (state.bindingState === "worker") {
+    assertExactKeys(state, WORKER_STATE_KEYS, "worker session");
+    return {
+      bindingState: "worker",
+      sessionId: boundedString(state.sessionId, "sessionId", MAX_SESSION_ID_LENGTH),
+      ...baseState(state, key),
+    };
+  }
   if (state.bindingState === "bound") {
     assertExactKeys(state, BOUND_STATE_KEYS, "bound session");
     const sessionFile = normalizedAbsolutePath(state.sessionFile, "sessionFile");
@@ -574,6 +583,9 @@ export class SessionStore {
    */
   migrateLegacySessions(config: BotConfig, options: LegacySessionMigrationOptions = {}): boolean {
     if (!this.legacyData || !this.legacySourceBytes) return false;
+    if (Object.values(this.legacyData).some(state => config.agents[state.agentId]?.workerRuntime)) {
+      throw new Error("Complete the local legacy session-store migration before enabling worker routing for an agent with legacy history");
+    }
     const migrated: SessionStoreData = {};
     type AgentEvidence =
       | {

@@ -1,16 +1,64 @@
-# Standalone agent execution core (issue 252)
+# Agent execution worker
 
 `minime-agent-runtime --descriptor /absolute/readonly-descriptor.json` is an
 inert, separately launched execution worker. Importing its module starts
 nothing. Installation, account provisioning, launch policy, and supervision
-belong to the host administrator/controller. The bot's production transports
-and SessionManager still use their existing path. This increment neither
-activates isolation nor completes the migration.
+belong to the host administrator. Normal Telegram and Discord text can opt in
+per agent. Existing configurations continue to use local Pi.
 
 The earlier `scripts/probes/user-isolation-canary.mjs` established a physical
 cross-UID macOS mechanism with an offline provider. That probe and its approved
 stage are separate from this reusable core. This core has not been installed
 or exercised as a cross-UID deployment.
+
+## Opt-in text routing
+
+Add a `workerRuntime` object to the existing agent entry in the bot's canonical
+configuration. The example uses a synthetic endpoint and identity.
+
+```yaml
+agents:
+  satellite:
+    workspaceCwd: /example/previous-workspace
+    model: example/model
+    workerRuntime:
+      socketPath: /example/worker/agent.sock
+      workerUid: 60001
+      controllerName: example-controller
+```
+
+The controller selects routes at startup. Change the route with the controller
+and the agent's scheduled jobs stopped. Use a dedicated worker for this
+controller's session store. The worker UID must be distinct and nonroot. The
+descriptor's `agentId` must match the config map key. Use the descriptor for the
+worker's model, tools, workspace, context, and auth. The existing controller
+model and workspace fields remain required for the agent config.
+
+Use a fresh transport lane with no prior local binding, such as a new thread
+with the existing agent binding. A lane with a local session binding rejects
+routing before opening the worker and retains its history. An ID-only legacy
+store with history for the selected agent must first complete the existing
+local store migration with worker routing off. The controller store records
+an opaque worker session ID and route metadata. Reopen requires that exact
+identity. If the route is removed or the worker binding disappears, the lane
+fails closed. Controller versions predating the worker binding record cannot
+read a store containing that record.
+
+The worker opens Pi for a turn, confirms settlement, and closes Pi before the
+transport sends the final answer. The queue collects later text during a turn
+and sends it as a separate follow-up. A missing worker fails the message without
+starting local Pi. A lost completion is reported as uncertain and the message
+is never automatically replayed. If the next exact open reports an interrupted
+turn, further prompts require operator inspection. There is no chat command for
+clearing that worker state.
+
+This route handles text. Attachments and voice are rejected before download or
+transcription. Outbox delivery, live steering, passive echo steering, private
+topic tools, Fast controls, and session cleanup/reconnect commands are
+unavailable on worker lanes. Collaboration and ask-agent reject worker agents,
+and trigger input cannot target one. Scheduled LLM and script jobs for the agent
+reject before execution or outbox replay. Transport bindings and reply delivery
+remain controller responsibilities.
 
 ## Descriptor and capability slice
 
@@ -105,7 +153,7 @@ state root: there is no cross-process lease or database.
 ## Controller API and failure semantics
 
 `AgentRuntimeClient.connect(socketPath)` exposes `open(laneId,
-expectedSessionId?)`, `prompt(handle, requestId, text, onEvent?)`,
+expectedSessionId?, expectedAgentId?)`, `prompt(handle, requestId, text, onEvent?)`,
 `getState(handle)`, `abort(handle, requestId)`, `close(handle)`, and `shutdown()`.
 A prompt returns separate `accepted` and `completed` promises; `onEvent` receives
 normalized text/tool/result stream events. A thrown `onEvent` error rejects that
@@ -183,7 +231,7 @@ Unix-socket listen; a sandbox `listen EPERM` is not integration evidence and
 must not be converted to a passing skip.
 
 Remaining migration work includes other first-party wrappers and transport
-integration; collaboration/consultation, cron and outbox boundaries;
+capabilities, collaboration/consultation, cron and outbox integration,
 explicit per-user auth provisioning; additional isolated agents;
 and representative production canaries with history preservation. No production
 readiness or parity claim follows from these source tests.

@@ -8,7 +8,7 @@ import { Bot, HttpError, type Transformer } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
 import { createHash } from "node:crypto";
 import type { BotConfig, TelegramBinding } from "./types.js";
-import { outboxDir, hasExited, type SessionManager } from "./session-manager.js";
+import { outboxDir, hasExited, WORKER_MEDIA_UNSUPPORTED, type SessionManager } from "./session-manager.js";
 import { relayStream } from "./stream-relay.js";
 import { MessageQueue } from "./message-queue.js";
 import { sendPiSteer } from "./pi-rpc-protocol.js";
@@ -823,7 +823,7 @@ export function createTelegramBot(
         await relayStream(
           stream,
           platform,
-          outboxDir(chatId),
+          sessionManager.isWorkerLane(chatId, agentId) ? undefined : outboxDir(chatId),
           onAgentOwnership,
           (suspend) => draftCoordinator.register(chatId, suspend),
         );
@@ -835,10 +835,11 @@ export function createTelegramBot(
       acknowledgedSteerFn: (chatId, agentId, text, onEnqueued, imagePaths) =>
         sessionManager.steerSessionMessage(chatId, agentId, text, onEnqueued, imagePaths),
       prepareSessionFn: async (chatId, agentId) => {
-        await sessionManager.getOrCreateSession(chatId, agentId);
+        if (!sessionManager.isWorkerLane(chatId, agentId)) await sessionManager.getOrCreateSession(chatId, agentId);
       },
-      recoveryNoticeFn: (chatId, _agentId, platform) =>
-        sessionManager.deliverPendingRecoveryNotice(chatId, platform).then(() => undefined),
+      recoveryNoticeFn: async (chatId, agentId, platform) => {
+        if (!sessionManager.isWorkerLane(chatId, agentId)) await sessionManager.deliverPendingRecoveryNotice(chatId, platform);
+      },
     },
   );
 
@@ -888,6 +889,10 @@ export function createTelegramBot(
     const binding = resolveBinding(ctx.chat.id, config.bindings, topicId);
     if (!binding) return;
     if (ctx.message) setThread(ctx.chat.id, ctx.message.message_id, topicId);
+    if (sessionManager.isWorkerLane(sessionKey(ctx.chat.id, topicId), binding.agentId)) {
+      await ctx.reply("Fast controls are unavailable for worker-routed sessions.");
+      return;
+    }
     try {
       if (ctx.match.trim() === "help") {
         await ctx.reply(handleFastCommand(ctx.match, undefined));
@@ -914,6 +919,10 @@ export function createTelegramBot(
     if (ctx.message) setThread(chatId, ctx.message.message_id, topicId);
     const binding = resolveBinding(chatId, config.bindings, topicId);
     if (!binding) return;
+    if (sessionManager.isWorkerLane(sessionKey(chatId, topicId), binding.agentId)) {
+      await ctx.reply(`This chat is configured to route text to the worker for "${binding.agentId}".`);
+      return;
+    }
     const agent = config.agents[binding.agentId];
     await ctx.reply(
       `Connected to agent "${binding.agentId}" (${agent?.model ?? "unknown"}). Send a message to start.`,
@@ -932,6 +941,10 @@ export function createTelegramBot(
     const binding = resolveBinding(ctx.chat.id, config.bindings, topicId);
     if (!binding) return;
     const key = sessionKey(ctx.chat.id, topicId);
+    if (sessionManager.isWorkerLane(key, binding.agentId)) {
+      await ctx.reply("Reconnect is unavailable for worker-routed sessions. The worker closes Pi after each turn.");
+      return;
+    }
     messageQueue.clear(key);
     await sessionManager.closeSession(key);
     await ctx.reply("Session restarted. Prior context may be partially retained.");
@@ -946,6 +959,10 @@ export function createTelegramBot(
     const binding = resolveBinding(ctx.chat.id, config.bindings, topicId);
     if (!binding) return;
     const key = sessionKey(ctx.chat.id, topicId);
+    if (sessionManager.isWorkerLane(key, binding.agentId)) {
+      await ctx.reply("Clean is unavailable for worker-routed sessions. The existing binding was retained.");
+      return;
+    }
     messageQueue.clear(key);
     await sessionManager.destroySession(key);
     await ctx.reply("Session cleaned. Fresh start.");
@@ -958,6 +975,10 @@ export function createTelegramBot(
     const binding = resolveBinding(ctx.chat.id, config.bindings, topicId);
     if (!binding) return;
     const key = sessionKey(ctx.chat.id, topicId);
+    if (sessionManager.isWorkerLane(key, binding.agentId)) {
+      await ctx.reply("Worker-routed text session. Live Pi status is available on the worker.");
+      return;
+    }
     const sessionHealth = sessionManager.getSessionHealth(key);
     let fastStatusLine: string | undefined;
     if (sessionHealth) {
@@ -1003,6 +1024,10 @@ export function createTelegramBot(
       ...intake.photos.map(photo => ({ photo, fromParent: intake.parentPhotoIds.has(photo.file_id) })),
       ...(parent?.photo?.slice(-1) ?? []).map(photo => ({ photo, fromParent: true })),
     ];
+    if (photos.length && sessionManager.isWorkerLane(key, binding.agentId)) {
+      await ctx.reply(WORKER_MEDIA_UNSUPPORTED);
+      return;
+    }
     const seen = new Set<string>();
     const paths: string[] = [];
     let remaining = Math.min(config.sessionDefaults.maxMediaBytes, TELEGRAM_FILE_SIZE_LIMIT);
@@ -1060,9 +1085,13 @@ export function createTelegramBot(
 
     if (!shouldRespondInGroup(binding, bot.botInfo.id, bot.botInfo.username, ctx.message, config.sessionDefaults)) return;
 
+    const key = sessionKey(chatId, topicId);
+    if (sessionManager.isWorkerLane(key, binding.agentId)) {
+      await ctx.reply(WORKER_MEDIA_UNSUPPORTED);
+      return;
+    }
     messagesReceived.inc({ type: "voice" });
 
-    const key = sessionKey(chatId, topicId);
     try {
       // Download voice file from Telegram
       const fileId = ctx.msg.voice.file_id;
@@ -1118,6 +1147,10 @@ export function createTelegramBot(
 
     if (!shouldRespondInGroup(binding, bot.botInfo.id, bot.botInfo.username, ctx.message, config.sessionDefaults)) return;
 
+    if (sessionManager.isWorkerLane(sessionKey(chatId, topicId), binding.agentId)) {
+      await ctx.reply(WORKER_MEDIA_UNSUPPORTED);
+      return;
+    }
     // Telegram Bot API limits file downloads to 20 MB
     const docSize = anim?.file_size ?? doc.file_size;
     if (docSize !== undefined && docSize > TELEGRAM_FILE_SIZE_LIMIT) {
@@ -1223,6 +1256,10 @@ export function createTelegramBot(
 
     if (!shouldRespondInGroup(binding, bot.botInfo.id, bot.botInfo.username, ctx.message, config.sessionDefaults)) return;
 
+    if (sessionManager.isWorkerLane(sessionKey(chatId, topicId), binding.agentId)) {
+      await ctx.reply(WORKER_MEDIA_UNSUPPORTED);
+      return;
+    }
     if (media.file_size !== undefined && media.file_size > TELEGRAM_FILE_SIZE_LIMIT) {
       const stage = mediaPipelineStage(new MediaPipelineError("size-limit"), "download");
       recordMediaPipelineError({ transport: "telegram", mediaType, stage });
@@ -1347,7 +1384,8 @@ export function createTelegramBot(
         bindings: config.bindings,
         sessionDefaults: config.sessionDefaults,
         onBeforeSteer: (key) => { draftCoordinator.suspend(key); },
-        steerFn,
+        steerFn: (key, agentId, framedText) =>
+          !sessionManager.isWorkerLane(key, agentId) && steerFn(key, agentId, framedText),
       });
       if (!delivered) {
         log.debug("telegram-bot", `Dropped echo context for chat ${chatId}: no active eligible Pi turn`);

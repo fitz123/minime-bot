@@ -53,6 +53,11 @@ const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catc
 
 test('direct worker core: real tools/context, durable binding, close/restart history and native settlement', { timeout: 45_000 }, async t => {
   const f = fixture(); t.after(() => f.worker.shutdown());
+  await assert.rejects(
+    f.dispatch({ op: 'open', laneId: 'lane', expectedAgentId: 'different-agent' }),
+    (e: AgentRuntimeError) => e.code === 'agent_mismatch',
+  );
+  assert.equal(existsSync(join(f.d.stateRoot, 'lanes')), false);
   const opened = await f.open();
   assert.equal(json(join(f.d.workspace, 'started.json')).bindingVisible, true);
   assert.equal(json(join(f.d.workspace, 'started.json')).noCentralEnv, true);
