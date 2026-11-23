@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 2026.11.12
+
+- Reload Telegram group binding additions and removals explicitly without restarting the running poller. Rejected changes keep the previously applied routes (#280, #282).
+
 ## 2026.11.11
 
 - Support opt-in worker routing for new text conversations; local routing stays the default (#279).
