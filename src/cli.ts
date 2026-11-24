@@ -83,6 +83,7 @@ const HELP_TEXT = `Usage:
   minime-bot --help
   minime-bot config validate --workspace <path>
   minime-bot workspace validate --workspace <path>
+  minime-bot worker-lane adopt|rollback --workspace <path> --agent <id> --lane <session-store-key>
   minime-bot knowledge search --workspace <agent-workspace> --query <q> [--variant <q> ...] [--scope auto|default|diary|all] [--json]
   minime-bot knowledge get --workspace <agent-workspace> --path <relpath> [--from N] [--lines N]
   minime-bot knowledge update --workspace <agent-workspace> --op create|update|upsert --type <type> --slug <slug> --frontmatter <json> --body-file <file> [--json]
@@ -93,7 +94,7 @@ const HELP_TEXT = `Usage:
   minime-bot knowledge migrate --workspace <agent-workspace> --apply [--allow-dirty] [--report <path>]
   minime-bot launchd crons sync --workspace <path> [--dry-run] [--no-prune] [--launch-agents-dir <path>] [--run-cron-script <absolute-path>]
 Options:
-  --workspace <path>         Control/app workspace root for config/workspace commands. Agent workspace root for knowledge commands.
+  --workspace <path>         Control/app workspace root for config, workspace and worker-lane commands. Agent workspace root for knowledge commands.
   --variant <q>             Knowledge search reformulation; repeat up to 5 times, at most 500 characters each.
   --run-cron-script <path>  Preserve an explicit executable run-cron.sh path during launchd cron sync.
   -h, --help                 Show this help text.
@@ -888,7 +889,43 @@ export async function runCliAsync(
   argv: readonly string[] = process.argv.slice(2),
   options: CliRunOptions = {},
 ): Promise<number> {
-  return runCli(argv, options);
+  let parsed: ParsedArgs;
+  try {
+    parsed = parseArgs(argv);
+  } catch {
+    return runCli(argv, options);
+  }
+  if (parsed.help || parsed.command[0] !== "worker-lane") return runCli(argv, options);
+
+  const stdout = options.stdout ?? ((text: string) => process.stdout.write(text));
+  const stderr = options.stderr ?? ((text: string) => process.stderr.write(text));
+  try {
+    const [, action, ...args] = parsed.command;
+    const agentIndex = args.indexOf("--agent");
+    const laneIndex = args.indexOf("--lane");
+    if ((action !== "adopt" && action !== "rollback") || args.length !== 4
+      || ![0, 2].includes(agentIndex) || ![0, 2].includes(laneIndex)
+      || !args[agentIndex + 1] || !args[laneIndex + 1]) {
+      throw new CliUsageError("worker-lane requires adopt or rollback, --agent <id> and --lane <session-store-key>");
+    }
+    const contract = resolveForCli(parsed, options);
+    const config = loadConfig(contract.paths.configPath, {
+      resolveSecrets: false,
+      workspaceRoot: contract.paths.controlWorkspaceRoot,
+      instanceConfigPath: contract.paths.instanceConfigPath,
+    });
+    const agentId = args[agentIndex + 1];
+    if (!Object.hasOwn(config.agents, agentId)) throw new Error("Unknown worker agent");
+    const { SessionStore } = await import("./session-store.js");
+    const { changeWorkerChatBinding } = await import("./worker-chat-adoption.js");
+    await changeWorkerChatBinding(action, new SessionStore(contract.paths.sessionStorePath), args[laneIndex + 1],
+      config.agents[agentId], options.env);
+    writeLine(stdout, action === "adopt" ? "Worker lane adopted." : "Local lane restored.");
+    return 0;
+  } catch (error) {
+    writeLine(stderr, `Error: ${(error as Error).message}`);
+    return error instanceof CliUsageError ? 2 : 1;
+  }
 }
 
 function realpathOrResolve(path: string): string {

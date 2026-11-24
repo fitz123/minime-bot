@@ -250,13 +250,14 @@ describe("minime-bot CLI", () => {
     assert.equal(result.code, 0);
     assert.match(result.stdout, /minime-bot config validate --workspace <path>/);
     assert.match(result.stdout, /minime-bot workspace validate --workspace <path>/);
+    assert.match(result.stdout, /minime-bot worker-lane adopt\|rollback --workspace <path> --agent <id> --lane <session-store-key>/);
     assert.match(result.stdout, /minime-bot knowledge search --workspace <agent-workspace>/);
     assert.match(result.stdout, /--variant <q>.*repeat up to 5 times/);
     assert.match(result.stdout, /minime-bot knowledge sync --workspace <agent-workspace> \[--json\]/);
     assert.match(result.stdout, /--op archive\|restore --path <wiki\/pages\/type\/page\.md>/);
     assert.match(result.stdout, /minime-bot knowledge maintain --workspace <agent-workspace>/);
     assert.match(result.stdout, /minime-bot launchd crons sync --workspace <path>/);
-    assert.doesNotMatch(result.stdout, /minime-bot worker/);
+    assert.doesNotMatch(result.stdout, /minime-bot worker(?=\s|$)/);
     assert.match(result.stdout, /--run-cron-script <absolute-path>/);
     assert.match(result.stdout, /Preserve an explicit executable run-cron\.sh path/);
     assert.doesNotMatch(result.stdout, /minime-bot recovery/);

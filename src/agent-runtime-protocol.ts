@@ -1,10 +1,23 @@
 /** Versioned controller API. No worker-local paths or spawn controls cross this boundary. */
-import type { StreamLine } from './types.js';
+import type { AgentConfig, StreamLine } from './types.js';
+import { createHash } from 'node:crypto';
 
 export const AGENT_RUNTIME_MAX_FRAME_BYTES = 1024 * 1024;
 export const AGENT_RUNTIME_RPC_TIMEOUT_MS = 15_000;
 export const AGENT_RUNTIME_PROMPT_TIMEOUT_MS = 120_000;
 export const AGENT_RUNTIME_CLIENT_PROMPT_TIMEOUT_MS = AGENT_RUNTIME_PROMPT_TIMEOUT_MS + 10_000;
+
+export function workerChatLaneId(chatId: string): string {
+  return `chat-${createHash('sha256').update(chatId).digest('hex')}`;
+}
+
+export function workerRouteDigest(route: NonNullable<AgentConfig['workerRuntime']>): string {
+  return createHash('sha256').update(JSON.stringify([route.socketPath, route.workerUid, route.controllerName])).digest('hex');
+}
+
+export const WORKER_CHAT_LANE = /^chat-[0-9a-f]{64}$/;
+export const WORKER_CRON_LANE = /^cron-[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/;
+export const WORKER_TRANSCRIPT_DIGEST = /^[0-9a-f]{64}$/;
 
 export interface AgentLaneHandle {
   agentId: string;
@@ -21,9 +34,10 @@ export interface AgentLaneState {
   phase: 'opening' | 'ready' | 'prompting' | 'closing' | 'closed';
   request?: AgentRequestOutcome;
   contextDigest?: string;
+  adoptionDigest?: string;
 }
 export type AgentRuntimeOperation =
-  | { op: 'open'; laneId: string; expectedSessionId?: string; expectedAgentId?: string }
+  | { op: 'open'; laneId: string; expectedSessionId?: string; expectedAgentId?: string; adoptionDigest?: string }
   | { op: 'prompt'; handle: AgentLaneHandle; requestId: string; text: string }
   | { op: 'getState'; handle: AgentLaneHandle }
   | { op: 'abort'; handle: AgentLaneHandle; requestId: string }

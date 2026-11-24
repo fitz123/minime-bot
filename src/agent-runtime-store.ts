@@ -3,7 +3,7 @@ import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readF
 import { dirname, join } from 'node:path';
 import type { InteractiveSessionBinding } from './interactive-session-binding.js';
 import type { AgentRequestOutcome } from './agent-runtime-protocol.js';
-import { AgentRuntimeError } from './agent-runtime-protocol.js';
+import { AgentRuntimeError, WORKER_TRANSCRIPT_DIGEST } from './agent-runtime-protocol.js';
 import type { PiContextManifest } from './pi-context-assembler.js';
 
 export interface WorkerLaneRecord {
@@ -12,6 +12,7 @@ export interface WorkerLaneRecord {
   laneId: string;
   generation: number;
   binding: InteractiveSessionBinding;
+  adoptionDigest?: string;
   contextManifest?: PiContextManifest;
   request?: AgentRequestOutcome;
 }
@@ -30,11 +31,13 @@ export class WorkerLaneStore {
   private readonly directory: string;
   private readonly path: string;
   readonly isNew: boolean;
-  constructor(root: string, readonly agentId: string, readonly laneId: string, expectExisting = false) {
+  constructor(root: string, readonly agentId: string, readonly laneId: string, expectExisting = false,
+    beforeCreate?: () => void) {
     this.directory = join(root, createHash('sha256').update(laneId).digest('hex'));
     this.path = join(this.directory, 'binding.json');
-    if (expectExisting && !existsSync(this.directory)) {
-      throw new AgentRuntimeError('binding_invalid', 'Expected session has no existing lane binding');
+    if ((expectExisting || beforeCreate) && !existsSync(this.directory)) {
+      if (expectExisting) throw new AgentRuntimeError('binding_invalid', 'Expected session has no existing lane binding');
+      beforeCreate?.();
     }
     try { mkdirSync(this.directory, { mode: 0o700 }); this.isNew = true; sync(root); }
     catch (e) { if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e; this.isNew = false; }
@@ -48,6 +51,7 @@ export class WorkerLaneStore {
       if (r.version !== 1 || r.agentId !== this.agentId || r.laneId !== this.laneId
         || !Number.isSafeInteger(r.generation) || r.generation < 0
         || !r.binding || typeof r.binding.sessionId !== 'string' || !r.binding.sessionId
+        || (r.adoptionDigest !== undefined && (typeof r.adoptionDigest !== 'string' || !WORKER_TRANSCRIPT_DIGEST.test(r.adoptionDigest)))
         || (r.request && (typeof r.request.requestId !== 'string' || !r.request.requestId
           || !['accepted', 'settled', 'interrupted'].includes(r.request.outcome)))) throw new Error('Invalid binding');
       return r;

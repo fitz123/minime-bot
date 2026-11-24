@@ -34,15 +34,13 @@ descriptor's `agentId` must match the config map key. Use the descriptor for the
 worker's model, tools, workspace, context, and auth. The existing controller
 model and workspace fields remain required for the agent config.
 
-Use a fresh transport lane with no prior local binding, such as a new thread
-with the existing agent binding. A lane with a local session binding rejects
-routing before opening the worker and retains its history. An ID-only legacy
-store with history for the selected agent must first complete the existing
-local store migration with worker routing off. The controller store records
-an opaque worker session ID and route metadata. Reopen requires that exact
-identity. If the route is removed or the worker binding disappears, the lane
-fails closed. Controller versions predating the worker binding record cannot
-read a store containing that record.
+A fresh transport lane, such as a new thread with the existing agent binding,
+can open a worker session immediately. An existing local lane requires the
+explicit adoption below. An ID-only legacy store with history for the selected
+agent must first complete the existing local store migration with worker routing
+off. The controller store records an opaque worker session ID. Reopen requires
+that exact identity. If the route is removed or the worker binding disappears,
+the lane fails closed.
 
 The worker opens Pi for a turn, confirms settlement, and closes Pi before the
 transport sends the final answer. The queue collects later text during a turn
@@ -56,9 +54,74 @@ This route handles text. Attachments and voice are rejected before download or
 transcription. Outbox delivery, live steering, passive echo steering, private
 topic tools, Fast controls, and session cleanup/reconnect commands are
 unavailable on worker lanes. Collaboration and ask-agent reject worker agents,
-and trigger input cannot target one. Scheduled LLM and script jobs for the agent
-reject before execution or outbox replay. Transport bindings and reply delivery
+and trigger input cannot target one. Transport bindings and reply delivery
 remain controller responsibilities.
+
+## Adopt or roll back one existing text lane
+
+Quiesce controller work for the selected lane, including queued messages and
+any live local Pi process. Run the binding commands with the same controller
+workspace, instance overlay, and Pi session-directory resolution the controller
+uses. The lane argument is the exact key in the controller's session store.
+Leave the worker available for exact open verification.
+
+Prepare an independent 0600 worker-owned copy of the current-version transcript
+directly under the descriptor's session root. Its filename is
+`adopt-chat-<sha256 of the UTF-8 session-store key>.jsonl`. In the copy's JSON
+header, set `cwd` to the worker's canonical workspace. Preserve the other
+header fields and their order, the session ID, every subsequent byte, and the
+final newline. The handoff into the worker's private root is an administrator
+operation. IPC carries the expected identities and digest only.
+
+~~~sh
+minime-bot worker-lane adopt --workspace /example/control --agent satellite --lane example-lane
+minime-bot worker-lane rollback --workspace /example/control --agent satellite --lane example-lane
+~~~
+
+Adoption checks the local binding and the staged copy, opens the exact worker
+transcript with pinned Pi, and updates the selected controller record while the
+connection owns the worker lane. A stale selected record causes the write to
+fail. Other records are reloaded under the store writer lock and retained.
+If the worker adopted the transcript before the controller commit failed,
+retrying from the same unchanged local history reuses the worker binding.
+An existing worker lane from a different source blocks adoption.
+
+Rollback verifies the original endpoint, the exact adopted worker session, and
+the saved local transcript before restoring the selected lane to local Pi.
+It refuses a changed or missing local transcript, a changed binding, an
+unavailable or busy worker, and a prior interrupted worker request. Settled
+worker turns stay in the worker copy. Local replies after rollback extend the
+original local transcript, so the two histories can diverge. Repeat adoption
+requires the same original history. Automatic history merging is unsupported.
+
+Keep the controller quiesced for the selected lane through the operation and
+reload its in-memory session store before resuming traffic. A competing store
+writer can cause a lock error. After an interrupted process, inspect the
+selected binding and verify writer ownership before clearing a stale store
+lock. Controllers predating this format reject records carrying adoption or
+rollback metadata.
+
+## Scheduled LLM jobs
+
+Set `workerRuntime.scheduledLlm: true` to route that agent's LLM cron
+execution through the worker. Existing local cron jobs keep their print-mode
+path. Scripts for worker-routed agents and worker LLM jobs without this
+additional opt-in fail before execution or outbox replay.
+
+Each invocation opens a fresh `cron-` lane with the expected agent identity
+and submits one prompt using the descriptor's model, workspace, context and
+tools. The worker forces Fast off through the packaged Codex request wrapper
+and the cron child environment. The runner uses the smaller of the configured
+prompt timeout and the 130-second client bound. Worker prompt and cleanup
+deadlines also apply. A lane and its private transcript are retained for
+inspection. The controller logs the opaque lane ID and uses a fresh lane on
+the next scheduled invocation.
+
+The controller waits for correlated settlement and confirmed close before
+passing any output to its existing unresolved-marker, `NO_REPLY`, delivery,
+and outbox logic. A worker failure or uncertain completion ends the invocation
+without replaying its prompt or starting local Pi. Worker-created files and
+the local cron Web wrapper are outside this delivery path.
 
 ## Descriptor and capability slice
 
@@ -90,9 +153,9 @@ It can be used independently of `local-tools`. The worker resolves only the
 Knowledge wrapper bundled with its executing source/distribution; a missing or
 unloadable required wrapper fails before prompt execution. Ambient extension
 settings cannot disable a requested capability. All other capabilities fail with
-`unsupported_capability`. Ask-agent, cross-UID collaboration, Fast, subagents,
-cron, Web/provider wrappers, media, and outbox delivery are
-not adapted in this slice. Knowledge v2 **context** can be required independently
+`unsupported_capability`. Ask-agent, cross-UID collaboration, interactive Fast,
+subagents, Web/provider wrappers, media, and worker-side outbox delivery remain
+outside the worker capability slice. Knowledge v2 **context** can be required independently
 of Knowledge **tools**. Without either capability the worker passes `--no-tools`.
 Knowledge calls use only the worker-local `MINIME_AGENT_WORKSPACE_ROOT`; no
 controller configuration or auth is passed over IPC.
@@ -107,8 +170,9 @@ there is no extension-path, cwd, executable, environment, or transcript-path
 field in IPC. The standalone CLI does not load test extensions. Offline tests
 register a synthetic provider and execute real Pi tools without network or real
 auth. Later provisioning may supply the worker's own user-local Pi auth below
-`stateRoot/pi`; the worker never copies controller auth or passes API-key env
-fallbacks.
+`stateRoot/pi`. The worker uses its own auth and omits API-key env fallbacks.
+Adopted and scheduled runs require any existing `auth.json` there to be an
+independent 0600 worker-owned file.
 
 ## Context and session ownership
 
@@ -144,8 +208,9 @@ validate full JSONL integrity. Pinned Pi 1.5.0 skips malformed later records,
 including an unparseable partial tail, when loading history. A parseable final
 record is handled normally. For a valid-header file with a nonempty unterminated
 tail, Pi appends a newline; it does not truncate the skipped malformed bytes.
-This slice adds no whole-history validation,
-migration, or repair. An incomplete initial lane allocation also needs explicit
+Exact adoption fingerprints the staged history and relies on the same Pi
+JSONL open behavior. Whole-history repair remains outside the operation.
+An incomplete initial lane allocation also needs explicit
 administrator recovery;
 there is no automatic repair or history rotation. Only one worker may own a
 state root: there is no cross-process lease or database.
@@ -153,7 +218,8 @@ state root: there is no cross-process lease or database.
 ## Controller API and failure semantics
 
 `AgentRuntimeClient.connect(socketPath)` exposes `open(laneId,
-expectedSessionId?, expectedAgentId?)`, `prompt(handle, requestId, text, onEvent?)`,
+expectedSessionId?, expectedAgentId?)`, `adopt(laneId, expectedSessionId,
+expectedAgentId, adoptionDigest)`, `prompt(handle, requestId, text, onEvent?)`,
 `getState(handle)`, `abort(handle, requestId)`, `close(handle)`, and `shutdown()`.
 A prompt returns separate `accepted` and `completed` promises; `onEvent` receives
 normalized text/tool/result stream events. A thrown `onEvent` error rejects that
@@ -230,8 +296,13 @@ and synthetic local fixtures. The socket suite requires a host that permits
 Unix-socket listen; a sandbox `listen EPERM` is not integration evidence and
 must not be converted to a passing skip.
 
+`src/__tests__/worker-continuity-offline.test.ts` exercises the package CLI,
+ordinary session entry point and cron runner with real pinned Pi and a synthetic
+provider. Its in-memory wire replaces socket I/O and endpoint checks. Cron
+delivery is a controller-side test double. Cross-UID endpoints and authentic
+provider requests require separate evidence.
+
 Remaining migration work includes other first-party wrappers and transport
-capabilities, collaboration/consultation, cron and outbox integration,
-explicit per-user auth provisioning; additional isolated agents;
-and representative production canaries with history preservation. No production
-readiness or parity claim follows from these source tests.
+capabilities, collaboration and consultation, worker-side file delivery,
+per-user auth provisioning, additional isolated agents, and representative
+production canaries with history preservation.

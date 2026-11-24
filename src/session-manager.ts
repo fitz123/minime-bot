@@ -1,7 +1,7 @@
 import { RICH_RESERVED_DIR } from "./telegram-rich.js";
 import { type ChildProcess } from "node:child_process";
 import { chmodSync, createWriteStream, existsSync, lstatSync, mkdirSync, readdirSync, renameSync, rmSync, type Stats, unlinkSync } from "node:fs";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { on } from "node:events";
@@ -16,7 +16,7 @@ import type { BoundSessionState, PendingSessionRecoveryNotice, PlatformContext, 
 import { spawnPiRpcSession, sendPiPrompt, sendPiSteer, sendPiAcknowledgedSteer, sendPiGetState, readPiStream, parsePiStartupIdentityRecord, assertPiSessionIdentityMatchesBinding, PiStartupBlockingUiError, NewlineOnlyJsonlSplitter, normalizePiModel, PI_EXTENSIONS_DISABLED_ENV, type PiAcknowledgedSteerResult, type PiRpcEvent, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions, type PiStartupDiagnostics } from "./pi-rpc-protocol.js";
 import { SessionStore } from "./session-store.js";
 import { AgentRuntimeClient } from "./agent-runtime-client.js";
-import { AgentRuntimeError, AgentRuntimeUncertainError, type AgentLaneState } from "./agent-runtime-protocol.js";
+import { AgentRuntimeError, AgentRuntimeUncertainError, workerChatLaneId, workerRouteDigest, type AgentLaneState } from "./agent-runtime-protocol.js";
 import { log } from "./logger.js";
 import { recordResultMetrics, recordPiRetry, recordPiTurnDuration, sessionsActive, sessionCrashes, piSessionResumeDiscarded } from "./metrics.js";
 import { ensureSessionMediaDir, cleanupSessionMediaDir, cleanupStaleSessionMedia } from "./media-store.js";
@@ -162,6 +162,7 @@ export interface ActiveSession {
   workspaceRealpath?: string;
   /** Durable recovery notice retained until the transport confirms delivery. */
   pendingRecoveryNotice?: PendingSessionRecoveryNotice;
+  workerRollback?: true;
   agentId: string;
   /** Provider is retained temporarily for status/reporting while runtime is Pi-only. */
   provider: "pi";
@@ -358,8 +359,9 @@ export class SessionManager {
 
   isWorkerLane(chatId: string, agentId?: string): boolean {
     const stored = this.store.getSession(chatId);
+    if (this.workerTurns.has(chatId)) return true;
+    if (stored?.bindingState === "bound" && stored.workerRollback && (agentId === undefined || agentId === stored.agentId)) return false;
     return (agentId !== undefined && this.workerRoutes.has(agentId))
-      || this.workerTurns.has(chatId)
       || (stored !== undefined && (stored.bindingState === "worker" || this.workerRoutes.has(stored.agentId)));
   }
 
@@ -587,6 +589,7 @@ export class SessionManager {
         sessionId: session.sessionId,
         sessionFile: session.sessionFile,
         workspaceRealpath: session.workspaceRealpath,
+        ...(session.workerRollback ? { workerRollback: true as const } : {}),
         ...(session.pendingRecoveryNotice
           ? { pendingRecoveryNotice: session.pendingRecoveryNotice }
           : {}),
@@ -826,6 +829,9 @@ export class SessionManager {
       }
       : undefined;
     const state = this.boundState(chatId, agentId, agent, binding, notice);
+    if (expected?.bindingState === "bound" && expected.agentId === agentId && expected.workerRollback) {
+      state.workerRollback = true;
+    }
     if (!this.store.compareAndSetSession(chatId, expected, state)) {
       throw new Error(`Session binding changed concurrently for chat ${chatId}`);
     }
@@ -1014,6 +1020,7 @@ export class SessionManager {
     };
     const assertUnchangedRoute = (config: BotConfig): void => {
       const stored = this.store.getSession(chatId);
+      if (stored?.bindingState === "bound" && stored.workerRollback && stored.agentId === agentId) return;
       if (config.agents[agentId]?.workerRuntime || (stored && config.agents[stored.agentId]?.workerRuntime)) {
         throw new AgentRuntimeError("route_changed", "Worker routing changed. Restart the controller before sending more messages to this lane.");
       }
@@ -1253,6 +1260,7 @@ export class SessionManager {
       sessionFile: prepared.binding.sessionFile,
       workspaceRealpath: prepared.binding.workspaceRealpath,
       pendingRecoveryNotice: prepared.state.pendingRecoveryNotice,
+      workerRollback: prepared.state.workerRollback,
       agentId,
       provider: "pi",
       model: normalizedSessionModel(agent),
@@ -1616,9 +1624,12 @@ export class SessionManager {
     const route = this.workerRoutes.get(agentId);
     const stored = this.store.getSession(chatId);
     if (stored && (stored.bindingState !== "worker" || stored.agentId !== agentId)) {
-      throw new AgentRuntimeError("binding_conflict", "This chat has an existing session binding. Moving its history to a worker is unsupported.");
+      throw new AgentRuntimeError("binding_conflict", "This chat has an existing session binding. An exact local binding requires explicit adoption.");
     }
     if (!route) throw new AgentRuntimeError("route_missing", "This chat requires its configured worker route.");
+    if (stored?.adoption && workerRouteDigest(route) !== stored.adoption.routeDigest) {
+      throw new AgentRuntimeError("route_changed", "This adopted session requires its original worker route.");
+    }
     if (this.workerTurns.has(chatId) || this.active.has(chatId) || this.sessionStartups.has(chatId)
       || this.sessionTeardowns.has(chatId)) {
       throw new AgentRuntimeError("busy", "This session is already processing or changing state.");
@@ -1627,7 +1638,7 @@ export class SessionManager {
 
     const turn: { client?: AgentRuntimeClient } = {};
     this.workerTurns.set(chatId, turn);
-    const laneId = `chat-${createHash("sha256").update(chatId).digest("hex")}`;
+    const laneId = workerChatLaneId(chatId);
     try {
       let client: AgentRuntimeClient;
       let opened: AgentLaneState;
@@ -1641,7 +1652,7 @@ export class SessionManager {
       }
       const handle = opened.handle;
       if (opened.phase !== "ready" || handle.agentId !== agentId || handle.laneId !== laneId
-        || (stored && handle.sessionId !== stored.sessionId)) {
+        || (stored && (handle.sessionId !== stored.sessionId || opened.adoptionDigest !== stored.adoption?.digest))) {
         throw new AgentRuntimeError("binding_conflict", "The worker did not open the expected session. This message was not submitted.");
       }
       if (!stored && !this.store.compareAndSetSession(chatId, undefined, {
@@ -1652,6 +1663,12 @@ export class SessionManager {
       if (opened.request && opened.request.outcome !== "settled") {
         await client.close(handle);
         throw new AgentRuntimeError("prior_interruption", "A previous worker turn was interrupted. The worker session requires operator inspection before more messages can run.");
+      }
+      // Fence a queued turn against a rollback that committed before this
+      // connection acquired the worker lane. Keep the lane owned through submission.
+      if (stored?.adoption && !this.store.compareAndSetSession(chatId, stored, { ...stored, lastActivity: Date.now() })) {
+        try { await client.close(handle); } catch { /* Disconnect still releases the owned lane. */ }
+        throw new AgentRuntimeError("binding_conflict", "The selected binding changed before this message was submitted.");
       }
 
       const lines: StreamLine[] = [];

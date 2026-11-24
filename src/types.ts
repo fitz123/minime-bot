@@ -27,7 +27,7 @@ export interface AgentConfig {
    */
   provider?: "pi";
   askAgent?: AskAgentConfig;
-  workerRuntime?: { socketPath: string; workerUid: number; controllerName: string };
+  workerRuntime?: { socketPath: string; workerUid: number; controllerName: string; scheduledLlm?: boolean };
   /** Explicit eligibility only; preferences start off and live in control data. */
   codexFast?: { provider: "openai-codex"; model: string };
 }
@@ -134,6 +134,8 @@ export interface BoundSessionState extends SessionStateBase {
   sessionFile: string;
   workspaceRealpath: string;
   pendingRecoveryNotice?: PendingSessionRecoveryNotice;
+  /** This lane explicitly returned to the controller after an operator rollback. */
+  workerRollback?: true;
   failedSessionId?: never;
   legacyFailure?: never;
 }
@@ -158,6 +160,7 @@ export interface UnresolvedLegacySessionState extends SessionStateBase {
 export interface WorkerSessionState extends SessionStateBase {
   bindingState: "worker";
   sessionId: string;
+  adoption?: { local: BoundSessionState; digest: string; routeDigest: string };
   sessionFile?: never;
   workspaceRealpath?: never;
   pendingRecoveryNotice?: never;

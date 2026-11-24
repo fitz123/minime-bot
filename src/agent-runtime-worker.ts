@@ -1,20 +1,24 @@
 import { createServer, type Server, type Socket } from 'node:net';
 import { createHash } from 'node:crypto';
-import { chmodSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { chmodSync, closeSync, fsyncSync, lstatSync, openSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, join, relative, isAbsolute } from 'node:path';
 import { assemblePiContext, type PiContextArtifacts } from './pi-context-assembler.js';
 import { resolveKnowledgeLayout } from './knowledge/layout.js';
-import { inspectInteractiveSessionBinding, resolveExplicitInteractiveSessionLocation } from './interactive-session-binding.js';
+import { fingerprintInteractiveSession, inspectInteractiveSessionBinding, resolveExplicitInteractiveSessionLocation,
+  type InteractiveSessionBinding } from './interactive-session-binding.js';
 import { preseedInteractiveSessionBinding, assertInteractiveSessionBindingOpenable } from './interactive-session-seed.js';
 import { NewlineOnlyJsonlSplitter, resolvePiExtensionArgs, spawnPreparedPiRpcSession } from './pi-rpc-protocol.js';
 import { resolveWorkspaceContract } from './workspace-contract.js';
 import { AgentRuntimePi } from './agent-runtime-pi.js';
+import { buildCronFastEnv } from './cron-fast-env.js';
+import { buildCronSystemInstruction } from './cron-llm-instruction.js';
 import { WorkerLaneStore, requirePrivateWorkerDirectory, type WorkerLaneRecord } from './agent-runtime-store.js';
 import {
   validateAgentRuntimeDescriptor, assertAgentRuntimeIdentity, assertAgentEndpointMetadata, ensureAgentEndpointAcl, type AgentRuntimeDescriptor,
 } from './agent-runtime-descriptor.js';
 import {
   AGENT_RUNTIME_MAX_FRAME_BYTES, AGENT_RUNTIME_PROMPT_TIMEOUT_MS, AgentRuntimeError,
+  WORKER_CHAT_LANE, WORKER_CRON_LANE, WORKER_TRANSCRIPT_DIGEST,
   type AgentLaneHandle, type AgentLaneState, type AgentRuntimeRequest, type AgentRuntimeMessage,
 } from './agent-runtime-protocol.js';
 
@@ -149,6 +153,7 @@ export class AgentRuntimeWorker {
       handle: { agentId: r.agentId, laneId: r.laneId, sessionId: r.binding.sessionId, generation: r.generation },
       phase: lane.phase,
       ...(r.request ? { request: { ...r.request } } : {}),
+      ...(r.adoptionDigest ? { adoptionDigest: r.adoptionDigest } : {}),
       ...(lane.context ? { contextDigest: lane.context.manifest.digest } : {}),
     };
   }
@@ -169,12 +174,28 @@ export class AgentRuntimeWorker {
   private async startPi(lane: Lane): Promise<void> {
     if (this.stopping || lane.owner?.destroyed || lane.phase === 'closing') return fail('disconnected', 'Lane owner disconnected');
     const d = this.descriptor;
+    const cron = WORKER_CRON_LANE.test(lane.record.laneId);
+    const env = this.environment();
+    if (cron || lane.record.adoptionDigest) {
+      try {
+        const auth = lstatSync(join(env.PI_CODING_AGENT_DIR!, 'auth.json'));
+        if (!auth.isFile() || auth.uid !== d.workerUid || (auth.mode & 0o777) !== 0o600 || auth.nlink !== 1) {
+          return fail('auth_invalid', 'Worker Pi auth must be a private worker-owned file');
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
+    const [, cronFastExtension] = cron ? resolvePiExtensionArgs({ env: {}, relpaths: ['codex-fast.ts'],
+      extensionsDir: resolveWorkspaceContract({ env: {}, workspace: d.workspace }).paths.piExtensionDir }) : [];
     const child = spawnPreparedPiRpcSession({ binding: lane.record.binding, context: lane.context!,
       model: d.model, thinking: d.thinking,
       // Pi's explicit --tools list also filters registered extension tools.
       tools: [...d.tools, ...(d.capabilities.includes('knowledge-tools')
-        ? ['knowledge_search', 'knowledge_get', 'knowledge_update'] : [])], extensions: this.extensions,
-      env: this.environment(), offline: d.offline });
+        ? ['knowledge_search', 'knowledge_get', 'knowledge_update'] : [])],
+      extensions: cronFastExtension ? [...this.extensions, cronFastExtension] : this.extensions,
+      env: cron ? buildCronFastEnv(env) : env, offline: d.offline,
+      appendSystemPrompt: cron ? buildCronSystemInstruction() : undefined });
     const pi = new AgentRuntimePi(child, lane.record.binding, this.startupTimeoutMs, { model: d.model, thinking: d.thinking });
     lane.pi = pi;
     child.once('close', () => {
@@ -188,7 +209,8 @@ export class AgentRuntimeWorker {
     lane.phase = 'ready';
   }
 
-  private async open(laneId: string, expectedSessionId: string | undefined, socket: Socket): Promise<AgentLaneState> {
+  private async open({ laneId, expectedSessionId, adoptionDigest }: Extract<AgentRuntimeRequest, { op: 'open' }>,
+    socket: Socket): Promise<AgentLaneState> {
     let lane = this.lanes.get(laneId);
     if (lane && lane.phase !== 'closed') return fail('busy', 'Lane is already open or changing state');
     // Source failures cannot mint a new session or create an unbound lane marker.
@@ -197,14 +219,36 @@ export class AgentRuntimeWorker {
     const location = resolveExplicitInteractiveSessionLocation(d.workspace, d.sessionRoot, d.workerUid);
     const root = join(d.stateRoot, 'lanes');
     requirePrivateWorkerDirectory(root, d.workerUid);
-    const store = new WorkerLaneStore(root, d.agentId, laneId, expectedSessionId !== undefined);
+    let staged: InteractiveSessionBinding | undefined;
+    const checkStage = adoptionDigest === undefined ? undefined : () => {
+      const inspection = inspectInteractiveSessionBinding(location, join(d.sessionRoot, `adopt-${laneId}.jsonl`), expectedSessionId!);
+      if (!inspection.valid) return fail('binding_invalid', 'The exact worker-local staged transcript is missing or unsafe');
+      if (lstatSync(inspection.binding.sessionFile).nlink !== 1) {
+        return fail('binding_invalid', 'The staged transcript must be an independent copy');
+      }
+      if (fingerprintInteractiveSession(inspection.binding) !== adoptionDigest) {
+        return fail('history_mismatch', 'The staged transcript differs from the controller history');
+      }
+      assertInteractiveSessionBindingOpenable(inspection.binding);
+      for (const path of [inspection.binding.sessionFile, location.sessionDirectory]) {
+        const fd = openSync(path, 'r');
+        try { fsyncSync(fd); } finally { closeSync(fd); }
+      }
+      staged = inspection.binding;
+    };
+    const store = new WorkerLaneStore(root, d.agentId, laneId, expectedSessionId !== undefined && !checkStage, checkStage);
     let record: WorkerLaneRecord;
     if (store.isNew) {
-      if (expectedSessionId) return fail('binding_invalid', 'Expected session has no existing lane binding');
-      record = { version: 1, agentId: d.agentId, laneId, generation: 0, binding: preseedInteractiveSessionBinding(location) };
+      if (adoptionDigest && !staged) return fail('binding_invalid', 'The staged binding was not verified');
+      record = { version: 1, agentId: d.agentId, laneId, generation: 0,
+        binding: staged ?? preseedInteractiveSessionBinding(location), ...(adoptionDigest ? { adoptionDigest } : {}) };
     } else {
       record = store.load();
       if (expectedSessionId && record.binding.sessionId !== expectedSessionId) return fail('session_mismatch', 'Expected session does not match the lane binding');
+      if (record.adoptionDigest && !expectedSessionId) return fail('binding_invalid', 'An adopted lane requires its exact session identity');
+      if (adoptionDigest !== undefined && record.adoptionDigest !== adoptionDigest) {
+        return fail('history_mismatch', 'The existing worker binding was not adopted from this controller history');
+      }
       if (record.binding.workspaceRealpath !== location.workspaceRealpath || record.binding.sessionDirectory !== location.sessionDirectory) return fail('binding_invalid', 'Existing binding does not match worker roots');
       const inspection = inspectInteractiveSessionBinding(location, record.binding.sessionFile, record.binding.sessionId);
       if (!inspection.valid) return fail('binding_invalid', 'Existing exact transcript is missing, corrupt, or unsafe; refusing to rotate identity');
@@ -242,6 +286,9 @@ export class AgentRuntimeWorker {
   private async prompt(lane: Lane, request: Extract<AgentRuntimeRequest, { op: 'prompt' }>, socket: Socket): Promise<void> {
     if (lane.phase !== 'ready' || !lane.pi) return fail('busy', 'Lane has an active request or state transition');
     if (lane.record.request?.requestId === request.requestId) return fail('duplicate_request', 'Request ID was already used; no replay is performed');
+    if (WORKER_CRON_LANE.test(lane.record.laneId) && lane.record.request) {
+      return fail('duplicate_request', 'A scheduled lane can run only one prompt');
+    }
     lane.phase = 'prompting';
     lane.record.request = { requestId: request.requestId, outcome: 'accepted' };
     try { lane.store.save(lane.record); }
@@ -341,7 +388,7 @@ export class AgentRuntimeWorker {
       if (r.expectedAgentId !== undefined && r.expectedAgentId !== this.descriptor.agentId) {
         return fail('agent_mismatch', 'Endpoint belongs to a different agent');
       }
-      const state = await this.open(r.laneId, r.expectedSessionId, socket);
+      const state = await this.open(r, socket);
       this.send(socket, { version: 1, type: 'response', id: r.id, state }); return;
     }
     if (r.op === 'getState') {
@@ -384,7 +431,7 @@ function validateRequest(value: unknown): AgentRuntimeRequest {
   const r = value as AgentRuntimeRequest;
   if (!r || r.version !== 1 || typeof r.id !== 'string' || !r.id || r.id.length > 100) throw new Error('Invalid request');
   const fields: Record<string, string[]> = {
-    open: ['laneId', 'expectedSessionId', 'expectedAgentId'], prompt: ['handle', 'requestId', 'text'],
+    open: ['laneId', 'expectedSessionId', 'expectedAgentId', 'adoptionDigest'], prompt: ['handle', 'requestId', 'text'],
     getState: ['handle'], abort: ['handle', 'requestId'], close: ['handle'], shutdown: [],
   };
   if (!Object.hasOwn(fields, r.op) || Object.keys(r).some(k => !['version', 'id', 'op', ...fields[r.op]].includes(k))) throw new Error('Unsupported request field');
@@ -392,6 +439,9 @@ function validateRequest(value: unknown): AgentRuntimeRequest {
     if (typeof r.laneId !== 'string' || !r.laneId || r.laneId.length > 200
       || (r.expectedAgentId !== undefined && (typeof r.expectedAgentId !== 'string' || !/^[a-zA-Z0-9_-]{1,80}$/.test(r.expectedAgentId)))
       || (r.expectedSessionId !== undefined && (typeof r.expectedSessionId !== 'string' || !r.expectedSessionId.trim() || r.expectedSessionId.length > 200))) throw new Error('Invalid lane');
+    if (r.adoptionDigest !== undefined && (!WORKER_CHAT_LANE.test(r.laneId) || !r.expectedSessionId || !r.expectedAgentId
+      || typeof r.adoptionDigest !== 'string' || !WORKER_TRANSCRIPT_DIGEST.test(r.adoptionDigest))) throw new Error('Invalid adoption proof');
+    if (WORKER_CRON_LANE.test(r.laneId) && !r.expectedAgentId) throw new Error('Scheduled lane requires expected agent identity');
   } else if (r.op !== 'shutdown') {
     const h = r.handle;
     if (!h || Object.keys(h).some(k => !['agentId', 'laneId', 'sessionId', 'generation'].includes(k))
