@@ -84,21 +84,33 @@ function excessiveFormattingDepth(text: string): boolean {
   return /[*_~|=]{33}/.test(text);
 }
 
+// An inline formula closes at a non-space on the inside and a prose boundary
+// on the outside. In particular, the dollar in a following price cannot close it.
+const INLINE_MATH = /(?<![\\$])\$(?![\s$])(?:\\[^\n]|[^\\$`\n])*?(?:\\[^\n]|[^\\$`\s])\$(?![$\\\p{L}\p{N}]|\.\d)/gu;
+const DISPLAY_MATH = /^\$\$\s*([^$]+?)\s*\$\$$/;
+const PRICE_DOLLAR = /\$(?=\.?\d)/;
+
 function needsLiteralEncoding(text: string): boolean {
-  const outsideCode = text.replace(/(`+)[\s\S]*?\1/g, "");
-  return (outsideCode.match(/<[^<>\n]+>/g) ?? []).some(tag => {
+  if (!text.includes("<")) return false;
+  const outsideCodeAndMath = sourceBlocks(text).filter(block => !DISPLAY_MATH.test(block))
+    .map(block => block.replace(/(`+)[\s\S]*?\1/g, "").replace(INLINE_MATH, "")).join("\n\n");
+  return (outsideCodeAndMath.match(/<[^<>\n]+>/g) ?? []).some(tag => {
     const name = tag.match(/^<\/?([\w-]+)>$/)?.[1];
-    return !name || !(name in INLINE_HTML_TYPES) || !new RegExp(`<${name}>[\\s\\S]*?</${name}>`).test(outsideCode);
+    return !name || !(name in INLINE_HTML_TYPES) || !new RegExp(`<${name}>[\\s\\S]*?</${name}>`).test(outsideCodeAndMath);
   });
 }
 
-/** Native RichText for source-context literals: no HTML escape round trip.
- * Only inline formatting in these paragraphs is scanned; this is not a document AST.
- */
-export function literalRichText(text: string, depth = 0): RichText {
+const BEFORE_EMPHASIS = /\\[\\`*_[\]{}()#+.!<>~-]|(`+)([\s\S]*?)\1|<(b|strong|i|em|u|s|strike|del|sup|sub|mark|tg-spoiler)>([\s\S]*?)<\/\3>|(\*\*|__|~~|==|\|\||\*|_)/;
+const LINK_TOKENS = /\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|https?:\/\/[^\s<>]+/;
+const LITERAL_TOKENS = String.raw`${BEFORE_EMPHASIS.source}([^\n]+?)\5|${LINK_TOKENS.source}`;
+// Keep TeX operators inside a formula opaque when looking for the end of emphasis.
+const PROSE_TOKENS = String.raw`${BEFORE_EMPHASIS.source}((?:${INLINE_MATH.source}|(?!${INLINE_MATH.source})[^\n])+?)\5|${LINK_TOKENS.source}|\\\$|(?<math>${INLINE_MATH.source})`;
+
+/** Native RichText for source-context literals: no HTML escape round trip. */
+export function literalRichText(text: string, depth = 0, projectMath = false): RichText {
   if (depth >= 6) return text;
   const parts: RichText[] = [];
-  const tokens = /\\[\\`*_[\]{}()#+.!<>~-]|(`+)([\s\S]*?)\1|<(b|strong|i|em|u|s|strike|del|sup|sub|mark|tg-spoiler)>([\s\S]*?)<\/\3>|(\*\*|__|~~|==|\|\||\*|_)([^\n]+?)\5|\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|https?:\/\/[^\s<>]+/g;
+  const tokens = projectMath ? new RegExp(PROSE_TOKENS, "gu") : new RegExp(LITERAL_TOKENS, "g");
   let end = 0;
   for (let match; (match = tokens.exec(text));) {
     if (match[7]) {
@@ -124,11 +136,12 @@ export function literalRichText(text: string, depth = 0): RichText {
     if (match.index! > end) parts.push(text.slice(end, match.index));
     if (match[0].startsWith("\\")) parts.push(match[0].slice(1));
     else if (match[1]) parts.push({ type: "code", text: match[2] });
-    else if (match[3]) parts.push({ type: INLINE_HTML_TYPES[match[3] as keyof typeof INLINE_HTML_TYPES], text: literalRichText(match[4], depth + 1) });
+    else if (match[3]) parts.push({ type: INLINE_HTML_TYPES[match[3] as keyof typeof INLINE_HTML_TYPES], text: literalRichText(match[4], depth + 1, projectMath) });
     else if (match[5]) {
       const types = { "**": "bold", "__": "bold", "~~": "strikethrough", "==": "marked", "||": "spoiler", "*": "italic", "_": "italic" } as const;
-      parts.push({ type: types[match[5] as keyof typeof types], text: literalRichText(match[6], depth + 1) });
-    } else if (match[7]) parts.push({ type: "url", text: literalRichText(match[7], depth + 1), url: match[8] });
+      parts.push({ type: types[match[5] as keyof typeof types], text: literalRichText(match[6], depth + 1, projectMath) });
+    } else if (match[7]) parts.push({ type: "url", text: literalRichText(match[7], depth + 1, projectMath), url: match[8] });
+    else if (match.groups?.math) parts.push({ type: "mathematical_expression", expression: match.groups.math.slice(1, -1) });
     else parts.push(match[0]); // A bare URL is opaque to emphasis scanning.
     end = match.index! + match[0].length;
   }
@@ -142,7 +155,8 @@ export function richDraftPayload(source: string): InputRichMessageWithoutUpload 
   const blocks = simpleTypographyBlocks(text);
   if (blocks && blocks.length <= 400) return { blocks };
   if (blockCost(text) > 400) return { blocks: [{ type: "pre", text }] };
-  return needsLiteralEncoding(text) ? { blocks: [{ type: "paragraph", text: literalRichText(text) }] } : { markdown: text };
+  return needsLiteralEncoding(text) ? { blocks: [{ type: "paragraph", text: literalRichText(text) }] }
+    : { markdown: escapeMarkdownPrices(text) };
 }
 
 function tableCells(line: string): string[] {
@@ -159,14 +173,46 @@ function isIndentedCode(block: string): boolean { return /^(?: {4}|\t)/.test(blo
 
 function isFence(block: string): boolean { return /^ {0,3}(`{3,}|~{3,})/.test(block); }
 
+/** Protect prices in server Markdown while leaving formulas and opaque syntax intact. */
+function escapeMarkdownPrices(text: string): string {
+  if (!PRICE_DOLLAR.test(text)) return text;
+  const opaque = /(`+)[\s\S]*?\1|\\[\\$]|\]\(|https?:\/\/[^\s<>]+|\$\$/;
+  const tokens = new RegExp(`${opaque.source}|${INLINE_MATH.source}|(?<price>${PRICE_DOLLAR.source})`, "gu");
+  const parts: string[] = [];
+  let blockEnd = 0, copied = 0;
+  for (const block of sourceBlocks(text)) {
+    const start = text.indexOf(block, blockEnd);
+    blockEnd = start + block.length;
+    if (isFence(block) || isIndentedCode(block) || DISPLAY_MATH.test(block)) continue;
+    tokens.lastIndex = 0;
+    for (let match; (match = tokens.exec(block));) {
+      if (match[0] === "](") tokens.lastIndex = linkDestinationEnd(block, tokens.lastIndex) ?? tokens.lastIndex;
+      if (match.groups?.price) {
+        const index = start + match.index;
+        parts.push(text.slice(copied, index), "\\");
+        copied = index;
+      }
+    }
+  }
+  parts.push(text.slice(copied));
+  return parts.join("");
+}
+
 /** Text-only bounded projection; full authoritative source never undergoes tail slicing. */
 export function richDraft(source: string): string {
   const blocks = sourceBlocks(source);
   const parts: string[] = [];
   let bytes = 0;
   for (const block of blocks.slice(-80).reverse()) {
-    let part = isFence(block) || isIndentedCode(block) ? block : mapImages(block,
-      (caption) => `[Image${caption ? `: ${caption}` : ""}]`);
+    let part = block;
+    if (!isFence(block) && !isIndentedCode(block)) {
+      const table = /^\s*\|?\s*:?-{3,}/.test(block.split("\n")[1] ?? "");
+      part = mapImages(block, (caption, target) => {
+        const preview = `[Image${caption ? `: ${caption}` : ""}]`;
+        return !table && target.startsWith("outbox:") ? `\n\n${preview}\n\n` : preview;
+      });
+      if (part.includes("\n\n")) part = sourceBlocks(part).join("\n\n");
+    }
     if (isFence(part)) {
       const lines = part.split("\n");
       const opener = lines.shift()!;
@@ -196,38 +242,55 @@ function byteTail(text: string, limit: number): string {
   return chars.slice(start).join("");
 }
 
-/** Native equivalents only for the simple blocks we already handle. Complex
- * Markdown remains on its server-parsed path; this is not a document parser. */
-function compatibleNativeBlocks(text: string): InputRichMessageWithoutUpload["blocks"] | undefined {
+/** Project native equivalents for ordinary prose or the existing compatibility paths. */
+function compatibleNativeBlocks(text: string, simpleOnly = false): InputRichMessageWithoutUpload["blocks"] | undefined {
   const result: NonNullable<InputRichMessageWithoutUpload["blocks"]> = [];
-  for (const block of sourceBlocks(text)) {
+  const source = sourceBlocks(text);
+  const renderInline = (value: string) => literalRichText(value, 0, simpleOnly);
+  for (const block of source) {
     const photo = block.match(/^!\[([^\]]*)\]\(tg:\/\/photo\?id=([^)]+)\)$/);
     if (photo) {
-      result.push({ type: "photo", photo: { type: "photo", media: photo[2] }, caption: { text: literalRichText(photo[1]) } });
+      if (simpleOnly && photo[1] && !isSimpleTypography(photo[1])) return undefined;
+      result.push({ type: "photo", photo: { type: "photo", media: photo[2] }, caption: { text: renderInline(photo[1]) } });
       continue;
     }
+    if (simpleOnly) {
+      const math = block.match(DISPLAY_MATH)?.[1].trim();
+      if (math && source.length > 1) {
+        result.push({ type: "mathematical_expression", expression: math });
+        continue;
+      }
+      const preview = block.match(/^\[Image(?:: ([^\]\n]*))?\]$/);
+      if (preview) {
+        if (preview[1] && !isSimpleTypography(preview[1])) return undefined;
+        result.push({ type: "paragraph", text: renderInline(block) });
+        continue;
+      }
+      if (!isSimpleTypography(block)) return undefined;
+    }
     const rows = block.split("\n");
-    if (rows.length >= 2 && /^\s*\|?\s*:?-{3,}/.test(rows[1])) {
+    if (!simpleOnly && rows.length >= 2 && /^\s*\|?\s*:?-{3,}/.test(rows[1])) {
       result.push({ type: "table", cells: [rows[0], ...rows.slice(2)].map((row, i) => tableCells(row).map((cell, j) => ({
         text: literalRichText(cell), ...(i === 0 ? { is_header: true as const } : {}),
         align: tableCells(rows[1])[j]?.endsWith(":") ? tableCells(rows[1])[j]?.startsWith(":") ? "center" : "right" : "left", valign: "top",
       }))) });
       continue;
     }
-    // Leave lists, quotations, reference links, math and block HTML to native Markdown.
-    const syntax = block.replace(/(`+)[\s\S]*?\1/g, "");
-    if (/^\s*(?:[-*+] |\d+[.)] |> ?|(?:[-*_]{3,}|=+)\s*$|\[.+\]:|\$\$)/m.test(syntax)
-      || /\[\^|\]\((?!https?:\/\/)|\$[^$]+\$|\]\[[^\]]*\]|<\/?(?:div|details|summary|table|ul|ol|li|p|h[1-6])\b/i.test(syntax)) return undefined;
+    if (!simpleOnly) {
+      const syntax = block.replace(/(`+)[\s\S]*?\1/g, "");
+      if (/^\s*(?:[-*+] |\d+[.)] |> ?|(?:[-*_]{3,}|=+)\s*$|\[.+\]:|\$\$)/m.test(syntax)
+        || /\[\^|\]\((?!https?:\/\/)|\$[^$]+\$|\]\[[^\]]*\]|<\/?(?:div|details|summary|table|ul|ol|li|p|h[1-6])\b/i.test(syntax)) return undefined;
+    }
     let paragraph: string[] = [];
     const flushParagraph = () => {
-      if (paragraph.length) result.push({ type: "paragraph", text: literalRichText(paragraph.join("\n")) });
+      if (paragraph.length) result.push({ type: "paragraph", text: renderInline(paragraph.join("\n")) });
       paragraph = [];
     };
     for (const line of rows) {
       const heading = line.match(/^(#{1,6}) (.+)$/);
       if (heading) {
         flushParagraph();
-        result.push({ type: "heading", size: heading[1].length as 1 | 2 | 3 | 4 | 5 | 6, text: literalRichText(heading[2]) });
+        result.push({ type: "heading", size: heading[1].length as 1 | 2 | 3 | 4 | 5 | 6, text: renderInline(heading[2]) });
       } else paragraph.push(line);
     }
     flushParagraph();
@@ -235,26 +298,29 @@ function compatibleNativeBlocks(text: string): InputRichMessageWithoutUpload["bl
   return result;
 }
 
-/** Opt in only plain prose, ATX headings, simple emphasis and literal placeholders.
- * The compatibility builder is not a Markdown parser: code, links, escapes and
- * complex syntax must keep their existing routes, including in draft windows.
- */
-function simpleTypographyBlocks(text: string): InputRichMessageWithoutUpload["blocks"] | undefined {
-  if (!text || /^[ \t]|[ \t]+$|\r/m.test(text)
-    || /^(?:[-+*](?:\s|$)|\d+[.)](?:\s|$)|[-=_* \t]+$)/m.test(text)
+/** Eligibility for ordinary prose with ATX headings, simple emphasis, prices and inline math. */
+function isSimpleTypography(text: string): boolean {
+  if (/^(?:[-+*](?:\s|$)|\d+[.)](?:\s|$)|[-=_* \t]+$|>)/m.test(text)
     || /^\s*\|?\s*:?-{3,}/m.test(text)
-    || /https?:\/\//i.test(text)) return undefined;
-  let syntax = text.replace(/^#{1,6} (?=\S)/gm, "");
+    || /https?:\/\//i.test(text)) return false;
+  let syntax = text.replace(/^#{1,6} (?=\S)/gm, "")
+    .replace(INLINE_MATH, "M").replace(/\\\$|\$(?=\.?\d)/g, "");
   // Unknown placeholder tags are literal; supported HTML and document tags
   // retain their prior handling rather than widening this inline subset.
   syntax = syntax.replace(/<([\w/-]+)>/g, (tag, name: string) =>
     name in INLINE_HTML_TYPES || /^(?:\/?(?:div|details|summary|table|ul|ol|li|p|h[1-6]))$/i.test(name) ? tag : "");
-  // Admit word/phrase emphasis only at clear prose boundaries. Ambiguous
-  // punctuation and intraword delimiters stay on the existing Markdown path.
-  syntax = syntax.replace(/(?<!\S)(\*\*|__|\*|_)([\p{L}\p{N}](?:[^*_\n]*[\p{L}\p{N}])?)\1(?=$|[\s.,!?;:])/gu, "$2")
+  // Labels can include their closing punctuation inside the emphasis delimiters.
+  syntax = syntax.replace(/(?<!\S)(\*\*|__|\*|_)([\p{L}\p{N}](?:[^*_\n]*[\p{L}\p{N}.,!?;:])?)\1(?=$|[\s.,!?;:])/gu, "$2")
     .replace(/(?<![\p{L}\p{N}])[\p{L}\p{N}]+(?:_[\p{L}\p{N}]+)+/gu, "");
-  if (/[`\\[\]<>$|*_~=#&@]/.test(syntax)) return undefined;
-  return compatibleNativeBlocks(text);
+  return !/[`\\[\]<>$|*_~=#&@]/.test(syntax);
+}
+
+function simpleTypographyBlocks(text: string): InputRichMessageWithoutUpload["blocks"] | undefined {
+  if (!text || /^[ \t]|[ \t]+$|\r/m.test(text) || !text.replace(INLINE_MATH, "").trim()) return undefined;
+  const blocks = compatibleNativeBlocks(text, true);
+  // Keep the established route for standalone photos.
+  if (blocks?.some(block => block.type !== "photo")) return blocks;
+  return undefined;
 }
 
 function packCompatibleChunks(chunks: RichAnswerChunk[]): void {
@@ -263,8 +329,8 @@ function packCompatibleChunks(chunks: RichAnswerChunk[]): void {
     const text = `${left.text}\n\n${right.text}`;
     if ((left.options.nativeBlocks || right.options.nativeBlocks) && Buffer.byteLength(text) <= RICH_TEXT_BYTES
       && blockCost(text) <= 400 && (text.match(/tg:\/\/photo\?id=/g)?.length ?? 0) <= MAX_PHOTOS) {
-      const a = left.options.nativeBlocks ?? compatibleNativeBlocks(left.text);
-      const b = right.options.nativeBlocks ?? compatibleNativeBlocks(right.text);
+      const a = left.options.nativeBlocks ?? simpleTypographyBlocks(left.text) ?? compatibleNativeBlocks(left.text);
+      const b = right.options.nativeBlocks ?? simpleTypographyBlocks(right.text) ?? compatibleNativeBlocks(right.text);
       if (a && b && a.length + b.length <= 400) {
         left.text = text;
         left.options.nativeBlocks = [...a, ...b];
@@ -335,7 +401,7 @@ export function prepareRichAnswer(source: string, outboxPath?: string): {
     const photoCaption = text.match(/^!\[([^\]]*)\]\(tg:\/\/photo\?id=[^)]+\)$/)?.[1];
     if (needsLiteralEncoding(text) || (photoCaption !== undefined && /["\\]/.test(photoCaption))) {
       flush();
-      chunks.push({ text, options: { purpose: "agent-answer", nativeBlocks: compatibleNativeBlocks(text)
+      chunks.push({ text, options: { purpose: "agent-answer", nativeBlocks: simpleTypographyBlocks(text) ?? compatibleNativeBlocks(text)
         ?? [{ type: "paragraph", text: literalRichText(text) }] } });
       return;
     }
@@ -440,8 +506,10 @@ export function prepareRichAnswer(source: string, outboxPath?: string): {
     chunk.options.indexText = chunk.text.replace(/!\[([^\]]*)\]\(tg:\/\/photo\?id=[^)]+\)/g, (_, caption) => `[Image${caption ? `: ${caption}` : ""}]`);
     // In native Markdown the image title carries the visible media caption.
     // Captions requiring literal handling already use a native photo block.
-    if (!chunk.options.nativeBlocks) chunk.text = chunk.text.replace(/!\[([^\]]*)\]\(tg:\/\/photo\?id=([^)]+)\)/g,
-      (_, caption: string, id: string) => `![](tg://photo?id=${id}${caption ? ` "${caption}"` : ""})`);
+    if (!chunk.options.nativeBlocks) {
+      chunk.text = escapeMarkdownPrices(chunk.text.replace(/!\[([^\]]*)\]\(tg:\/\/photo\?id=([^)]+)\)/g,
+        (_, caption: string, id: string) => `![](tg://photo?id=${id}${caption ? ` "${caption}"` : ""})`));
+    }
   });
   return { chunks, confirm(index) {
     for (const file of reserved.values()) {
