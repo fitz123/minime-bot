@@ -342,14 +342,25 @@ describe("native rich relay vertical slice", () => {
         assert.equal(method, 'sendRichMessage');
         const pieces: Buffer[] = [];
         for await (const piece of init!.body as unknown as AsyncIterable<Uint8Array>) pieces.push(Buffer.from(piece));
-        const form = await new Response(Buffer.concat(pieces), { headers: init!.headers }).formData();
-        const rich = JSON.parse(String(form.get('rich_message')));
+        const contentType = new Headers(init!.headers).get('content-type');
+        const boundary = contentType?.match(/^multipart\/form-data; boundary=(.+)$/)?.[1];
+        assert.ok(boundary);
+        // Node 22.19's FormData parser rejects grammY's Content-Disposition formatting.
+        const wire = Buffer.concat(pieces).toString('latin1');
+        const parts = `\r\n${wire}`.split(`\r\n--${boundary}`);
+        const readPart = (name: string, dispositionSuffix: string) => {
+          const part = parts.find(part => part.startsWith(`\r\ncontent-disposition:form-data;name="${name}"${dispositionSuffix}`));
+          assert.ok(part, `missing multipart part ${name}`);
+          const headerEnd = part.indexOf('\r\n\r\n');
+          assert.notEqual(headerEnd, -1);
+          return Buffer.from(part.slice(headerEnd + 4), 'latin1');
+        };
+        const rich = JSON.parse(readPart('rich_message', '\r\n').toString('utf8'));
         const photo = rich.blocks?.find((block: { type: string }) => block.type === 'photo');
         if (photo) {
           assert.match(photo.photo.media, /^attach:\/\//);
-          const upload = form.get(photo.photo.media.replace(/^attach:\/\//, ''));
-          assert.ok(upload instanceof Blob);
-          assert.deepEqual(Buffer.from(await upload.arrayBuffer()), png);
+          const upload = readPart(photo.photo.media.replace(/^attach:\/\//, ''), ';filename=');
+          assert.deepEqual(upload, png);
           photo.photo.media = 'uploaded chart';
         }
         calls.push([method, rich]);
