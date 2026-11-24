@@ -21,6 +21,7 @@ import {
   buildBundle,
   collectRules,
   expandImports,
+  fileDeliveryContext,
   resolvePersona,
   writeTempArtifact,
   _resetPiContextCache,
@@ -880,15 +881,21 @@ describe("assemblePiContext", () => {
     }
   });
 
-  it("adds inline-photo guidance only to the Telegram rich variant", () => {
+  it("adds phone-friendly prose and optional chart guidance only to the Telegram rich variant", () => {
     const ws = makeWorkspace({ claudeMd: "# Fixture" });
     const agent = agentFor(ws, { id: "rich-guidance" });
     const plain = assemblePiContext(agent, { includeFileDelivery: true })!;
     const rich = assemblePiContext(agent, { includeFileDelivery: true, telegramRichAnswers: true })!;
     assert.notEqual(plain.appendSystemPromptPath, rich.appendSystemPromptPath);
-    assert.doesNotMatch(readFileSync(plain.appendSystemPromptPath, "utf8"), /outbox:filename/);
+    const plainGuidance = readFileSync(plain.appendSystemPromptPath, "utf8");
     const richGuidance = readFileSync(rich.appendSystemPromptPath, "utf8");
-    assert.match(richGuidance, /!\[caption\]\(outbox:filename.png\)/);
+    assert.ok(richGuidance.includes(fileDeliveryContext(true)));
+    for (const guidance of [/Markdown headings to group related ideas and short paragraphs/, /emphasis selectively/,
+      /Keep short answers short/, /If a chart clarifies .+ place it beside the relevant prose/,
+      /!\[caption\]\(outbox:filename\.png\)/]) {
+      assert.match(richGuidance, guidance);
+      assert.doesNotMatch(plainGuidance, guidance);
+    }
     for (const constraint of [/between paragraphs, outside table cells/, /basenames without whitespace or directory separators/,
       /captions without closing brackets/, /invalid inline reference prevents final answer delivery/]) {
       assert.match(richGuidance, constraint);

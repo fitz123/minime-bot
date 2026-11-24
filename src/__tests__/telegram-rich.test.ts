@@ -68,6 +68,65 @@ describe('simple answer typography', () => {
     });
   }
 
+  it('projects emphasized labels with closing punctuation in plain prose', () => {
+    const source = '**Decision:** Accept the proof. *Why?* The type is legible.';
+    const blocks = [{ type: 'paragraph', text: [
+      { type: 'bold', text: 'Decision:' }, ' Accept the proof. ',
+      { type: 'italic', text: 'Why?' }, ' The type is legible.',
+    ] }];
+    assert.deepEqual(richDraftPayload(source), { blocks });
+    assert.deepEqual(prepareRichAnswer(source).chunks[0].options.nativeBlocks, blocks);
+  });
+
+  it('keeps prices literal alongside inline and displayed math', () => {
+    const source = '## Print costs\nThe quotes are $24 and $36. **Model:** $2x+1$ uses $n_i$ as the index.\n\n$$\n2x+1=7\n$$\n\nA proof still costs $24. Enter <copies> before using $2n$.';
+    const blocks = [
+      { type: 'heading', size: 2, text: 'Print costs' },
+      { type: 'paragraph', text: [
+        'The quotes are $24 and $36. ', { type: 'bold', text: 'Model:' }, ' ',
+        { type: 'mathematical_expression', expression: '2x+1' }, ' uses ',
+        { type: 'mathematical_expression', expression: 'n_i' }, ' as the index.',
+      ] },
+      { type: 'mathematical_expression', expression: '2x+1=7' },
+      { type: 'paragraph', text: [
+        'A proof still costs $24. Enter <copies> before using ', { type: 'mathematical_expression', expression: '2n' }, '.',
+      ] },
+    ];
+    assert.deepEqual(richDraftPayload(source), { blocks });
+    assert.deepEqual(prepareRichAnswer(source).chunks.map(chunk => chunk.options.nativeBlocks), [blocks]);
+  });
+
+  it('keeps escaped and formatted prices distinct from a single-number formula', () => {
+    const source = String.raw`**$24.50:** Pay \$1,036 for the full run. Use $2$ as the order index. *Scale by $a*b$ for foldouts.*`;
+    const blocks = [{ type: 'paragraph', text: [
+      { type: 'bold', text: '$24.50:' }, ' Pay ', '$', '1,036 for the full run. Use ',
+      { type: 'mathematical_expression', expression: '2' }, ' as the order index. ',
+      { type: 'italic', text: ['Scale by ', { type: 'mathematical_expression', expression: 'a*b' }, ' for foldouts.'] },
+    ] }];
+    assert.deepEqual(richDraftPayload(source), { blocks });
+    assert.deepEqual(prepareRichAnswer(source).chunks[0].options.nativeBlocks, blocks);
+  });
+
+  it('keeps leading-decimal prices literal next to numeric-leading math', () => {
+    const source = 'Stock costs $.24–$.36 per sheet. Use $2x+1$ to estimate the run.';
+    const blocks = [{ type: 'paragraph', text: [
+      'Stock costs $.24–$.36 per sheet. Use ',
+      { type: 'mathematical_expression', expression: '2x+1' }, ' to estimate the run.',
+    ] }];
+    assert.deepEqual(richDraftPayload(source), { blocks });
+    assert.deepEqual(prepareRichAnswer(source).chunks.map(chunk => chunk.options.nativeBlocks), [blocks]);
+  });
+
+  it('keeps paired inequalities in display math on the same path in draft and final', () => {
+    const source = 'Quotes are $24 and $36.\n\n$$P(X<a, Y>b)$$';
+    const blocks = [
+      { type: 'paragraph', text: 'Quotes are $24 and $36.' },
+      { type: 'mathematical_expression', expression: 'P(X<a, Y>b)' },
+    ];
+    assert.deepEqual(richDraftPayload(source), { blocks });
+    assert.deepEqual(prepareRichAnswer(source).chunks.map(chunk => chunk.options.nativeBlocks), [blocks]);
+  });
+
   it('delivers the representative typography as native draft and final blocks', async () => {
     const source = '# Daily plan\nSet <token> in env.\n\n09:00 Review\n10:00 Walk';
     const expected = [
@@ -112,7 +171,7 @@ describe('simple answer typography', () => {
 
   for (const source of [
     '- first\n- second', '1. first\n2. second', '> quote\ncontinued',
-    '[label][ref]\n\n[ref]: https://example.test', '$x + y$', '$$\nx\n$$',
+    '[label][ref]\n\n[ref]: https://example.test', '$x + y$', '$2x+1$', '$$\nx\n$$',
     '| Name |\n| --- |\n| Value |', 'Name\n:---\nValue', 'Title\n===', '* * *',
     'Before\n\n--\t--\n\nAfter',
     ...['---FAILED---', ':---FAILED---', '|---FAILED---', '| :---FAILED---']
@@ -218,6 +277,96 @@ async function* answer(text: string): AsyncGenerator<StreamLine> {
 }
 
 describe("native rich relay vertical slice", () => {
+  it('escapes only price dollars in server Markdown sent by draft and final', async () => {
+    const calls: unknown[] = [];
+    const adapter = createTelegramApiAdapter({
+      api: {
+        async sendRichMessageDraft(_chat: number, _id: number, rich: unknown) { calls.push(rich); return true; },
+        async sendRichMessage(_chat: number, rich: unknown) { calls.push(rich); return { message_id: 1 }; },
+      } as any,
+      chatId: 1,
+      binding: { kind: 'dm', agentId: 'test', chatId: 1, typingIndicator: false },
+    });
+    const prose = '**Standard:** $24. **Heavy:** $36.';
+    const escaped = String.raw`**Standard:** \$24. **Heavy:** \$36.`;
+    for (const complex of ['[Paper specs](https://example.test/specs)', '- Check the proof.',
+      '| Stock | Proof |\n| --- | --- |\n| Heavy | Included |', '## Q&A']) {
+      await relayStream(answer(`${prose}\n\n${complex}`), adapter);
+      const markdown = `${escaped}\n\n${complex}`;
+      assert.deepEqual(calls.splice(0), [{ markdown }, { markdown, media: [] }]);
+    }
+
+    const tail = ' Already paid \\$2. Use $2x+1$ and $P(X<a, Y>b)$. Keep `$24` as entered.\n\n'
+      + '$$2x+1=7$$\n\n[Paper specs](https://example.test/specs/$24)';
+    const costs = 'Stock costs $.24–$.36 per sheet. Check $24 against `cost$`.';
+    await relayStream(answer(`${prose} ${costs}${tail}`), adapter);
+    const markdown = `${escaped} Stock costs \\$.24–\\$.36 per sheet. Check \\$24 against \`cost$\`.${tail}`;
+    assert.deepEqual(calls, [{ markdown }, { markdown, media: [] }]);
+  });
+
+  it('sends an editorial brief with literal prices and an inline chart in source order', async () => {
+    const { Api } = await import('grammy');
+    const outbox = mkdtempSync(join(tmpdir(), 'rich-print-brief-'));
+    writeFileSync(join(outbox, 'print-quotes.png'), png);
+    const source = [
+      '# Field notes print brief\nChoose a short run for a folded exhibition handout. We need enough copies for the opening and a few to mail with review packets.',
+      '## Compare the quotes\n**Standard:** $24 for uncoated stock. **Heavyweight:** $36 for a stiffer sheet. Both quotes include a folded proof.\n'
+        + '![Print quote comparison](outbox:print-quotes.png)\n'
+        + 'The heavier stock costs more and makes the folds bulkier. The chart shows the premium at a glance.',
+      '## Editorial decision\n*Recommendation:* Choose uncoated stock so the handout folds flat. Check the captions on the proof before approving the run.',
+    ].join('\n\n');
+    const blocks = [
+      { type: 'heading', size: 1, text: 'Field notes print brief' },
+      { type: 'paragraph', text: 'Choose a short run for a folded exhibition handout. We need enough copies for the opening and a few to mail with review packets.' },
+      { type: 'heading', size: 2, text: 'Compare the quotes' },
+      { type: 'paragraph', text: [
+        { type: 'bold', text: 'Standard:' }, ' $24 for uncoated stock. ',
+        { type: 'bold', text: 'Heavyweight:' }, ' $36 for a stiffer sheet. Both quotes include a folded proof.',
+      ] },
+      { type: 'paragraph', text: '[Image: Print quote comparison]' },
+      { type: 'paragraph', text: 'The heavier stock costs more and makes the folds bulkier. The chart shows the premium at a glance.' },
+      { type: 'heading', size: 2, text: 'Editorial decision' },
+      { type: 'paragraph', text: [
+        { type: 'italic', text: 'Recommendation:' },
+        ' Choose uncoated stock so the handout folds flat. Check the captions on the proof before approving the run.',
+      ] },
+    ];
+    const calls: unknown[] = [];
+    const api = new Api('test:fixture', {
+      fetch: async (url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        const method = String(url).split('/').at(-1);
+        if (method === 'sendRichMessageDraft') {
+          calls.push([method, JSON.parse(init!.body as string).rich_message]);
+          return Response.json({ ok: true, result: true });
+        }
+        assert.equal(method, 'sendRichMessage');
+        const pieces: Buffer[] = [];
+        for await (const piece of init!.body as unknown as AsyncIterable<Uint8Array>) pieces.push(Buffer.from(piece));
+        const form = await new Response(Buffer.concat(pieces), { headers: init!.headers }).formData();
+        const rich = JSON.parse(String(form.get('rich_message')));
+        const photo = rich.blocks?.find((block: { type: string }) => block.type === 'photo');
+        if (photo) {
+          assert.match(photo.photo.media, /^attach:\/\//);
+          const upload = form.get(photo.photo.media.replace(/^attach:\/\//, ''));
+          assert.ok(upload instanceof Blob);
+          assert.deepEqual(Buffer.from(await upload.arrayBuffer()), png);
+          photo.photo.media = 'uploaded chart';
+        }
+        calls.push([method, rich]);
+        return Response.json({ ok: true, result: { message_id: 7 } });
+      },
+    });
+    const adapter = createTelegramApiAdapter({ api, chatId: 1, binding: { kind: 'dm', agentId: 'test', chatId: 1, typingIndicator: false } });
+    await relayStream(answer(source), adapter, outbox);
+    const finalBlocks = [
+      ...blocks.slice(0, 4),
+      { type: 'photo', photo: { type: 'photo', media: 'uploaded chart' }, caption: { text: 'Print quote comparison' } },
+      ...blocks.slice(5),
+    ];
+    assert.deepEqual(calls, [['sendRichMessageDraft', { blocks }], ['sendRichMessage', { blocks: finalBlocks }]]);
+    assert.deepEqual(readdirSync(outbox), []);
+  });
+
   for (const context of [false, true]) it(`draft settles before final upload, no duplicate standalone (${context ? "context" : "API"})`, async () => {
     const outbox = mkdtempSync(join(tmpdir(), "rich-outbox-"));
     writeFileSync(join(outbox, "one.png"), png); writeFileSync(join(outbox, "two.png"), png);
@@ -227,13 +376,14 @@ describe("native rich relay vertical slice", () => {
     const api: any = {
       async sendRichMessageDraft(_chat: number, _id: number, rich: any) {
         calls.push("draft"); assert.equal(rich.media, undefined);
-        assert.ok(!rich.markdown.includes("outbox:")); assert.match(rich.markdown, /Image: First/);
+        assert.deepEqual(rich.blocks.map((block: any) => block.text), ["Report", "Before", "[Image: First]", "Between", "[Image: Second]"]);
         await gate; calls.push("draft-settled"); return true;
       },
       async sendRichMessage(_chat: number, rich: any, opts: any) {
         calls.push("final"); assert.equal(opts.message_thread_id, 7);
-        assert.equal(rich.media.length, 2);
-        assert.match(rich.markdown, /# Report\n\nBefore\n\n!\[\]\(tg:\/\/photo\?id=photo_0 "First"\)\n\nBetween\n\n!\[\]\(tg:\/\/photo\?id=photo_1 "Second"\)/);
+        assert.deepEqual(rich.blocks.map((block: any) => block.type), ["heading", "paragraph", "photo", "paragraph", "photo"]);
+        assert.deepEqual(rich.blocks.map((block: any) => block.text ?? block.caption.text), ["Report", "Before", "First", "Between", "Second"]);
+        assert.ok(rich.blocks.filter((block: any) => block.type === "photo").every((block: any) => typeof block.photo.media.toRaw === "function"));
         return { message_id: 100 };
       },
       async sendPhoto() { calls.push("standalone"); }, async sendDocument() { calls.push("standalone"); },
@@ -481,7 +631,7 @@ it('never requests server-side media for reference-style external images', () =>
   assert.throws(() => prepareRichAnswer('![bad [nested]](outbox:missing.png)'), /Malformed inline photo/);
 });
 
-it('uses grammY multipart serialization for the actual native final API call', async () => {
+it('keeps grammY multipart uploads on the Markdown path for a complex caption', async () => {
   const { Api } = await import('grammy');
   const outbox = mkdtempSync(join(tmpdir(), 'rich-wire-'));
   writeFileSync(join(outbox, 'one.png'), png); writeFileSync(join(outbox, 'two.png'), png);
@@ -508,7 +658,7 @@ it('uses grammY multipart serialization for the actual native final API call', a
     },
   });
   const adapter = createTelegramApiAdapter({ api, chatId: 1, binding: { chatId: 1, kind: 'dm', agentId: 'test', typingIndicator: false } });
-  await relayStream(answer('# Wire report\n\nBefore\n\n![One](outbox:one.png)\n\nBetween\n\n![Two](outbox:two.png)'), adapter, outbox);
+  await relayStream(answer('# Wire report\n\nBefore\n\n![***One***](outbox:one.png)\n\nBetween\n\n![Two](outbox:two.png)'), adapter, outbox);
   assert.deepEqual(methods, ['sendRichMessageDraft', 'sendRichMessage']);
   assert.deepEqual(readdirSync(outbox), []);
 });
@@ -668,7 +818,12 @@ it('incomplete local image syntax cannot abort the authoritative streamed answer
   let finals = 0;
   const api: any = {
     async sendRichMessageDraft() { return true; },
-    async sendRichMessage(_chat: number, rich: any) { finals++; assert.equal(rich.media.length, 1); return { message_id: 1 }; },
+    async sendRichMessage(_chat: number, rich: any) {
+      finals++;
+      assert.deepEqual(rich.blocks.map((block: any) => block.type), ['paragraph', 'photo', 'paragraph']);
+      assert.equal(typeof rich.blocks[1].photo.media.toRaw, 'function');
+      return { message_id: 1 };
+    },
   };
   async function* stream(): AsyncGenerator<StreamLine> {
     for (const text of ['Before\n\n![Chart](outbox:', 'one.png)\n\nAfter']) {
