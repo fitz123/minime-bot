@@ -863,6 +863,7 @@ export function spawnPreparedPiRpcSession(options: {
   extensions: readonly string[];
   env: NodeJS.ProcessEnv;
   offline: boolean;
+  appendSystemPrompt?: string;
 }): ChildProcess {
   const { binding, context } = options;
   if (!options.model.trim() || !options.thinking) throw new Error("Explicit Pi model/thinking required");
@@ -876,6 +877,7 @@ export function spawnPreparedPiRpcSession(options: {
   // Pi discovers SYSTEM.md independently of --no-context-files. Empty input
   // suppresses that discovery while retaining Pi's built-in default prompt.
   if (!context.systemPromptPath && !context.behavioralFoundation) args.push("--system-prompt", "");
+  if (options.appendSystemPrompt) args.push("--append-system-prompt", options.appendSystemPrompt);
   if (options.tools.length) args.push("--tools", options.tools.join(","));
   else args.push("--no-tools");
   for (const extension of options.extensions) args.push("--extension", extension);

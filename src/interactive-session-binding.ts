@@ -1,8 +1,9 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   closeSync,
   fchmodSync,
+  fstatSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
@@ -35,6 +36,37 @@ export interface InteractiveSessionBinding extends InteractiveSessionLocation {
   sessionFile: string;
 }
 
+/** Fingerprint a verified exact binding, allowing only the header cwd to differ across users. */
+export function fingerprintInteractiveSession(binding: InteractiveSessionBinding): string {
+  const descriptor = openSync(binding.sessionFile, "r");
+  try {
+    const before = fstatSync(descriptor);
+    const buffer = Buffer.alloc(MAX_INTERACTIVE_SESSION_HEADER_BYTES);
+    const count = readSync(descriptor, buffer);
+    const newline = buffer.subarray(0, count).indexOf(0x0a);
+    if (newline < 1) throw new Error("Pi transcript has no complete header");
+    const { cwd, ...header } = JSON.parse(buffer.subarray(0, newline).toString("utf8"));
+    if (cwd !== binding.workspaceRealpath || header.id !== binding.sessionId) {
+      throw new Error("Pi transcript identity changed during inspection");
+    }
+    const digest = createHash("sha256").update(JSON.stringify(header)).update("\n");
+    digest.update(buffer.subarray(newline + 1, count));
+    let lastByte = buffer[count - 1];
+    for (let length = readSync(descriptor, buffer); length > 0; length = readSync(descriptor, buffer)) {
+      digest.update(buffer.subarray(0, length));
+      lastByte = buffer[length - 1];
+    }
+    const after = fstatSync(descriptor);
+    if (lastByte !== 0x0a || before.size !== after.size
+      || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
+      throw new Error("Pi transcript must be complete and unchanged during inspection");
+    }
+    return digest.digest("hex");
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
 export type InteractiveTranscriptFailure =
   | "missing"
   | "unsafe"
@@ -59,6 +91,8 @@ export interface InteractiveSessionLocationOptions {
   env?: NodeJS.ProcessEnv;
   homeDirectory?: string;
   expectedUid?: number;
+  /** Inspection for an operator binding change must leave the source alone. */
+  readOnly?: boolean;
 }
 
 export interface InteractiveSessionInspectionOptions {
@@ -213,7 +247,7 @@ export function resolveInteractiveSessionLocation(
   const requestedDirectory = absolutePiPath(selectedDirectory, workspaceRealpath, homeDirectory);
   const sessionDirectory = privateSessionDirectory(
     requestedDirectory,
-    true,
+    !options.readOnly,
     expectedUid(options),
   );
   return { workspaceRealpath, sessionDirectory };

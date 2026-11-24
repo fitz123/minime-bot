@@ -1,6 +1,6 @@
 // cron-runner.ts — CLI entry point for running scheduled cron tasks
 // Usage: npx tsx src/cron-runner.ts --task <name>
-// Loads cron definition from crons.yaml, runs a Pi print-mode one-shot, delivers output to Telegram
+// Loads cron definition from crons.yaml, runs a one-shot, delivers output to Telegram
 
 import {
   appendFileSync,
@@ -21,6 +21,7 @@ import {
   loadTelegramToken,
   resolveConfigWorkspaceRoot,
   validateAgent,
+  validateWorkerRuntime,
 } from "./config.js";
 import {
   execFileSync,
@@ -34,11 +35,15 @@ import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { buildCronFastEnv } from "./cron-fast-env.js";
+import { buildCronSystemInstruction, MINIME_CRON_UNRESOLVED_MARKER } from "./cron-llm-instruction.js";
+import { AgentRuntimeClient } from "./agent-runtime-client.js";
+import { AGENT_RUNTIME_CLIENT_PROMPT_TIMEOUT_MS, AgentRuntimeError, AgentRuntimeUncertainError } from "./agent-runtime-protocol.js";
+import { isDeepStrictEqual } from "node:util";
 import { setTimeout as sleep } from "node:timers/promises";
 import { Api } from "grammy";
 import { CronResultPreparationError, deliverCronResult } from "./cron-rich-delivery.js";
 import type { TelegramAdapterApi } from "./telegram-adapter.js";
-import type { CronJob, AgentConfig } from "./types.js";
+import type { CronJob, AgentConfig, ResultMessage } from "./types.js";
 import { shouldSuppressNoReply } from "./no-reply.js";
 import {
   buildPiSpawnEnv,
@@ -83,6 +88,7 @@ import {
   type CronDiagnosticFailureCategory,
 } from "./cron-diagnostics.js";
 export { loadMergedCrons, resolveCronsPath } from "./cron-loader.js";
+export { MINIME_CRON_UNRESOLVED_MARKER } from "./cron-llm-instruction.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOT_DIR = resolve(__dirname, "..");
@@ -95,7 +101,6 @@ const CRON_HEALTH_LOCK_TIMEOUT_MS = CRON_HEALTH_STALE_LOCK_MS + 5_000;
 const PI_ERROR_EXCERPT_CHARS = 1000;
 const FAILURE_FALLBACK_ERROR_CHARS = 400;
 export const CRON_DELIVERY_RETRY_DELAYS_MS = [5_000, 30_000] as const;
-export const MINIME_CRON_UNRESOLVED_MARKER = "[[MINIME_CRON_UNRESOLVED_V1]]";
 export type CronTerminalOutcome = "success" | "failure";
 type PiThinkingLevel = NonNullable<AgentConfig["thinking"]>;
 const PI_THINKING_LEVELS = new Set<PiThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh"]);
@@ -743,7 +748,7 @@ export interface DeliveryDefaults {
 }
 
 interface CronConfigDefaults extends DeliveryDefaults {
-  workerRoutedAgents?: ReadonlySet<string>;
+  workerRoutedAgents?: ReadonlyMap<string, unknown>;
 }
 
 function loadCronTask(taskName: string, cronsPath?: string, defaults?: DeliveryDefaults): CronJob {
@@ -939,10 +944,13 @@ export function loadDefaultDelivery(configPath?: string): CronConfigDefaults {
     agents?: Record<string, unknown>;
   };
   const result: CronConfigDefaults = {};
-  const workerRoutedAgents = Object.entries(raw?.agents ?? {}).filter(([, agent]) =>
-    agent !== null && typeof agent === "object" && Object.hasOwn(agent, "workerRuntime")
-  ).map(([id]) => id);
-  if (workerRoutedAgents.length) result.workerRoutedAgents = new Set(workerRoutedAgents);
+  const workerRoutedAgents = new Map<string, unknown>();
+  for (const [id, agent] of Object.entries(raw?.agents ?? {})) {
+    if (agent !== null && typeof agent === "object" && Object.hasOwn(agent, "workerRuntime")) {
+      workerRoutedAgents.set(id, (agent as Record<string, unknown>).workerRuntime);
+    }
+  }
+  if (workerRoutedAgents.size) result.workerRoutedAgents = workerRoutedAgents;
   if (raw?.defaultDeliveryChatId !== undefined) {
     if (typeof raw.defaultDeliveryChatId === "number" && Number.isInteger(raw.defaultDeliveryChatId) && raw.defaultDeliveryChatId !== 0) {
       result.defaultDeliveryChatId = raw.defaultDeliveryChatId;
@@ -1276,15 +1284,6 @@ function scrubLegacyRuntimeEnv(rawEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return env;
 }
 
-function buildCronSystemInstruction(): string {
-  const today = new Date().toISOString().split("T")[0];
-  return [
-    `Today is ${today}. Respond concisely.`,
-    `Cron jobs always run with Fast off. Preserve the cron environment in child processes; direct absolute Codex CLI calls must include -c 'service_tier="default"'.`,
-    `If your final report has an unresolved finding, add ${MINIME_CRON_UNRESOLVED_MARKER} as its exact standalone final non-empty line. Do not use this marker otherwise.`,
-  ].join(" ");
-}
-
 export interface LlmCronTerminalResult {
   output: string;
   outcome: CronTerminalOutcome;
@@ -1547,6 +1546,51 @@ function runOneShot(
   return deps.runPi(cron, workspaceCwd, agentData);
 }
 
+async function runWorkerCron(
+  cron: CronJob,
+  route: NonNullable<AgentConfig["workerRuntime"]>,
+  log: (name: string, message: string) => void,
+): Promise<string> {
+  resolveCronEngine(cron);
+  if (!cron.prompt?.trim()) throw new Error("Worker cron requires a nonempty prompt");
+  const requestId = randomUUID();
+  const laneId = `cron-${requestId}`;
+  log(cron.name, `Worker invocation lane=${laneId}`);
+
+  let client: AgentRuntimeClient;
+  try {
+    client = await AgentRuntimeClient.connect(route.socketPath, undefined, route);
+  } catch {
+    throw new AgentRuntimeError("connection_failed", "Could not connect to the scheduled worker. No prompt was submitted.");
+  }
+  try {
+    const opened = await client.open(laneId, undefined, cron.agentId);
+    const { handle } = opened;
+    if (opened.phase !== "ready" || handle.laneId !== laneId || handle.agentId !== cron.agentId || opened.request) {
+      throw new AgentRuntimeError("binding_conflict", "The worker did not open a fresh scheduled lane");
+    }
+    let result: ResultMessage | undefined;
+    const timeout = Math.min(Math.ceil(cron.timeout ?? AGENT_RUNTIME_CLIENT_PROMPT_TIMEOUT_MS), AGENT_RUNTIME_CLIENT_PROMPT_TIMEOUT_MS);
+    const finished = await client.prompt(handle, requestId, cron.prompt, event => {
+      if (event.type === "result") result = event;
+    }, timeout).completed;
+    if (!isDeepStrictEqual(finished.handle, handle) || finished.request?.requestId !== requestId
+      || finished.request.outcome !== "settled" || !result) {
+      throw new AgentRuntimeUncertainError();
+    }
+    try {
+      const closed = await client.close(handle);
+      if (closed.phase !== "closed" || !isDeepStrictEqual(closed.handle, handle)) throw new AgentRuntimeUncertainError();
+    } catch {
+      throw new AgentRuntimeError("cleanup_unconfirmed", "The scheduled worker finished, but lane cleanup could not be confirmed");
+    }
+    if (result.is_error === true) throw new AgentRuntimeError("worker_prompt_failed", "The scheduled worker reported a Pi execution failure");
+    return result.result;
+  } finally {
+    client.disconnect();
+  }
+}
+
 export interface CronRunnerMainDeps {
   argv: string[];
   consoleError: (message?: unknown, ...optionalParams: unknown[]) => void;
@@ -1750,10 +1794,16 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
   }
 
   let cron: CronJob;
+  let workerRoute: AgentConfig["workerRuntime"];
   try {
     cron = deps.loadCronTask(taskName, undefined, defaults);
     if (defaults.workerRoutedAgents?.has(cron.agentId)) {
-      throw new Error(`Cron execution is unavailable for worker-routed agent "${cron.agentId}"`);
+      if (cron.type === "llm") {
+        workerRoute = validateWorkerRuntime(defaults.workerRoutedAgents.get(cron.agentId), cron.agentId);
+      }
+      if (!workerRoute?.scheduledLlm) {
+        throw new Error(`Cron execution is unavailable for worker-routed agent "${cron.agentId}"`);
+      }
     }
   } catch (err) {
     try {
@@ -1992,14 +2042,12 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
       output = deps.runScript(cron);
       deps.log(taskName, `Script returned ${output.length} chars`);
     } else {
-      const cronAgentData = deps.resolveCronAgentData(cron.agentId);
-      const workspaceCwd = cronAgentData.workspaceCwd;
-      output = runOneShot(
-        cron,
-        workspaceCwd,
-        { runPi: deps.runPi },
-        cronAgentData,
-      );
+      if (workerRoute) {
+        output = await runWorkerCron(cron, workerRoute, deps.log);
+      } else {
+        const cronAgentData = deps.resolveCronAgentData(cron.agentId);
+        output = runOneShot(cron, cronAgentData.workspaceCwd, { runPi: deps.runPi }, cronAgentData);
+      }
       deps.log(taskName, `Pi returned ${output.length} chars`);
       const classified = classifyLlmCronTerminalResult(output);
       output = classified.output.trim();

@@ -456,6 +456,25 @@ function validateAskAgentConfig(
   };
 }
 
+export function validateWorkerRuntime(worker: unknown, id: string): NonNullable<AgentConfig["workerRuntime"]> {
+  if (!isConfigRecord(worker)
+    || Object.keys(worker).some(key => !["socketPath", "workerUid", "controllerName", "scheduledLlm"].includes(key))
+    || typeof worker.socketPath !== "string" || !isAbsolute(worker.socketPath)
+    || normalize(worker.socketPath) !== worker.socketPath || /[\u0000-\u001f\u007f]/u.test(worker.socketPath)
+    || Buffer.byteLength(worker.socketPath) >= 104
+    || typeof worker.workerUid !== "number" || !Number.isSafeInteger(worker.workerUid)
+    || worker.workerUid <= 0 || worker.workerUid === process.getuid?.()
+    || typeof worker.controllerName !== "string" || !/^[a-zA-Z_][a-zA-Z0-9_.-]*$/.test(worker.controllerName)
+    || !/^[a-zA-Z0-9_-]{1,80}$/.test(id)) {
+    throw new Error(`Agent "${id}" workerRuntime requires a canonical socketPath, a distinct nonroot workerUid, and a controllerName`);
+  }
+  if (worker.scheduledLlm !== undefined && typeof worker.scheduledLlm !== "boolean") {
+    throw new Error(`Agent "${id}" workerRuntime.scheduledLlm must be a boolean`);
+  }
+  return { socketPath: worker.socketPath, workerUid: worker.workerUid, controllerName: worker.controllerName,
+    ...(worker.scheduledLlm === undefined ? {} : { scheduledLlm: worker.scheduledLlm }) };
+}
+
 export function validateAgent(
   raw: unknown,
   id: string,
@@ -468,22 +487,7 @@ export function validateAgent(
   }
   const obj = raw as Record<string, unknown>;
   const askAgent = validateAskAgentConfig(obj.askAgent, id, knownAgentIds);
-  let workerRuntime: AgentConfig["workerRuntime"];
-  if (obj.workerRuntime !== undefined) {
-    const worker = obj.workerRuntime;
-    if (!isConfigRecord(worker)
-      || Object.keys(worker).some(key => !["socketPath", "workerUid", "controllerName"].includes(key))
-      || typeof worker.socketPath !== "string" || !isAbsolute(worker.socketPath)
-      || normalize(worker.socketPath) !== worker.socketPath || /[\u0000-\u001f\u007f]/u.test(worker.socketPath)
-      || Buffer.byteLength(worker.socketPath) >= 104
-      || typeof worker.workerUid !== "number" || !Number.isSafeInteger(worker.workerUid)
-      || worker.workerUid <= 0 || worker.workerUid === process.getuid?.()
-      || typeof worker.controllerName !== "string" || !/^[a-zA-Z_][a-zA-Z0-9_.-]*$/.test(worker.controllerName)
-      || !/^[a-zA-Z0-9_-]{1,80}$/.test(id)) {
-      throw new Error(`Agent "${id}" workerRuntime requires a canonical socketPath, a distinct nonroot workerUid, and a controllerName`);
-    }
-    workerRuntime = { socketPath: worker.socketPath, workerUid: worker.workerUid, controllerName: worker.controllerName };
-  }
+  const workerRuntime = obj.workerRuntime === undefined ? undefined : validateWorkerRuntime(obj.workerRuntime, id);
   if (Object.hasOwn(obj, "behavioralFoundation") || Object.hasOwn(obj, "behavioralFoundationRoot")) {
     throw new Error(`Agent "${id}": behavioralFoundation.root is deployment-global, not a per-agent setting`);
   }

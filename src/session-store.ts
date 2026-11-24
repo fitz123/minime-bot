@@ -7,6 +7,7 @@ import {
   openSync,
   readFileSync,
   renameSync,
+  rmdirSync,
   type Stats,
   unlinkSync,
   writeFileSync,
@@ -22,6 +23,7 @@ import type {
   PiThinkingLevel,
   SessionState,
   UnresolvedLegacySessionState,
+  WorkerSessionState,
 } from "./types.js";
 import {
   listInteractiveSessionEvidence,
@@ -36,6 +38,7 @@ import {
   MAX_SESSION_RECOVERY_REASON_LENGTH,
 } from "./types.js";
 import { resolveWorkspaceContract } from "./workspace-contract.js";
+import { WORKER_TRANSCRIPT_DIGEST } from "./agent-runtime-protocol.js";
 
 function defaultStorePath(): string {
   return resolveWorkspaceContract().paths.sessionStorePath;
@@ -80,13 +83,15 @@ const BOUND_STATE_KEYS = new Set([
   "sessionFile",
   "workspaceRealpath",
   "pendingRecoveryNotice",
+  "workerRollback",
 ]);
 const UNRESOLVED_STATE_KEYS = new Set([
   ...BASE_STATE_KEYS,
   "failedSessionId",
   "legacyFailure",
 ]);
-const WORKER_STATE_KEYS = new Set([...BASE_STATE_KEYS, "sessionId"]);
+const WORKER_STATE_KEYS = new Set([...BASE_STATE_KEYS, "sessionId", "adoption"]);
+const ADOPTION_KEYS = new Set(["local", "digest", "routeDigest"]);
 const LEGACY_STATE_KEYS = new Set([
   "sessionId",
   "chatId",
@@ -278,10 +283,27 @@ function parseSessionState(value: unknown, key: string): SessionState {
   const state = record(value, `session "${key}"`);
   if (state.bindingState === "worker") {
     assertExactKeys(state, WORKER_STATE_KEYS, "worker session");
+    const sessionId = boundedString(state.sessionId, "sessionId", MAX_SESSION_ID_LENGTH);
+    const base = baseState(state, key);
+    let adoption: WorkerSessionState["adoption"];
+    if (state.adoption !== undefined) {
+      const proof = record(state.adoption, "worker adoption");
+      assertExactKeys(proof, ADOPTION_KEYS, "worker adoption");
+      const local = record(proof.local, "original local session");
+      if (local.bindingState !== "bound") throw new Error("Worker adoption requires an exact local binding");
+      const parsed = parseSessionState(local, key);
+      if (parsed.bindingState !== "bound" || parsed.agentId !== base.agentId || parsed.sessionId !== sessionId
+        || parsed.pendingRecoveryNotice || typeof proof.digest !== "string" || !WORKER_TRANSCRIPT_DIGEST.test(proof.digest)
+        || typeof proof.routeDigest !== "string" || !WORKER_TRANSCRIPT_DIGEST.test(proof.routeDigest)) {
+        throw new Error("Invalid worker adoption proof");
+      }
+      adoption = { local: parsed, digest: proof.digest, routeDigest: proof.routeDigest };
+    }
     return {
       bindingState: "worker",
-      sessionId: boundedString(state.sessionId, "sessionId", MAX_SESSION_ID_LENGTH),
-      ...baseState(state, key),
+      sessionId,
+      ...base,
+      ...(adoption ? { adoption } : {}),
     };
   }
   if (state.bindingState === "bound") {
@@ -290,12 +312,16 @@ function parseSessionState(value: unknown, key: string): SessionState {
     if (!sessionFile.endsWith(".jsonl")) {
       throw new Error("Invalid session store: sessionFile must end in .jsonl");
     }
+    if (state.workerRollback !== undefined && state.workerRollback !== true) {
+      throw new Error("Invalid session store: workerRollback must be true when present");
+    }
     const parsed: BoundSessionState = {
       bindingState: "bound",
       sessionId: boundedString(state.sessionId, "sessionId", MAX_SESSION_ID_LENGTH),
       sessionFile,
       workspaceRealpath: normalizedAbsolutePath(state.workspaceRealpath, "workspaceRealpath"),
       ...baseState(state, key),
+      ...(state.workerRollback ? { workerRollback: true } : {}),
       ...(state.pendingRecoveryNotice === undefined
         ? {}
         : { pendingRecoveryNotice: parsePendingRecoveryNotice(state.pendingRecoveryNotice) }),
@@ -439,6 +465,23 @@ export class SessionStore {
     }
   }
 
+  /** Serialize read/modify/write operations across cooperating store instances. */
+  private withWriteLock<T>(write: () => T): T {
+    ensurePrivateStoreDir(dirname(this.path));
+    const lock = `${this.path}.lock`;
+    try {
+      mkdirSync(lock, { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      throw new Error("Session store is locked by another writer");
+    }
+    try {
+      return write();
+    } finally {
+      rmdirSync(lock);
+    }
+  }
+
   private writeData(data: SessionStoreData): void {
     const dir = dirname(this.path);
     ensurePrivateStoreDir(dir);
@@ -472,8 +515,11 @@ export class SessionStore {
 
   /** Persist the already-validated current store atomically. */
   save(): void {
-    this.assertMigrated();
-    this.writeData(this.data);
+    this.withWriteLock(() => {
+      this.load();
+      this.assertMigrated();
+      this.writeData(this.data);
+    });
   }
 
   getSession(chatId: string): SessionState | undefined {
@@ -483,20 +529,25 @@ export class SessionStore {
   }
 
   setSession(chatId: string, state: SessionState): void {
-    this.assertMigrated();
-    const parsed = parseSessionState(state, chatId);
-    const next = { ...this.data, [chatId]: parsed };
-    this.writeData(next);
-    this.data = next;
+    this.withWriteLock(() => {
+      this.load();
+      this.assertMigrated();
+      const next = { ...this.data, [chatId]: parseSessionState(state, chatId) };
+      this.writeData(next);
+      this.data = next;
+    });
   }
 
   deleteSession(chatId: string): void {
-    this.assertMigrated();
-    if (!(chatId in this.data)) return;
-    const next = { ...this.data };
-    delete next[chatId];
-    this.writeData(next);
-    this.data = next;
+    this.withWriteLock(() => {
+      this.load();
+      this.assertMigrated();
+      if (!Object.hasOwn(this.data, chatId)) return;
+      const next = { ...this.data };
+      delete next[chatId];
+      this.writeData(next);
+      this.data = next;
+    });
   }
 
   getAllSessions(): SessionStoreData {
@@ -510,18 +561,21 @@ export class SessionStore {
     expected: SessionState | undefined,
     replacement: SessionState | undefined,
   ): boolean {
-    this.assertMigrated();
-    const current = this.data[chatId];
-    if (!isDeepStrictEqual(current, expected)) return false;
-    const next = { ...this.data };
-    if (replacement === undefined) {
-      delete next[chatId];
-    } else {
-      next[chatId] = parseSessionState(replacement, chatId);
-    }
-    this.writeData(next);
-    this.data = next;
-    return true;
+    return this.withWriteLock(() => {
+      this.load();
+      this.assertMigrated();
+      const current = Object.hasOwn(this.data, chatId) ? this.data[chatId] : undefined;
+      if (!isDeepStrictEqual(current, expected)) return false;
+      const next = { ...this.data };
+      if (replacement === undefined) {
+        delete next[chatId];
+      } else {
+        next[chatId] = parseSessionState(replacement, chatId);
+      }
+      this.writeData(next);
+      this.data = next;
+      return true;
+    });
   }
 
   /** Clear only the exact notice a transport confirms it delivered. */
@@ -582,6 +636,11 @@ export class SessionStore {
    * succeed.
    */
   migrateLegacySessions(config: BotConfig, options: LegacySessionMigrationOptions = {}): boolean {
+    if (!this.legacyData || !this.legacySourceBytes) return false;
+    return this.withWriteLock(() => this.migrateLegacySessionsLocked(config, options));
+  }
+
+  private migrateLegacySessionsLocked(config: BotConfig, options: LegacySessionMigrationOptions): boolean {
     if (!this.legacyData || !this.legacySourceBytes) return false;
     if (Object.values(this.legacyData).some(state => config.agents[state.agentId]?.workerRuntime)) {
       throw new Error("Complete the local legacy session-store migration before enabling worker routing for an agent with legacy history");
