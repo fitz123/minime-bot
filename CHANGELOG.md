@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 2026.11.13
+
+- Keep prices, emphasized labels, inline charts and genuine formulas distinct in Telegram replies (#245, #284).
+
 ## 2026.11.12
 
 - Reload Telegram group binding additions and removals explicitly without restarting the running poller. Rejected changes keep the previously applied routes (#280, #282).
