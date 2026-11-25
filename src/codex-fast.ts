@@ -7,7 +7,7 @@ import { resolveWorkspaceContract } from "./workspace-contract.js";
 export const PI_FAST_THREAD_ENV = "MINIME_BOT_PI_SESSION_THREAD_KEY";
 class FastPreferencesError extends Error {}
 export function formatFastCommandError(error: unknown): string {
-  return error instanceof FastPreferencesError ? error.message : "Codex Fast control data is unavailable; check configuration/preferences and permissions, then retry.";
+  return error instanceof FastPreferencesError ? error.message : "Codex Fast settings are unavailable. Check the configuration, preferences file, and permissions, then try again.";
 }
 
 export type FastOverride = "on" | "off" | "inherit";
@@ -39,7 +39,7 @@ function readPreferences(path: string): Preferences {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return { version: 1, defaults: [], threads: [] };
     throw error;
   }
-  const invalid = () => { throw new FastPreferencesError("Invalid Codex Fast preferences; restore valid version 1 control data"); };
+  const invalid = () => { throw new FastPreferencesError("The Codex Fast preferences file is invalid. Restore a valid version 1 file and try again."); };
   if (Buffer.byteLength(text) > 1024 * 1024) return invalid();
   let raw: any;
   try { raw = JSON.parse(text); } catch { return invalid(); }
@@ -80,7 +80,7 @@ function setPreference(scope: FastScope, value: FastOverride, defaultScope: bool
   let lock: number;
   try { lock = openSync(`${path}.lock`, "wx", 0o600); }
   catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new FastPreferencesError("Codex Fast preferences are busy; retry (remove a stale codex-fast.json.lock after a crashed writer)");
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new FastPreferencesError("Codex Fast preferences are busy. Try again. If the process writing the preferences crashed, remove the stale codex-fast.json.lock file before retrying.");
     throw error;
   }
   const temporary = `${path}.${randomUUID()}.tmp`;
@@ -115,15 +115,15 @@ export function formatFastStatusLine(scope: FastScope | undefined, model: string
 
 export const FAST_USAGE = "Usage: /fast [status|on|off|inherit|help] or /fast default [on|off|status]";
 const FAST_HELP = [
-  "/fast или /fast status — показать режим для этого треда.",
-  "/fast on|off — включить или выключить Fast в этом треде.",
-  "/fast inherit — следовать общему режиму агента/модели.",
-  "/fast default on|off|status — общий режим агента/модели; без треда доступен только общий режим.",
-  "В Telegram менять общий режим можно только в личном чате с DM-привязкой.",
-  "Нужен явный opt-in агента для точной модели openai-codex. /fast help доступен и без него.",
-  "Fast — настройка запроса service_tier=priority; выданный сервером приоритет неизвестен.",
-  "Независимые настройки service_tier сохраняются: priority действует и при выключенном Fast, а auto или другой заданный tier мешает адаптеру добавить priority.",
-  "Fast не меняет модель, thinking, авторизацию или историю. Квоты и расход — отдельно: в Telegram /status показывает доступные данные квот.",
+  "Use /fast or /fast status to check the Fast setting for this thread.",
+  "Use /fast on or /fast off to turn Fast on or off for this thread.",
+  "Use /fast inherit to follow the default for this agent and model.",
+  "Use /fast default on|off|status to change or check that default. Without a thread, you can only change the default.",
+  "In Telegram, you can change the default only in a private chat with a DM binding.",
+  "The agent must opt in to Fast for the exact openai-codex model in use. You can read this help without opting in.",
+  "Fast requests priority processing (service_tier=priority). The server decides whether to grant priority.",
+  "A service tier set elsewhere takes precedence. An existing priority tier still requests priority when Fast is off. A tier such as auto prevents Fast from adding priority.",
+  "The model, reasoning level, authentication, and conversation history are independent of Fast. Use /status in Telegram to see available quota information.",
 ].join("\n");
 export function handleFastCommand(args: string, scope: FastScope | undefined, path?: string): string {
   const words = args.trim().split(/\s+/).filter(Boolean);
@@ -131,18 +131,18 @@ export function handleFastCommand(args: string, scope: FastScope | undefined, pa
   const defaultScope = words[0] === "default";
   const value = defaultScope ? words[1] : words[0];
   if (defaultScope ? words.length !== 2 || !["on", "off", "status"].includes(value) : words.length > 1 || (value !== undefined && !["status", "on", "off", "inherit"].includes(value))) return FAST_USAGE;
-  if (!scope || !isFastEligible(scope.agent)) return "Codex Fast unavailable: an identified agent must explicitly opt into its exact openai-codex model.";
-  if (!defaultScope && value !== undefined && value !== "status" && scope.threadKey === undefined) return "No identified chat/thread here. Use /fast default on|off|status.";
+  if (!scope || !isFastEligible(scope.agent)) return "Codex Fast is unavailable. The agent must opt in to Fast for the exact openai-codex model in use.";
+  if (!defaultScope && value !== undefined && value !== "status" && scope.threadKey === undefined) return "This session has no thread. Use /fast default on|off|status.";
   if (value !== undefined && value !== "status") setPreference(scope, value as FastOverride, defaultScope, path ?? fastPreferencesPath());
   const status = readFastStatus(scope, path);
   const agentLabel = scope.agent.id === "main" ? "Main" : scope.agent.id;
   const modelLabel = scope.agent.codexFast.model === "gpt-6-astra" ? "Astra" : `${scope.agent.codexFast.provider}/${scope.agent.codexFast.model}`;
-  const enabledLabel = (enabled: boolean) => enabled ? "включён" : "выключен";
+  const enabledLabel = (enabled: boolean) => enabled ? "on" : "off";
   return [
     `Fast: ${enabledLabel(status.enabled)}`,
-    `Модель: ${modelLabel}`,
-    scope.threadKey === undefined ? "Область: только общий режим (без треда)" :
-      `Этот тред: ${status.override === "inherit" ? "по умолчанию" : `${enabledLabel(status.enabled)} (переопределение)`}`,
-    `Общий режим ${agentLabel}/${modelLabel}: ${enabledLabel(status.defaultEnabled)}`,
+    `Model: ${modelLabel}`,
+    scope.threadKey === undefined ? "This session has no thread." :
+      `This thread: ${status.override === "inherit" ? "follows the default" : `${enabledLabel(status.enabled)} (override)`}`,
+    `Default for ${agentLabel}/${modelLabel}: ${enabledLabel(status.defaultEnabled)}`,
   ].join("\n");
 }

@@ -17,6 +17,7 @@ export interface BuildStatusReportOptions {
   maxSessions: number;
   uptimeSeconds: number;
   sessionHealth?: SessionHealth;
+  effortHint?: boolean;
   fastStatusLine?: string;
   quotaStatus?: QuotaStatus;
   now?: Date;
@@ -31,7 +32,7 @@ export function buildStatusReport(options: BuildStatusReportOptions): string {
   ];
 
   if (options.sessionHealth) {
-    lines.push("", ...formatSessionHealth(options.sessionHealth, now, options.lastSuccessStaleMs, options.fastStatusLine));
+    lines.push("", ...formatSessionHealth(options.sessionHealth, now, options.lastSuccessStaleMs, options.fastStatusLine, options.effortHint));
   }
 
   const quotaLines = formatQuotaBlock(options.quotaStatus, options.sessionHealth, now);
@@ -47,11 +48,12 @@ function formatSessionHealth(
   now: Date,
   lastSuccessStaleMs = DEFAULT_SESSION_LAST_SUCCESS_STALE_MS,
   fastStatusLine?: string,
+  effortHint?: boolean,
 ): string[] {
   const lines = [
     `Agent: ${health.agentId} (${health.provider})`,
     `Model: ${health.model}`,
-    formatReasoningLine(health),
+    `Configured thinking: ${health.thinking ?? "default"}${effortHint ? " (see /effort for the effective level)" : ""}`,
     ...(fastStatusLine ? [fastStatusLine] : []),
     `State: ${formatSessionState(health)}`,
     `Session ID: ${health.sessionId}`,
@@ -63,10 +65,6 @@ function formatSessionHealth(
   }
 
   return lines;
-}
-
-function formatReasoningLine(health: SessionHealth): string {
-  return `Thinking: ${health.thinking ?? "default"}`;
 }
 
 function formatSessionState(health: SessionHealth): string {

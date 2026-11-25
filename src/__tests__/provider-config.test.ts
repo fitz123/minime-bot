@@ -78,6 +78,16 @@ describe("validateAgent provider field", () => {
     assert.strictEqual(agent.thinking, "xhigh");
   });
 
+  it("keeps max as a native thread capability outside the six configured thinking levels", () => {
+    assert.throws(
+      () => validateAgent(
+        { workspaceCwd: "/tmp/x", model: "gpt-5.5", provider: "pi", thinking: "max" },
+        "coder",
+      ),
+      /Agent "coder" has invalid thinking "max" \(must be one of: off, minimal, low, medium, high, xhigh\)/,
+    );
+  });
+
   it("rejects invalid thinking values", () => {
     assert.throws(
       () => validateAgent(

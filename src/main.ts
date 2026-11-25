@@ -129,16 +129,18 @@ async function main(): Promise<void> {
   restoreThreadCache();
   restoreMessageIndex();
 
+  const loadControlConfig = () => loadConfig(undefined, { resolveSecrets: false });
   const telegramBindingReload = config.telegramToken
     ? createTelegramBindingReload(
       config,
-      () => loadConfig(undefined, { resolveSecrets: false }),
+      loadControlConfig,
       () => loadConfig(undefined, { telegramBindingReload: true }),
     )
     : undefined;
   const sessionManager = new SessionManager(loadConfig, undefined, undefined, {
     initialConfig: config,
     telegramBindingReload,
+    loadControlConfig,
   });
   log.info("main", "Session manager initialized");
 
@@ -263,6 +265,7 @@ async function main(): Promise<void> {
     let onUpdateFn: (() => void) | undefined;
     const { bot, messageQueue, echoWatcher: ew, pollProgress, updateProcessing, topicController, reloadGroupBindings } = createTelegramBot(config, sessionManager, {
       bindingReload: telegramBindingReload,
+      loadConfig: loadControlConfig,
       hasOtherActivePlatform: () => !!discordClient?.isReady() && (config.discord?.bindings.length ?? 0) > 0,
       onUpdate: () => onUpdateFn?.(),
       // A failed generation disables this before grammY's final offset

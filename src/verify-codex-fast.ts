@@ -9,7 +9,7 @@ import { normalizeContext } from "@earendil-works/pi-ai";
 import { stream as buildCodexRequest } from "@earendil-works/pi-ai/api/openai-codex-responses";
 import { OPENAI_CODEX_MODELS } from "@earendil-works/pi-ai/providers/openai-codex.models";
 import { formatFastStatusLine, PI_FAST_THREAD_ENV } from "./codex-fast.js";
-import { CRON_FAST_OFF_ENV, isCronFastOff } from "./cron-fast-env.js";
+import { CRON_FAST_OFF_ENV } from "./cron-fast-env.js";
 import { buildStatusReport } from "./status-report.js";
 import { EXPECTED_PI_PACKAGE_VERSION, resolvePackageOwnedPiInvocation } from "./pi-runtime.js";
 import { MINIME_CONFIG_PATH_ENV, MINIME_CONTROL_WORKSPACE_ROOT_ENV, MINIME_INSTANCE_CONFIG_PATH_ENV } from "./workspace-contract.js";
@@ -67,7 +67,7 @@ export async function verifyCodexFast(extensionPath?: string): Promise<{ piVersi
     const created = await createAgentSession({ cwd: root, agentDir, resourceLoader, settingsManager, modelRuntime, model: OPENAI_CODEX_MODELS["gpt-6-astra"], thinkingLevel: "high", noTools: "all", sessionManager: SessionManager.inMemory(root) });
     session = created.session;
     assert.deepEqual(created.extensionsResult.errors, []);
-    assert.ok(session.extensionRunner.getCommand("fast"));
+    assert.equal(session.extensionRunner.getCommand("fast")?.description, "Check or change Codex Fast settings. See /fast help for details.");
     const errors: string[] = [];
     session.extensionRunner.onError(error => errors.push(error.error));
     const notices: string[] = [];
@@ -77,12 +77,13 @@ export async function verifyCodexFast(extensionPath?: string): Promise<{ piVersi
       const count = notices.length;
       await session!.prompt(`/fast${args ? ` ${args}` : ""}`);
       assert.equal(notices.length, count + 1);
-      assert.match(notices.at(-1)!, expected);
-      if (!isCronFastOff(process.env) && notices.at(-1)!.startsWith("Fast:")) {
-        assert.equal(notices.at(-1)!.split("\n").length, 4);
-        assert.match(notices.at(-1)!, /Модель: Astra/);
-        assert.match(notices.at(-1)!, /Общий режим fixture-primary\/Astra:/);
-        assert.doesNotMatch(notices.at(-1)!, /service_tier|priority|Backend/);
+      const notice = notices.at(-1)!;
+      assert.match(notice, expected);
+      if (notice.startsWith("Fast:")) {
+        assert.equal(notice.split("\n").length, 4);
+        assert.match(notice, /Model: Astra/);
+        assert.match(notice, /Default for fixture-primary\/Astra:/);
+        assert.doesNotMatch(notice, /service_tier|priority|Backend/);
       }
       commandsChecked++;
     };
@@ -98,15 +99,15 @@ export async function verifyCodexFast(extensionPath?: string): Promise<{ piVersi
     };
     const preferencesPath = join(root, "data/codex-fast.json");
     await command("help", /service_tier=priority/);
-    await command("", /Fast: выключен/); await check(false);
+    await command("", /Fast: off/); await check(false);
     assert.equal(existsSync(preferencesPath), false, "Help/status must not create preferences");
-    await command("on", /Этот тред: включён \(переопределение\)/); await check(true);
-    await command("off", /Fast: выключен/); await check(false);
-    await command("inherit", /Этот тред: по умолчанию/); await check(false);
-    await command("default on", /Общий режим .*: включён/); await check(true);
-    await command("off", /Этот тред: выключен \(переопределение\)/); await check(false);
+    await command("on", /This thread: on \(override\)/); await check(true);
+    await command("off", /Fast: off/); await check(false);
+    await command("inherit", /This thread: follows the default/); await check(false);
+    await command("default on", /Default for .*: on/); await check(true);
+    await command("off", /This thread: off \(override\)/); await check(false);
     process.env[PI_FAST_THREAD_ENV] = "fixture-chat:two";
-    await command("", /Этот тред: по умолчанию/); await check(true);
+    await command("", /This thread: follows the default/); await check(true);
     const statusScope = { agent: { ...agent, id: "fixture-primary" }, threadKey: process.env[PI_FAST_THREAD_ENV] };
     const beforeStatus = readFileSync(preferencesPath, "utf8");
     const fastStatusLine = formatFastStatusLine(statusScope, agent.model);
@@ -115,31 +116,31 @@ export async function verifyCodexFast(extensionPath?: string): Promise<{ piVersi
       activeCount: 1, maxSessions: 2, uptimeSeconds: 60, fastStatusLine,
       sessionHealth: { agentId: "fixture-primary", model: agent.model, thinking: "high", provider: "pi", sessionId: "fixture-session", pid: null, alive: true, idleMs: 0, processingMs: null, lastSuccessAt: Date.now(), restartCount: 0 },
     });
-    assert.match(report, /Model: openai-codex\/gpt-6-astra\nThinking: high\nFast: on · inherited\nState:/);
+    assert.match(report, /Model: openai-codex\/gpt-6-astra\nConfigured thinking: high\nFast: on · inherited\nState:/);
     assert.match(report, /Session ID: fixture-session/);
     assert.match(report, /Codex quota:/);
     assert.equal(readFileSync(preferencesPath, "utf8"), beforeStatus);
-    await command("on", /Этот тред: включён \(переопределение\)/);
-    await command("default off", /Общий режим .*: выключен/); await check(true);
+    await command("on", /This thread: on \(override\)/);
+    await command("default off", /Default for .*: off/); await check(true);
     process.env[PI_FAST_THREAD_ENV] = "fixture-chat:one"; await check(false);
-    await command("inherit", /Этот тред: по умолчанию/); await check(false);
-    await command("default on", /Общий режим .*: включён/);
+    await command("inherit", /This thread: follows the default/); await check(false);
+    await command("default on", /Default for .*: on/);
     delete process.env[PI_FAST_THREAD_ENV];
-    await command("", /Область: только общий режим \(без треда\)/); await check(true);
-    await command("status", /Область: только общий режим \(без треда\)/);
-    await command("off", /No identified chat/); await check(true);
-    await command("default status", /Общий режим .*: включён/);
+    await command("", /This session has no thread\./); await check(true);
+    await command("status", /This session has no thread\./);
+    await command("off", /^This session has no thread\. Use \/fast default on\|off\|status\.$/); await check(true);
+    await command("default status", /Default for .*: on/);
     await command("default inherit", /Usage:/);
     await command("on extra", /Usage:/);
     await check(false, { ...payload, service_tier: "auto" });
     await check(false, { ...payload, service_tier: "priority" });
-    await command("default off", /Общий режим .*: выключен/);
+    await command("default off", /Default for .*: off/);
     await check(false, { ...payload, service_tier: "priority" });
     await check(false, { ...payload, model: "another-model" });
-    await command("default on", /Общий режим .*: включён/);
+    await command("default on", /Default for .*: on/);
     for (const id of ["fixture-other", "unknown", ""]) {
       process.env.MINIME_BOT_PI_SESSION_AGENT_ID = id;
-      await check(false); await command("on", /unavailable/);
+      await check(false); await command("on", /Codex Fast is unavailable\. The agent must opt in to Fast/);
     }
     process.env.MINIME_BOT_PI_SESSION_AGENT_ID = "fixture-primary";
     // The native scope uses ctx.model, not a replacement configured model.
@@ -154,9 +155,14 @@ export async function verifyCodexFast(extensionPath?: string): Promise<{ piVersi
     await command("help", /\/fast default on\|off\|status/);
     // Help must not even need valid opt-in configuration or preferences.
     writeFileSync(join(root, "config.yaml"), "invalid fixture config");
-    await command("help", /выданный сервером приоритет неизвестен/);
+    await command("status", /Codex Fast settings are unavailable\. Check the configuration, preferences file, and permissions, then try again\./);
     assert.equal(readFileSync(preferencesPath, "utf8"), beforeHelp);
+    writeFileSync(preferencesPath, "invalid fixture preferences");
+    await command("help", /The server decides whether to grant priority\./);
     writeFileSync(join(root, "config.yaml"), JSON.stringify(config));
+    await command("status", /The Codex Fast preferences file is invalid\. Restore a valid version 1 file and try again\./);
+    assert.equal(readFileSync(preferencesPath, "utf8"), "invalid fixture preferences");
+    writeFileSync(preferencesPath, beforeHelp);
     await check(true);
     // Execute Pi's real Codex request builder, stopping inside onPayload before
     // any transport. The token contains only synthetic fixture claims.
@@ -164,7 +170,7 @@ export async function verifyCodexFast(extensionPath?: string): Promise<{ piVersi
     const built: Record<string, unknown>[] = [];
     for (const mode of ["on", "off", "cron"]) {
       if (mode === "cron") process.env[CRON_FAST_OFF_ENV] = "1";
-      else await command(`default ${mode}`, /Общий режим /);
+      else await command(`default ${mode}`, /Default for /);
       const result = await buildCodexRequest(OPENAI_CODEX_MODELS["gpt-6-astra"], normalizeContext({ messages: [{ role: "user", content: "offline fixture", timestamp: 0 }] }), {
         apiKey: token, reasoningEffort: "high", transport: "sse",
         onPayload: async body => {
@@ -194,11 +200,11 @@ export async function verifyCodexFast(extensionPath?: string): Promise<{ piVersi
         requestChecks++;
       }
       for (const args of ["", "status", "on", "off", "inherit", "default on", "default off", "default status", "help"]) {
-        await command(args, /Fast: off \(enforced for cron jobs\)/);
+        await command(args, /Fast is always off for cron jobs\./);
       }
     };
     for (const enabled of [true, false]) {
-      await command(`default ${enabled ? "on" : "off"}`, /Общий режим /);
+      await command(`default ${enabled ? "on" : "off"}`, /Default for /);
       const beforeCron = readFileSync(preferencesPath, "utf8");
       process.env[CRON_FAST_OFF_ENV] = "1";
       for (const id of ["fixture-primary", "fixture-other", ""]) {

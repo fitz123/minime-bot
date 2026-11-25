@@ -5,6 +5,7 @@ import type { InputRichMessageWithoutUpload } from "grammy/types";
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
 export type PiThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+export type NativeEffortLevel = PiThinkingLevel | "max";
 
 export interface AskAgentConfig {
   enabled: boolean;
@@ -125,6 +126,8 @@ interface SessionStateBase {
   model?: string;
   /** Pi thinking level used when this session state was last persisted. Optional for legacy stores. */
   thinking?: PiThinkingLevel;
+  /** Explicit current-thread override; distinct from the runtime signature. */
+  effortOverride?: NativeEffortLevel;
   lastActivity: number;
 }
 

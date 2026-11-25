@@ -17,9 +17,10 @@ import { ensureSessionMediaDir, sessionMediaDir, allocateMediaPath, releaseMedia
 // Real protocol helpers the spawn-path capture needs (parse get_state replies).
 // Resolved here BEFORE mock.module installs the stub, so these are the genuine
 // implementations; the stub below re-exports them so capture parses correctly.
-import { MINIME_BOT_PI_SESSION_AGENT_ID_ENV, NewlineOnlyJsonlSplitter, PiStartupBlockingUiError, assertPiSessionIdentityMatchesBinding, normalizePiModel, parsePiStartupIdentityRecord, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions } from "../pi-rpc-protocol.js";
+import { buildPiSpawnArgs, PI_PROVIDER, MINIME_BOT_PI_SESSION_AGENT_ID_ENV, NewlineOnlyJsonlSplitter, handlePiExtensionUiRecord, PiStartupBlockingUiError, assertPiSessionIdentityMatchesBinding, normalizePiModel, parsePiStartupIdentityRecord, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions } from "../pi-rpc-protocol.js";
+import type { EffortRequestAction, EffortResult } from "../session-effort-wire.js";
 import PQueue from "p-queue";
-import { CURRENT_SESSION_VERSION } from "@earendil-works/pi-coding-agent";
+import { CURRENT_SESSION_VERSION, ModelRuntime, resolveCliModel } from "@earendil-works/pi-coding-agent";
 import { collaborationTransport } from "../collaboration.js";
 import { loadConfig } from "../config.js";
 import { createTelegramBindingReload } from "../telegram-binding-reload.js";
@@ -432,7 +433,9 @@ mock.module("../pi-rpc-protocol.js", {
     sendPiSteer() {},
     sendPiAcknowledgedSteer() {},
     PI_EXTENSIONS_DISABLED_ENV: "PI_EXTENSIONS_DISABLED",
+    PI_PROVIDER,
     normalizePiModel,
+    handlePiExtensionUiRecord,
     async *readPiStream(): AsyncGenerator<StreamLine> {
       // Message-path reader (unused by the spawn-path capture, which now reads
       // child.stdout directly). Present so session-manager's import resolves.
@@ -569,6 +572,198 @@ describe("SessionManager exact Pi binding startup", () => {
       assert.ok(existsSync(reserved));
       await manager.getOrCreateSession("218", "pi");
       assert.ok(existsSync(reserved));
+    } finally { await manager.closeAll(); }
+  });
+
+  it("forwards native model suffix configuration unchanged at startup and resume", async () => {
+    const config = makeConfig();
+    config.agents.pi.model = "gpt-5.5:high";
+    delete config.agents.pi.thinking;
+    const manager = new SessionManager(() => config, TEST_STORE_PATH, TEST_DIR);
+    try {
+      const first = await manager.getOrCreateSession("456:1", "pi");
+      await manager.closeSession("456:1");
+      const resumed = await manager.getOrCreateSession("456:1", "pi");
+      assert.equal(resumed.sessionId, first.sessionId);
+      assert.equal(piSpawnCaptures.length, 2);
+      for (const capture of piSpawnCaptures) {
+        assert.equal(capture.agent.model, "gpt-5.5:high");
+        assert.equal(capture.agent.thinking, undefined);
+        assert.deepEqual(capture.runtimeEnvOptions?.sessionEffort, { provider: PI_PROVIDER, model: "openai-codex/gpt-5.5:high", inherited: undefined, override: undefined });
+      }
+    } finally { await manager.closeAll(); }
+  });
+
+  it("admits the newly configured model before controlling idle effort and honors a new worker route", async t => {
+    const startup = makeConfig();
+    const disk = structuredClone(startup);
+    const loadFullConfig = t.mock.fn(() => disk);
+    const loadControlConfig = t.mock.fn(() => disk);
+    const telegramBindingReload = createTelegramBindingReload(startup, loadControlConfig, loadFullConfig);
+    const manager = new SessionManager(loadFullConfig, TEST_STORE_PATH, TEST_DIR, { initialConfig: startup, loadControlConfig, telegramBindingReload });
+    const key = "456:1";
+    try {
+      const previous = await manager.getOrCreateSession(key, "pi");
+      loadFullConfig.mock.resetCalls();
+      disk.agents.pi.model = "openai-codex/another-model";
+      disk.bindings[1].kind = "group";
+      const request = t.mock.method(manager as unknown as {
+        requestEffort: (lane: string, session: typeof previous, action: EffortRequestAction) => Promise<EffortResult>;
+      }, "requestEffort", async (_lane: string, session: typeof previous, action: EffortRequestAction): Promise<EffortResult> => {
+        assert.notEqual(session, previous);
+        assert.equal(session.model, "openai-codex/another-model");
+        assert.deepEqual(action, { kind: "default", level: "high" });
+        return { kind: "result", id: "new-model", effective: "high", source: "agent default", levels: ["off", "high"] };
+      });
+
+      assert.match(await manager.sessionEffort(key, "pi", "default high"), /default for this model is now high/);
+      const replacement = manager.getActive(key)!;
+      assert.equal(replacement.sessionId, previous.sessionId);
+      assert.equal(previous.child.killed, true);
+      assert.equal(piSpawnCaptures.length, 2);
+      assert.equal(piSpawnCaptures.at(-1)?.runtimeEnvOptions?.sessionEffort?.model, disk.agents.pi.model);
+      assert.equal(loadFullConfig.mock.callCount(), 0);
+      assert.equal(loadControlConfig.mock.callCount(), 1);
+
+      disk.agents.pi.workerRuntime = { socketPath: "/tmp/synthetic-worker.sock", workerUid: 1234, controllerName: "fixture" };
+      await assert.rejects(manager.sessionEffort(key, "pi", "high"), /Worker routing changed.*Restart the controller/);
+      assert.equal(manager.getActive(key), replacement);
+      assert.equal(piSpawnCaptures.length, 2);
+      assert.equal(request.mock.callCount(), 1);
+    } finally { await manager.closeAll(); }
+  });
+
+  it("enables read-only effort inheritance on local lanes without a matching Telegram binding", async () => {
+    const config = makeConfig();
+    const manager = new SessionManager(() => config, TEST_STORE_PATH, TEST_DIR);
+    try {
+      for (const key of ["discord:789", "collaboration:fixture:pi", "789", "123:1"]) {
+        await manager.getOrCreateSession(key, "pi");
+        assert.deepEqual(piSpawnCaptures.at(-1)?.runtimeEnvOptions?.sessionEffort, {
+          provider: PI_PROVIDER, model: "openai-codex/gpt-5.5", inherited: "xhigh", readOnly: true,
+        });
+      }
+      await assert.rejects(manager.sessionEffort("discord:789", "pi"), /require a Telegram conversation/);
+      await assert.rejects(manager.sessionEffort("123:1", "pi"), /Telegram thread binding changed/);
+    } finally { await manager.closeAll(); }
+  });
+
+  it("reopens the exact transcript with writable effort when a group binding returns", async t => {
+    const key = "-456:1";
+    const group = { chatId: -456, agentId: "pi", kind: "group" as const };
+    const startup = makeConfig();
+    startup.bindings.push(group);
+    const disk = structuredClone(startup);
+    const load = () => disk;
+    const telegramBindingReload = createTelegramBindingReload(startup, load, load);
+    const manager = new SessionManager(load, TEST_STORE_PATH, TEST_DIR, { initialConfig: startup, loadControlConfig: load, telegramBindingReload });
+    try {
+      const first = await manager.getOrCreateSession(key, "pi");
+      first.effortOverride = "low";
+      const transcript = readFileSync(first.sessionFile!, "utf8");
+      await manager.closeSession(key);
+      disk.bindings.pop();
+      assert.equal(telegramBindingReload.reload(() => {}), 0);
+      const detached = await manager.getOrCreateSession(key, "pi", first.sessionId, true);
+      assert.equal(detached.effortReadOnly, true);
+      assert.equal(piSpawnCaptures.at(-1)?.runtimeEnvOptions?.sessionEffort?.override, undefined);
+      let finishDelivery!: () => void;
+      const delivery = new Promise<void>(resolve => { finishDelivery = resolve; });
+      const queued = detached.queue.add(() => delivery);
+      disk.bindings.push(group);
+      assert.equal(telegramBindingReload.reload(() => {}), 1);
+      t.mock.method(manager as unknown as {
+        requestEffort: (lane: string, session: ActiveSession) => Promise<EffortResult>;
+      }, "requestEffort", async (_lane: string, session: ActiveSession): Promise<EffortResult> => {
+        assert.notEqual(session, detached);
+        assert.equal(session.effortReadOnly, undefined);
+        return { kind: "result", id: "restored-group", effective: "low", source: "conversation override", levels: ["off", "low"] };
+      });
+      const status = manager.sessionEffort(key, "pi");
+      try {
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(detached.child.killed, false);
+      } finally {
+        finishDelivery();
+        await queued;
+      }
+      assert.match(await status, /Effort is low.*conversation override/);
+      const restored = await manager.getOrCreateSession(key, "pi");
+      assert.equal(restored.sessionId, first.sessionId);
+      assert.equal(restored.sessionFile, first.sessionFile);
+      assert.equal(readFileSync(restored.sessionFile!, "utf8"), transcript);
+      assert.equal(piSpawnCaptures.length, 3);
+      assert.equal(piSpawnCaptures.at(-1)?.runtimeEnvOptions?.sessionEffort?.override, "low");
+    } finally { await manager.closeAll(); }
+  });
+
+  it("preserves uncatalogued model suffix argv after reconnecting with an effort override", async () => {
+    const config = makeConfig();
+    config.agents.pi.model = "openai-codex/custom-id:high";
+    delete config.agents.pi.thinking;
+    const runtime = await ModelRuntime.create({ modelsPath: null, authPath: `${TEST_DIR}/auth.json` });
+    const manager = new SessionManager(() => config, TEST_STORE_PATH, TEST_DIR);
+    const captureArgs = () => {
+      const capture = piSpawnCaptures.at(-1)!;
+      return buildPiSpawnArgs(capture.agent, capture.sessionBinding, capture.extensionOptions, capture.runtimeEnvOptions);
+    };
+    const nativeModel = (args: string[]) => resolveCliModel({
+      cliProvider: args[args.indexOf("--provider") + 1],
+      cliModel: args[args.indexOf("--model") + 1],
+      cliThinking: args.includes("--thinking") ? args[args.indexOf("--thinking") + 1] as "low" : undefined,
+      modelRuntime: runtime,
+    });
+    try {
+      const first = await manager.getOrCreateSession("456:1", "pi");
+      const originalArgs = captureArgs();
+      assert.equal(nativeModel(originalArgs).model?.id, "custom-id");
+      assert.equal(nativeModel(originalArgs).model?.provider, PI_PROVIDER);
+      first.effortOverride = "low";
+      await manager.closeSession("456:1");
+      const resumed = await manager.getOrCreateSession("456:1", "pi");
+      const resumedArgs = captureArgs();
+      assert.deepEqual(resumedArgs, originalArgs, "saved effort does not change native CLI parsing");
+      assert.equal(resumedArgs.includes("--thinking"), false);
+      assert.equal(nativeModel(resumedArgs).model?.id, "custom-id");
+      assert.deepEqual(piSpawnCaptures.at(-1)?.runtimeEnvOptions?.sessionEffort, { provider: PI_PROVIDER, model: config.agents.pi.model, inherited: undefined, override: "low" });
+      assert.equal(resumed.thinking, undefined, "effort is independent of the configured runtime signature");
+      assert.equal(await manager.getOrCreateSession("456:1", "pi"), resumed);
+    } finally { await manager.closeAll(); }
+  });
+
+  it("keeps effort separate from runtime signatures across reconnect, idle, restart, clean and rebinding", async () => {
+    const config = makeConfig();
+    let manager = new SessionManager(() => config, TEST_STORE_PATH, TEST_DIR);
+    try {
+      const session = await manager.getOrCreateSession("456:1", "pi");
+      session.effortOverride = "high";
+      assert.equal(await manager.getOrCreateSession("456:1", "pi"), session, "override does not trigger config respawn");
+      await manager.closeSession("456:1");
+      const resumed = await manager.getOrCreateSession("456:1", "pi");
+      assert.equal(resumed.sessionId, session.sessionId);
+      assert.equal(resumed.effortOverride, "high");
+      assert.equal(piSpawnCaptures.at(-1)?.agent.thinking, "xhigh");
+      assert.deepEqual(piSpawnCaptures.at(-1)?.runtimeEnvOptions?.sessionEffort, { provider: PI_PROVIDER, model: normalizePiModel(config.agents.pi.model), inherited: "xhigh", override: "high" });
+      resumed.idleTimeoutMs = 1;
+      manager.resetIdleTimer("456:1");
+      await new Promise(resolve => setTimeout(resolve, 20));
+      assert.equal(manager.getActive("456:1"), undefined);
+      await manager.closeAll();
+      manager = new SessionManager(() => config, TEST_STORE_PATH, TEST_DIR);
+      const restarted = await manager.getOrCreateSession("456:1", "pi");
+      assert.equal(restarted.effortOverride, "high");
+      assert.equal(restarted.sessionId, session.sessionId);
+      await manager.destroySession("456:1");
+      const cleaned = await manager.getOrCreateSession("456:1", "pi");
+      assert.equal(cleaned.effortOverride, undefined);
+      assert.equal(cleaned.thinking, "xhigh");
+      assert.notEqual(cleaned.sessionId, session.sessionId);
+      cleaned.effortOverride = "low";
+      await manager.closeSession("456:1");
+      config.bindings[1].agentId = "main";
+      const rebound = await manager.getOrCreateSession("456:1", "main");
+      assert.equal(rebound.effortOverride, undefined);
+      assert.equal(rebound.thinking, undefined);
     } finally { await manager.closeAll(); }
   });
 
@@ -745,6 +940,7 @@ describe("SessionManager exact Pi binding startup", () => {
       askCallerAgentId: "pi",
       fastThreadKey: "pi-chat",
       outboxPath: session.outboxPath,
+      sessionEffort: { provider: PI_PROVIDER, model: "openai-codex/gpt-5.5", inherited: "xhigh", readOnly: true },
     });
     assert.ok(!session.outboxPath.startsWith("/tmp/bot-outbox"));
     assert.strictEqual(statSync(dirname(session.outboxPath)).mode & 0o777, 0o700);
@@ -922,6 +1118,7 @@ describe("SessionManager exact Pi binding startup", () => {
         askCallerAgentId: "pi",
         fastThreadKey: "pi-caller",
         outboxPath: outboxDir("pi-caller"),
+        sessionEffort: { provider: PI_PROVIDER, model: "openai-codex/gpt-5.5", inherited: "xhigh", readOnly: true },
       });
     } finally {
       if (oldCaller === undefined) {
@@ -1231,6 +1428,25 @@ describe("SessionManager exact Pi binding startup", () => {
     await manager.closeAll();
   });
 
+  for (const atSpawn of [false, true]) {
+    it(`preserves the effort pin when a same-agent transcript is replaced ${atSpawn ? "on spawn retry" : "before spawn"}`, async () => {
+      const key = "456:1";
+      const store = new SessionStore(TEST_STORE_PATH);
+      const prior = storedPiBinding(key, "pinned-transcript", { effortOverride: "high" });
+      store.setSession(key, prior);
+      if (atSpawn) piSpawnOutcomes = [{ throwBindingFailure: "unreadable" }];
+      else rmSync(prior.sessionFile);
+      const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
+      try {
+        const replacement = await manager.getOrCreateSession(key, "pi");
+        assert.notEqual(replacement.sessionId, prior.sessionId);
+        assert.equal(replacement.effortOverride, "high");
+        assert.equal(new SessionStore(TEST_STORE_PATH).getSession(key)?.effortOverride, "high");
+        assert.equal(piSpawnCaptures.at(-1)?.runtimeEnvOptions?.sessionEffort?.override, "high");
+      } finally { await manager.closeAll(); }
+    });
+  }
+
   it("spawns an absent-provider agent through one exact Pi binding", async () => {
     const manager = new SessionManager(() => makeConfig(), TEST_STORE_PATH);
     const session = await manager.getOrCreateSession("main-chat", "main");
@@ -1430,10 +1646,12 @@ describe("SessionManager exact-path recovery", () => {
     );
     assert.deepStrictEqual(
       piSpawnCaptures.map((capture) => capture.runtimeEnvOptions),
-      [
-        { askCallerAgentId: "pi", fastThreadKey: "pi-stale", outboxPath: outboxDir("pi-stale") },
-        { askCallerAgentId: "pi", fastThreadKey: "pi-stale", outboxPath: outboxDir("pi-stale") },
-      ],
+      Array.from({ length: 2 }, () => ({
+        askCallerAgentId: "pi",
+        fastThreadKey: "pi-stale",
+        outboxPath: outboxDir("pi-stale"),
+        sessionEffort: { provider: PI_PROVIDER, model: "openai-codex/gpt-5.5", inherited: "xhigh", readOnly: true },
+      })),
       "recovery retry keeps the exact session outbox path",
     );
 

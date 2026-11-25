@@ -21,6 +21,7 @@ import type {
   LegacyCutoverFailure,
   PendingSessionRecoveryNotice,
   PiThinkingLevel,
+  NativeEffortLevel,
   SessionState,
   UnresolvedLegacySessionState,
   WorkerSessionState,
@@ -75,6 +76,7 @@ const BASE_STATE_KEYS = new Set([
   "provider",
   "model",
   "thinking",
+  "effortOverride",
   "lastActivity",
 ]);
 const BOUND_STATE_KEYS = new Set([
@@ -205,6 +207,7 @@ function optionalRuntimeFields(value: Record<string, unknown>): {
   provider?: "pi";
   model?: string;
   thinking?: PiThinkingLevel;
+  effortOverride?: NativeEffortLevel;
 } {
   const provider = value.provider;
   if (provider !== undefined && provider !== "pi") {
@@ -217,7 +220,12 @@ function optionalRuntimeFields(value: Record<string, unknown>): {
   if (thinking !== undefined && (typeof thinking !== "string" || !THINKING_LEVELS.has(thinking))) {
     throw new Error("Invalid session store: unknown thinking level");
   }
+  const effortOverride = value.effortOverride;
+  if (effortOverride !== undefined && effortOverride !== "max" && (typeof effortOverride !== "string" || !THINKING_LEVELS.has(effortOverride))) {
+    throw new Error("Invalid session store: unknown effort override");
+  }
   return {
+    ...(effortOverride === undefined ? {} : { effortOverride: effortOverride as NativeEffortLevel }),
     ...(provider === undefined ? {} : { provider }),
     ...(model === undefined ? {} : { model }),
     ...(thinking === undefined ? {} : { thinking: thinking as PiThinkingLevel }),

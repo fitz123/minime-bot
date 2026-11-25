@@ -1,5 +1,6 @@
 import { loadConfig } from "./config.js";
 import { formatFastCommandError, formatFastStatusLine, handleFastCommand } from "./codex-fast.js";
+import { EFFORT_DEFAULT_PERMISSION, formatEffortError, parseEffortAction } from "./session-effort-wire.js";
 import { statSync } from "node:fs";
 import type { RichMessage } from "grammy/types";
 import { validateRichPhoto } from "./telegram-rich.js";
@@ -72,7 +73,7 @@ export const BOT_COMMANDS = [
   { command: "reconnect", description: "Reconnect session (keeps context)" },
   { command: "clean", description: "Clean session (fresh start)" },
   { command: "status", description: "Show bot status" },
-  { command: "fast", description: "Show/set scoped Codex Fast" },
+  { command: "fast", description: "Check or change Codex Fast settings" },
 ] as const;
 
 export const TELEGRAM_ALLOWED_UPDATES = ["message", "message_reaction"] as const;
@@ -853,6 +854,7 @@ export function createTelegramBot(
     },
   );
 
+  const pendingEffortReplies = new Map<string, number>();
   const reloadGroupBindings = bindingReload && (() => {
     // Admission and enqueue can be separated by asynchronous media handling.
     if (updateProcessing.snapshot().inFlight) {
@@ -862,12 +864,13 @@ export function createTelegramBot(
       if (candidate.length === 0 && !opts?.hasOtherActivePlatform?.()) {
         throw new Error("Cannot remove the last binding without another running conversational transport");
       }
-      if (messageQueue.hasWorkWhere(key => {
+      const removesLane = (key: string) => {
         const [chatId, topicId] = key.split(":");
         const threadId = topicId === undefined ? undefined : Number(topicId);
         return resolveBinding(Number(chatId), getBindings(), threadId)?.kind === "group"
           && !resolveBinding(Number(chatId), candidate, threadId);
-      })) {
+      };
+      if (messageQueue.hasWorkWhere(removesLane) || [...pendingEffortReplies.keys()].some(removesLane)) {
         throw new Error("A removed Telegram lane still has accepted work. Retry the binding reload when it is idle");
       }
     });
@@ -920,7 +923,7 @@ export function createTelegramBot(
     if (!binding) return;
     if (ctx.message) setThread(ctx.chat.id, ctx.message.message_id, topicId);
     if (sessionManager.isWorkerLane(sessionKey(ctx.chat.id, topicId), binding.agentId)) {
-      await ctx.reply("Fast controls are unavailable for worker-routed sessions.");
+      await ctx.reply("This session is routed to a worker, so Fast controls are unavailable here.");
       return;
     }
     try {
@@ -929,7 +932,7 @@ export function createTelegramBot(
         return;
       }
       if (/^default\s+(?:on|off)$/.test(ctx.match.trim()) && (ctx.chat.type !== "private" || binding.kind !== "dm")) {
-        await ctx.reply("Use a private chat with a DM binding to change Fast defaults.");
+        await ctx.reply("To change the Fast default, use a private Telegram chat with a DM binding.");
         return;
       }
       const currentConfig = loadControlConfig(binding);
@@ -998,6 +1001,40 @@ export function createTelegramBot(
     await ctx.reply("Session cleaned. Fresh start.");
   });
 
+  // Text-only effort control deliberately stays out of setMyCommands.
+  bot.command("effort", async ctx => {
+    const topicId = ctx.message?.message_thread_id;
+    if (ctx.message) setThread(ctx.chat.id, ctx.message.message_id, topicId);
+    const binding = resolveBinding(ctx.chat.id, getBindings(), topicId);
+    if (!binding) return;
+    const key = sessionKey(ctx.chat.id, topicId);
+    if (sessionManager.isWorkerLane(key, binding.agentId)) {
+      await ctx.reply("Effort controls are unavailable for worker-routed sessions.");
+      return;
+    }
+    const value = ctx.match.trim() || undefined;
+    if (parseEffortAction(value)?.kind === "default" && (ctx.chat.type !== "private" || binding.kind !== "dm")) {
+      await ctx.reply(EFFORT_DEFAULT_PERMISSION);
+      return;
+    }
+    // Startup and the session queue can be slow; release sequential polling
+    // while retaining this update's topic context for the eventual reply.
+    pendingEffortReplies.set(key, (pendingEffortReplies.get(key) ?? 0) + 1);
+    void (async () => {
+      let response: string;
+      try {
+        response = await sessionManager.sessionEffort(key, binding.agentId, value);
+      } catch (error) {
+        response = formatEffortError(error);
+      }
+      await ctx.reply(response, topicId === undefined ? {} : { message_thread_id: topicId });
+    })().catch(error => log.warn("telegram-bot", `Effort reply failed: ${(error as Error).message}`)).finally(() => {
+      const remaining = (pendingEffortReplies.get(key) ?? 1) - 1;
+      if (remaining) pendingEffortReplies.set(key, remaining);
+      else pendingEffortReplies.delete(key);
+    });
+  });
+
   // /status command — session health and a bounded quota refresh.
   bot.command("status", async (ctx) => {
     const topicId = ctx.message?.message_thread_id;
@@ -1025,6 +1062,7 @@ export function createTelegramBot(
       maxSessions: config.sessionDefaults.maxConcurrentSessions,
       uptimeSeconds: Math.floor(process.uptime()),
       sessionHealth,
+      effortHint: process.env.PI_EXTENSIONS_DISABLED !== "1",
       fastStatusLine,
       quotaStatus,
     }));

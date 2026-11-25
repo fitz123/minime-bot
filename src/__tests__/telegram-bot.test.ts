@@ -18,6 +18,7 @@ import {
 import { ActiveDraftCoordinator } from "../active-draft-coordinator.js";
 import { buildCollectPrompt } from "../message-queue.js";
 import { DRAFT_REFRESH_INTERVAL_MS } from "../stream-relay.js";
+import { createTelegramBindingReload } from "../telegram-binding-reload.js";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -258,6 +259,7 @@ describe("BOT_COMMANDS", () => {
   it("contains start, reconnect, clean, status, and fast commands", () => {
     const names = BOT_COMMANDS.map((c) => c.command);
     assert.deepStrictEqual(names, ["start", "reconnect", "clean", "status", "fast"]);
+    assert.equal(BOT_COMMANDS.find(command => command.command === "fast")?.description, "Check or change Codex Fast settings");
   });
 
   it("each command has a non-empty description", () => {
@@ -1463,6 +1465,7 @@ describe("command handler wiring", () => {
     const calls: string[] = [];
     return {
       calls,
+      sessionEffort: async (key: string, agent: string, value?: string) => { calls.push(`effort:${key}:${agent}:${value ?? "status"}`); return "Effort: high"; },
       isWorkerLane: () => false,
       closeSession: async (_chatId: string) => { calls.push("closeSession"); },
       destroySession: async (_chatId: string) => { calls.push("destroySession"); },
@@ -1577,12 +1580,12 @@ describe("command handler wiring", () => {
       await bot.handleUpdate(update);
     };
     await send("on");
-    assert.match(apiCalls.at(-1)!.payload.text, /Этот тред: включён \(переопределение\)/);
+    assert.match(apiCalls.at(-1)!.payload.text, /This thread: on \(override\)/);
     assert.equal(readFastStatus({ agent: primary, threadKey: `${testChatId}:11` }).enabled, true);
     await send("", 12);
-    assert.match(apiCalls.at(-1)!.payload.text, /Этот тред: по умолчанию/);
+    assert.match(apiCalls.at(-1)!.payload.text, /This thread: follows the default/);
     await send("on", 22);
-    assert.match(apiCalls.at(-1)!.payload.text, /unavailable/);
+    assert.match(apiCalls.at(-1)!.payload.text, /Codex Fast is unavailable\. The agent must opt in to Fast/);
     await send("on extra");
     assert.match(apiCalls.at(-1)!.payload.text, /Usage:/);
     const beforeUnauthorized = apiCalls.length;
@@ -1594,13 +1597,17 @@ describe("command handler wiring", () => {
     await bot.handleUpdate(clean);
     assert.deepEqual(manager.calls, ["destroySession"]);
     await send("");
-    assert.match(apiCalls.at(-1)!.payload.text, /Этот тред: включён \(переопределение\)/);
+    assert.match(apiCalls.at(-1)!.payload.text, /This thread: on \(override\)/);
     await send("default on");
-    assert.match(apiCalls.at(-1)!.payload.text, /private chat.*DM binding/);
+    assert.match(apiCalls.at(-1)!.payload.text, /To change the Fast default, use a private Telegram chat with a DM binding\./);
     await send("", 12);
-    assert.match(apiCalls.at(-1)!.payload.text, /Fast: выключен/);
+    assert.match(apiCalls.at(-1)!.payload.text, /Fast: off/);
     await send("inherit");
-    assert.match(apiCalls.at(-1)!.payload.text, /Этот тред: по умолчанию/);
+    assert.match(apiCalls.at(-1)!.payload.text, /This thread: follows the default/);
+    manager.isWorkerLane = () => true;
+    await send("on");
+    assert.equal(apiCalls.at(-1)!.payload.text, "This session is routed to a worker, so Fast controls are unavailable here.");
+    assert.equal(readFastStatus({ agent: primary, threadKey: `${testChatId}:11` }).override, "inherit");
   });
 
   it("allows Telegram Fast default mutations only for private chats with DM bindings", async t => {
@@ -1637,32 +1644,32 @@ describe("command handler wiring", () => {
         assert.match(await send("default on extra"), /Usage:/);
         assert.equal(existsSync(path), false);
         if (chatType !== "private" || kind !== "dm") {
-          assert.match(await send("default on"), /private chat.*DM binding/);
+          assert.match(await send("default on"), /To change the Fast default, use a private Telegram chat with a DM binding\./);
           assert.equal(existsSync(path), false);
         }
-        assert.match(await send("on"), /Этот тред: включён \(переопределение\)/);
+        assert.match(await send("on"), /This thread: on \(override\)/);
         const beforeDefault = readFileSync(path, "utf8");
         if (chatType === "private" && kind === "dm") {
-          assert.match(await send("default on"), /Общий режим .*: включён/);
+          assert.match(await send("default on"), /Default for .*: on/);
           assert.equal(readFastStatus({ agent: primary }).enabled, true);
           assert.equal(readFastStatus({ agent: primary, threadKey: "new-thread" }).enabled, true);
-          assert.match(await send("default off"), /Общий режим .*: выключен/);
+          assert.match(await send("default off"), /Default for .*: off/);
           assert.equal(readFastStatus({ agent: primary }).enabled, false);
         } else {
           for (const args of ["default on", "default off"]) {
-            assert.match(await send(args), /private chat.*DM binding/);
+            assert.match(await send(args), /To change the Fast default, use a private Telegram chat with a DM binding\./);
             assert.equal(readFileSync(path, "utf8"), beforeDefault);
           }
         }
         const beforeReadOnly = readFileSync(path, "utf8");
-        assert.match(await send("default status"), /Общий режим .*: выключен/);
-        assert.match(await send("status"), /Этот тред: включён \(переопределение\)/);
+        assert.match(await send("default status"), /Default for .*: off/);
+        assert.match(await send("status"), /This thread: on \(override\)/);
         for (const args of ["default", "default on extra", "default off extra", "default inherit", "default ON"]) {
           assert.match(await send(args), /Usage:/);
           assert.equal(readFileSync(path, "utf8"), beforeReadOnly);
         }
-        assert.match(await send("off"), /Этот тред: выключен \(переопределение\)/);
-        assert.match(await send("inherit"), /Этот тред: по умолчанию/);
+        assert.match(await send("off"), /This thread: off \(override\)/);
+        assert.match(await send("inherit"), /This thread: follows the default/);
         assert.equal(readFastStatus({ agent: primary, threadKey: `${testChatId}:11` }).enabled, false);
         assert.deepEqual(manager.calls, [], "Fast commands must not invoke model sessions");
       });
@@ -1700,13 +1707,13 @@ describe("command handler wiring", () => {
     };
     assert.match(await send("status"), /unavailable/);
     updateAgent({ codexFast: pin("gpt-6-astra") });
-    assert.match(await send("on"), /Модель: Astra/);
+    assert.match(await send("on"), /Model: Astra/);
     assert.equal(readFastStatus({ agent: { ...primary, codexFast: pin("gpt-6-astra") }, threadKey: `${testChatId}:11` }).enabled, true);
     updateAgent({ model: "openai-codex/gpt-6-sol", codexFast: pin("gpt-6-sol") });
     const changed = await send("status");
-    assert.match(changed, /Модель: openai-codex\/gpt-6-sol/);
-    assert.match(changed, /Fast: выключен/);
-    assert.match(await send("default on"), /Общий режим .*: включён/);
+    assert.match(changed, /Model: openai-codex\/gpt-6-sol/);
+    assert.match(changed, /Fast: off/);
+    assert.match(await send("default on"), /Default for .*: on/);
     const sol = { ...primary, model: "openai-codex/gpt-6-sol", codexFast: { provider: "openai-codex" as const, model: "gpt-6-sol" } };
     assert.equal(readFastStatus({ agent: sol }).enabled, true);
     // The base config has no opt-in; removing the overlay removes eligibility.
@@ -1716,7 +1723,7 @@ describe("command handler wiring", () => {
     assert.match(await send("default off"), /unavailable/);
     assert.equal(readFileSync(join(root, "data/codex-fast.json"), "utf8"), before);
     updateAgent({ model: sol.model, codexFast: sol.codexFast });
-    assert.match(await send("status"), /Общий режим .*: включён/);
+    assert.match(await send("status"), /Default for .*: on/);
     assert.deepEqual(manager.calls, [], "Local commands must not invoke or create model sessions");
   });
 
@@ -1910,6 +1917,141 @@ describe("command handler wiring", () => {
     assert.ok(!mockSM.calls.includes("closeSession"), "/clean handler calls destroySession, not closeSession directly");
   });
 
+  it("/effort routes plain-text status and setters to the current thread without model prompts or buttons", async () => {
+    const mockSM = createMockSessionManager();
+    const apiCalls: Array<{ method: string; payload: any }> = [];
+    const { bot } = initBot(mockSM, apiCalls);
+    await bot.handleUpdate(makeCommandUpdate("effort", 71));
+    const update = makeCommandUpdate("effort", 72);
+    update.message.text = "/effort high";
+    Object.assign(update.message, { message_thread_id: 9 });
+    await bot.handleUpdate(update);
+    const reset = makeCommandUpdate("effort", 76);
+    reset.message.text = "/effort inherit";
+    Object.assign(reset.message, { message_thread_id: 9 });
+    await bot.handleUpdate(reset);
+    assert.ok(mockSM.calls.includes("effort:111111111:main:status"));
+    assert.ok(mockSM.calls.includes("effort:111111111:9:main:high"));
+    assert.ok(mockSM.calls.includes("effort:111111111:9:main:inherit"));
+    assert.ok(!mockSM.calls.includes("sendSessionMessage"));
+    for (const reply of apiCalls.filter(call => call.method === "sendMessage")) assert.equal(reply.payload.reply_markup, undefined);
+  });
+
+  it("/effort default uses the routed agent and requires the same private DM scope as /fast", async t => {
+    for (const [chatType, kind] of [["private", "dm"], ["supergroup", "dm"], ["private", "group"], ["group", "group"]] as const) {
+      await t.test(`${chatType} chat / ${kind} binding`, async () => {
+        const manager = createMockSessionManager();
+        const apiCalls: Array<{ method: string; payload: any }> = [];
+        const { bot } = initBot(manager, apiCalls, undefined, undefined, (base, sm, options) => createTelegramBot({
+          ...base,
+          agents: { personal: { ...base.agents.main, id: "personal" } },
+          bindings: [{ chatId: testChatId, agentId: "personal", kind }],
+        }, sm, options));
+        const update = makeCommandUpdate("effort", 77);
+        update.message.text = "/effort default high";
+        Object.assign(update.message.chat, { type: chatType });
+        Object.assign(update.message.from, { id: 222222222 });
+        await bot.handleUpdate(update);
+        if (chatType === "private" && kind === "dm") {
+          assert.deepEqual(manager.calls, ["effort:111111111:personal:default high"]);
+        } else {
+          assert.deepEqual(manager.calls, []);
+          assert.match(apiCalls.at(-1)?.payload.text, /private chat with a DM binding/);
+        }
+      });
+    }
+  });
+
+  it("releases sequential updates while /effort is pending and retains its topic for delivery", async () => {
+    const mockSM = createMockSessionManager();
+    const pending = deferred<string>();
+    mockSM.sessionEffort = () => pending.promise;
+    const apiCalls: Array<{ method: string; payload: any }> = [];
+    const { bot, updateProcessing } = initBot(mockSM, apiCalls);
+    const update = makeCommandUpdate("effort", 73);
+    Object.assign(update.message, { message_thread_id: 9 });
+    let returned = false;
+    const handling = bot.handleUpdate(update).then(() => { returned = true; });
+    try {
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(returned, true, "handler returns before Pi startup/queue completes");
+      assert.equal(updateProcessing.snapshot().inFlight, false);
+      const unrelated = makeCommandUpdate("status", 74);
+      Object.assign(unrelated.message, { message_thread_id: 10 });
+      await bot.handleUpdate(unrelated);
+      assert.ok(mockSM.calls.includes("getSessionHealth:111111111:10"));
+      assert.equal(apiCalls.some(call => call.payload.text === "Effort: high"), false);
+      pending.resolve("Effort: high");
+      await new Promise(resolve => setImmediate(resolve));
+      const replies = apiCalls.filter(call => call.payload.text === "Effort: high");
+      assert.equal(replies.length, 1);
+      assert.equal(replies[0].payload.message_thread_id, 9);
+    } finally { pending.resolve("Effort: high"); await handling; }
+  });
+
+  it("blocks group removal until every detached effort reply has finished delivery", async () => {
+    const chatId = -456;
+    const group: TelegramBinding = { chatId, agentId: "main", kind: "group" };
+    const startup = { ...handlerConfig, bindings: [...handlerConfig.bindings, group] };
+    const candidate = { ...startup, bindings: handlerConfig.bindings };
+    const bindingReload = createTelegramBindingReload(startup, () => candidate, () => candidate);
+    const manager = createMockSessionManager();
+    const effort = [deferred<string>(), deferred<string>()];
+    const delivery = [deferred<boolean>(), deferred<boolean>()];
+    let controls = 0;
+    let replies = 0;
+    manager.sessionEffort = () => effort[controls++].promise;
+    const { bot, reloadGroupBindings } = initBot(manager, [], { bindingReload },
+      method => method === "sendMessage" ? delivery[replies++].promise : undefined,
+      (_base, sm, options) => createTelegramBot(startup, sm, options));
+    for (const id of [76, 77]) {
+      const update = makeCommandUpdate("effort", id);
+      Object.assign(update.message, { message_thread_id: 9 });
+      Object.assign(update.message.chat, { id: chatId, type: "supergroup" });
+      await bot.handleUpdate(update);
+    }
+    try {
+      assert.equal(controls, 2);
+      assert.throws(reloadGroupBindings!, /removed Telegram lane still has accepted work/);
+      effort[0].resolve("Effort: high");
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(replies, 1);
+      delivery[0].resolve(true);
+      effort[1].reject(new Error("synthetic effort failure"));
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(replies, 2);
+      assert.throws(reloadGroupBindings!, /removed Telegram lane still has accepted work/);
+    } finally {
+      effort[0].resolve("Effort: high");
+      effort[1].resolve("Effort: high");
+      for (const pending of delivery) pending.resolve(true);
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    assert.equal(reloadGroupBindings!(), 0);
+  });
+
+  for (const fails of [false, true]) {
+    it(`catches detached /effort ${fails ? "failure" : "success"} reply delivery errors`, async () => {
+      const mockSM = createMockSessionManager();
+      const pending = deferred<string>();
+      mockSM.sessionEffort = () => pending.promise;
+      const apiCalls: Array<{ method: string; payload: any }> = [];
+      const { bot } = initBot(mockSM, apiCalls, undefined, method => {
+        if (method === "sendMessage") throw new Error("simulated delivery failure");
+      });
+      const update = makeCommandUpdate("effort", 75);
+      Object.assign(update.message, { message_thread_id: 9 });
+      await bot.handleUpdate(update);
+      if (fails) pending.reject(new Error("simulated startup failure at /tmp/synthetic-private-config.yaml")); else pending.resolve("Effort: high");
+      await new Promise(resolve => setImmediate(resolve));
+      const replies = apiCalls.filter(call => call.method === "sendMessage");
+      assert.equal(replies.length, 1, "failed delivery does not trigger a second send");
+      assert.equal(replies[0].payload.message_thread_id, 9);
+      assert.match(replies[0].payload.text, fails ? /Effort change not confirmed: Effort control data is unavailable/ : /Effort: high/);
+      assert.doesNotMatch(replies[0].payload.text, /synthetic-private-config/);
+    });
+  }
+
   it("/status refreshes quota once before replying without opening a session", async () => {
     const mockSM = createMockSessionManager();
     const apiCalls: Array<{ method: string; payload: any }> = [];
@@ -1970,7 +2112,7 @@ describe("command handler wiring", () => {
       await bot.handleUpdate(update);
       return String(apiCalls.at(-1)!.payload.text);
     };
-    assert.match(await send(11), /Thinking: high\nFast: off · inherited\nState:/);
+    assert.match(await send(11), /Configured thinking: high \(see \/effort for the effective level\)\nFast: off · inherited\nState:/);
     assert.equal(existsSync(path), false);
     handleFastCommand("default on", { agent: primary }, path);
     handleFastCommand("off", { agent: primary, threadKey: `${testChatId}:11` }, path);
@@ -1989,7 +2131,7 @@ describe("command handler wiring", () => {
       ...primary, model: "openai-codex/gpt-6-sol", codexFast: { provider: "openai-codex", model: "gpt-6-sol" },
     } } };
     const mismatch = await send(12);
-    assert.match(mismatch, /Model: openai-codex\/gpt-6-astra\nThinking: high\nFast: unavailable/);
+    assert.match(mismatch, /Model: openai-codex\/gpt-6-astra\nConfigured thinking: high[^\n]*\nFast: unavailable/);
     assert.doesNotMatch(mismatch, /Model: .*gpt-6-sol/);
     currentConfig = { ...currentConfig, agents: { ...currentConfig.agents, main: primary } };
     configError = true;
@@ -2006,7 +2148,7 @@ describe("command handler wiring", () => {
     health = undefined;
     const noSession = await send(12);
     assert.match(noSession, /Sessions: 1\/2/);
-    assert.doesNotMatch(noSession, /Agent:|Model:|Thinking:|Fast:|Session ID:/);
+    assert.doesNotMatch(noSession, /Agent:|Model:|Configured thinking:|Fast:|Session ID:/);
     assert.equal(configReads, readsBeforeHelp, "No-session status must not read Fast config");
     assert.equal(readFileSync(path, "utf8"), "invalid fixture preferences");
     assert.ok(manager.calls.every(call => call.startsWith("getSessionHealth:")), "Status/help must never create or prompt a session");

@@ -655,6 +655,23 @@ environment.
 
 ### Runtime Session Controls
 
+Send `/effort` in Telegram to see the effective reasoning level, where it comes
+from, and the levels the current model supports. Send `/effort high` to pin the
+current conversation or `/effort inherit` to remove its pin. To change the
+routed agent's default for its current provider and model, send
+`/effort default high` in a private chat with a DM binding, as with `/fast`.
+Conversations that inherit, including local Discord lanes, pick up the new
+default on their next message.
+Until the agent has a saved default for that model, it uses the configured
+thinking level or Pi's settings.
+
+You can also ask in plain language to show or change effort through the
+`set_session_effort` tool. A conversation override applies from the next model
+request, including within a running tool loop. Overrides survive reconnect, idle
+closure, and bot restart. Cleaning or rebinding a conversation removes its
+override. Effort controls are available in local Telegram Pi sessions and use
+plain-text replies.
+
 `/clean` clears queued work, deletes the stored session state for that chat, and
 supersedes any in-flight startup for the same chat. The next accepted message for
 that chat starts a fresh Pi session instead of resuming the previous one.

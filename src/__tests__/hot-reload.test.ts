@@ -8,9 +8,11 @@ import type { BotConfig } from "../types.js";
 import type { InteractiveSessionBinding } from "../interactive-session-binding.js";
 import {
   NewlineOnlyJsonlSplitter,
+  handlePiExtensionUiRecord,
   PiStartupBlockingUiError,
   assertPiSessionIdentityMatchesBinding,
   normalizePiModel,
+  PI_PROVIDER,
   parsePiStartupIdentityRecord,
   parsePiStartupRecord,
 } from "../pi-rpc-protocol.js";
@@ -75,6 +77,7 @@ function createAutoSpawnChild(): ChildProcess {
 // ---------------------------------------------------------------------------
 mock.module("../pi-rpc-protocol.js", {
   namedExports: {
+    handlePiExtensionUiRecord,
     spawnPiRpcSession(agent: CapturedSpawn["agent"], sessionBinding: InteractiveSessionBinding) {
       spawnCaptures.push({ agent, sessionBinding });
       const child = createAutoSpawnChild();
@@ -103,6 +106,7 @@ mock.module("../pi-rpc-protocol.js", {
     PI_EXTENSIONS_DISABLED_ENV: "PI_EXTENSIONS_DISABLED",
     async *readPiStream() {},
     normalizePiModel,
+    PI_PROVIDER,
     NewlineOnlyJsonlSplitter,
     PiStartupBlockingUiError,
     assertPiSessionIdentityMatchesBinding,
