@@ -1,7 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -81,5 +82,29 @@ describe("package root import safety", () => {
     }
 
     assert.equal(readPackageFile("src/cli.ts").includes(retiredProductSegment), false);
+  });
+
+  it("keeps the standalone agent runtime inert on import and exposes its own help", () => {
+    const imported = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", [
+      'const before = process.listenerCount("SIGTERM");',
+      'await import("./src/agent-runtime.ts");',
+      'if (process.listenerCount("SIGTERM") !== before) throw new Error("runtime activated on import");',
+    ].join("\n")], { cwd: packageRoot, encoding: "utf8", timeout: 10_000 });
+    assert.equal(imported.status, 0, imported.stderr);
+    assert.equal(imported.stdout, "");
+    const help = spawnSync(process.execPath, ["--import", "tsx", "src/agent-runtime.ts", "--help"], {
+      cwd: packageRoot, encoding: "utf8", timeout: 10_000,
+    });
+    assert.equal(help.status, 0, help.stderr);
+    assert.match(help.stdout, /minime-agent-runtime --descriptor/);
+    const binLink = join(mkdtempSync(join(tmpdir(), "agent-runtime-bin-")), "runtime.ts");
+    symlinkSync(resolve(packageRoot, "src/agent-runtime.ts"), binLink);
+    const linkedHelp = spawnSync(process.execPath, ["--import", "tsx", binLink, "--help"], {
+      cwd: packageRoot, encoding: "utf8", timeout: 10_000,
+    });
+    assert.equal(linkedHelp.status, 0, linkedHelp.stderr);
+    assert.match(linkedHelp.stdout, /minime-agent-runtime --descriptor/);
+    const pkg = JSON.parse(readPackageFile("package.json"));
+    assert.equal(pkg.bin["minime-agent-runtime"], "./dist/agent-runtime.js");
   });
 });

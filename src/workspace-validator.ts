@@ -267,6 +267,7 @@ export function validateWorkspaceContract(
 
   if (config) {
     for (const [agentId, agent] of Object.entries(config.agents)) {
+      if (agent.workerRuntime) continue;
       const agentWorkspace = resolveAgentWorkspaceCwd(contract.paths.workspaceRoot, agent.workspaceCwd);
       if (!existsSync(agentWorkspace)) {
         issue(issues, "error", `agent "${agentId}" workspaceCwd does not exist: ${agentWorkspace}`);

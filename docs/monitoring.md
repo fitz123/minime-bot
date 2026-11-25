@@ -16,7 +16,7 @@ locations.
 
 ## Runtime compatibility boundary
 
-The current package pins its package-owned Pi runtime to 0.99.1 and grammY to
+The current package pins its package-owned Pi runtime to 1.5.0 and grammY to
 1.46.0. Pi owns bounded summarization retries. Its
 `summarization_retry_scheduled`, `summarization_retry_attempt_start`, and
 `summarization_retry_finished` records are continued stream activity, not a
@@ -46,10 +46,61 @@ state, provider fallback, package concurrency quota, or provider-specific
 Prometheus metric family. After terminal failure or retry exhaustion, the
 calling model receives the last bounded classification and owns any alternative.
 
-The out-of-band `minime-codex-quota-sampler` remains the single quota source for
-interactive work and search. It writes the cached snapshot used by `/status`
-and the `codex_usage_*` node-exporter textfile metrics, including bounded probe
-success and timestamp series.
+`minime-codex-quota-sampler` and Telegram/Discord `/status` use one shared
+GET-only reader for `https://chatgpt.com/backend-api/wham/usage`, following the
+[official Codex backend client](https://github.com/openai/codex/blob/main/codex-rs/backend-client/src/client/rate_limit_resets.rs).
+It resolves the existing Pi `openai-codex` OAuth with `ModelRuntime.create`
+(`modelsPath: null`, `refreshOnCreate: false`, `allowModelNetwork: false`) and
+`getAuth`, requires the resolved source to be `OAuth`, and obtains the account
+claim from the resolved JWT. It does not launch Pi inference or Codex app-server.
+Exhausted allowance is valid quota data and does not block this GET.
+
+The whole read, including OAuth and response body, has a deadline: three seconds
+for status and 20 seconds by default for the sampler (`--timeout-ms` or
+`CODEX_QUOTA_TIMEOUT_MS` overrides the sampler deadline). Concurrent refreshes
+within a process share one in-flight read per cache/metrics target. Discord
+defers its interaction before awaiting the refresh. Status never opens an agent
+session. A failed read preserves the last successful sample and usage metrics;
+status explicitly shows cached age and refresh failure, even for a recent sample.
+Diagnostics contain fixed classifications, never provider bodies or auth errors.
+
+The existing state path (`CODEX_QUOTA_STATE_FILE`, otherwise the selected control
+workspace's `.tmp/codex-quota-state.json`) and textfile directory selection
+(`CODEX_QUOTA_TEXTFILE_DIR`, `NODE_EXPORTER_TEXTFILE_DIR`, then the writable
+node-exporter default) are retained. The sampler still requires a textfile
+directory. `--model`, `--prompt`, `--pi-bin`, and `--sampler-cwd` are accepted
+and ignored for invocation compatibility; their former environment settings are
+also ignored. `--dry-run` resolves paths without OAuth or a request.
+
+Snapshots retain only plan/quota metadata and `families`, each with an `id`,
+optional name/metered feature and allowance flags, and `primary`/`secondary`
+windows containing actual `durationSeconds`, usage and reset time. Null or
+zero-filled empty windows are omitted. Acquisition parses the GET JSON response.
+The retained header parser discovers `x-{family}-primary/secondary-*` and
+`x-{family}-limit-name` for callers that explicitly load the compatibility
+`extensions/pi/codex-usage.ts` provider-response capture hook; the sampler does
+not load that hook. Legacy positional cache entries remain readable as primary/secondary with unknown durations;
+status never derives durations from position or plan.
+
+The `codex_usage.prom` textfile exposes these gauges:
+
+- `codex_usage_window_percent{family,window}` for reported usage;
+- `codex_usage_window_duration_seconds{family,window}` only for known durations;
+- `codex_usage_window_reset_timestamp{family,window}` only for known resets;
+- existing `codex_usage_last_success_timestamp` and `codex_usage_info` metadata.
+
+The existing `codex_usage_probe.prom` retains
+`codex_usage_last_attempt_timestamp` and `codex_usage_probe_success`. Failure
+updates attempt telemetry without advancing last success. The legacy
+`codex_usage_5h_percent`/`codex_usage_5h_reset_timestamp` and
+`codex_usage_weekly_percent`/`codex_usage_weekly_reset_timestamp` gauges are emitted
+only when a default-family window actually reports 18,000 or 604,800 seconds,
+regardless of its slot. Missing windows/durations produce no legacy series,
+not a false zero. Both metrics textfiles are written with mode `0644` for
+collectors running under another UID; quota state is `0600` on both successful
+and failed refreshes. Consumers of those legacy series must tolerate absence and
+use the dynamic gauges for other families/durations. The package does not
+change external alert rules or alert policy.
 
 Direct URL reads and browser automation do not go through `web_search`.
 Bash-capable full agents use the host `agent-browser` executable (`read` for
@@ -202,6 +253,18 @@ retry/outbox delivery, then records a logical failure and exits non-zero. A
 marker embedded in prose, quoted, repeated, or followed by another non-empty
 line is delivered unchanged. Script cron output is never marker-classified.
 
+The cron runner appends versioned diagnostic events to
+`$LOG_DIR/cron-diagnostics.jsonl` and enforces mode `0600` on the file. Its
+allowlisted metadata and bounded, control-character-sanitized,
+secret/URI-redacted final output or controlled failure summaries provide
+execution, fresh-delivery, and replay evidence without prompts, commands,
+configuration/environment objects, raw child diagnostics, or stacks. Use
+`runId` to correlate one invocation and
+`originalRunId` on replay events to locate the run that created the pending
+output. Rotation belongs to the deployment, which must apply a
+copytruncate-compatible policy to this exact file so concurrent cron appenders
+remain safe; the package does not provide rotation.
+
 The example `MinimeCronTerminalFailure` rule joins non-zero exit state to an
 existing terminal timestamp by `cron`. Its five-minute `for` period suppresses
 brief evaluation churn, and its five-minute future tolerance rejects
@@ -225,8 +288,9 @@ after upgrade is discarded without delivery.
 
 Pickup-only outbox preflight failures and deferred redelivery attempts happen
 before a new logical cron run begins. They exit non-zero without changing
-last-exit, last-run, last-success, or counter series; use their bounded
-`OUTBOX` cron-log evidence and process status for diagnosis.
+last-exit, last-run, last-success, or counter series; use their JSONL replay
+attempts/dispositions, existing bounded `OUTBOX` cron-log evidence, and process
+status for diagnosis.
 
 Run the deterministic rule fixture from the package root:
 

@@ -75,6 +75,7 @@ describe("Discord media failure handling", () => {
       bindings: [{ channelId: "channel-1", guildId: "guild-1", agentId: "main", kind: "channel", requireMention: false }],
     };
     const sessionManager = {
+      isWorkerLane: () => false,
       sendSessionMessage: () => { throw new Error("unexpected"); },
     } as unknown as SessionManager;
 
@@ -162,6 +163,7 @@ describe("Discord shutdown", () => {
       bindings: [{ channelId: "channel-1", guildId: "guild-1", agentId: "main", kind: "channel", requireMention: false }],
     };
     const sessionManager = {
+      isWorkerLane: () => false,
       sendSessionMessage: () => { throw new Error("unexpected"); },
     } as unknown as SessionManager;
     let ready: DiscordBotResult | undefined;
@@ -227,6 +229,7 @@ describe("Discord shutdown", () => {
       bindings: [{ channelId: "channel-1", guildId: "guild-1", agentId: "main", kind: "channel", requireMention: false }],
     };
     const sessionManager = {
+      isWorkerLane: () => false,
       sendSessionMessage: () => { throw new Error("unexpected"); },
     } as unknown as SessionManager;
     let created: DiscordBotResult | undefined;
@@ -282,6 +285,7 @@ describe("Discord shutdown", () => {
       bindings: [{ channelId: "channel-1", guildId: "guild-1", agentId: "main", kind: "channel", requireMention: false }],
     };
     const sessionManager = {
+      isWorkerLane: () => false,
       sendSessionMessage: () => { throw new Error("unexpected"); },
     } as unknown as SessionManager;
     let resolveReply!: () => void;
@@ -364,6 +368,7 @@ describe("Discord recovery notice delivery", () => {
     };
     const events: string[] = [];
     const sessionManager = {
+      isWorkerLane: () => false,
       getOrCreateSession: async () => {
         events.push("prepare");
         return {};
@@ -444,6 +449,7 @@ describe("Discord stale-message handling", () => {
     };
     let sessionCalls = 0;
     const sessionManager = {
+      isWorkerLane: () => false,
       sendSessionMessage: () => { sessionCalls++; throw new Error("unexpected"); },
     } as unknown as SessionManager;
 
@@ -612,7 +618,7 @@ describe("resolveDiscordBinding with guild-wide defaults", () => {
 });
 
 describe("Discord slash command status wiring", () => {
-  it("renders local status for a thread without opening or sending a session", async () => {
+  it("defers, refreshes quota once and renders thread status without opening or sending a session", async () => {
     const calls: string[] = [];
     const replies: Array<string | { content: string; ephemeral?: boolean }> = [];
     const config: BotConfig = {
@@ -636,6 +642,7 @@ describe("Discord slash command status wiring", () => {
       ],
     };
     const sessionManager = {
+      isWorkerLane: () => false,
       getActiveCount: () => 1,
       getSessionHealth: (key: string) => {
         calls.push(`getSessionHealth:${key}`);
@@ -667,20 +674,27 @@ describe("Discord slash command status wiring", () => {
           isThread: () => true,
           parentId: "parent-1",
         },
-        reply: async (response) => {
-          replies.push(response);
-        },
+        reply: async () => { throw new Error("status must defer and edit"); },
+        deferReply: async () => { calls.push("defer"); },
+        editReply: async (response) => { calls.push("edit"); replies.push(response); },
       },
       {
         config,
         discordConfig,
         sessionManager,
+        refreshQuotaStatus: async () => {
+          assert.equal(calls.at(-1), "defer");
+          calls.push("refresh");
+          return { state: "unavailable", stateFile: "/tmp/synthetic-quota.json", reason: "no_success", staleMs: 1800000 };
+        },
         messageQueue: {
           clear: (key: string) => { calls.push(`clear:${key}`); },
         },
       },
     );
 
+    assert.equal(calls.filter(call => call === "refresh").length, 1);
+    assert.match(String(replies[0]), /Codex quota: unavailable \(no successful sample\)/);
     assert.equal(replies.length, 1);
     assert.equal(typeof replies[0], "string");
     assert.match(String(replies[0]), /Sessions: 1\/2/);

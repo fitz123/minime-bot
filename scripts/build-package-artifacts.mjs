@@ -15,6 +15,7 @@ const wrappers = [
   ["session-effort.ts", "session-effort.js"],
   ["compaction-continuation.ts", "compaction-continuation.js"],
   ["codex-usage.ts", "codex-usage.js"],
+  ["codex-fast.ts", "codex-fast.js"],
   ["codex-transport-overflow.ts", "codex-transport-overflow.js"],
   ["web-tools.ts", "web-tools.js"],
   ["knowledge-tools.ts", "knowledge-tools.js"],
@@ -64,6 +65,8 @@ for (const [sourceRel, targetRel] of wrappers) {
   );
 }
 
+cpSync(join(sourceExtensionDir, "codex-fast-LICENSE.md"), join(artifactExtensionDir, "codex-fast-LICENSE.md"));
+
 for (const rel of [
   join("subagent", "agents"),
   join("subagent", "prompts"),
@@ -76,3 +79,4 @@ for (const rel of [
 
 chmodSync(join(packageRoot, "dist", "cli.js"), 0o755);
 chmodSync(join(packageRoot, "dist", "codex-quota-sampler.js"), 0o755);
+chmodSync(join(packageRoot, "dist", "agent-runtime.js"), 0o755);

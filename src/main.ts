@@ -1,6 +1,6 @@
 import { loadConfig } from "./config.js";
 import { SessionManager } from "./session-manager.js";
-import { CollaborationRouter } from "./collaboration.js";
+import { CollaborationRouter, collaborationTransport } from "./collaboration.js";
 import {
   createTelegramBot,
   BOT_COMMANDS,
@@ -8,6 +8,7 @@ import {
   type TelegramBotResult,
 } from "./telegram-bot.js";
 import { createDiscordBot } from "./discord-bot.js";
+import { createTelegramBindingReload } from "./telegram-binding-reload.js";
 import { log, setLogLevel } from "./logger.js";
 import {
   initializeInstanceIdentity,
@@ -128,7 +129,17 @@ async function main(): Promise<void> {
   restoreThreadCache();
   restoreMessageIndex();
 
-  const sessionManager = new SessionManager(loadConfig);
+  const telegramBindingReload = config.telegramToken
+    ? createTelegramBindingReload(
+      config,
+      () => loadConfig(undefined, { resolveSecrets: false }),
+      () => loadConfig(undefined, { telegramBindingReload: true }),
+    )
+    : undefined;
+  const sessionManager = new SessionManager(loadConfig, undefined, undefined, {
+    initialConfig: config,
+    telegramBindingReload,
+  });
   log.info("main", "Session manager initialized");
 
   // Track resources for shutdown
@@ -215,13 +226,21 @@ async function main(): Promise<void> {
     requestShutdown("unhandledRejection", 1);
   });
 
-  if (config.collaboration) {
+  const transport = collaborationTransport(config);
+  if (transport) {
     collaborationRouter = new CollaborationRouter({
       discover: () => sessionManager.collaborationEndpoints(),
       deliver: (message, consumed) => sessionManager.deliverCollaboration(message, consumed),
-    });
-    await collaborationRouter.start(config.collaboration.socketPath);
-    log.info("main", "Same-host collaboration router started");
+      topicContext: source => sessionManager.topicContext(source),
+      topicApply: (source, request) => sessionManager.topicApply(source, request),
+    }, { topicOnly: transport.topicOnly });
+    if (await collaborationRouter.start(transport.socketPath)) {
+      log.info("main", transport.topicOnly ? "Private-topic router started" : "Same-host collaboration router started");
+    } else {
+      collaborationRouter = undefined;
+      sessionManager.disableTopicTransport();
+      log.warn("main", "Private-topic router unavailable; continuing without cosmetic topic edits");
+    }
   }
 
   // Telegram starts before Discord has finished connecting. Polling failures
@@ -233,14 +252,18 @@ async function main(): Promise<void> {
   });
 
   // Start Telegram bot if configured
-  if (config.telegramToken) {
+  if (telegramBindingReload) {
+    const { getBindings } = telegramBindingReload;
     telegramPollingRestart = createTelegramPollingRestartScheduler();
     let telegramPollingGeneration = 0;
     let telegramFailureHandled = true;
+    let startedSuccessfully = false;
     // Mutable reference so onUpdate callback can reach the watchdog
     // (watchdog needs bot.api, which doesn't exist until after createTelegramBot)
     let onUpdateFn: (() => void) | undefined;
-    const { bot, messageQueue, echoWatcher: ew, pollProgress, updateProcessing } = createTelegramBot(config, sessionManager, {
+    const { bot, messageQueue, echoWatcher: ew, pollProgress, updateProcessing, topicController, reloadGroupBindings } = createTelegramBot(config, sessionManager, {
+      bindingReload: telegramBindingReload,
+      hasOtherActivePlatform: () => !!discordClient?.isReady() && (config.discord?.bindings.length ?? 0) > 0,
       onUpdate: () => onUpdateFn?.(),
       // A failed generation disables this before grammY's final offset
       // confirmation, so cleanup cannot collapse the restart backoff.
@@ -248,8 +271,21 @@ async function main(): Promise<void> {
         if (!telegramFailureHandled && !shuttingDown) telegramPollingRestart?.reset();
       },
     });
+    sessionManager.setTopicController(topicController);
     telegramBot = bot;
     messageQueues.push(messageQueue);
+    if (reloadGroupBindings) process.on("SIGHUP", () => {
+      if (shuttingDown || telegramFailureHandled || !startedSuccessfully || !bot.isRunning()) {
+        log.warn("main", "Telegram group binding reload skipped because polling is unavailable");
+        return;
+      }
+      try {
+        const groupCount = reloadGroupBindings();
+        log.info("main", `Telegram group bindings reloaded (${groupCount} group bindings)`);
+      } catch (error) {
+        log.warn("main", `Telegram group binding reload rejected. Keeping current routes. ${(error as Error).message}`);
+      }
+    });
     if (config.triggerInput) {
       triggerInput = await startTriggerInput({
         config: config.triggerInput,
@@ -278,7 +314,7 @@ async function main(): Promise<void> {
       void agentPlatformStartup.then(async () => {
         if (shuttingDown) return;
         const restartRequired = shouldRestartForTelegramFailure({
-          telegramBindingCount: config.bindings.length,
+          telegramBindingCount: getBindings().length,
           discordStarted: Boolean(discordClient),
           discordBindingCount: config.discord?.bindings.length ?? 0,
         });
@@ -315,7 +351,7 @@ async function main(): Promise<void> {
       if (shuttingDown) return;
       const generation = ++telegramPollingGeneration;
       telegramFailureHandled = false;
-      let startedSuccessfully = false;
+      startedSuccessfully = false;
       const pollingAbortController = new AbortController();
       telegramPollingAbortController = pollingAbortController;
 
@@ -367,7 +403,7 @@ async function main(): Promise<void> {
               }
               setBotUsername(botInfo.username);
               log.info("main", `Telegram bot @${botInfo.username} is running (id: ${botInfo.id})`);
-              publishRuntimeReadiness(config.bindings.length);
+              publishRuntimeReadiness(getBindings().length);
               // No global media wipe on startup: grammY invokes onStart before the
               // first getUpdates, so polling ownership isn't proven yet. A blanket
               // wipe here can clobber files that an overlapping old instance is
@@ -419,7 +455,7 @@ async function main(): Promise<void> {
   // Require at least one started transport with a conversational binding.
   if (!hasActiveAgentPlatform({
     telegramStarted: Boolean(telegramBot),
-    telegramBindingCount: config.bindings.length,
+    telegramBindingCount: telegramBindingReload?.getBindings().length ?? 0,
     discordStarted: Boolean(discordClient),
     discordBindingCount: config.discord?.bindings.length ?? 0,
   })) {

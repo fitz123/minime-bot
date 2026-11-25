@@ -1,4 +1,4 @@
-import { effortInvocation, parseEffortNotice, SESSION_EFFORT_COMMAND, SESSION_EFFORT_ACK_COMMAND, type EffortResult } from "./pi-extensions/session-effort.js";
+import { EFFORT_DEFAULT_PERMISSION, EFFORT_USAGE, effortInvocation, parseEffortAction, parseEffortNotice, SESSION_EFFORT_COMMAND, SESSION_EFFORT_ACK_COMMAND, type EffortRequestAction, type EffortResult } from "./pi-extensions/session-effort.js";
 import { RICH_RESERVED_DIR } from "./telegram-rich.js";
 import { type ChildProcess } from "node:child_process";
 import { chmodSync, createWriteStream, existsSync, lstatSync, mkdirSync, readdirSync, renameSync, rmSync, type Stats, unlinkSync } from "node:fs";
@@ -8,10 +8,16 @@ import { join } from "node:path";
 import { on } from "node:events";
 import PQueue from "p-queue";
 import { resolveBinding } from "./telegram-binding.js";
-import { CollaborationDeliveryError, collaborationPrompt, type Delivery, type Endpoint } from "./collaboration.js";
+import type { TelegramBindingReload } from "./telegram-binding-reload.js";
+import { CollaborationDeliveryError, collaborationPrompt, collaborationTransport, type Delivery, type Endpoint } from "./collaboration.js";
+import type { Address } from "./collaboration.js";
+import { topicScopeEnabled, type PrivateTopicController, type TopicApply } from "./private-topics.js";
+import type { TopicRecord, TopicTarget } from "./topic-store.js";
 import type { BoundSessionState, PendingSessionRecoveryNotice, PlatformContext, SessionRecoveryReason, SessionState, StreamLine, BotConfig, AgentConfig } from "./types.js";
 import { spawnPiRpcSession, sendPiPrompt, sendPiSteer, sendPiAcknowledgedSteer, sendPiGetState, readPiStream, parsePiStartupIdentityRecord, assertPiSessionIdentityMatchesBinding, PiStartupBlockingUiError, NewlineOnlyJsonlSplitter, handlePiExtensionUiRecord, normalizePiModel, PI_EXTENSIONS_DISABLED_ENV, type PiAcknowledgedSteerResult, type PiRpcEvent, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions, type PiStartupDiagnostics } from "./pi-rpc-protocol.js";
 import { SessionStore } from "./session-store.js";
+import { AgentRuntimeClient } from "./agent-runtime-client.js";
+import { AgentRuntimeError, AgentRuntimeUncertainError, workerChatLaneId, workerRouteDigest, type AgentLaneState } from "./agent-runtime-protocol.js";
 import { log } from "./logger.js";
 import { recordResultMetrics, recordPiRetry, recordPiTurnDuration, sessionsActive, sessionCrashes, piSessionResumeDiscarded } from "./metrics.js";
 import { ensureSessionMediaDir, cleanupSessionMediaDir, cleanupStaleSessionMedia } from "./media-store.js";
@@ -36,6 +42,7 @@ const RESPONSE_LIVENESS_PROBE_TIMEOUT_MS = 10_000;
 const CRASH_BACKOFF_BASE_MS = 5_000; // Base delay for crash backoff
 const MAX_CRASH_BACKOFF_MS = 60_000; // Maximum backoff delay (1 minute)
 export const MAX_CRASH_RESTARTS = 5; // Block session after this many consecutive crashes
+export const WORKER_MEDIA_UNSUPPORTED = "Attachments and voice messages are unavailable for worker-routed agents.";
 
 class HumanInputPendingError extends Error {}
 
@@ -156,12 +163,13 @@ export interface ActiveSession {
   workspaceRealpath?: string;
   /** Durable recovery notice retained until the transport confirms delivery. */
   pendingRecoveryNotice?: PendingSessionRecoveryNotice;
+  workerRollback?: true;
   agentId: string;
   /** Provider is retained temporarily for status/reporting while runtime is Pi-only. */
   provider: "pi";
   /** Spawn-time Pi model after normalization. */
   model: string;
-  /** Requested runtime thinking signature (override or configured value). */
+  /** Spawn-time thinking configuration used by the runtime signature. */
   thinking?: AgentConfig["thinking"];
   effortOverride?: AgentConfig["thinking"];
   queue: PQueue;
@@ -246,7 +254,7 @@ function normalizedSessionModel(agent: AgentConfig): string {
 }
 
 function runtimeSignatureChanged(session: ActiveSession, agent: AgentConfig): boolean {
-  const current = sessionRuntimeSignature({ ...agent, thinking: session.effortOverride ?? agent.thinking });
+  const current = sessionRuntimeSignature(agent);
   return (
     session.provider !== current.provider ||
     session.model !== current.model ||
@@ -300,6 +308,8 @@ export function waitForSpawn(child: ChildProcess, timeoutMs: number = STARTUP_TI
 
 export class SessionManager {
   private active: Map<string, ActiveSession> = new Map();
+  private readonly workerRoutes = new Map<string, NonNullable<AgentConfig["workerRuntime"]>>();
+  private readonly workerTurns = new Map<string, { client?: AgentRuntimeClient }>();
   private acceptingSessionWork = true;
   /** Restart counts survive crash recovery (active.delete) so they accumulate. */
   private restartCounts: Map<string, number> = new Map();
@@ -317,9 +327,11 @@ export class SessionManager {
   private effortWaiters = new Map<string, { session: ActiveSession; resolve: (result: EffortResult) => void }>();
   private store: SessionStore;
   private loadConfig: () => BotConfig;
+  private telegramBindingReload?: TelegramBindingReload;
   private logDir: string;
   private startupTimeoutMs: number;
-  private collaborationSocket?: string;
+  private transport?: ReturnType<typeof collaborationTransport>;
+  private topicController?: PrivateTopicController;
   private humanWorkPending: (chatId: string) => boolean = () => false;
   private humanInputs = new Map<string, number>();
 
@@ -327,12 +339,16 @@ export class SessionManager {
     loadConfig: () => BotConfig,
     storePath?: string,
     logDir?: string,
-    options?: { startupTimeoutMs?: number },
+    options?: { startupTimeoutMs?: number; initialConfig?: BotConfig; telegramBindingReload?: TelegramBindingReload },
   ) {
     this.loadConfig = loadConfig;
+    this.telegramBindingReload = options?.telegramBindingReload;
     // Validate config at boot — fail fast if config is broken
-    const startupConfig = loadConfig();
-    this.collaborationSocket = startupConfig.collaboration?.socketPath;
+    const startupConfig = options?.initialConfig ?? loadConfig();
+    this.transport = collaborationTransport(startupConfig);
+    for (const [agentId, agent] of Object.entries(startupConfig.agents)) {
+      if (agent.workerRuntime) this.workerRoutes.set(agentId, { ...agent.workerRuntime });
+    }
     this.store = new SessionStore(storePath);
     this.store.migrateLegacySessions(startupConfig);
     this.logDir = logDir ?? LOG_DIR;
@@ -341,6 +357,81 @@ export class SessionManager {
 
   setHumanWorkPending(pending: (chatId: string) => boolean): void {
     this.humanWorkPending = pending;
+  }
+
+  setTopicController(controller: PrivateTopicController | undefined): void { this.topicController = controller; }
+
+  disableTopicTransport(): void {
+    if (this.transport?.topicOnly) this.transport = undefined;
+  }
+
+  isWorkerLane(chatId: string, agentId?: string): boolean {
+    const stored = this.store.getSession(chatId);
+    if (this.workerTurns.has(chatId)) return true;
+    if (stored?.bindingState === "bound" && stored.workerRollback && (agentId === undefined || agentId === stored.agentId)) return false;
+    return (agentId !== undefined && this.workerRoutes.has(agentId))
+      || (stored !== undefined && (stored.bindingState === "worker" || this.workerRoutes.has(stored.agentId)));
+  }
+
+  private assertLocalLane(chatId: string, agentId?: string): void {
+    if (this.isWorkerLane(chatId, agentId)) {
+      throw new AgentRuntimeError("unsupported_route", "This operation is unavailable for worker-routed sessions. The existing binding was retained.");
+    }
+  }
+
+  /** Read-only inventory joined to current routing; no session identity is persisted in topic data. */
+  inspectKnownTopics(botId: number, chatId: number): Array<{ topic: TopicRecord; agentId?: string; session?: Pick<BoundSessionState, "sessionId" | "sessionFile"> }> {
+    const controller = this.topicController;
+    if (!controller || controller.currentBotId() !== botId) return [];
+    const config = this.getFreshConfig();
+    if (!config.privateTopics?.enabled) return [];
+    const sessions = this.store.getAllSessions();
+    return controller.store.list().flatMap(topic => {
+      if (topic.botId !== botId || topic.chatId !== chatId) return [];
+      const binding = resolveBinding(chatId, config.bindings, topic.topicId);
+      const agentId = binding?.kind === "dm" && config.agents[binding.agentId] ? binding.agentId : undefined;
+      const lane = `${chatId}:${topic.topicId}`;
+      const current = sessions[lane];
+      const session = agentId && !this.isWorkerLane(lane, agentId) && !config.agents[agentId]?.workerRuntime
+        && current?.bindingState === "bound" && current.agentId === agentId
+        ? { sessionId: current.sessionId, sessionFile: current.sessionFile } : undefined;
+      return [{ topic, agentId, session }];
+    });
+  }
+
+  /** Join metadata to today's routed session; the inventory never copies session identity. */
+  resolveTopicSource(source: Address): (TopicTarget & { agentId: string; sessionId: string }) | undefined {
+    if (source.kind !== "session" || process.env.PI_EXTENSIONS_DISABLED === "1") return;
+    const config = this.getFreshConfig();
+    const botId = this.topicController?.currentBotId();
+    if (botId === undefined) return;
+    const entries = Object.entries(this.store.getAllSessions()).filter(([, state]) => state.bindingState === "bound" && state.sessionId === source.id);
+    if (entries.length !== 1) return;
+    const [lane, state] = entries[0];
+    const match = /^(\d+):(\d+)$/.exec(lane);
+    if (!match || !config.agents[state.agentId] || config.agents[state.agentId].workerRuntime
+      || this.isWorkerLane(lane, state.agentId) || this.active.get(lane)?.internalTurn) return;
+    const target = { botId, chatId: Number(match[1]), topicId: Number(match[2]) };
+    if (!this.topicController?.eligible(target, config) || resolveBinding(target.chatId, config.bindings, target.topicId)?.agentId !== state.agentId) return;
+    return { ...target, agentId: state.agentId, sessionId: source.id };
+  }
+
+  async topicContext(source: Address): Promise<unknown> {
+    const target = this.resolveTopicSource(source);
+    if (!target) return { status: "unavailable" };
+    const context = await this.topicController!.context(target);
+    const current = this.resolveTopicSource(source);
+    return current && current.botId === target.botId && current.chatId === target.chatId && current.topicId === target.topicId && current.agentId === target.agentId
+      ? context : { status: "unavailable" };
+  }
+
+  topicApply(source: Address, request: TopicApply): unknown {
+    const target = this.resolveTopicSource(source);
+    if (!target) return { status: "unavailable" };
+    return this.topicController!.apply(target, request, () => {
+      const current = this.resolveTopicSource(source);
+      return !!current && current.botId === target.botId && current.chatId === target.chatId && current.topicId === target.topicId && current.agentId === target.agentId;
+    });
   }
 
   /** Reserve a lane while an incoming human message is staged (e.g. media download). */
@@ -381,17 +472,21 @@ export class SessionManager {
   }
 
   collaborationEndpoints(): Endpoint[] {
-    const config = this.getFreshConfig();
+    const fresh = this.getFreshConfig();
+    const config = this.telegramBindingReload?.withGroupBindings(fresh) ?? fresh;
     const threads = this.configuredCollaborationThreads(config);
     const sessions: Endpoint[] = [];
     for (const [lane, state] of Object.entries(this.store.getAllSessions())) {
-      if (!config.agents[state.agentId]) continue;
+      if (!config.agents[state.agentId] || config.agents[state.agentId].workerRuntime || this.isWorkerLane(lane, state.agentId)) continue;
       if (!lane.startsWith("collaboration:")) threads.set(lane, state.agentId);
       if (state.bindingState === "bound") sessions.push({ address: { kind: "session", id: state.sessionId }, label: state.agentId });
     }
     return [
-      ...Object.keys(config.agents).map(id => ({ address: { kind: "agent" as const, id }, label: id })),
-      ...[...threads].map(([id, agentId]) => ({ address: { kind: "thread" as const, id }, label: agentId })),
+      ...Object.keys(config.agents)
+        .filter(id => !this.workerRoutes.has(id) && !config.agents[id].workerRuntime)
+        .map(id => ({ address: { kind: "agent" as const, id }, label: id })),
+      ...[...threads].filter(([id, agentId]) => !this.isWorkerLane(id, agentId) && !config.agents[agentId]?.workerRuntime)
+        .map(([id, agentId]) => ({ address: { kind: "thread" as const, id }, label: agentId })),
       ...sessions,
     ];
   }
@@ -404,7 +499,8 @@ export class SessionManager {
     let session: ActiveSession;
     let generation: number;
     try {
-      const config = this.getFreshConfig();
+      const fresh = this.getFreshConfig();
+      const config = this.telegramBindingReload?.withGroupBindings(fresh) ?? fresh;
       const states = this.store.getAllSessions();
       if (message.to.kind === "agent") {
         agentId = message.to.id;
@@ -428,6 +524,9 @@ export class SessionManager {
         agentId = entry[1].agentId;
       } else throw new Error("Terminal delivery belongs to its extension");
       if (!agentId || !config.agents[agentId]) throw new Error("Target agent unavailable");
+      if (config.agents[agentId].workerRuntime || this.isWorkerLane(lane, agentId)) {
+        throw new CollaborationDeliveryError("rejected", "collaboration is unavailable for worker-routed sessions");
+      }
       const stored = states[lane];
       if (stored && stored.bindingState !== "bound") throw new Error("Target requires owner recovery");
       expected = stored?.sessionId;
@@ -467,11 +566,11 @@ export class SessionManager {
     }
   }
 
-  /**
-   * Load fresh config for use at each decision point (spawn, eviction, idle timer).
-   * On failure, propagates the error — no cache fallback.
-   */
-  private getFreshConfig(): BotConfig {
+  /** Group session startup can use the last usable config from the running transport. */
+  private getFreshConfig(chatId?: string): BotConfig {
+    if (this.telegramBindingReload && chatId && /^-\d+(?::\d+)?$/.test(chatId)) {
+      return this.telegramBindingReload.loadGroupConfig();
+    }
     try {
       const config = this.loadConfig();
       log.debug("session-manager", "config: reload ok");
@@ -499,6 +598,7 @@ export class SessionManager {
         sessionId: session.sessionId,
         sessionFile: session.sessionFile,
         workspaceRealpath: session.workspaceRealpath,
+        ...(session.workerRollback ? { workerRollback: true as const } : {}),
         ...(session.pendingRecoveryNotice
           ? { pendingRecoveryNotice: session.pendingRecoveryNotice }
           : {}),
@@ -738,6 +838,9 @@ export class SessionManager {
       }
       : undefined;
     const state = this.boundState(chatId, agentId, agent, binding, notice);
+    if (expected?.bindingState === "bound" && expected.agentId === agentId && expected.workerRollback) {
+      state.workerRollback = true;
+    }
     if (!this.store.compareAndSetSession(chatId, expected, state)) {
       throw new Error(`Session binding changed concurrently for chat ${chatId}`);
     }
@@ -767,6 +870,7 @@ export class SessionManager {
       return this.publishPreseededBinding(chatId, agentId, agent, undefined, location);
     }
 
+    if (stored.bindingState === "worker") throw new Error("Worker binding requires its exact worker route");
     if (strict && (stored.bindingState !== "bound" || stored.agentId !== agentId)) throw new Error("Exact target changed");
     if (stored.bindingState === "legacy-unresolved") {
       return this.publishPreseededBinding(
@@ -865,6 +969,7 @@ export class SessionManager {
    * Enforces maxConcurrentSessions via LRU eviction.
    */
   async getOrCreateSession(chatId: string, agentId: string, expectedId?: string, internal = false): Promise<ActiveSession> {
+    this.assertLocalLane(chatId, agentId);
     if (expectedId) {
       const state = this.store.getSession(chatId);
       if (state?.bindingState !== "bound" || state.sessionId !== expectedId) throw new Error("Exact target reset");
@@ -919,8 +1024,15 @@ export class SessionManager {
 
     let freshConfig: BotConfig | undefined;
     const getFreshConfig = (): BotConfig => {
-      freshConfig ??= this.getFreshConfig();
+      freshConfig ??= this.getFreshConfig(chatId);
       return freshConfig;
+    };
+    const assertUnchangedRoute = (config: BotConfig): void => {
+      const stored = this.store.getSession(chatId);
+      if (stored?.bindingState === "bound" && stored.workerRollback && stored.agentId === agentId) return;
+      if (config.agents[agentId]?.workerRuntime || (stored && config.agents[stored.agentId]?.workerRuntime)) {
+        throw new AgentRuntimeError("route_changed", "Worker routing changed. Restart the controller before sending more messages to this lane.");
+      }
     };
     const tryGetFreshConfigForActiveSession = (): BotConfig | undefined => {
       try {
@@ -939,6 +1051,7 @@ export class SessionManager {
         if (expectedId && existing.sessionId === expectedId) return existing;
         const activeConfig = tryGetFreshConfigForActiveSession();
         const activeAgent = activeConfig?.agents[agentId];
+        if (activeConfig) assertUnchangedRoute(activeConfig);
         if (!activeConfig || (activeAgent && !runtimeSignatureChanged(existing, activeAgent))) {
           existing.lastActivity = Date.now();
           this.resetIdleTimer(chatId);
@@ -955,6 +1068,8 @@ export class SessionManager {
         }
         existing = undefined;
       } else {
+        const activeConfig = tryGetFreshConfigForActiveSession();
+        if (activeConfig) assertUnchangedRoute(activeConfig);
         log.warn(
           "session-manager",
           `Closing active session for chat ${chatId}: agentId changed from "${existing.agentId}" to "${agentId}"`,
@@ -990,6 +1105,7 @@ export class SessionManager {
 
     // Reload config fresh — pick up any changes to agents/sessionDefaults
     freshConfig = getFreshConfig();
+    assertUnchangedRoute(freshConfig);
     const agent = freshConfig.agents[agentId];
     if (!agent) {
       throw new Error(`Unknown agent: ${agentId}`);
@@ -1025,16 +1141,19 @@ export class SessionManager {
     ensureSessionMediaDir(chatId);
 
     const outboxPath = outboxDir(chatId);
-    const collaborationEnabled = Boolean(this.collaborationSocket);
-    const extensionOptions: PiSpawnExtensionOptions | undefined = collaborationEnabled
-      ? { extraExtensions: freshConfig.piExtraExtensions, collaboration: true }
-      : freshConfig.piExtraExtensions === undefined
-        ? undefined
-        : { extraExtensions: freshConfig.piExtraExtensions };
     const telegramLane = /^(-?\d+)(?::(\d+))?$/.exec(chatId);
-    const telegramRichAnswers = !!telegramLane && !!resolveBinding(Number(telegramLane[1]), freshConfig.bindings,
+    const telegramBinding = telegramLane && resolveBinding(Number(telegramLane[1]), freshConfig.bindings,
       telegramLane[2] === undefined ? undefined : Number(telegramLane[2]));
-    const runtimeEnvOptions: PiSpawnRuntimeEnvOptions = { askCallerAgentId: agentId, outboxPath, ...(telegramRichAnswers ? { telegramRichAnswers: true } : {}) };
+    const telegramRichAnswers = !!telegramBinding;
+    const topicBotId = this.topicController?.currentBotId();
+    const privateTopicPolicy = !!this.transport && process.env.PI_EXTENSIONS_DISABLED !== "1" && topicBotId !== undefined && !!telegramLane?.[2] &&
+      topicScopeEnabled(freshConfig, { botId: topicBotId, chatId: Number(telegramLane[1]), topicId: Number(telegramLane[2]) }) &&
+      telegramBinding?.agentId === agentId;
+    const transportEnabled = !!this.transport && (!this.transport.topicOnly || privateTopicPolicy);
+    const extensionOptions: PiSpawnExtensionOptions | undefined = transportEnabled
+      ? { extraExtensions: freshConfig.piExtraExtensions, collaboration: true }
+      : freshConfig.piExtraExtensions === undefined ? undefined : { extraExtensions: freshConfig.piExtraExtensions };
+    const runtimeEnvOptions: PiSpawnRuntimeEnvOptions = { askCallerAgentId: agentId, fastThreadKey: chatId, outboxPath, ...(privateTopicPolicy ? { privateTopicPolicy: true } : {}), ...(telegramRichAnswers ? { telegramRichAnswers: true } : {}) };
     let prepared = this.prepareSessionBinding(chatId, agentId, agent, freshConfig, Boolean(expectedId));
     if (isStartupSuperseded()) {
       await abortSupersededStartup();
@@ -1043,9 +1162,11 @@ export class SessionManager {
     let child: ChildProcess | undefined;
     for (;;) {
       try {
-        if (telegramRichAnswers) runtimeEnvOptions.sessionEffort = { model: normalizePiModel(agent.model), inherited: agent.thinking, override: prepared.state.effortOverride };
-        child = spawnPiRpcSession(agent, prepared.binding, extensionOptions, collaborationEnabled
-          ? { ...runtimeEnvOptions, collaborationSession: prepared.binding.sessionId, collaborationSocket: this.collaborationSocket }
+        if (telegramBinding?.agentId === agentId) {
+          runtimeEnvOptions.sessionEffort = { model: normalizedSessionModel(agent), inherited: agent.thinking, override: prepared.state.effortOverride };
+        }
+        child = spawnPiRpcSession(agent, prepared.binding, extensionOptions, transportEnabled
+          ? { ...runtimeEnvOptions, collaborationSession: prepared.binding.sessionId, collaborationSocket: this.transport!.socketPath, ...(this.transport!.topicOnly ? { collaborationTopicOnly: true } : {}) }
           : runtimeEnvOptions);
         await waitForSpawn(child, this.startupTimeoutMs);
         if (isStartupSuperseded()) {
@@ -1152,10 +1273,11 @@ export class SessionManager {
       sessionFile: prepared.binding.sessionFile,
       workspaceRealpath: prepared.binding.workspaceRealpath,
       pendingRecoveryNotice: prepared.state.pendingRecoveryNotice,
+      workerRollback: prepared.state.workerRollback,
       agentId,
       provider: "pi",
       model: normalizedSessionModel(agent),
-      thinking: prepared.state.effortOverride ?? agent.thinking,
+      thinking: agent.thinking,
       effortOverride: prepared.state.effortOverride,
       queue: new PQueue({ concurrency: 1 }),
       idleTimer: null,
@@ -1217,6 +1339,14 @@ export class SessionManager {
     text: string,
     options?: { internal?: boolean; expectedSession?: ActiveSession; expires?: number; consumed?: () => void; outputDone?: Promise<void>; imagePaths?: string[] },
   ): AsyncGenerator<StreamLine> {
+    if (this.isWorkerLane(chatId, agentId)) {
+      if (options?.internal || options?.expectedSession) {
+        throw new AgentRuntimeError("unsupported_route", "Internal delivery is unavailable for worker-routed sessions.");
+      }
+      if (options?.imagePaths?.length) throw new AgentRuntimeError("unsupported_media", WORKER_MEDIA_UNSUPPORTED);
+      yield* this.sendWorkerMessage(chatId, agentId, text);
+      return;
+    }
     const session = options?.expectedSession ?? await this.getOrCreateSession(chatId, agentId);
 
     // Async channel: queue task pushes lines, generator yields them in real-time
@@ -1509,6 +1639,99 @@ export class SessionManager {
     }
   }
 
+  private async *sendWorkerMessage(chatId: string, agentId: string, text: string): AsyncGenerator<StreamLine> {
+    if (!this.acceptingSessionWork) throw new AgentRuntimeError("shutting_down", "Session manager is shutting down.");
+    const route = this.workerRoutes.get(agentId);
+    const stored = this.store.getSession(chatId);
+    if (stored && (stored.bindingState !== "worker" || stored.agentId !== agentId)) {
+      throw new AgentRuntimeError("binding_conflict", "This chat has an existing session binding. An exact local binding requires explicit adoption.");
+    }
+    if (!route) throw new AgentRuntimeError("route_missing", "This chat requires its configured worker route.");
+    if (stored?.adoption && workerRouteDigest(route) !== stored.adoption.routeDigest) {
+      throw new AgentRuntimeError("route_changed", "This adopted session requires its original worker route.");
+    }
+    if (this.workerTurns.has(chatId) || this.active.has(chatId) || this.sessionStartups.has(chatId)
+      || this.sessionTeardowns.has(chatId)) {
+      throw new AgentRuntimeError("busy", "This session is already processing or changing state.");
+    }
+    if (!text.trim()) throw new AgentRuntimeError("invalid_request", "The worker requires a nonempty text message.");
+
+    const turn: { client?: AgentRuntimeClient } = {};
+    this.workerTurns.set(chatId, turn);
+    const laneId = workerChatLaneId(chatId);
+    try {
+      let client: AgentRuntimeClient;
+      let opened: AgentLaneState;
+      try {
+        client = turn.client = await AgentRuntimeClient.connect(route.socketPath, undefined, route);
+        if (!this.acceptingSessionWork) throw new AgentRuntimeError("shutting_down", "Session manager is shutting down.");
+        opened = await client.open(laneId, stored?.sessionId, agentId);
+      } catch (error) {
+        const code = error instanceof AgentRuntimeError ? error.code : "connection_failed";
+        throw new AgentRuntimeError(code, `The worker session could not be opened (${code}). This message was not submitted.`);
+      }
+      const handle = opened.handle;
+      if (opened.phase !== "ready" || handle.agentId !== agentId || handle.laneId !== laneId
+        || (stored && (handle.sessionId !== stored.sessionId || opened.adoptionDigest !== stored.adoption?.digest))) {
+        throw new AgentRuntimeError("binding_conflict", "The worker did not open the expected session. This message was not submitted.");
+      }
+      if (!stored && !this.store.compareAndSetSession(chatId, undefined, {
+        bindingState: "worker", agentId, chatId, sessionId: handle.sessionId, lastActivity: Date.now(),
+      })) {
+        throw new AgentRuntimeError("binding_conflict", "The session binding changed before the message could be submitted.");
+      }
+      if (opened.request && opened.request.outcome !== "settled") {
+        await client.close(handle);
+        throw new AgentRuntimeError("prior_interruption", "A previous worker turn was interrupted. The worker session requires operator inspection before more messages can run.");
+      }
+      // Fence a queued turn against a rollback that committed before this
+      // connection acquired the worker lane. Keep the lane owned through submission.
+      if (stored?.adoption && !this.store.compareAndSetSession(chatId, stored, { ...stored, lastActivity: Date.now() })) {
+        try { await client.close(handle); } catch { /* Disconnect still releases the owned lane. */ }
+        throw new AgentRuntimeError("binding_conflict", "The selected binding changed before this message was submitted.");
+      }
+
+      const lines: StreamLine[] = [];
+      let wake: (() => void) | undefined;
+      let terminal: StreamLine | undefined;
+      let outcome: { state?: AgentLaneState; error?: unknown } | undefined;
+      const requestId = randomUUID();
+      const prompt = client.prompt(handle, requestId, text, line => {
+        // The relay stops at result. Hold it until the worker confirms settlement.
+        if (line.type === "result") terminal = line;
+        else lines.push(line);
+        wake?.();
+      });
+      const finish = (result: NonNullable<typeof outcome>) => {
+        outcome = result;
+        wake?.();
+      };
+      void prompt.completed.then(state => finish({ state }), error => finish({ error }));
+      while (!outcome || lines.length) {
+        if (lines.length) yield lines.shift()!;
+        else await new Promise<void>(resolve => { wake = resolve; });
+      }
+      if (outcome.error instanceof AgentRuntimeError && outcome.error.code === "busy") {
+        throw new AgentRuntimeError("busy", "The worker was busy and rejected this message before processing.");
+      }
+      if (outcome.state?.request?.outcome === "interrupted") {
+        throw new AgentRuntimeError("uncertain_outcome", "The worker reported an interrupted turn. The message may have been partially processed. Operator inspection is required before continuing.");
+      }
+      if (outcome.state?.request?.requestId !== requestId || outcome.state.request.outcome !== "settled" || !terminal) {
+        throw new AgentRuntimeUncertainError();
+      }
+      try {
+        await client.close(handle);
+      } catch {
+        throw new AgentRuntimeError("cleanup_unconfirmed", "The worker completed this turn, but cleanup could not be confirmed. The message was already processed.");
+      }
+      yield terminal;
+    } finally {
+      turn.client?.disconnect();
+      this.workerTurns.delete(chatId);
+    }
+  }
+
   /**
    * Attempt first-party Pi steering for an active turn. The returned promise is
    * true only after the existing stdout reader observes the exact correlated
@@ -1523,6 +1746,7 @@ export class SessionManager {
     onEnqueued?: () => void,
     imagePaths?: string[],
   ): Promise<boolean> {
+    if (this.isWorkerLane(chatId, agentId)) return Promise.resolve(false);
     const session = this.active.get(chatId);
     if (
       session?.internalTurn ||
@@ -1601,17 +1825,23 @@ export class SessionManager {
 
   /** Plain-text, current-lane control. Native Pi remains the capability authority. */
   async sessionEffort(chatId: string, agentId: string, value?: string, expected?: ActiveSession): Promise<string> {
+    const action = parseEffortAction(value);
+    if (!action) throw new Error(EFFORT_USAGE);
+    this.assertLocalLane(chatId, agentId);
     const generation = this.sessionGenerations.get(chatId) ?? 0;
     const previous = this.effortOperations.get(chatId) ?? Promise.resolve();
     const operation = previous.catch(() => {}).then(async () => {
       if (!this.acceptingSessionWork || (this.sessionGenerations.get(chatId) ?? 0) !== generation) throw new Error("Session changed; retry /effort.");
       if (process.env[PI_EXTENSIONS_DISABLED_ENV] === "1") throw new Error("Session effort extension is disabled.");
+      const lane = /^(-?\d+)(?::(\d+))?$/.exec(chatId);
+      if (!lane) throw new Error("Effort controls require a Telegram conversation.");
+      const telegramChatId = Number(lane[1]);
+      const topicId = lane[2] === undefined ? undefined : Number(lane[2]);
       const configuredAgent = (): AgentConfig => {
-        const config = this.getFreshConfig();
-        const lane = /^(-?\d+)(?::(\d+))?$/.exec(chatId);
-        const binding = lane && resolveBinding(Number(lane[1]), config.bindings,
-          lane[2] === undefined ? undefined : Number(lane[2]));
+        const config = this.getFreshConfig(chatId);
+        const binding = resolveBinding(telegramChatId, config.bindings, topicId);
         if (!binding || binding.agentId !== agentId) throw new Error("Telegram thread binding changed.");
+        if (action.kind === "default" && (binding.kind !== "dm" || telegramChatId <= 0)) throw new Error(EFFORT_DEFAULT_PERMISSION);
         const agent = config.agents[agentId];
         if (!agent) throw new Error("Current agent is unavailable.");
         return agent;
@@ -1621,7 +1851,7 @@ export class SessionManager {
       try {
         const current = this.active.get(chatId);
         if (current && current.agentId !== agentId && (current.processingStartedAt !== null || current.queue.pending > 0)) throw new Error("Thread binding changed; wait for the current answer before retrying /effort.");
-        if (expected && current !== expected) throw new Error("Current session changed.");
+        if (expected && (current !== expected || expected.internalTurn)) throw new Error("Effort controls are available only in the current Telegram conversation.");
         const session = current && current.agentId === agentId && !hasExited(current.child) && !current.child.killed
           ? current : await this.getOrCreateSession(chatId, agentId, undefined, true);
         if ((this.sessionGenerations.get(chatId) ?? 0) !== generation) throw new Error("Session changed; retry /effort.");
@@ -1632,36 +1862,39 @@ export class SessionManager {
           try {
             if (this.active.get(chatId) !== session) throw new Error("Current session closed.");
             const agent = configuredAgent();
-            const result = await this.requestEffort(chatId, session, value, agent, readerReleased);
+            const result = await this.requestEffort(chatId, session, action, agent, readerReleased);
             if (this.active.get(chatId) !== session || (this.sessionGenerations.get(chatId) ?? 0) !== generation) throw new Error("Current session changed.");
-            const supported = `Supported: ${result.levels.join(", ") || "none"}, default.`;
-            if (result.error) throw new Error(`${result.error} Effective effort: ${result.effective}. ${supported}`);
-            if (value !== undefined) {
+            const supported = result.levels.length ? `Supported levels are ${result.levels.join(", ")}.` : "No supported levels are available.";
+            const status = `Effort is ${result.effective}. Source is the ${result.source}. ${supported}`;
+            if (result.error) throw new Error(`${result.error} ${status}`);
+            if (action.kind === "override" || action.kind === "inherit") {
               const stored = this.store.getSession(chatId);
               if (stored?.bindingState !== "bound" || stored.sessionId !== session.sessionId || stored.sessionFile !== session.sessionFile) throw new Error("Session binding changed; effort was not saved.");
-              const override = value === "default" ? undefined : result.effective;
+              const previousOverride = session.effortOverride;
+              const override = action.kind === "inherit" ? undefined : result.effective;
               const { effortOverride: _previous, ...snapshot } = this.toSessionState(chatId, session);
-              const replacement = { ...snapshot, thinking: override ?? agent.thinking, ...(override === undefined ? {} : { effortOverride: override }) };
+              const replacement = { ...snapshot, ...(override === undefined ? {} : { effortOverride: override }) };
               try {
                 if (!this.store.compareAndSetSession(chatId, stored, replacement)) throw new Error("Session binding changed; effort was not saved.");
               } catch (error) {
                 // A failed durable write must not leave an untracked live override.
-                if (result.previous && this.active.get(chatId) === session) {
-                  const restored = await this.requestEffort(chatId, session, result.previous, agent, readerReleased);
+                if (this.active.get(chatId) === session) {
+                  const restored = await this.requestEffort(chatId, session, { kind: "restore", level: previousOverride }, agent, readerReleased);
                   if (restored.error) throw new Error(`Effort was not saved and restoring the previous value failed. Effective effort: ${restored.effective}.`);
                 }
                 throw error;
               }
               session.effortOverride = override;
-              session.thinking = override ?? agent.thinking;
             }
             this.touchActivity(chatId);
-            return `Effort: ${result.effective} (${session.effortOverride === undefined ? "inherited default" : `thread override: ${session.effortOverride}`}). ${supported} Changes apply to the next model request; an in-flight request is unchanged.`;
+            if (action.kind === "default") return `The agent's default for this model is now ${action.level}. Conversations that inherit it will use it from their next message. ${status}`;
+            if (action.kind === "status") return status;
+            return `${status} This applies from the next model request.`;
           } finally { releaseControl(); }
         };
         // A turn holds the queue through delivery, but releases stdout earlier.
         // Controls can use that boundary without waiting for final delivery.
-        if (session.processingStartedAt !== null || session.turnReaderDone) return await apply(false);
+        if (!session.internalTurn && (session.processingStartedAt !== null || session.turnReaderDone)) return await apply(false);
         return await session.queue.add(() => apply(true)) as string;
       } finally { release(); }
     });
@@ -1691,7 +1924,7 @@ export class SessionManager {
     }
   }
 
-  private async requestEffort(chatId: string, session: ActiveSession, value: string | undefined, agent: AgentConfig, readerReleased?: Promise<void>): Promise<EffortResult> {
+  private async requestEffort(chatId: string, session: ActiveSession, action: EffortRequestAction, agent: AgentConfig, readerReleased?: Promise<void>): Promise<EffortResult> {
     const id = randomUUID();
     const stdout = session.child.stdout;
     if (!stdout) throw new Error("Pi stdout is unavailable.");
@@ -1715,7 +1948,7 @@ export class SessionManager {
         timer = setTimeout(() => reject(new Error("Pi did not confirm effort; check /effort before retrying.")), this.startupTimeoutMs);
         onExit = () => reject(new Error("Pi exited before confirming effort."));
         session.child.once("exit", onExit);
-        try { sendPiPrompt(session.child, effortInvocation(SESSION_EFFORT_COMMAND, { id, value, inherited: agent.thinking, model: normalizePiModel(agent.model) }), "followUp"); }
+        try { sendPiPrompt(session.child, effortInvocation(SESSION_EFFORT_COMMAND, { id, action, inherited: agent.thinking, model: normalizedSessionModel(agent) }), "followUp"); }
         catch (error) { reject(error); }
       });
       // Settlement releases the turn reader before final transport delivery.
@@ -1876,6 +2109,7 @@ export class SessionManager {
   beginShutdown(): void {
     if (!this.acceptingSessionWork) return;
     this.acceptingSessionWork = false;
+    for (const turn of this.workerTurns.values()) turn.client?.disconnect();
     for (const chatId of this.sessionStartups.keys()) {
       this.sessionGenerations.set(chatId, (this.sessionGenerations.get(chatId) ?? 0) + 1);
     }
@@ -1890,6 +2124,7 @@ export class SessionManager {
    * transcript during the child-exit await window.
    */
   async destroySession(chatId: string): Promise<void> {
+    this.assertLocalLane(chatId);
     const hadActiveSession = this.active.has(chatId);
     // Bump the startup generation BEFORE deleting store state so any in-flight
     // getOrCreateSession for this chat is superseded and cannot re-persist state.
@@ -1983,12 +2218,13 @@ export class SessionManager {
     agentId: string,
     config?: BotConfig,
   ): { resume: false } | { resume: true; sessionId: string; sessionFile: string } {
+    this.assertLocalLane(chatId, agentId);
     const stored = this.store.getSession(chatId);
     if (!stored) {
       return { resume: false };
     }
 
-    if (stored.bindingState === "legacy-unresolved") {
+    if (stored.bindingState !== "bound") {
       return { resume: false };
     }
 
@@ -2013,7 +2249,7 @@ export class SessionManager {
 
     const currentAgent = agents[agentId];
     if (currentAgent && stored.provider && stored.model) {
-      const currentSignature = sessionRuntimeSignature({ ...currentAgent, thinking: stored.effortOverride ?? currentAgent.thinking });
+      const currentSignature = sessionRuntimeSignature(currentAgent);
       if (
         stored.provider !== currentSignature.provider ||
         stored.model !== currentSignature.model ||

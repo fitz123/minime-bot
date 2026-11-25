@@ -143,6 +143,21 @@ function assertCronSystemInstruction(value: string): void {
 }
 
 describe("cron-runner runPi", () => {
+  it("supplies the current cron agent identity without a caller thread", () => {
+    const ws = makeWorkspace();
+    const captures: SpawnCapture[] = [];
+    runPi(makeCron(), ws, makeDeps(captures, {
+      buildEnv: (cwd, options) => {
+        assert.equal(cwd, ws);
+        assert.deepEqual(options, { askCallerAgentId: "main" });
+        return buildPiSpawnEnv(cwd, options);
+      },
+    }));
+    assert.equal(captures[0].options.env?.MINIME_BOT_PI_SESSION_AGENT_ID, "main");
+    assert.equal(captures[0].options.env?.MINIME_CRON_FAST_OFF, "1");
+    assert.equal(captures[0].options.env?.MINIME_BOT_PI_SESSION_THREAD_KEY, undefined);
+  });
+
   it("spawns Pi in print one-shot mode with the required argv and spawn options", () => {
     const ws = makeWorkspace();
     const captures: SpawnCapture[] = [];
@@ -230,9 +245,9 @@ describe("cron-runner runPi", () => {
     }
 
     const extensions = flagValues(captures[0].args, "--extension");
-    assert.strictEqual(extensions.length, 2);
+    assert.strictEqual(extensions.length, 3);
     assert.equal(extensions.filter((path) => path.endsWith("web-tools.ts")).length, 1);
-    assert.ok(extensions[1].endsWith("knowledge-tools.ts"));
+    assert.ok(extensions[2].endsWith("knowledge-tools.ts"));
     assert.ok(!extensions.includes(extraExtension));
   });
 
@@ -738,7 +753,7 @@ describe("cron-runner runPi", () => {
     assert.throws(() => runPi(makeCron(), ws, deps), /Pi cron spawn failed: ENOENT pi/);
   });
 
-  it("keeps timeout spawn diagnostics separate from the public spawn error", () => {
+  it("keeps timeout spawn diagnostics separate and exposes safe timeout metadata", () => {
     const ws = makeWorkspace();
     const captures: SpawnCapture[] = [];
     const timeoutError = Object.assign(new Error("spawnSync pi ETIMEDOUT"), { code: "ETIMEDOUT" });
@@ -752,11 +767,22 @@ describe("cron-runner runPi", () => {
       })),
     });
 
-    assert.throws(() => runPi(makeCron(), ws, deps), (err: unknown) => {
+    assert.throws(() => runPi(makeCron({ timeout: 4_321 }), ws, deps), (err: unknown) => {
       assert.match((err as Error).message, /Pi cron spawn failed: spawnSync pi ETIMEDOUT/);
       assert.doesNotMatch((err as Error).message, /timeout stderr details/);
       assert.match((err as { diagnostics?: string }).diagnostics ?? "", /stderr: timeout stderr details/);
       assert.match((err as { diagnostics?: string }).diagnostics ?? "", /stdout: partial timeout stdout/);
+      assert.deepStrictEqual(
+        (err as { diagnosticFailure?: unknown }).diagnosticFailure,
+        {
+          category: "pi_timeout",
+          kind: "timeout",
+          summary: "Pi cron timed out after 4321ms",
+          code: "ETIMEDOUT",
+          signal: "SIGTERM",
+          timeoutMs: 4_321,
+        },
+      );
       return true;
     });
   });

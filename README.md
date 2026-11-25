@@ -100,13 +100,13 @@ minime-codex-quota-sampler --workspace /path/to/workspace --textfile-dir /path/t
 ```
 
 Interactive RPC sessions, cron runs, subagents, and ask-agent children resolve
-the package-owned Pi 0.99.1 entrypoints and execute them with Node. They never
+the package-owned Pi 1.5.0 entrypoints and execute them with Node. They never
 fall back to a global `pi` from `PATH`; a missing packaged entrypoint fails
 explicitly. Startup logs report only the expected version, entrypoint kind, and
 mismatch state, without exposing the resolved host path.
 
 The runtime dependency contract pins all four package-owned Pi packages to
-0.99.1 and grammY to 1.46.0 (`@grammyjs/types` 5.0.0). Pi owns the bounded
+1.5.0 and grammY to 1.46.0 (`@grammyjs/types` 5.0.0). Pi owns the bounded
 summarization retry, including transient WebSocket recovery; Minime treats its
 retry records as stream activity and does not add a second compaction retry.
 `agent_settled` remains the accepted-turn terminal boundary. In primary
@@ -115,6 +115,11 @@ visible text continues automatically after successful threshold compaction
 through a hidden follow-up. If compaction produces no meaningful continuation
 outcome, Minime returns a specific length-limit error. Cron, subagent-child, and
 ask-agent-child sessions do not load this continuation wrapper.
+
+Codex Fast priority requests are available through an explicit agent/exact-model
+opt-in and per-thread `/fast` controls; preferences start off. See
+[scoped Codex Fast](docs/codex-fast.md) for commands, isolation, existing-tier
+precedence, and the offline installed-package verifier.
 
 Other direct dependency targets are discord.js 14.27.0, p-queue 9.3.3,
 typebox 1.3.34, yaml 2.9.1, tsx 4.23.15, and @types/node 26.6.3. Already-current
@@ -159,10 +164,11 @@ Final delivery follows that bounded wait. Final requests retain existing bounded
 transport retries and their delivery ambiguity; later-chunk failures can leave
 partial delivery. This is not an exactly-once transport guarantee.
 
-The sampler uses the same packaged Pi CLI by default; override it explicitly
-with `--pi-bin` or `CODEX_QUOTA_PI_BIN`. Its probe passes `--approve` for the
-isolated sampler project settings, and `--dry-run` prints the resolved command
-without executing it.
+The quota sampler reads `GET https://chatgpt.com/backend-api/wham/usage`
+with the existing Pi OAuth; it sends no inference and launches no Pi child.
+The former `--model`, `--prompt`, `--pi-bin` and `--sampler-cwd` options remain
+accepted and ignored, as do their former environment settings. `--dry-run`
+prints the resolved configuration without resolving OAuth or making a request.
 
 ## Control Workspace
 
@@ -241,7 +247,7 @@ metricsPort: <deployment-metrics-port>
 
 `topicId` is optional. The overlay may also carry deployment delivery IDs,
 metrics host, the complete `triggerInput` section described below, and the
-`collaboration` socket configuration. It
+`collaboration` socket configuration and `privateTopics` policy. It
 cannot override agents, models, thinking, prompts, session defaults,
 extensions, logging behavior, raw bindings, or `workspaceCwd`. Exact
 `discord: false` is the sole Discord entry allowed. Add it when the canonical
@@ -387,6 +393,12 @@ waiting for the peer; internal turns use separate output handling and never ente
 the normal human relays. See the guide for the configuration, package extension,
 address types, continuing conversations, receipt semantics, and trade-offs.
 
+The optional [private-topic presentation policy](docs/collaboration.md#private-topic-presentation)
+uses that same extension and the ordinary human turn to select a concise semantic
+name and a separate thematic catalog icon for one automatic initialization, plus
+explicit manual edits. It opts in all authorized private DM topics using the
+actual bot identity; it adds no commands or extra model calls.
+
 Optional top-level `piExtraExtensions` entries allow operator-approved external
 Pi extension entrypoints in normal bot-created interactive RPC sessions:
 
@@ -410,7 +422,7 @@ that point back at the first-party `subagent` or `ask-agent` wrappers.
 Bot-created RPC sessions do not provide an interactive extension UI bridge.
 Blocking `select`, `confirm`, `input`, and `editor` requests are answered as
 cancelled; fire-and-forget UI updates are ignored. External extensions must
-handle cancellation or provide a noninteractive path. Pi 0.99.1 does not bind
+handle cancellation or provide a noninteractive path. Pi 1.5.0 does not bind
 its RPC input reader until startup handlers complete, so a blocking dialog from
 `session_start` instead fails session creation promptly and the child is reaped.
 
@@ -643,17 +655,21 @@ environment.
 
 ### Runtime Session Controls
 
-Telegram effort is independent for each current thread. Send `/effort` for the
-actual value and the current model's supported levels, or `/effort high` to set
-an override. `/effort default` removes it and restores the agent's configured
-thinking level, falling back to Pi's native per-model/global default. An explicit
-natural-language request can also use the current-session `set_session_effort`
-tool. Changes apply to the next model request, including the next request in a
-running tool loop; an in-flight request keeps its effort. Overrides survive
-reconnect, idle closure, and bot restart. Cleaning or rebinding the session drops
-the override. These controls do not change the model or global defaults and are
-not available to cron or delegated child sessions. `/effort` uses plain text and
-is not registered in Telegram's command menu.
+Send `/effort` in Telegram to see the effective reasoning level, where it comes
+from, and the levels the current model supports. Send `/effort high` to pin the
+current conversation or `/effort inherit` to remove its pin. To change the
+routed agent's default for its current provider and model, send
+`/effort default high` in a private chat with a DM binding, as with `/fast`.
+Conversations that inherit pick up the new default on their next message.
+Until the agent has a saved default for that model, it uses the configured
+thinking level or Pi's settings.
+
+You can also ask in plain language to show or change effort through the
+`set_session_effort` tool. A conversation override applies from the next model
+request, including within a running tool loop. Overrides survive reconnect, idle
+closure, and bot restart. Cleaning or rebinding a conversation removes its
+override. Effort controls are available in local Telegram Pi sessions and use
+plain-text replies.
 
 `/clean` clears queued work, deletes the stored session state for that chat, and
 supersedes any in-flight startup for the same chat. The next accepted message for
@@ -780,6 +796,28 @@ after exponential delays from five seconds up to one minute; all `getUpdates`
 calls, including the signal-less final update-offset confirmation, are bounded
 at 45 seconds. A successful polling-loop request resets that delay. A started
 transport counts only when it has conversational bindings.
+
+### Reload Telegram group bindings
+
+On a release that documents Telegram group binding reload, first confirm that
+the running Telegram poller is using that release and verify its PID. Save the
+group binding edits, including any instance identity overrides, then send
+`kill -HUP <verified-bot-pid>` to that process. Older releases can terminate on
+this signal. Check the bot log for the reload result.
+
+Reload reads the same base config, local overlay, and instance overlay as
+startup and verifies the running transport's Telegram credential. A rejected
+reload preserves the previous routes. Use
+`minime-bot config validate` with the same workspace and instance environment
+to check the config schema. Retry once any in-flight update and accepted work
+on a group being removed have finished.
+
+Reload supports adding and removing group bindings for agents configured at
+startup. Use a restart for edits to existing bindings, including reassignment
+of a chat or topic, and for changes to DM bindings, worker routes, the global
+mention policy, or the running trigger input's target. Group chat/topic routes
+must be unique. Removing the last Telegram binding requires another running
+transport with conversational bindings.
 
 ## Launchd Operations
 
@@ -928,11 +966,23 @@ retry/outbox path, and then records a non-zero logical failure. Embedded,
 quoted, repeated, or non-final marker-like text is ordinary output, and script
 cron output is never interpreted as this marker.
 
+The cron runner also appends versioned JSONL evidence to
+`$LOG_DIR/cron-diagnostics.jsonl`. The package keeps this file owner-only at
+mode `0600`. Events contain only allowlisted metadata and bounded,
+control-character-sanitized, secret/URI-redacted final output or controlled
+failure summaries; they never contain prompts, commands, environment/config
+objects, raw child diagnostics, or stacks. A `runId` correlates one invocation, while replay
+delivery events also carry `originalRunId` to correlate them to the run that
+created the pending output. Rotation is deployment-owned: deployments must
+rotate this exact file with copytruncate-compatible behavior because cron
+processes may append concurrently. The package does not rotate it.
+
 Execution failures no longer send a direct generic `Cron FAIL` message or
 create a failure-notice outbox entry. Prometheus and Alertmanager own terminal
-incident grouping, repeats, and recovery. Bounded diagnostics remain in the
-local cron log, while the existing admin fallback for a delivery-path failure
-is unchanged. On upgrade, an old queued `failure-notice` record is discarded
+incident grouping, repeats, and recovery. The diagnostic JSONL retains safe
+structured execution evidence, and bounded legacy diagnostics remain in the
+per-cron local log. The existing admin fallback for a delivery-path failure is
+unchanged. On upgrade, an old queued `failure-notice` record is discarded
 without delivery.
 
 Cron delivery is pickup-first. At the start of each scheduled invocation, the
@@ -953,12 +1003,13 @@ bot), and local destination validation errors, take the terminal clear/admin
 notice path so corrected configuration can run. Rate limits, 5xx, network errors,
 and unknown responses remain queueable. Legacy failure notices are dropped.
 Queue, redelivery, expiry, deferral, and terminal decisions are recorded as
+structured attempts/dispositions in `cron-diagnostics.jsonl` and as existing
 `OUTBOX` lines in `cron-<name>.log`.
 
 Pickup-only outbox preflight failures and deferred redelivery attempts do not
 start a new logical cron run, so they do not change terminal metrics or
-counters. Their non-zero process exit and `OUTBOX` log lines remain the
-diagnostic evidence.
+counters. Their JSONL replay evidence, non-zero process exit, and existing
+`OUTBOX` log lines support diagnosis.
 
 Delivery has at-least-once, not exactly-once, semantics: a process crash after
 the chat accepts a message but before the outbox record is cleared can produce

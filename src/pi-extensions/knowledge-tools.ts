@@ -597,16 +597,32 @@ function staticShellPathPrefix(rawPath: string): string {
   return literalPrefix.slice(0, separatorIndex) || "/";
 }
 
-function extractBashWriteTargetsAtDepth(command: string, depth: number, cwd?: string, env?: NodeJS.ProcessEnv): string[] {
+function extractBashWriteTargetsAtDepth(
+  command: string,
+  depth: number,
+  cwd?: string,
+  env?: NodeJS.ProcessEnv,
+  retainKnowledgeCliFallback = false,
+): string[] {
   if (depth > MAX_NESTED_SHELL_DEPTH) {
     return extractManagedKnowledgePathReferences(command);
   }
   const tokens = expandAttachedRedirections(tokenizeShell(command).map((token) => token.value));
+  // Only simple standalone readers are exempt; quoted syntax markers also retain fallback.
+  retainKnowledgeCliFallback ||= /[(){}\r\n`]/.test(command) || tokens.some((token, index) =>
+    /[;&|]/.test(token) && !isWriteRedirection(token) &&
+    !(/^&\d+$/.test(token) && (tokens[index - 1] === ">" || tokens[index - 1] === "<"))
+  );
   const targets: string[] = [];
   let currentCwd = cwd;
 
   for (const segment of splitShellSegments(tokens)) {
-    appendTargetCandidates(targets, extractCommandWriteTargets(segment, depth, currentCwd, env), currentCwd, env);
+    appendTargetCandidates(
+      targets,
+      extractCommandWriteTargets(segment, depth, retainKnowledgeCliFallback, currentCwd, env),
+      currentCwd,
+      env,
+    );
     currentCwd = cwdAfterSegment(segment, currentCwd, env);
   }
 
@@ -832,6 +848,7 @@ function redirectionTargets(segment: string[]): string[] {
 function extractCommandWriteTargets(
   segment: string[],
   depth: number,
+  retainKnowledgeCliFallback: boolean,
   cwd?: string,
   env?: NodeJS.ProcessEnv,
 ): string[] {
@@ -850,7 +867,7 @@ function extractCommandWriteTargets(
   if (NESTED_SHELL_COMMANDS.has(name)) {
     const nestedCommand = nestedShellCommand(args);
     const nestedTargets = nestedCommand
-      ? [...targets, ...extractBashWriteTargetsAtDepth(nestedCommand, depth + 1, commandCwd, commandEnv)]
+      ? [...targets, ...extractBashWriteTargetsAtDepth(nestedCommand, depth + 1, commandCwd, commandEnv, retainKnowledgeCliFallback)]
       : targets;
     return targetCandidates(nestedTargets, commandCwd, commandEnv);
   }
@@ -880,7 +897,7 @@ function extractCommandWriteTargets(
     return targetCandidates([...targets, ...commandOperands(args)], commandCwd, commandEnv);
   }
 
-  if (isReadOnlyShellCommand(name, args)) {
+  if (isReadOnlyShellCommand(command[0], args, retainKnowledgeCliFallback)) {
     return targetCandidates(targets, commandCwd, commandEnv);
   }
   return targetCandidates(
@@ -921,7 +938,11 @@ function nestedShellCommand(args: string[]): string | undefined {
   return undefined;
 }
 
-function isReadOnlyShellCommand(name: string, args: string[]): boolean {
+function isReadOnlyShellCommand(executable: string, args: string[], retainKnowledgeCliFallback: boolean): boolean {
+  const name = basename(executable);
+  if (name === "minime-bot" && (executable === name || isAbsolute(executable))) {
+    return !retainKnowledgeCliFallback && isReadOnlyKnowledgeCliCommand(args);
+  }
   if (name === "find") {
     return !args.some((arg) => arg === "-delete" || arg === "-exec" || arg === "-execdir");
   }
@@ -929,6 +950,31 @@ function isReadOnlyShellCommand(name: string, args: string[]): boolean {
     return isReadOnlyGitCommand(args);
   }
   return READ_ONLY_SHELL_COMMANDS.has(name);
+}
+
+function isReadOnlyKnowledgeCliCommand(args: string[]): boolean {
+  // cli.ts parseArgs removes global workspace/help options before scope/action dispatch.
+  const command: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--help" || arg === "-h") {
+      continue;
+    }
+    if (arg === "--workspace") {
+      const value = args[index + 1];
+      if (!value || value.startsWith("-")) {
+        return false;
+      }
+      index += 1;
+    } else if (arg.startsWith("--workspace=")) {
+      if (!arg.slice("--workspace=".length).trim()) {
+        return false;
+      }
+    } else {
+      command.push(arg);
+    }
+  }
+  return command[0] === "knowledge" && (command[1] === "get" || command[1] === "search");
 }
 
 function isReadOnlyGitCommand(args: string[]): boolean {

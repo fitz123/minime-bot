@@ -1,3 +1,6 @@
+import { loadConfig } from "./config.js";
+import { formatFastCommandError, formatFastStatusLine, handleFastCommand } from "./codex-fast.js";
+import { EFFORT_DEFAULT_PERMISSION, parseEffortAction } from "./pi-extensions/session-effort.js";
 import { statSync } from "node:fs";
 import type { RichMessage } from "grammy/types";
 import { validateRichPhoto } from "./telegram-rich.js";
@@ -6,7 +9,7 @@ import { Bot, HttpError, type Transformer } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
 import { createHash } from "node:crypto";
 import type { BotConfig, TelegramBinding } from "./types.js";
-import { outboxDir, hasExited, type SessionManager } from "./session-manager.js";
+import { outboxDir, hasExited, WORKER_MEDIA_UNSUPPORTED, type SessionManager } from "./session-manager.js";
 import { relayStream } from "./stream-relay.js";
 import { MessageQueue } from "./message-queue.js";
 import { sendPiSteer } from "./pi-rpc-protocol.js";
@@ -38,7 +41,8 @@ import { recordMessage, lookupMessage } from "./message-content-index.js";
 import type { MessageRecord } from "./message-content-index.js";
 import { logReaction } from "./reaction-log.js";
 import { EchoWatcher, ECHO_PREFIX } from "./echo-watcher.js";
-import { readQuotaStatus } from "./quota-status.js";
+import type { QuotaStatus } from "./quota-status.js";
+import { refreshQuotaStatus } from "./codex-quota-refresh.js";
 import { buildStatusReport } from "./status-report.js";
 import {
   createPollProgressProbe,
@@ -48,6 +52,9 @@ import {
 } from "./poll-progress.js";
 import { ActiveDraftCoordinator } from "./active-draft-coordinator.js";
 import { resolveBinding } from "./telegram-binding.js";
+import type { TelegramBindingReload } from "./telegram-binding-reload.js";
+import { PrivateTopicController } from "./private-topics.js";
+import { TopicStore } from "./topic-store.js";
 // Re-export for backward compatibility (tests import from here)
 export { isImageMimeType, imageExtensionForMime };
 export { resolveBinding } from "./telegram-binding.js";
@@ -66,6 +73,7 @@ export const BOT_COMMANDS = [
   { command: "reconnect", description: "Reconnect session (keeps context)" },
   { command: "clean", description: "Clean session (fresh start)" },
   { command: "status", description: "Show bot status" },
+  { command: "fast", description: "Show/set scoped Codex Fast" },
 ] as const;
 
 export const TELEGRAM_ALLOWED_UPDATES = ["message", "message_reaction"] as const;
@@ -179,12 +187,12 @@ export function resolveBindingLabel(
  * receives the `"unbound"` or `"none"` sentinel) so existing callers / tests
  * keep working unchanged.
  */
-export function createApiErrorLoggingTransformer(opts?: { bindings?: TelegramBinding[] }): Transformer {
+export function createApiErrorLoggingTransformer(opts?: { bindings?: TelegramBinding[]; getBindings?: () => TelegramBinding[] }): Transformer {
   const bindings = opts?.bindings ?? [];
   return async (prev, method, payload, signal) => {
     const ctx = extractChatContext(payload);
     const ctxStr = formatChatContextForLog(ctx);
-    recordTelegramApiCall(String(method), resolveBindingLabel(ctx, bindings));
+    recordTelegramApiCall(String(method), resolveBindingLabel(ctx, opts?.getBindings?.() ?? bindings));
     try {
       const res = await prev(method, payload, signal);
       if (!res.ok && res.error_code === 429) {
@@ -663,6 +671,8 @@ export interface TelegramBotResult {
   echoWatcher: EchoWatcher;
   pollProgress: PollProgressProbe;
   updateProcessing: UpdateProcessingProbe;
+  topicController?: PrivateTopicController;
+  reloadGroupBindings?: () => number;
 }
 
 /** autoRetry options — exported so tests can assert the rethrowHttpErrors value. */
@@ -759,6 +769,13 @@ export function createTelegramBot(
     onUpdate?: () => void;
     onSuccessfulPoll?: () => void;
     draftCoordinator?: ActiveDraftCoordinator;
+    /** Fresh local-control config; defaults to the regular loader without secret resolution. */
+    loadConfig?: () => BotConfig;
+    bindingReload?: TelegramBindingReload;
+    hasOtherActivePlatform?: () => boolean;
+    refreshQuotaStatus?: () => Promise<QuotaStatus>;
+    /** Optional inventory location for an isolated host/test. */
+    topicStorePath?: string;
   },
 ): TelegramBotResult {
   if (!config.telegramToken) {
@@ -766,16 +783,31 @@ export function createTelegramBot(
   }
   const token = config.telegramToken;
   const bot = new Bot(token);
+  const bindingReload = opts?.bindingReload;
+  const getBindings = bindingReload?.getBindings ?? (() => config.bindings);
+  const loadControlConfig = (binding: TelegramBinding): BotConfig => {
+    if (binding.kind === "group" && bindingReload) return bindingReload.loadGroupConfig();
+    return opts?.loadConfig ? opts.loadConfig() : loadConfig(undefined, { resolveSecrets: false });
+  };
 
   // Log Telegram API errors, especially 429 rate limits, and count every API
   // call attempt by binding (inner transformer — sees each individual attempt
   // before autoRetry decides whether to retry)
-  bot.api.config.use(createApiErrorLoggingTransformer({ bindings: config.bindings }));
+  bot.api.config.use(createApiErrorLoggingTransformer({ getBindings }));
 
   // Auto-retry on rate limits and server errors (outermost transformer —
   // retries after inner errors). Polling uses grammY's own retry loop, while
   // cosmetic drafts and typing remain excluded from retries.
   bot.api.config.use(createTelegramAutoRetryTransformer());
+
+  let topicController: PrivateTopicController | undefined;
+  if (config.privateTopics?.enabled) {
+    try {
+      topicController = new PrivateTopicController(config, new TopicStore(opts?.topicStorePath), bot.api, () => {
+        try { return bot.botInfo.id; } catch { return undefined; }
+      });
+    } catch { log.warn("telegram-bot", "Private-topic inventory unavailable; cosmetic policy disabled"); }
+  }
 
   // Outermost transformer: observe completion of each logical getUpdates call,
   // including grammY polling calls, without retaining request/response data.
@@ -802,7 +834,7 @@ export function createTelegramBot(
         await relayStream(
           stream,
           platform,
-          outboxDir(chatId),
+          sessionManager.isWorkerLane(chatId, agentId) ? undefined : outboxDir(chatId),
           onAgentOwnership,
           (suspend) => draftCoordinator.register(chatId, suspend),
         );
@@ -814,12 +846,33 @@ export function createTelegramBot(
       acknowledgedSteerFn: (chatId, agentId, text, onEnqueued, imagePaths) =>
         sessionManager.steerSessionMessage(chatId, agentId, text, onEnqueued, imagePaths),
       prepareSessionFn: async (chatId, agentId) => {
-        await sessionManager.getOrCreateSession(chatId, agentId);
+        if (!sessionManager.isWorkerLane(chatId, agentId)) await sessionManager.getOrCreateSession(chatId, agentId);
       },
-      recoveryNoticeFn: (chatId, _agentId, platform) =>
-        sessionManager.deliverPendingRecoveryNotice(chatId, platform).then(() => undefined),
+      recoveryNoticeFn: async (chatId, agentId, platform) => {
+        if (!sessionManager.isWorkerLane(chatId, agentId)) await sessionManager.deliverPendingRecoveryNotice(chatId, platform);
+      },
     },
   );
+
+  const reloadGroupBindings = bindingReload && (() => {
+    // Admission and enqueue can be separated by asynchronous media handling.
+    if (updateProcessing.snapshot().inFlight) {
+      throw new Error("Telegram is processing an update. Retry the binding reload");
+    }
+    return bindingReload.reload(candidate => {
+      if (candidate.length === 0 && !opts?.hasOtherActivePlatform?.()) {
+        throw new Error("Cannot remove the last binding without another running conversational transport");
+      }
+      if (messageQueue.hasWorkWhere(key => {
+        const [chatId, topicId] = key.split(":");
+        const threadId = topicId === undefined ? undefined : Number(topicId);
+        return resolveBinding(Number(chatId), getBindings(), threadId)?.kind === "group"
+          && !resolveBinding(Number(chatId), candidate, threadId);
+      })) {
+        throw new Error("A removed Telegram lane still has accepted work. Retry the binding reload when it is idle");
+      }
+    });
+  });
 
   // Watchdog touch: notify liveness watchdog on every incoming update
   if (opts?.onUpdate) {
@@ -835,7 +888,7 @@ export function createTelegramBot(
     const chatId = ctx.chat?.id;
     if (chatId === undefined) return;
 
-    if (!isAuthorized(chatId, config.bindings)) {
+    if (!isAuthorized(chatId, getBindings())) {
       log.info("telegram-bot", `Rejected message from unauthorized chat ${chatId}`);
       return; // Silent drop
     }
@@ -847,6 +900,10 @@ export function createTelegramBot(
   // cosmetic updates for the active relay before commands, media processing,
   // or message ownership/steering logic runs.
   bot.use(async (ctx, next) => {
+    if (ctx.message && topicController) {
+      try { topicController.observe(ctx.message, ctx.update.update_id); }
+      catch { log.warn("telegram-bot", "Private-topic observation unavailable; continuing message routing"); }
+    }
     const key = ctx.message ? sessionKey(ctx.message.chat.id, ctx.message.message_thread_id) : undefined;
     const releaseInput = key === undefined ? undefined : sessionManager.holdHumanInput?.(key);
     try {
@@ -857,13 +914,46 @@ export function createTelegramBot(
     }
   });
 
+  // Authenticated local control, before text framing or any model invocation.
+  bot.command("fast", async (ctx) => {
+    const topicId = ctx.message?.message_thread_id;
+    const binding = resolveBinding(ctx.chat.id, getBindings(), topicId);
+    if (!binding) return;
+    if (ctx.message) setThread(ctx.chat.id, ctx.message.message_id, topicId);
+    if (sessionManager.isWorkerLane(sessionKey(ctx.chat.id, topicId), binding.agentId)) {
+      await ctx.reply("Fast controls are unavailable for worker-routed sessions.");
+      return;
+    }
+    try {
+      if (ctx.match.trim() === "help") {
+        await ctx.reply(handleFastCommand(ctx.match, undefined));
+        return;
+      }
+      if (/^default\s+(?:on|off)$/.test(ctx.match.trim()) && (ctx.chat.type !== "private" || binding.kind !== "dm")) {
+        await ctx.reply("Use a private chat with a DM binding to change Fast defaults.");
+        return;
+      }
+      const currentConfig = loadControlConfig(binding);
+      await ctx.reply(handleFastCommand(ctx.match, {
+        agent: currentConfig.agents[binding.agentId],
+        threadKey: sessionKey(ctx.chat.id, topicId),
+      }));
+    } catch (error) {
+      await ctx.reply(formatFastCommandError(error));
+    }
+  });
+
   // /start command
   bot.command("start", async (ctx) => {
     const chatId = ctx.chat.id;
     const topicId = ctx.message?.message_thread_id;
     if (ctx.message) setThread(chatId, ctx.message.message_id, topicId);
-    const binding = resolveBinding(chatId, config.bindings, topicId);
+    const binding = resolveBinding(chatId, getBindings(), topicId);
     if (!binding) return;
+    if (sessionManager.isWorkerLane(sessionKey(chatId, topicId), binding.agentId)) {
+      await ctx.reply(`This chat is configured to route text to the worker for "${binding.agentId}".`);
+      return;
+    }
     const agent = config.agents[binding.agentId];
     await ctx.reply(
       `Connected to agent "${binding.agentId}" (${agent?.model ?? "unknown"}). Send a message to start.`,
@@ -879,9 +969,13 @@ export function createTelegramBot(
   bot.command("reconnect", async (ctx) => {
     const topicId = ctx.message?.message_thread_id;
     if (ctx.message) setThread(ctx.chat.id, ctx.message.message_id, topicId);
-    const binding = resolveBinding(ctx.chat.id, config.bindings, topicId);
+    const binding = resolveBinding(ctx.chat.id, getBindings(), topicId);
     if (!binding) return;
     const key = sessionKey(ctx.chat.id, topicId);
+    if (sessionManager.isWorkerLane(key, binding.agentId)) {
+      await ctx.reply("Reconnect is unavailable for worker-routed sessions. The worker closes Pi after each turn.");
+      return;
+    }
     messageQueue.clear(key);
     await sessionManager.closeSession(key);
     await ctx.reply("Session restarted. Prior context may be partially retained.");
@@ -893,9 +987,13 @@ export function createTelegramBot(
   bot.command("clean", async (ctx) => {
     const topicId = ctx.message?.message_thread_id;
     if (ctx.message) setThread(ctx.chat.id, ctx.message.message_id, topicId);
-    const binding = resolveBinding(ctx.chat.id, config.bindings, topicId);
+    const binding = resolveBinding(ctx.chat.id, getBindings(), topicId);
     if (!binding) return;
     const key = sessionKey(ctx.chat.id, topicId);
+    if (sessionManager.isWorkerLane(key, binding.agentId)) {
+      await ctx.reply("Clean is unavailable for worker-routed sessions. The existing binding was retained.");
+      return;
+    }
     messageQueue.clear(key);
     await sessionManager.destroySession(key);
     await ctx.reply("Session cleaned. Fresh start.");
@@ -905,15 +1003,24 @@ export function createTelegramBot(
   bot.command("effort", async ctx => {
     const topicId = ctx.message?.message_thread_id;
     if (ctx.message) setThread(ctx.chat.id, ctx.message.message_id, topicId);
-    const binding = resolveBinding(ctx.chat.id, config.bindings, topicId);
+    const binding = resolveBinding(ctx.chat.id, getBindings(), topicId);
     if (!binding) return;
+    const key = sessionKey(ctx.chat.id, topicId);
+    if (sessionManager.isWorkerLane(key, binding.agentId)) {
+      await ctx.reply("Effort controls are unavailable for worker-routed sessions.");
+      return;
+    }
     const value = ctx.match.trim() || undefined;
+    if (parseEffortAction(value)?.kind === "default" && (ctx.chat.type !== "private" || binding.kind !== "dm")) {
+      await ctx.reply(EFFORT_DEFAULT_PERMISSION);
+      return;
+    }
     // Startup and the session queue can be slow; release sequential polling
     // while retaining this update's topic context for the eventual reply.
     void (async () => {
       let response: string;
       try {
-        response = await sessionManager.sessionEffort(sessionKey(ctx.chat.id, topicId), binding.agentId, value);
+        response = await sessionManager.sessionEffort(key, binding.agentId, value);
       } catch (error) {
         response = `Effort change not confirmed: ${(error as Error).message}`;
       }
@@ -921,19 +1028,35 @@ export function createTelegramBot(
     })().catch(error => log.warn("telegram-bot", `Effort reply failed: ${(error as Error).message}`));
   });
 
-  // /status command — compact local-only session and quota health.
+  // /status command — session health and a bounded quota refresh.
   bot.command("status", async (ctx) => {
     const topicId = ctx.message?.message_thread_id;
     if (ctx.message) setThread(ctx.chat.id, ctx.message.message_id, topicId);
-    const binding = resolveBinding(ctx.chat.id, config.bindings, topicId);
+    const binding = resolveBinding(ctx.chat.id, getBindings(), topicId);
     if (!binding) return;
     const key = sessionKey(ctx.chat.id, topicId);
+    if (sessionManager.isWorkerLane(key, binding.agentId)) {
+      await ctx.reply("Worker-routed text session. Live Pi status is available on the worker.");
+      return;
+    }
+    const sessionHealth = sessionManager.getSessionHealth(key);
+    let fastStatusLine: string | undefined;
+    if (sessionHealth) {
+      try {
+        const currentConfig = loadControlConfig(binding);
+        fastStatusLine = formatFastStatusLine({ agent: currentConfig.agents[sessionHealth.agentId], threadKey: key }, sessionHealth.model);
+      } catch {
+        fastStatusLine = "Fast: unknown (read error)";
+      }
+    }
+    const quotaStatus = await (opts?.refreshQuotaStatus ?? refreshQuotaStatus)();
     await ctx.reply(buildStatusReport({
       activeCount: sessionManager.getActiveCount(),
       maxSessions: config.sessionDefaults.maxConcurrentSessions,
       uptimeSeconds: Math.floor(process.uptime()),
-      sessionHealth: sessionManager.getSessionHealth(key),
-      quotaStatus: readQuotaStatus(),
+      sessionHealth,
+      fastStatusLine,
+      quotaStatus,
     }));
   });
 
@@ -945,7 +1068,7 @@ export function createTelegramBot(
     const intake = extractRichIntake(ctx.message.rich_message, ctx.message.reply_to_message?.rich_message);
     const body = ctx.message.text ?? ctx.message.caption ?? intake.text;
     recordMessage(chatId, ctx.message.message_id, senderLabel(ctx.from), body || "[photo]", "in");
-    const binding = resolveBinding(chatId, config.bindings, topicId);
+    const binding = resolveBinding(chatId, getBindings(), topicId);
     if (!binding) return;
     if (!shouldRespondInGroup(binding, bot.botInfo.id, bot.botInfo.username, ctx.message, config.sessionDefaults)) return;
     messagesReceived.inc({ type: ctx.message.photo ? "photo" : "text" });
@@ -961,6 +1084,10 @@ export function createTelegramBot(
       ...intake.photos.map(photo => ({ photo, fromParent: intake.parentPhotoIds.has(photo.file_id) })),
       ...(parent?.photo?.slice(-1) ?? []).map(photo => ({ photo, fromParent: true })),
     ];
+    if (photos.length && sessionManager.isWorkerLane(key, binding.agentId)) {
+      await ctx.reply(WORKER_MEDIA_UNSUPPORTED);
+      return;
+    }
     const seen = new Set<string>();
     const paths: string[] = [];
     let remaining = Math.min(config.sessionDefaults.maxMediaBytes, TELEGRAM_FILE_SIZE_LIMIT);
@@ -1013,14 +1140,18 @@ export function createTelegramBot(
     const topicId = ctx.message?.message_thread_id;
     setThread(chatId, ctx.message.message_id, topicId);
     recordMessage(chatId, ctx.message.message_id, senderLabel(ctx.from), "[voice]", "in");
-    const binding = resolveBinding(chatId, config.bindings, topicId);
+    const binding = resolveBinding(chatId, getBindings(), topicId);
     if (!binding) return;
 
     if (!shouldRespondInGroup(binding, bot.botInfo.id, bot.botInfo.username, ctx.message, config.sessionDefaults)) return;
 
+    const key = sessionKey(chatId, topicId);
+    if (sessionManager.isWorkerLane(key, binding.agentId)) {
+      await ctx.reply(WORKER_MEDIA_UNSUPPORTED);
+      return;
+    }
     messagesReceived.inc({ type: "voice" });
 
-    const key = sessionKey(chatId, topicId);
     try {
       // Download voice file from Telegram
       const fileId = ctx.msg.voice.file_id;
@@ -1071,11 +1202,15 @@ export function createTelegramBot(
     const doc = ctx.msg.document;
 
     recordMessage(chatId, ctx.message.message_id, senderLabel(ctx.from), ctx.message.caption ?? (anim ? "[animation]" : "[document]"), "in");
-    const binding = resolveBinding(chatId, config.bindings, topicId);
+    const binding = resolveBinding(chatId, getBindings(), topicId);
     if (!binding) return;
 
     if (!shouldRespondInGroup(binding, bot.botInfo.id, bot.botInfo.username, ctx.message, config.sessionDefaults)) return;
 
+    if (sessionManager.isWorkerLane(sessionKey(chatId, topicId), binding.agentId)) {
+      await ctx.reply(WORKER_MEDIA_UNSUPPORTED);
+      return;
+    }
     // Telegram Bot API limits file downloads to 20 MB
     const docSize = anim?.file_size ?? doc.file_size;
     if (docSize !== undefined && docSize > TELEGRAM_FILE_SIZE_LIMIT) {
@@ -1176,11 +1311,15 @@ export function createTelegramBot(
     const { media, mediaType, typeLabel } = extractMediaInfo(ctx.msg);
 
     recordMessage(chatId, ctx.message.message_id, senderLabel(ctx.from), ctx.message.caption ?? `[${typeLabel.toLowerCase()}]`, "in");
-    const binding = resolveBinding(chatId, config.bindings, topicId);
+    const binding = resolveBinding(chatId, getBindings(), topicId);
     if (!binding) return;
 
     if (!shouldRespondInGroup(binding, bot.botInfo.id, bot.botInfo.username, ctx.message, config.sessionDefaults)) return;
 
+    if (sessionManager.isWorkerLane(sessionKey(chatId, topicId), binding.agentId)) {
+      await ctx.reply(WORKER_MEDIA_UNSUPPORTED);
+      return;
+    }
     if (media.file_size !== undefined && media.file_size > TELEGRAM_FILE_SIZE_LIMIT) {
       const stage = mediaPipelineStage(new MediaPipelineError("size-limit"), "download");
       recordMediaPipelineError({ transport: "telegram", mediaType, stage });
@@ -1251,7 +1390,7 @@ export function createTelegramBot(
     const chatId = ctx.chat.id;
     const messageId = ctx.messageReaction.message_id;
     const topicId = getThread(chatId, messageId);
-    const binding = resolveBinding(chatId, config.bindings, topicId);
+    const binding = resolveBinding(chatId, getBindings(), topicId);
     if (!binding) return;
     if (!shouldRespondToReaction(binding, config.sessionDefaults)) return;
 
@@ -1302,10 +1441,11 @@ export function createTelegramBot(
         chatId,
         threadId,
         text,
-        bindings: config.bindings,
+        bindings: getBindings(),
         sessionDefaults: config.sessionDefaults,
         onBeforeSteer: (key) => { draftCoordinator.suspend(key); },
-        steerFn,
+        steerFn: (key, agentId, framedText) =>
+          !sessionManager.isWorkerLane(key, agentId) && steerFn(key, agentId, framedText),
       });
       if (!delivered) {
         log.debug("telegram-bot", `Dropped echo context for chat ${chatId}: no active eligible Pi turn`);
@@ -1313,5 +1453,5 @@ export function createTelegramBot(
     },
   });
 
-  return { bot, messageQueue, echoWatcher, pollProgress, updateProcessing };
+  return { bot, messageQueue, echoWatcher, pollProgress, updateProcessing, topicController, reloadGroupBindings };
 }

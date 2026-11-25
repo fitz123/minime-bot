@@ -95,6 +95,7 @@ import {
   MINIME_INSTANCE_CONFIG_PATH_ENV,
 } from "../workspace-contract.js";
 import { RUNTIME_READINESS_PATH_ENV } from "../runtime-readiness.js";
+import { CRON_FAST_OFF_ENV, CRON_REAL_CODEX_ENV, CRON_CODEX_SHIM_DIR_ENV } from "../cron-fast-env.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const packageRoot = resolve(__dirname, "..", "..");
@@ -768,7 +769,7 @@ describe("buildPiSpawnArgs context assembly (provider: pi)", () => {
     assert.ok(noContextIdx < firstExtension, "context args must precede --extension args");
     assert.ok(firstExtension < session, "--extension args must precede --session");
     assert.strictEqual(args[session + 1], TEST_SESSION_BINDING.sessionFile);
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 8);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 9);
   });
 
   it("delivers file guidance without suppressing native AGENTS.md loading", () => {
@@ -874,6 +875,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", wrapperAbs("session-effort.ts"),
       "--extension", wrapperAbs("compaction-continuation.ts"),
       "--extension", wrapperAbs("codex-transport-overflow.ts"),
+      "--extension", wrapperAbs("codex-fast.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
       "--extension", wrapperAbs("subagent/index.ts"),
@@ -884,11 +886,11 @@ describe("Pi extension loading (--extension)", () => {
   it("defaults the wrapper list to acknowledged steering and the existing first-party tools", () => {
     assert.deepStrictEqual(
       [...PI_EXTENSION_WRAPPER_RELPATHS],
-      ["acknowledged-steer.ts", "session-effort.ts", "compaction-continuation.ts", "codex-transport-overflow.ts", "web-tools.ts", "knowledge-tools.ts", "subagent/index.ts", "ask-agent/index.ts"],
+      ["acknowledged-steer.ts", "session-effort.ts", "compaction-continuation.ts", "codex-transport-overflow.ts", "codex-fast.ts", "web-tools.ts", "knowledge-tools.ts", "subagent/index.ts", "ask-agent/index.ts"],
     );
     assert.deepStrictEqual(
       [...PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS],
-      ["acknowledged-steer.js", "session-effort.js", "compaction-continuation.js", "codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js", "subagent/index.js", "ask-agent/index.js"],
+      ["acknowledged-steer.js", "session-effort.js", "compaction-continuation.js", "codex-transport-overflow.js", "codex-fast.js", "web-tools.js", "knowledge-tools.js", "subagent/index.js", "ask-agent/index.js"],
     );
   });
 
@@ -908,6 +910,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", wrapperAbs("session-effort.ts"),
       "--extension", wrapperAbs("compaction-continuation.ts"),
       "--extension", wrapperAbs("codex-transport-overflow.ts"),
+      "--extension", wrapperAbs("codex-fast.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
       "--extension", wrapperAbs("subagent/index.ts"),
@@ -919,6 +922,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", wrapperAbs("knowledge-tools.ts"),
     ]);
     assert.deepStrictEqual(cronArgs, [
+      "--extension", wrapperAbs("codex-fast.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
     ]);
@@ -997,6 +1001,15 @@ describe("Pi extension loading (--extension)", () => {
     }
   });
 
+  it("loads Fast only for identified-agent consumers and retains extension kill switches", () => {
+    for (const relpaths of [PI_EXTENSION_WRAPPER_RELPATHS, PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS, PI_CRON_WRAPPER_RELPATHS]) {
+      assert.equal(relpaths.filter(path => path === "codex-fast.ts").length, 1);
+      assert.deepEqual(resolvePiExtensionArgs({ ...presentAll, relpaths, env: { PI_EXTENSIONS_DISABLED: "1" } }), []);
+    }
+    assert.equal((PI_SUBAGENT_CHILD_WRAPPER_RELPATHS as readonly string[]).includes("codex-fast.ts"), false);
+    assert.equal((PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS as readonly string[]).includes("codex-fast.js"), false);
+  });
+
   it("loads the canonical web-tools wrapper exactly once on every package-managed runtime inventory", () => {
     const inventories: Record<string, readonly string[]> = {
       interactive: PI_EXTENSION_WRAPPER_RELPATHS,
@@ -1015,7 +1028,7 @@ describe("Pi extension loading (--extension)", () => {
   });
 
   it("the Pi cron wrapper subset exposes search and Knowledge without child-spawning tools", () => {
-    assert.deepStrictEqual([...PI_CRON_WRAPPER_RELPATHS], ["web-tools.ts", "knowledge-tools.ts"]);
+    assert.deepStrictEqual([...PI_CRON_WRAPPER_RELPATHS], ["codex-fast.ts", "web-tools.ts", "knowledge-tools.ts"]);
     assert.equal(PI_CRON_WRAPPER_RELPATHS.some((path) => /subagent|ask-agent/.test(path)), false);
   });
 
@@ -1038,6 +1051,7 @@ describe("Pi extension loading (--extension)", () => {
 
     assert.deepStrictEqual(args, [
       "--extension", wrapperAbs("codex-transport-overflow.ts"),
+      "--extension", wrapperAbs("codex-fast.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
       "--extension", extraA,
@@ -1081,6 +1095,7 @@ describe("Pi extension loading (--extension)", () => {
       }
       for (const file of [
         join(sourceDir, "web-tools.ts"),
+        join(sourceDir, "codex-fast.ts"),
         join(sourceDir, "codex-transport-overflow.ts"),
         join(sourceDir, "knowledge-tools.ts"),
         join(sourceDir, "ask-agent", "index.ts"),
@@ -1117,6 +1132,7 @@ describe("Pi extension loading (--extension)", () => {
   it("resolves only the requested relpaths subset for Pi cron search and Knowledge", () => {
     const args = resolvePiExtensionArgs({ ...presentAll, relpaths: PI_CRON_WRAPPER_RELPATHS });
     assert.deepStrictEqual(args, [
+      "--extension", wrapperAbs("codex-fast.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
     ]);
@@ -1144,6 +1160,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", wrapperAbs("knowledge-tools.ts"),
     ]);
     assert.deepStrictEqual(cronArgs, [
+      "--extension", wrapperAbs("codex-fast.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
     ]);
@@ -1178,6 +1195,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", resolve(artifactDir, "session-effort.js"),
       "--extension", resolve(artifactDir, "compaction-continuation.js"),
       "--extension", resolve(artifactDir, "codex-transport-overflow.js"),
+      "--extension", resolve(artifactDir, "codex-fast.js"),
       "--extension", resolve(artifactDir, "web-tools.js"),
       "--extension", resolve(artifactDir, "knowledge-tools.js"),
       "--extension", resolve(artifactDir, "subagent/index.js"),
@@ -1198,6 +1216,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", wrapperAbs("session-effort.ts"),
       "--extension", wrapperAbs("compaction-continuation.ts"),
       "--extension", wrapperAbs("codex-transport-overflow.ts"),
+      "--extension", wrapperAbs("codex-fast.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
       "--extension", wrapperAbs("subagent/index.ts"),
@@ -1222,6 +1241,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", resolve(artifactDir, "session-effort.js"),
       "--extension", resolve(artifactDir, "compaction-continuation.js"),
       "--extension", resolve(artifactDir, "codex-transport-overflow.js"),
+      "--extension", resolve(artifactDir, "codex-fast.js"),
       "--extension", resolve(artifactDir, "web-tools.js"),
       "--extension", resolve(artifactDir, "knowledge-tools.js"),
       "--extension", resolve(artifactDir, "subagent/index.js"),
@@ -1258,7 +1278,7 @@ describe("Pi extension loading (--extension)", () => {
     const args = buildPiSpawnArgs(testAgent, undefined, presentAll);
 
     assert.ok(args.includes("--no-extensions"), "ambient Pi extension discovery is always suppressed");
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 8);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 9);
     assert.ok(args.includes(wrapperAbs("acknowledged-steer.ts")));
     assert.ok(args.includes(wrapperAbs("compaction-continuation.ts")));
     assert.ok(args.includes(wrapperAbs("codex-transport-overflow.ts")));
@@ -1279,6 +1299,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", wrapperAbs("session-effort.ts"),
       "--extension", wrapperAbs("compaction-continuation.ts"),
       "--extension", wrapperAbs("codex-transport-overflow.ts"),
+      "--extension", wrapperAbs("codex-fast.ts"),
       "--extension", wrapperAbs("web-tools.ts"),
       "--extension", wrapperAbs("knowledge-tools.ts"),
       "--extension", wrapperAbs("subagent/index.ts"),
@@ -1294,7 +1315,7 @@ describe("Pi extension loading (--extension)", () => {
       extraExtensions: [extraA, extraB],
     });
 
-    assert.strictEqual(args.filter((a) => a === "--extension").length, 10);
+    assert.strictEqual(args.filter((a) => a === "--extension").length, 11);
     assert.deepStrictEqual(args.slice(-4), [
       "--extension", extraA,
       "--extension", extraB,
@@ -1316,6 +1337,7 @@ describe("Pi extension loading (--extension)", () => {
       "--extension", resolve(artifactDir, "session-effort.js"),
       "--extension", resolve(artifactDir, "compaction-continuation.js"),
       "--extension", resolve(artifactDir, "codex-transport-overflow.js"),
+      "--extension", resolve(artifactDir, "codex-fast.js"),
       "--extension", resolve(artifactDir, "web-tools.js"),
       "--extension", resolve(artifactDir, "knowledge-tools.js"),
       "--extension", resolve(artifactDir, "subagent/index.js"),
@@ -1444,10 +1466,10 @@ describe("Pi extension loading (--extension)", () => {
     const args = resolvePiExtensionArgs({ env: {} });
 
     const flags = args.filter((a) => a === "--extension");
-    assert.strictEqual(flags.length, 8, "expected one --extension per wrapper");
+    assert.strictEqual(flags.length, 9, "expected one --extension per wrapper");
 
     const paths = args.filter((a) => a !== "--extension");
-    assert.strictEqual(paths.length, 8);
+    assert.strictEqual(paths.length, 9);
     for (const p of paths) {
       assert.ok(p.startsWith("/"), `wrapper path must be absolute: ${p}`);
       assert.ok(existsSync(p), `resolved wrapper must exist on disk: ${p}`);
@@ -2042,6 +2064,9 @@ describe("spawnPiRpcSession workspace validation", () => {
 describe("buildPiSubagentChildSpawnEnv", () => {
   it("uses the same credential-scrubbed env as Pi spawns", () => {
     const envKeys = [
+      CRON_FAST_OFF_ENV,
+      CRON_REAL_CODEX_ENV,
+      CRON_CODEX_SHIM_DIR_ENV,
       "ANTHROPIC_API_KEY",
       "GITHUB_TOKEN",
       "LC_CTYPE",
@@ -2061,6 +2086,10 @@ describe("buildPiSubagentChildSpawnEnv", () => {
     const oldValues = new Map(envKeys.map((key) => [key, process.env[key]]));
 
     try {
+      // This fixture exercises a non-cron parent even when the test runner is marked.
+      delete process.env[CRON_FAST_OFF_ENV];
+      delete process.env[CRON_REAL_CODEX_ENV];
+      delete process.env[CRON_CODEX_SHIM_DIR_ENV];
       process.env.ANTHROPIC_API_KEY = "fixture";
       process.env.GITHUB_TOKEN = "fixture";
       process.env.LC_CTYPE = "UTF-8";
@@ -2104,6 +2133,7 @@ describe("buildPiSubagentChildSpawnEnv", () => {
         }
       }
     }
+    assert.deepStrictEqual(new Map(envKeys.map((key) => [key, process.env[key]])), oldValues);
   });
 
   it("propagates explicit control config and crons path overrides", () => {
@@ -2771,7 +2801,39 @@ describe("parsePiEvent", () => {
     assert.strictEqual(parsePiEvent({ type: "agent_settled" }, state), null);
   });
 
-  it("keeps reasoning-only stopReason=length as a distinct terminal error", () => {
+  it("settles reasoning-only stopReason=length once without compaction", () => {
+    const state: PiRpcParseState = {};
+    const events = [
+      {
+        type: "agent_end",
+        messages: [{
+          role: "assistant",
+          stopReason: "length",
+          content: [{ type: "thinking", thinking: "unfinished reasoning" }],
+        }],
+      },
+      { type: "agent_settled" },
+    ];
+    assert.strictEqual(
+      events.some((event) => event.type.startsWith("compaction_")),
+      false,
+    );
+    const lines = events.map((event) => parsePiEvent(event, state));
+    assert.strictEqual(lines[0], null);
+    assert.strictEqual(lines.filter((line) => line?.type === "result").length, 1);
+    assert.strictEqual(state.agentEndObserved, true);
+
+    const settled = lines[1];
+    assert.ok(settled);
+    assert.strictEqual((settled as { is_error?: boolean }).is_error, true);
+    assert.strictEqual(
+      (settled as { result: string }).result,
+      "Pi response hit the length limit before producing visible text",
+    );
+    assert.strictEqual(parsePiEvent({ type: "agent_settled" }, state), null);
+  });
+
+  it("preserves existing partial-visible length settlement for wording-only compatibility", () => {
     const state: PiRpcParseState = {};
     assert.strictEqual(
       parsePiEvent({
@@ -2779,20 +2841,21 @@ describe("parsePiEvent", () => {
         messages: [{
           role: "assistant",
           stopReason: "length",
-          content: [{ type: "thinking", thinking: "unfinished reasoning" }],
+          content: [
+            { type: "thinking", thinking: "unfinished reasoning" },
+            { type: "text", text: "partial answer" },
+          ],
         }],
       }, state),
       null,
     );
-    assert.strictEqual(state.agentEndObserved, true);
 
     const settled = parsePiEvent({ type: "agent_settled" }, state);
     assert.ok(settled);
-    assert.strictEqual((settled as { is_error?: boolean }).is_error, true);
-    assert.strictEqual(
-      (settled as { result: string }).result,
-      "Pi response hit the length limit before producing visible text and could not continue after compaction",
-    );
+    assert.strictEqual(settled.type, "result");
+    assert.strictEqual((settled as { result: string }).result, "partial answer");
+    assert.strictEqual((settled as { is_error?: boolean }).is_error, undefined);
+    assert.strictEqual(parsePiEvent({ type: "agent_settled" }, state), null);
   });
 
   it("keeps the length outcome until a meaningful continuation outcome replaces it", () => {
@@ -2824,7 +2887,7 @@ describe("parsePiEvent", () => {
     assert.ok(settled);
     assert.strictEqual(
       (settled as { result: string }).result,
-      "Pi response hit the length limit before producing visible text and could not continue after compaction",
+      "Pi response hit the length limit before producing visible text",
     );
     assert.strictEqual((settled as { is_error?: boolean }).is_error, true);
   });
@@ -3876,7 +3939,7 @@ describe("readPiStream", () => {
     assert.strictEqual(results.length, 1);
     assert.strictEqual(
       (results[0] as { result: string }).result,
-      "Pi response hit the length limit before producing visible text and could not continue after compaction",
+      "Pi response hit the length limit before producing visible text",
     );
     assert.strictEqual((results[0] as { session_id: string }).session_id, "length-session");
     assert.strictEqual((results[0] as { is_error?: boolean }).is_error, true);
@@ -3902,7 +3965,7 @@ describe("readPiStream", () => {
     assert.strictEqual(lines[0].type, "result");
     assert.strictEqual(
       (lines[0] as { result: string }).result,
-      "Pi response hit the length limit before producing visible text and could not continue after compaction",
+      "Pi response hit the length limit before producing visible text",
     );
     assert.strictEqual(
       (lines[0] as { session_id: string }).session_id,

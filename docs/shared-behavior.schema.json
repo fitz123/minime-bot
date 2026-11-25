@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Behavioral foundation publication version 1",
+  "type": "object",
+  "required": ["version", "revision", "rules", "skills", "files", "sourceOwnerAgentIds"],
+  "properties": {
+    "version": {"const": 1},
+    "revision": {"type": "string", "minLength": 1, "pattern": "\\S"},
+    "rules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "source"],
+        "properties": {
+          "path": {"$ref": "#/$defs/relativePath", "pattern": "\\.md$"},
+          "source": {"$ref": "#/$defs/relativePath", "pattern": "^\\.claude/rules/.+\\.md$"}
+        }
+      }
+    },
+    "skills": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "name"],
+        "properties": {
+          "path": {"$ref": "#/$defs/relativePath"},
+          "name": {"type": "string", "minLength": 1, "pattern": "\\S"},
+          "source": {
+            "$ref": "#/$defs/relativePath",
+            "pattern": "^\\.(claude|pi)/skills/.+$",
+            "description": "Optional unique source directory identity for source-owner exclusion, independent of the published path."
+          }
+        }
+      }
+    },
+    "files": {
+      "type": "object",
+      "propertyNames": {"$ref": "#/$defs/relativePath"},
+      "additionalProperties": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+    },
+    "sourceOwnerAgentIds": {"type": "array", "items": {"type": "string", "minLength": 1, "pattern": "\\S"}}
+  },
+  "$defs": {
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*//)(?!.*/$)(?!.*(?:^|/)\\.{1,2}(?:/|$))[^\\\\\u0000\r\n]+$",
+      "description": "Normalized relative POSIX path; no empty, dot or parent segments. Loader also verifies containment, hashes, unique rule/skill source identities and skill names, and complete skill assets."
+    }
+  }
+}

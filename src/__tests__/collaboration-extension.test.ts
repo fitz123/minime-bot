@@ -57,3 +57,41 @@ test("empty bot identity registers standalone; queued input wakes after manual c
     }
   }
 });
+
+for (const policy of ["0", "1"]) {
+  test(`Pi 1.5 user/custom starts retain collaboration outbox routing (private topic policy=${policy})`, async () => {
+    const keys = ["MINIME_COLLABORATION_SOCKET", "MINIME_COLLABORATION_SESSION", "MINIME_OUTBOX", "MINIME_PRIVATE_TOPIC_POLICY"];
+    const previous = keys.map(key => process.env[key]);
+    const handlers = new Map<string, Array<(event: any) => unknown>>();
+    try {
+      process.env.MINIME_COLLABORATION_SOCKET = "/unused/fixture.sock";
+      process.env.MINIME_COLLABORATION_SESSION = "fixture-session";
+      process.env.MINIME_OUTBOX = "/unused/fixture-outbox";
+      process.env.MINIME_PRIVATE_TOPIC_POLICY = policy;
+      registerCollaboration({
+        on: (name: string, handler: any) => {
+          const list = handlers.get(name) ?? [];
+          list.push(handler);
+          handlers.set(name, list);
+        },
+        registerTool: () => {},
+      } as any);
+      const starts = handlers.get("before_agent_start")!;
+      assert.equal(starts.length, policy === "1" ? 2 : 1);
+      // Pi appends event handlers and awaits each one in registration order.
+      const start = async (event: any) => {
+        for (const handler of starts) await handler(event);
+      };
+      await start({ messageType: "user", prompt: "human input" });
+      assert.equal(process.env.MINIME_OUTBOX, "/unused/fixture-outbox");
+      await start({ messageType: "custom", message: { customType: "minime-collaboration" } });
+      assert.equal(process.env.MINIME_OUTBOX, "/unused/fixture-outbox.internal");
+      await start({ messageType: "custom", message: { customType: "other" } });
+      assert.equal(process.env.MINIME_OUTBOX, "/unused/fixture-outbox");
+      await start({ messageType: "user", prompt: "[Internal collaboration fixture]" });
+      assert.equal(process.env.MINIME_OUTBOX, "/unused/fixture-outbox.internal");
+    } finally {
+      keys.forEach((key, i) => { if (previous[i] === undefined) delete process.env[key]; else process.env[key] = previous[i]; });
+    }
+  });
+}

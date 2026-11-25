@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, it } from "node:test";
@@ -10,6 +10,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import {
   createAgentSession,
+  DefaultResourceLoader,
   ModelRuntime,
   SessionManager,
   SettingsManager,
@@ -268,117 +269,170 @@ describe("compaction continuation Pi extension", () => {
   });
 
   it("keeps the continuation control out of real Pi session persistence", async (t) => {
-    const testRoot = await mkdtemp(
-      join(tmpdir(), "minime-continuation-session-"),
-    );
-    t.after(async () => {
-      await rm(testRoot, { recursive: true, force: true });
-    });
-    const sessionDir = join(testRoot, "sessions");
-    const sessionManager = SessionManager.create(testRoot, sessionDir);
-    const modelRuntime = await ModelRuntime.create({ modelsPath: null });
-    const faux = fauxProvider({
-      provider: "compaction-continuation-test",
-      api: "compaction-continuation-test",
-      models: [{
-        id: "continuation-model",
-        reasoning: true,
-        contextWindow: 200_000,
-        maxTokens: 128,
-      }],
-    });
-    modelRuntime.registerNativeProvider(faux.provider);
+    for (const hostContext of ["minimal", "global", "project", "global-and-project"] as const) {
+      await t.test(hostContext, async (t) => {
+        const testRoot = await mkdtemp(
+          join(tmpdir(), "minime-continuation-session-"),
+        );
+        t.after(async () => {
+          await rm(testRoot, { recursive: true, force: true });
+        });
+        const agentDir = join(testRoot, "agent");
+        await mkdir(agentDir, { recursive: true });
+        const ambientDirs = [
+          ...(hostContext.includes("global") ? [agentDir] : []),
+          ...(hostContext.includes("project") ? [join(testRoot, ".pi")] : []),
+        ];
+        for (const dir of ambientDirs) {
+          await mkdir(join(dir, "skills", "ambient"), { recursive: true });
+          await mkdir(join(dir, "prompts"), { recursive: true });
+          const ambient = "UNUSED_HOST_CONTEXT ".repeat(2_000);
+          for (const file of ["AGENTS.md", "SYSTEM.md", "APPEND_SYSTEM.md"]) {
+            await writeFile(join(dir, file), ambient);
+          }
+          await writeFile(join(dir, "skills/ambient/SKILL.md"), `---\nname: ambient\ndescription: ${ambient}\n---\n${ambient}`);
+          await writeFile(join(dir, "prompts/ambient.md"), ambient);
+        }
+        const sessionDir = join(testRoot, "sessions");
+        const sessionManager = SessionManager.create(testRoot, sessionDir);
+        const modelRuntime = await ModelRuntime.create({ modelsPath: null, authPath: join(agentDir, "auth.json") });
+        const faux = fauxProvider({
+          provider: "compaction-continuation-test",
+          api: "compaction-continuation-test",
+          models: [{
+            id: "continuation-model",
+            reasoning: true,
+            contextWindow: 200_000,
+            maxTokens: 1_024,
+          }],
+        });
+        modelRuntime.registerNativeProvider(faux.provider);
 
-    // Pi retries a length stop below the model's output budget as overflow.
-    // Exhaust that budget to exercise threshold compaction and our continuation.
-    let continuationRequest: Context | undefined;
-    faux.setResponses([
-      fauxAssistantMessage(fauxThinking("r".repeat(128 * 4)), {
-        stopReason: "length",
-      }),
-      fauxAssistantMessage("compacted turn prefix"),
-      (context) => {
-        continuationRequest = context;
-        return fauxAssistantMessage("continued final answer");
-      },
-    ]);
+        // Pi retries a length stop below the model's output budget as overflow.
+        // Exhaust that budget to exercise threshold compaction and our continuation.
+        let continuationRequest: Context | undefined;
+        faux.setResponses([
+          fauxAssistantMessage(fauxThinking("r".repeat(1_024 * 4)), {
+            stopReason: "length",
+          }),
+          fauxAssistantMessage("compacted turn prefix"),
+          (context) => {
+            continuationRequest = context;
+            return fauxAssistantMessage("continued final answer");
+          },
+        ]);
 
-    const settingsManager = SettingsManager.inMemory({
-      extensions: [resolve("extensions/pi/compaction-continuation.ts")],
-      compaction: {
-        enabled: true,
-        reserveTokens: 199_000,
-        keepRecentTokens: 1,
-      },
-      retry: { enabled: false },
-    });
-    const { session, extensionsResult } = await createAgentSession({
-      cwd: testRoot,
-      agentDir: join(testRoot, "agent"),
-      modelRuntime,
-      model: faux.getModel(),
-      thinkingLevel: "off",
-      settingsManager,
-      sessionManager,
-      noTools: "all",
-    });
+        const settingsManager = SettingsManager.inMemory({
+          compaction: {
+            enabled: true,
+            // The controlled input is ~1.4K tokens; the 1K reasoning response
+            // crosses this 2K threshold. Summary/continuation remain below it.
+            reserveTokens: 198_000,
+            keepRecentTokens: 1,
+          },
+          retry: { enabled: false },
+        });
+        const extensionPath = resolve("extensions/pi/compaction-continuation.ts");
+        const resourceLoader = new DefaultResourceLoader({
+          cwd: testRoot,
+          agentDir,
+          settingsManager,
+          noExtensions: true,
+          additionalExtensionPaths: [extensionPath],
+          noContextFiles: true,
+          noSkills: true,
+          noPromptTemplates: true,
+          noThemes: true,
+          systemPrompt: "Offline continuation fixture.",
+          appendSystemPrompt: [],
+        });
+        await resourceLoader.reload();
+        const { session, extensionsResult } = await createAgentSession({
+          cwd: testRoot,
+          agentDir,
+          resourceLoader,
+          modelRuntime,
+          model: faux.getModel(),
+          thinkingLevel: "off",
+          settingsManager,
+          sessionManager,
+          noTools: "all",
+        });
 
-    try {
-      assert.deepEqual(extensionsResult.errors, []);
-      const compactions: string[] = [];
-      let settlements = 0;
-      session.subscribe((event) => {
-        if (event.type === "compaction_start") compactions.push(event.reason);
-        if (event.type === "agent_settled") settlements += 1;
+        try {
+          assert.deepEqual(extensionsResult.errors, []);
+          assert.deepEqual(extensionsResult.extensions.map(extension => extension.path), [extensionPath]);
+          assert.deepEqual(resourceLoader.getAgentsFiles().agentsFiles, []);
+          assert.deepEqual(resourceLoader.getSkills().skills, []);
+          assert.deepEqual(resourceLoader.getPrompts().prompts, []);
+          assert.deepEqual(resourceLoader.getThemes().themes, []);
+          assert.equal(resourceLoader.getSystemPrompt(), "Offline continuation fixture.");
+          assert.deepEqual(resourceLoader.getAppendSystemPrompt(), []);
+          const compactions: string[] = [];
+          const responseTokens: number[] = [];
+          let settlements = 0;
+          session.subscribe((event) => {
+            if (event.type === "compaction_start") {
+              assert.equal(responseTokens.length, 1, "compact after the reasoning response, not before it");
+              compactions.push(event.reason);
+            }
+            if (event.type === "message_end" && event.message.role === "assistant") responseTokens.push(event.message.usage.totalTokens);
+            if (event.type === "agent_settled") settlements += 1;
+          });
+          await session.prompt("fixture input ".repeat(400));
+          assert.deepEqual(compactions, ["threshold"]);
+          assert.equal(responseTokens.length, 2);
+          assert.ok(responseTokens[0] > 2_000, "reasoning response crosses the controlled threshold");
+          assert.ok(responseTokens[1] < 2_000, "continuation stays below the controlled threshold");
+          assert.equal(settlements, 1);
+          assert.equal(session.getLastAssistantText(), "continued final answer");
+        } finally {
+          session.dispose();
+        }
+
+        assert.equal(faux.state.callCount, 3);
+        assert.ok(continuationRequest);
+        const requestText = JSON.stringify(continuationRequest.messages);
+        assert.equal(
+          requestText.split(PI_COMPACTION_CONTINUATION_CONTENT).length - 1,
+          1,
+          "the continuation request must receive one transient instruction",
+        );
+
+        const sessionFile = sessionManager.getSessionFile();
+        assert.ok(sessionFile);
+        const persistedText = await readFile(sessionFile, "utf8");
+        const persistedEntries = persistedText
+          .trim()
+          .split("\n")
+          .slice(1)
+          .map((line) => JSON.parse(line) as Record<string, unknown>);
+        assert.equal(persistedEntries.filter(entry => entry.type === "compaction").length, 1);
+        assert.equal(
+          persistedEntries.some(
+            (entry) =>
+              entry.type === "custom_message" &&
+              entry.customType === PI_COMPACTION_CONTINUATION_CUSTOM_TYPE,
+          ),
+          false,
+        );
+        assert.equal(
+          persistedText.includes(PI_COMPACTION_CONTINUATION_CONTENT),
+          false,
+        );
+
+        const resumed = SessionManager.open(sessionFile, sessionDir, testRoot);
+        const resumedText = JSON.stringify(resumed.buildSessionContext().messages);
+        assert.equal(
+          resumedText.includes(PI_COMPACTION_CONTINUATION_CUSTOM_TYPE),
+          false,
+        );
+        assert.equal(
+          resumedText.includes(PI_COMPACTION_CONTINUATION_CONTENT),
+          false,
+        );
       });
-      await session.prompt("long accepted turn ".repeat(300));
-      assert.deepEqual(compactions, ["threshold"]);
-      assert.equal(settlements, 1);
-      assert.equal(session.getLastAssistantText(), "continued final answer");
-    } finally {
-      session.dispose();
     }
-
-    assert.equal(faux.state.callCount, 3);
-    assert.ok(continuationRequest);
-    const requestText = JSON.stringify(continuationRequest.messages);
-    assert.equal(
-      requestText.split(PI_COMPACTION_CONTINUATION_CONTENT).length - 1,
-      1,
-      "the continuation request must receive one transient instruction",
-    );
-
-    const sessionFile = sessionManager.getSessionFile();
-    assert.ok(sessionFile);
-    const persistedText = await readFile(sessionFile, "utf8");
-    const persistedEntries = persistedText
-      .trim()
-      .split("\n")
-      .slice(1)
-      .map((line) => JSON.parse(line) as Record<string, unknown>);
-    assert.equal(
-      persistedEntries.some(
-        (entry) =>
-          entry.type === "custom_message" &&
-          entry.customType === PI_COMPACTION_CONTINUATION_CUSTOM_TYPE,
-      ),
-      false,
-    );
-    assert.equal(
-      persistedText.includes(PI_COMPACTION_CONTINUATION_CONTENT),
-      false,
-    );
-
-    const resumed = SessionManager.open(sessionFile, sessionDir, testRoot);
-    const resumedText = JSON.stringify(resumed.buildSessionContext().messages);
-    assert.equal(
-      resumedText.includes(PI_COMPACTION_CONTINUATION_CUSTOM_TYPE),
-      false,
-    );
-    assert.equal(
-      resumedText.includes(PI_COMPACTION_CONTINUATION_CONTENT),
-      false,
-    );
   });
 
   it("clears the arm when a later agent outcome does not match", async () => {

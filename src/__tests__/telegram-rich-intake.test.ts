@@ -24,6 +24,7 @@ function setup(overrides: Partial<BotConfig> = {}) {
   const commands: ReturnType<typeof buildPiPromptCommand>[] = [];
   const apiCalls: Array<{ method: string; payload: any }> = [];
   const manager = {
+    isWorkerLane: () => false,
     touchActivity() {}, getActive() { return undefined; }, getOrCreateSession: async () => ({}), deliverPendingRecoveryNotice: async () => false,
     async *sendSessionMessage(_key: string, _agent: string, text: string, options: { imagePaths?: string[] }): AsyncGenerator<StreamLine> {
       commands.push(buildPiPromptCommand(text, 'followUp', 'test-prompt', options.imagePaths));

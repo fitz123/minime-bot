@@ -1,5 +1,6 @@
 import {
   accessSync,
+  chmodSync,
   constants,
   existsSync,
   mkdirSync,
@@ -19,24 +20,23 @@ export const DEFAULT_CODEX_QUOTA_STATE_FILENAME = "codex-quota-state.json";
 export const DEFAULT_CODEX_QUOTA_STATE_RELPATH = join(".tmp", DEFAULT_CODEX_QUOTA_STATE_FILENAME);
 export const CODEX_USAGE_TEXTFILE_NAME = "codex_usage.prom";
 
-const HEADER_NAMES = {
-  primaryUsedPercent: "x-codex-primary-used-percent",
-  secondaryUsedPercent: "x-codex-secondary-used-percent",
-  primaryResetAt: "x-codex-primary-reset-at",
-  secondaryResetAt: "x-codex-secondary-reset-at",
-  planType: "x-codex-plan-type",
-  activeLimit: "x-codex-active-limit",
-} as const;
-
-const KNOWN_HEADER_NAMES = Object.values(HEADER_NAMES);
-
-export type CodexQuotaWindowName = "5h" | "week";
+export type CodexQuotaWindowName = "primary" | "secondary";
 
 export interface CodexQuotaWindow {
+  durationSeconds?: number;
   usedPercent?: number;
   remainingPercent?: number;
   resetAt?: string;
   resetTimestamp?: number;
+}
+
+export interface CodexQuotaFamily {
+  id: string;
+  name?: string;
+  meteredFeature?: string;
+  allowed?: boolean;
+  limitReached?: boolean;
+  windows: Partial<Record<CodexQuotaWindowName, CodexQuotaWindow>>;
 }
 
 export interface CodexQuotaSnapshot {
@@ -49,7 +49,7 @@ export interface CodexQuotaSnapshot {
   probeSuccess?: boolean;
   planType?: string;
   activeLimit?: string;
-  windows: Record<CodexQuotaWindowName, CodexQuotaWindow>;
+  families: CodexQuotaFamily[];
 }
 
 export interface CodexQuotaPathOptions {
@@ -127,39 +127,107 @@ export function resolveCodexQuotaPaths(options: CodexQuotaPathOptions = {}): Cod
   return { stateFile };
 }
 
-export function parseCodexQuotaHeaders(headers: unknown, now = new Date()): CodexQuotaSnapshot | null {
-  if (!hasAnyKnownHeader(headers)) {
+function newSnapshot(families: CodexQuotaFamily[], now: Date): CodexQuotaSnapshot | null {
+  if (!families.some((family) => Object.values(family.windows).some((window) => window.usedPercent !== undefined))) {
     return null;
   }
-
-  const sampledAt = now.toISOString();
-  const snapshot: CodexQuotaSnapshot = {
-    provider: "codex",
-    sampledAt,
-    lastSuccess: sampledAt,
-    lastSuccessTimestamp: Math.floor(now.getTime() / 1000),
-    windows: {
-      "5h": {},
-      week: {},
-    },
+  return {
+    provider: "codex", sampledAt: now.toISOString(), lastSuccess: now.toISOString(),
+    lastSuccessTimestamp: Math.floor(now.getTime() / 1000), families,
   };
+}
 
-  setUsedPercent(snapshot.windows["5h"], getHeaderValue(headers, HEADER_NAMES.primaryUsedPercent));
-  setUsedPercent(snapshot.windows.week, getHeaderValue(headers, HEADER_NAMES.secondaryUsedPercent));
-  setResetAt(snapshot.windows["5h"], getHeaderValue(headers, HEADER_NAMES.primaryResetAt));
-  setResetAt(snapshot.windows.week, getHeaderValue(headers, HEADER_NAMES.secondaryResetAt));
-
-  const planType = normalizeHeaderText(getHeaderValue(headers, HEADER_NAMES.planType));
-  if (planType) {
-    snapshot.planType = planType;
+export function parseCodexQuotaHeaders(headers: unknown, now = new Date()): CodexQuotaSnapshot | null {
+  const ids = new Set(["codex"]);
+  for (const key of headerNames(headers)) {
+    const match = /^x-(.+)-(?:primary|secondary)-/.exec(key.toLowerCase());
+    if (match) ids.add(match[1]);
   }
-
-  const activeLimit = normalizeHeaderText(getHeaderValue(headers, HEADER_NAMES.activeLimit));
-  if (activeLimit) {
-    snapshot.activeLimit = activeLimit;
+  const families: CodexQuotaFamily[] = [];
+  for (const id of ids) {
+    const family: CodexQuotaFamily = { id: id.replace(/-/g, "_"), windows: {} };
+    family.name = normalizeHeaderText(getHeaderValue(headers, `x-${id}-limit-name`));
+    for (const slot of ["primary", "secondary"] as const) {
+      const prefix = `x-${id}-${slot}-`;
+      const window: CodexQuotaWindow = {};
+      setUsedPercent(window, getHeaderValue(headers, prefix + "used-percent"));
+      setResetAt(window, getHeaderValue(headers, prefix + "reset-at"));
+      const minutes = parseNonNegativeNumber(getHeaderValue(headers, prefix + "window-minutes"));
+      if (minutes !== undefined && minutes > 0 && Number.isFinite(minutes * 60)) window.durationSeconds = minutes * 60;
+      // Upstream sometimes supplies a zero-filled absent window.
+      if (minutes === 0 && !window.usedPercent && !window.resetTimestamp) continue;
+      if (window.usedPercent !== undefined) family.windows[slot] = window;
+    }
+    if (Object.keys(family.windows).length) families.push(family);
   }
+  const snapshot = newSnapshot(families, now);
+  if (snapshot) {
+    snapshot.planType = normalizeHeaderText(getHeaderValue(headers, "x-codex-plan-type"));
+    snapshot.activeLimit = normalizeHeaderText(getHeaderValue(headers, "x-codex-active-limit"));
+  }
+  return snapshot;
+}
 
-  return hasUsableQuotaUsage(snapshot) ? snapshot : null;
+/** Retain quota metadata only; never persist the surrounding account/credits payload. */
+export function parseCodexQuotaUsage(raw: unknown, now = new Date()): CodexQuotaSnapshot | null {
+  const body = objectRecord(raw);
+  if (!body) return null;
+  const families: CodexQuotaFamily[] = [];
+  const add = (id: string, rateLimit: unknown, name?: string, meteredFeature?: string) => {
+    const rate = objectRecord(rateLimit);
+    if (!rate) return;
+    const family: CodexQuotaFamily = { id, name, meteredFeature, windows: {} };
+    if (typeof rate.allowed === "boolean") family.allowed = rate.allowed;
+    if (typeof rate.limit_reached === "boolean") family.limitReached = rate.limit_reached;
+    for (const slot of ["primary", "secondary"] as const) {
+      const source = objectRecord(rate[`${slot}_window`]);
+      if (!source) continue;
+      const window: CodexQuotaWindow = {};
+      const used = nonNegativeNumber(source.used_percent);
+      const duration = nonNegativeNumber(source.limit_window_seconds);
+      const reset = nonNegativeNumber(source.reset_at);
+      const after = nonNegativeNumber(source.reset_after_seconds);
+      if (used === undefined || (duration === 0 && used === 0 && !reset && !after)) continue;
+      setUsedPercent(window, used);
+      if (duration !== undefined && duration > 0) window.durationSeconds = duration;
+      setResetAt(window, reset ? String(reset) : after !== undefined ? String(Math.floor(now.getTime() / 1000) + after) : undefined);
+      family.windows[slot] = window;
+    }
+    if (Object.keys(family.windows).length) families.push(family);
+  };
+  add("codex", body.rate_limit);
+  if (Array.isArray(body.additional_rate_limits)) {
+    for (const entry of body.additional_rate_limits) {
+      const item = objectRecord(entry);
+      if (!item) continue;
+      const name = normalizeQuotaText(item.limit_name);
+      const feature = normalizeQuotaText(item.metered_feature);
+      const id = feature ?? name;
+      if (id) add(id, item.rate_limit, name, feature);
+    }
+  }
+  const snapshot = newSnapshot(families, now);
+  if (snapshot) snapshot.planType = normalizeQuotaText(body.plan_type);
+  return snapshot;
+}
+
+function normalizeQuotaText(raw: unknown): string | undefined {
+  return typeof raw === "string" ? normalizeHeaderText(raw) : undefined;
+}
+
+function objectRecord(raw: unknown): Record<string, unknown> | undefined {
+  return raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : undefined;
+}
+
+function nonNegativeNumber(raw: unknown): number | undefined {
+  return typeof raw === "number" && Number.isFinite(raw) && raw >= 0 ? raw : undefined;
+}
+
+function headerNames(headers: unknown): string[] {
+  if (headers instanceof Headers) return [...headers.keys()];
+  if (Array.isArray(headers)) return headers.flatMap((entry) => Array.isArray(entry) && typeof entry[0] === "string" ? [entry[0]] : []);
+  if (headers && typeof headers === "object") return Object.keys(headers);
+  return [];
 }
 
 export function extractCodexResponseHeaders(input: unknown): unknown | undefined {
@@ -231,8 +299,8 @@ export function writeCodexQuotaSnapshot(
   options: CodexQuotaWriteOptions = {},
 ): CodexQuotaWriteResult {
   const paths = resolveCodexQuotaPaths(options);
-  const writes: Array<{ path: string; content: string }> = [
-    { path: paths.stateFile, content: `${JSON.stringify(snapshot, null, 2)}\n` },
+  const writes: Array<{ path: string; content: string; mode: number }> = [
+    { path: paths.stateFile, content: `${JSON.stringify(snapshot, null, 2)}\n`, mode: 0o600 },
   ];
 
   if (!paths.textfileDir) {
@@ -241,37 +309,36 @@ export function writeCodexQuotaSnapshot(
   }
 
   const metricsFile = join(paths.textfileDir, options.textfileName ?? CODEX_USAGE_TEXTFILE_NAME);
-  writes.push({ path: metricsFile, content: formatCodexQuotaPrometheus(snapshot) });
+  writes.push({ path: metricsFile, content: formatCodexQuotaPrometheus(snapshot), mode: 0o644 });
   atomicWriteFiles(writes);
   return { stateFile: paths.stateFile, metricsFile };
 }
 
 export function formatCodexQuotaPrometheus(snapshot: CodexQuotaSnapshot): string {
   const lines: string[] = [];
-  pushGauge(
-    lines,
-    "codex_usage_5h_percent",
-    "Codex 5-hour usage percent from the last successful sampler probe.",
-    snapshot.windows["5h"].usedPercent,
-  );
-  pushGauge(
-    lines,
-    "codex_usage_weekly_percent",
-    "Codex weekly usage percent from the last successful sampler probe.",
-    snapshot.windows.week.usedPercent,
-  );
-  pushGauge(
-    lines,
-    "codex_usage_5h_reset_timestamp",
-    "Unix timestamp when the Codex 5-hour usage window resets.",
-    snapshot.windows["5h"].resetTimestamp,
-  );
-  pushGauge(
-    lines,
-    "codex_usage_weekly_reset_timestamp",
-    "Unix timestamp when the Codex weekly usage window resets.",
-    snapshot.windows.week.resetTimestamp,
-  );
+  for (const [metric, field] of [
+    ["percent", "usedPercent"], ["reset_timestamp", "resetTimestamp"], ["duration_seconds", "durationSeconds"],
+  ] as const) {
+    const name = `codex_usage_window_${metric}`;
+    lines.push(`# HELP ${name} Codex quota window ${metric} from the last successful read.`, `# TYPE ${name} gauge`);
+    for (const family of snapshot.families) {
+      for (const [slot, window] of Object.entries(family.windows)) {
+        const value = window[field];
+        if (value !== undefined) {
+          const labels = `family="${prometheusLabelValue(family.id)}",window="${slot}"`;
+          lines.push(`${name}{${labels}} ${formatPrometheusNumber(value)}`);
+        }
+      }
+    }
+  }
+  // Preserve semantic legacy series only for known durations in the default family.
+  const defaults = snapshot.families.find((family) => family.id === "codex");
+  for (const [duration, legacy] of [[18000, "5h"], [604800, "weekly"]] as const) {
+    const window = Object.values(defaults?.windows ?? {}).find((window) => window.durationSeconds === duration);
+    if (!window) continue;
+    pushGauge(lines, `codex_usage_${legacy}_percent`, "Codex usage percent for this duration.", window.usedPercent);
+    pushGauge(lines, `codex_usage_${legacy}_reset_timestamp`, "Unix timestamp when this Codex window resets.", window.resetTimestamp);
+  }
   pushGauge(
     lines,
     "codex_usage_last_success_timestamp",
@@ -290,9 +357,8 @@ export function formatCodexQuotaPrometheus(snapshot: CodexQuotaSnapshot): string
   return `${lines.join("\n")}\n`;
 }
 
-export function formatCodexQuotaWriteError(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  return `[codex-usage] failed to write quota cache: ${message}`;
+export function formatCodexQuotaWriteError(_error: unknown): string {
+  return "[codex-usage] failed to write quota cache: local_write_failed";
 }
 
 function configuredPath(raw: string | undefined, cwd: string): string | undefined {
@@ -329,7 +395,7 @@ function atomicWriteFile(path: string, content: string): void {
     `.${basename(path)}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`,
   );
   try {
-    writeFileSync(tempPath, content, { encoding: "utf8" });
+    writeFileSync(tempPath, content, { encoding: "utf8", mode: 0o600 });
     renameSync(tempPath, path);
   } catch (error) {
     try {
@@ -344,16 +410,18 @@ function atomicWriteFile(path: string, content: string): void {
 interface AtomicWritePlan {
   path: string;
   content: string;
+  mode: number;
   tempPath: string;
   previousContent?: string;
   existed: boolean;
   committed: boolean;
 }
 
-function atomicWriteFiles(writes: Array<{ path: string; content: string }>): void {
-  const plans: AtomicWritePlan[] = writes.map(({ path, content }) => ({
+function atomicWriteFiles(writes: Array<{ path: string; content: string; mode: number }>): void {
+  const plans: AtomicWritePlan[] = writes.map(({ path, content, mode }) => ({
     path,
     content,
+    mode,
     tempPath: tempPathFor(path),
     ...readPreviousFile(path),
     committed: false,
@@ -362,7 +430,8 @@ function atomicWriteFiles(writes: Array<{ path: string; content: string }>): voi
   try {
     for (const plan of plans) {
       mkdirSync(dirname(plan.path), { recursive: true });
-      writeFileSync(plan.tempPath, plan.content, { encoding: "utf8" });
+      writeFileSync(plan.tempPath, plan.content, { encoding: "utf8", mode: plan.mode });
+      chmodSync(plan.tempPath, plan.mode);
     }
     for (const plan of plans) {
       renameSync(plan.tempPath, plan.path);
@@ -471,11 +540,9 @@ function findHeaderSource(input: unknown, depth: number, seen: Set<object>): unk
 }
 
 function hasAnyKnownHeader(headers: unknown): boolean {
-  return KNOWN_HEADER_NAMES.some((name) => getHeaderValue(headers, name) !== undefined);
-}
-
-function hasUsableQuotaUsage(snapshot: CodexQuotaSnapshot): boolean {
-  return Object.values(snapshot.windows).some((window) => typeof window.usedPercent === "number");
+  return headerNames(headers).some((name) => /^x-.+-(primary|secondary)-used-percent$/i.test(name)) ||
+    getHeaderValue(headers, "x-codex-primary-used-percent") !== undefined ||
+    getHeaderValue(headers, "x-codex-secondary-used-percent") !== undefined;
 }
 
 function getHeaderValue(headers: unknown, name: string): string | undefined {
@@ -539,8 +606,8 @@ function normalizeHeaderValue(raw: unknown): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
-function setUsedPercent(window: CodexQuotaWindow, raw: string | undefined): void {
-  const usedPercent = parseNonNegativeNumber(raw);
+function setUsedPercent(window: CodexQuotaWindow, raw: string | number | undefined): void {
+  const usedPercent = typeof raw === "number" ? nonNegativeNumber(raw) : parseNonNegativeNumber(raw);
   if (usedPercent === undefined) {
     return;
   }
@@ -553,6 +620,7 @@ function setResetAt(window: CodexQuotaWindow, raw: string | undefined): void {
   if (resetTimestamp === undefined) {
     return;
   }
+  if (!Number.isFinite(new Date(resetTimestamp * 1000).getTime())) return;
   window.resetTimestamp = resetTimestamp;
   window.resetAt = new Date(resetTimestamp * 1000).toISOString();
 }
@@ -600,7 +668,7 @@ function normalizeHeaderText(raw: string | undefined): string | undefined {
 }
 
 function roundMetricValue(value: number): number {
-  return Math.round(value * 1000) / 1000;
+  return Number(value.toFixed(3));
 }
 
 function pushGauge(lines: string[], name: string, help: string, value: number | undefined): void {

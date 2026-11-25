@@ -8,7 +8,10 @@ import { mediaPipelineErrors, telegramApiCalls, telegramApiErrors } from "../met
 import type { TelegramBinding, BotConfig } from "../types.js";
 import type { SessionManager } from "../session-manager.js";
 import { cleanupSessionMediaDir } from "../media-store.js";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { handleFastCommand, readFastStatus } from "../codex-fast.js";
 import {
   TELEGRAM_GET_UPDATES_TIMEOUT_SECONDS,
 } from "../poll-progress.js";
@@ -252,9 +255,9 @@ describe("BOT_COMMANDS", () => {
     assert.deepEqual(TELEGRAM_ALLOWED_UPDATES, ["message", "message_reaction"]);
   });
 
-  it("contains start, reconnect, clean, and status commands", () => {
+  it("contains start, reconnect, clean, status, and fast commands", () => {
     const names = BOT_COMMANDS.map((c) => c.command);
-    assert.deepStrictEqual(names, ["start", "reconnect", "clean", "status"]);
+    assert.deepStrictEqual(names, ["start", "reconnect", "clean", "status", "fast"]);
   });
 
   it("each command has a non-empty description", () => {
@@ -1461,6 +1464,7 @@ describe("command handler wiring", () => {
     return {
       calls,
       sessionEffort: async (key: string, agent: string, value?: string) => { calls.push(`effort:${key}:${agent}:${value ?? "status"}`); return "Effort: high"; },
+      isWorkerLane: () => false,
       closeSession: async (_chatId: string) => { calls.push("closeSession"); },
       destroySession: async (_chatId: string) => { calls.push("destroySession"); },
       sendSessionMessage: () => { calls.push("sendSessionMessage"); throw new Error("unexpected"); },
@@ -1518,7 +1522,10 @@ describe("command handler wiring", () => {
     apiResult?: (method: string, payload: any) => unknown | Promise<unknown>,
     factory: typeof createTelegramBot = createTelegramBot,
   ) {
-    const result = factory(handlerConfig, mockSM, opts);
+    const result = factory(handlerConfig, mockSM, {
+      refreshQuotaStatus: async () => ({ state: "unavailable", stateFile: "/tmp/synthetic-quota.json", reason: "missing_file", staleMs: 1800000 }),
+      ...opts,
+    });
     const { bot } = result;
     // Intercept all API calls so nothing reaches Telegram
     bot.api.config.use(async (_prev, method, payload) => {
@@ -1546,6 +1553,173 @@ describe("command handler wiring", () => {
     };
     return result;
   }
+
+  it("routes authenticated /fast before prompting, uses actual topic binding, and survives /clean", async t => {
+    const root = mkdtempSync(join(tmpdir(), "telegram-fast-"));
+    const oldRoot = process.env.MINIME_CONTROL_WORKSPACE_ROOT;
+    process.env.MINIME_CONTROL_WORKSPACE_ROOT = root;
+    t.after(() => { if (oldRoot === undefined) delete process.env.MINIME_CONTROL_WORKSPACE_ROOT; else process.env.MINIME_CONTROL_WORKSPACE_ROOT = oldRoot; rmSync(root, { recursive: true, force: true }); });
+    const primary = { id: "main", workspaceCwd: root, model: "openai-codex/gpt-6-astra", thinking: "high" as const, codexFast: { provider: "openai-codex" as const, model: "gpt-6-astra" } };
+    const manager = createMockSessionManager();
+    const apiCalls: Array<{ method: string; payload: any }> = [];
+    const { bot, messageQueue } = initBot(manager, apiCalls, undefined, undefined, (base, sm, options) => {
+      const currentConfig: BotConfig = {
+        ...base, agents: { main: primary, other: { ...primary, id: "other", codexFast: undefined } },
+        bindings: [{ chatId: testChatId, agentId: "main", kind: "group", topics: [{ topicId: 22, agentId: "other" }] }],
+      };
+      return createTelegramBot(currentConfig, sm, { ...options, loadConfig: () => currentConfig });
+    });
+    t.after(() => messageQueue.clearAll());
+    const send = async (args: string, topic = 11, chat = testChatId) => {
+      const update = makeCommandUpdate("fast", 500 + apiCalls.length);
+      update.message.text = `/fast${args ? ` ${args}` : ""}`;
+      Object.assign(update.message, { message_thread_id: topic });
+      update.message.chat.id = chat;
+      await bot.handleUpdate(update);
+    };
+    await send("on");
+    assert.match(apiCalls.at(-1)!.payload.text, /Этот тред: включён \(переопределение\)/);
+    assert.equal(readFastStatus({ agent: primary, threadKey: `${testChatId}:11` }).enabled, true);
+    await send("", 12);
+    assert.match(apiCalls.at(-1)!.payload.text, /Этот тред: по умолчанию/);
+    await send("on", 22);
+    assert.match(apiCalls.at(-1)!.payload.text, /unavailable/);
+    await send("on extra");
+    assert.match(apiCalls.at(-1)!.payload.text, /Usage:/);
+    const beforeUnauthorized = apiCalls.length;
+    await send("default on", 11, 444);
+    assert.equal(apiCalls.length, beforeUnauthorized);
+    assert.deepEqual(manager.calls, [], "Fast must not create sessions, steer, or invoke a model");
+    const clean = makeCommandUpdate("clean", 600);
+    Object.assign(clean.message, { message_thread_id: 11 });
+    await bot.handleUpdate(clean);
+    assert.deepEqual(manager.calls, ["destroySession"]);
+    await send("");
+    assert.match(apiCalls.at(-1)!.payload.text, /Этот тред: включён \(переопределение\)/);
+    await send("default on");
+    assert.match(apiCalls.at(-1)!.payload.text, /private chat.*DM binding/);
+    await send("", 12);
+    assert.match(apiCalls.at(-1)!.payload.text, /Fast: выключен/);
+    await send("inherit");
+    assert.match(apiCalls.at(-1)!.payload.text, /Этот тред: по умолчанию/);
+  });
+
+  it("allows Telegram Fast default mutations only for private chats with DM bindings", async t => {
+    for (const [chatType, kind] of [
+      ["private", "dm"], ["group", "group"], ["supergroup", "group"],
+      ["private", "group"], ["supergroup", "dm"],
+    ] as const) {
+      await t.test(`${chatType} chat / ${kind} binding`, async t => {
+        const root = mkdtempSync(join(tmpdir(), "telegram-fast-authority-"));
+        const oldRoot = process.env.MINIME_CONTROL_WORKSPACE_ROOT;
+        process.env.MINIME_CONTROL_WORKSPACE_ROOT = root;
+        t.after(() => {
+          if (oldRoot === undefined) delete process.env.MINIME_CONTROL_WORKSPACE_ROOT;
+          else process.env.MINIME_CONTROL_WORKSPACE_ROOT = oldRoot;
+          rmSync(root, { recursive: true, force: true });
+        });
+        const primary = { id: "main", workspaceCwd: root, model: "openai-codex/gpt-6-astra", codexFast: { provider: "openai-codex" as const, model: "gpt-6-astra" } };
+        const manager = createMockSessionManager();
+        const apiCalls: Array<{ method: string; payload: any }> = [];
+        const { bot, messageQueue } = initBot(manager, apiCalls, undefined, undefined, (base, sm, options) => {
+          const currentConfig: BotConfig = { ...base, agents: { main: primary }, bindings: [{ chatId: testChatId, agentId: "main", kind }] };
+          return createTelegramBot(currentConfig, sm, { ...options, loadConfig: () => currentConfig });
+        });
+        t.after(() => messageQueue.clearAll());
+        const send = async (args: string) => {
+          const update = makeCommandUpdate("fast", 800 + apiCalls.length);
+          update.message.text = `/fast ${args}`;
+          Object.assign(update.message.chat, { type: chatType });
+          Object.assign(update.message, { message_thread_id: 11 });
+          await bot.handleUpdate(update);
+          return apiCalls.at(-1)!.payload.text as string;
+        };
+        const path = join(root, "data/codex-fast.json");
+        assert.match(await send("default on extra"), /Usage:/);
+        assert.equal(existsSync(path), false);
+        if (chatType !== "private" || kind !== "dm") {
+          assert.match(await send("default on"), /private chat.*DM binding/);
+          assert.equal(existsSync(path), false);
+        }
+        assert.match(await send("on"), /Этот тред: включён \(переопределение\)/);
+        const beforeDefault = readFileSync(path, "utf8");
+        if (chatType === "private" && kind === "dm") {
+          assert.match(await send("default on"), /Общий режим .*: включён/);
+          assert.equal(readFastStatus({ agent: primary }).enabled, true);
+          assert.equal(readFastStatus({ agent: primary, threadKey: "new-thread" }).enabled, true);
+          assert.match(await send("default off"), /Общий режим .*: выключен/);
+          assert.equal(readFastStatus({ agent: primary }).enabled, false);
+        } else {
+          for (const args of ["default on", "default off"]) {
+            assert.match(await send(args), /private chat.*DM binding/);
+            assert.equal(readFileSync(path, "utf8"), beforeDefault);
+          }
+        }
+        const beforeReadOnly = readFileSync(path, "utf8");
+        assert.match(await send("default status"), /Общий режим .*: выключен/);
+        assert.match(await send("status"), /Этот тред: включён \(переопределение\)/);
+        for (const args of ["default", "default on extra", "default off extra", "default inherit", "default ON"]) {
+          assert.match(await send(args), /Usage:/);
+          assert.equal(readFileSync(path, "utf8"), beforeReadOnly);
+        }
+        assert.match(await send("off"), /Этот тред: выключен \(переопределение\)/);
+        assert.match(await send("inherit"), /Этот тред: по умолчанию/);
+        assert.equal(readFastStatus({ agent: primary, threadKey: `${testChatId}:11` }).enabled, false);
+        assert.deepEqual(manager.calls, [], "Fast commands must not invoke model sessions");
+      });
+    }
+  });
+
+  it("reloads /fast model pins and added/removed opt-in from current merged config", async t => {
+    const root = mkdtempSync(join(tmpdir(), "telegram-fast-reload-"));
+    const keys = ["MINIME_CONTROL_WORKSPACE_ROOT", "MINIME_CONFIG_PATH", "MINIME_INSTANCE_CONFIG_PATH"];
+    const previous = keys.map(key => process.env[key]);
+    process.env.MINIME_CONTROL_WORKSPACE_ROOT = root;
+    process.env.MINIME_CONFIG_PATH = join(root, "config.yaml");
+    delete process.env.MINIME_INSTANCE_CONFIG_PATH;
+    t.after(() => {
+      keys.forEach((key, i) => { if (previous[i] === undefined) delete process.env[key]; else process.env[key] = previous[i]; });
+      rmSync(root, { recursive: true, force: true });
+    });
+    const primary = { id: "main", workspaceCwd: root, model: "openai-codex/gpt-6-astra", thinking: "high" as const };
+    const initialConfig: BotConfig = { ...handlerConfig, agents: { main: primary } };
+    writeFileSync(join(root, "config.yaml"), JSON.stringify({ ...initialConfig, telegramTokenEnv: "UNUSED_FAST_RELOAD_TOKEN" }));
+    const localPath = join(root, "config.local.yaml");
+    const pin = (model: string) => ({ provider: "openai-codex" as const, model });
+    const updateAgent = (settings: Record<string, unknown>) => writeFileSync(localPath, JSON.stringify({ agents: { main: settings } }));
+    const manager = createMockSessionManager();
+    const apiCalls: Array<{ method: string; payload: any }> = [];
+    const { bot, messageQueue } = initBot(manager, apiCalls, undefined, undefined,
+      (_base, sm, options) => createTelegramBot(initialConfig, sm, options));
+    t.after(() => messageQueue.clearAll());
+    const send = async (args: string) => {
+      const update = makeCommandUpdate("fast", 700 + apiCalls.length);
+      update.message.text = `/fast ${args}`;
+      Object.assign(update.message, { message_thread_id: 11 });
+      await bot.handleUpdate(update);
+      return apiCalls.at(-1)!.payload.text as string;
+    };
+    assert.match(await send("status"), /unavailable/);
+    updateAgent({ codexFast: pin("gpt-6-astra") });
+    assert.match(await send("on"), /Модель: Astra/);
+    assert.equal(readFastStatus({ agent: { ...primary, codexFast: pin("gpt-6-astra") }, threadKey: `${testChatId}:11` }).enabled, true);
+    updateAgent({ model: "openai-codex/gpt-6-sol", codexFast: pin("gpt-6-sol") });
+    const changed = await send("status");
+    assert.match(changed, /Модель: openai-codex\/gpt-6-sol/);
+    assert.match(changed, /Fast: выключен/);
+    assert.match(await send("default on"), /Общий режим .*: включён/);
+    const sol = { ...primary, model: "openai-codex/gpt-6-sol", codexFast: { provider: "openai-codex" as const, model: "gpt-6-sol" } };
+    assert.equal(readFastStatus({ agent: sol }).enabled, true);
+    // The base config has no opt-in; removing the overlay removes eligibility.
+    updateAgent({ model: "openai-codex/gpt-6-sol" });
+    const before = readFileSync(join(root, "data/codex-fast.json"), "utf8");
+    assert.match(await send("on"), /unavailable/);
+    assert.match(await send("default off"), /unavailable/);
+    assert.equal(readFileSync(join(root, "data/codex-fast.json"), "utf8"), before);
+    updateAgent({ model: sol.model, codexFast: sol.codexFast });
+    assert.match(await send("status"), /Общий режим .*: включён/);
+    assert.deepEqual(manager.calls, [], "Local commands must not invoke or create model sessions");
+  });
 
   function createSteeringSessionManager() {
     const sent: string[] = [];
@@ -1746,10 +1920,40 @@ describe("command handler wiring", () => {
     update.message.text = "/effort high";
     Object.assign(update.message, { message_thread_id: 9 });
     await bot.handleUpdate(update);
+    const reset = makeCommandUpdate("effort", 76);
+    reset.message.text = "/effort inherit";
+    Object.assign(reset.message, { message_thread_id: 9 });
+    await bot.handleUpdate(reset);
     assert.ok(mockSM.calls.includes("effort:111111111:main:status"));
     assert.ok(mockSM.calls.includes("effort:111111111:9:main:high"));
+    assert.ok(mockSM.calls.includes("effort:111111111:9:main:inherit"));
     assert.ok(!mockSM.calls.includes("sendSessionMessage"));
     for (const reply of apiCalls.filter(call => call.method === "sendMessage")) assert.equal(reply.payload.reply_markup, undefined);
+  });
+
+  it("/effort default uses the routed agent and requires the same private DM scope as /fast", async t => {
+    for (const [chatType, kind] of [["private", "dm"], ["supergroup", "dm"], ["private", "group"], ["group", "group"]] as const) {
+      await t.test(`${chatType} chat / ${kind} binding`, async () => {
+        const manager = createMockSessionManager();
+        const apiCalls: Array<{ method: string; payload: any }> = [];
+        const { bot } = initBot(manager, apiCalls, undefined, undefined, (base, sm, options) => createTelegramBot({
+          ...base,
+          agents: { personal: { ...base.agents.main, id: "personal" } },
+          bindings: [{ chatId: testChatId, agentId: "personal", kind }],
+        }, sm, options));
+        const update = makeCommandUpdate("effort", 77);
+        update.message.text = "/effort default high";
+        Object.assign(update.message.chat, { type: chatType });
+        Object.assign(update.message.from, { id: 222222222 });
+        await bot.handleUpdate(update);
+        if (chatType === "private" && kind === "dm") {
+          assert.deepEqual(manager.calls, ["effort:111111111:personal:default high"]);
+        } else {
+          assert.deepEqual(manager.calls, []);
+          assert.match(apiCalls.at(-1)?.payload.text, /private chat with a DM binding/);
+        }
+      });
+    }
   });
 
   it("releases sequential updates while /effort is pending and retains its topic for delivery", async () => {
@@ -1800,20 +2004,106 @@ describe("command handler wiring", () => {
     });
   }
 
-  it("/status replies from local health/cache without opening a session", async () => {
+  it("/status refreshes quota once before replying without opening a session", async () => {
     const mockSM = createMockSessionManager();
     const apiCalls: Array<{ method: string; payload: any }> = [];
-    const { bot } = initBot(mockSM, apiCalls);
+    let refreshes = 0;
+    const { bot } = initBot(mockSM, apiCalls, { refreshQuotaStatus: async () => {
+      refreshes++;
+      assert.equal(apiCalls.length, 0, "refresh precedes rendering");
+      return { state: "unavailable", stateFile: "/tmp/synthetic-quota.json", reason: "no_success", staleMs: 1800000, refreshFailed: true };
+    } });
 
     await bot.handleUpdate(makeCommandUpdate("status", 3, Math.floor(Date.now() / 1000) - 60 * 60));
 
+    assert.equal(refreshes, 1);
     const reply = apiCalls.find((call) => call.method === "sendMessage");
     assert.ok(reply);
+    assert.match(String(reply.payload.text), /Codex quota: unavailable \(no successful sample\)/);
     assert.match(String(reply.payload.text), /Sessions: 1\/2/);
     assert.match(String(reply.payload.text), /Session ID: session-123/);
     assert.ok(mockSM.calls.includes("getSessionHealth:111111111"));
     assert.ok(!mockSM.calls.includes("sendSessionMessage"));
     assert.ok(!mockSM.calls.includes("getOrCreateSession"));
+  });
+
+  it("/status reads Fast for the actual session agent/model and queried topic without changing settings", async t => {
+    const root = mkdtempSync(join(tmpdir(), "telegram-fast-status-"));
+    const oldRoot = process.env.MINIME_CONTROL_WORKSPACE_ROOT;
+    process.env.MINIME_CONTROL_WORKSPACE_ROOT = root;
+    t.after(() => {
+      if (oldRoot === undefined) delete process.env.MINIME_CONTROL_WORKSPACE_ROOT;
+      else process.env.MINIME_CONTROL_WORKSPACE_ROOT = oldRoot;
+      rmSync(root, { recursive: true, force: true });
+    });
+    const primary = { id: "main", workspaceCwd: root, model: "openai-codex/gpt-6-astra", thinking: "high" as const, codexFast: { provider: "openai-codex" as const, model: "gpt-6-astra" } };
+    let currentConfig: BotConfig = {
+      ...handlerConfig, agents: { main: primary, other: { ...primary, id: "other", codexFast: undefined } },
+      bindings: [{ chatId: testChatId, agentId: "other", kind: "group" }],
+    };
+    let configReads = 0;
+    let configError = false;
+    const manager = createMockSessionManager();
+    const getHealth = manager.getSessionHealth.bind(manager);
+    let health: ReturnType<SessionManager["getSessionHealth"]> = { ...getHealth("fixture")!, model: primary.model, thinking: "high" };
+    manager.calls.length = 0;
+    manager.getSessionHealth = key => { manager.calls.push(`getSessionHealth:${key}`); return health; };
+    const apiCalls: Array<{ method: string; payload: any }> = [];
+    const { bot, messageQueue } = initBot(manager, apiCalls, undefined, undefined, (_base, sm, options) =>
+      createTelegramBot(currentConfig, sm, { ...options, loadConfig: () => {
+        configReads++;
+        if (configError) throw new Error("synthetic config error");
+        return currentConfig;
+      } }));
+    t.after(() => messageQueue.clearAll());
+    const path = join(root, "data/codex-fast.json");
+    const send = async (topic: number, command = "status") => {
+      const update = makeCommandUpdate(command.split(" ")[0], 900 + apiCalls.length);
+      update.message.text = `/${command}`;
+      Object.assign(update.message, { message_thread_id: topic });
+      await bot.handleUpdate(update);
+      return String(apiCalls.at(-1)!.payload.text);
+    };
+    assert.match(await send(11), /Thinking: high\nFast: off · inherited\nState:/);
+    assert.equal(existsSync(path), false);
+    handleFastCommand("default on", { agent: primary }, path);
+    handleFastCommand("off", { agent: primary, threadKey: `${testChatId}:11` }, path);
+    const bytes = readFileSync(path, "utf8");
+    const overridden = await send(11);
+    assert.match(overridden, /Fast: off · thread override/);
+    assert.match(overridden, /Session ID: session-123/);
+    assert.match(overridden, /Codex quota:/);
+    assert.match(await send(12), /Fast: on · inherited/);
+    assert.ok(manager.calls.includes(`getSessionHealth:${testChatId}:12`));
+    health = { ...health!, agentId: "other" };
+    assert.match(await send(12), /Fast: unavailable \(agent\/model not opted in\)/);
+    health = { ...health, agentId: "main" };
+    // Config changes do not replace the already running session for a status read.
+    currentConfig = { ...currentConfig, agents: { ...currentConfig.agents, main: {
+      ...primary, model: "openai-codex/gpt-6-sol", codexFast: { provider: "openai-codex", model: "gpt-6-sol" },
+    } } };
+    const mismatch = await send(12);
+    assert.match(mismatch, /Model: openai-codex\/gpt-6-astra\nThinking: high\nFast: unavailable/);
+    assert.doesNotMatch(mismatch, /Model: .*gpt-6-sol/);
+    currentConfig = { ...currentConfig, agents: { ...currentConfig.agents, main: primary } };
+    configError = true;
+    assert.match(await send(12), /Fast: unknown \(read error\)/);
+    configError = false;
+    assert.equal(readFileSync(path, "utf8"), bytes);
+    writeFileSync(path, "invalid fixture preferences");
+    assert.match(await send(12), /Fast: unknown \(read error\)/);
+    // Help remains useful even if config and preferences cannot be read.
+    configError = true;
+    const readsBeforeHelp = configReads;
+    assert.match(await send(12, "fast help"), /service_tier=priority/);
+    assert.equal(configReads, readsBeforeHelp);
+    health = undefined;
+    const noSession = await send(12);
+    assert.match(noSession, /Sessions: 1\/2/);
+    assert.doesNotMatch(noSession, /Agent:|Model:|Thinking:|Fast:|Session ID:/);
+    assert.equal(configReads, readsBeforeHelp, "No-session status must not read Fast config");
+    assert.equal(readFileSync(path, "utf8"), "invalid fixture preferences");
+    assert.ok(manager.calls.every(call => call.startsWith("getSessionHealth:")), "Status/help must never create or prompt a session");
   });
 
   it("handles delayed command and text updates through their normal paths", async () => {
@@ -2102,8 +2392,8 @@ describe("command handler wiring", () => {
     t.mock.timers.tick(3_000);
     await flushAsyncWork();
     assert.deepStrictEqual(
-      apiCalls.filter(({ method }) => method === "sendRichMessageDraft").map(({ payload }) => payload.rich_message.markdown),
-      ["obsolete preview"],
+      apiCalls.filter(({ method }) => method === "sendRichMessageDraft").map(({ payload }) => payload.rich_message.blocks),
+      [[{ type: "paragraph", text: "obsolete preview" }]],
     );
 
     await bot.handleUpdate(makeTextUpdate("consumed correction", 51));
@@ -2128,8 +2418,8 @@ describe("command handler wiring", () => {
       "permanent delivery waits for the already in-flight draft to settle",
     );
     assert.deepStrictEqual(
-      apiCalls.filter(({ method }) => method === "sendRichMessageDraft").map(({ payload }) => payload.rich_message.markdown),
-      ["obsolete preview"],
+      apiCalls.filter(({ method }) => method === "sendRichMessageDraft").map(({ payload }) => payload.rich_message.blocks),
+      [[{ type: "paragraph", text: "obsolete preview" }]],
       "interleaved inputs and response reset cannot reactivate the suspended draft",
     );
 
@@ -2146,9 +2436,9 @@ describe("command handler wiring", () => {
     ]);
 
     const drafts = apiCalls.filter(({ method }) => method === "sendRichMessageDraft");
-    assert.deepStrictEqual(drafts.map(({ payload }) => payload.rich_message.markdown), [
-      "obsolete preview",
-      "fallback preview",
+    assert.deepStrictEqual(drafts.map(({ payload }) => payload.rich_message.blocks), [
+      [{ type: "paragraph", text: "obsolete preview" }],
+      [{ type: "paragraph", text: "fallback preview" }],
     ]);
     assert.notStrictEqual(
       drafts[0].payload.draft_id,
@@ -2156,8 +2446,8 @@ describe("command handler wiring", () => {
       "the fallback relay owns a fresh native draft",
     );
     assert.deepStrictEqual(
-      apiCalls.filter(({ method }) => method === "sendRichMessage").map(({ payload }) => payload.rich_message.markdown),
-      ["revised final", "fallback preview"],
+      apiCalls.filter(({ method }) => method === "sendRichMessage").map(({ payload }) => payload.rich_message.blocks),
+      [[{ type: "paragraph", text: "revised final" }], [{ type: "paragraph", text: "fallback preview" }]],
       "each relay sends exactly one permanent final and consumed steering is not duplicated",
     );
 
@@ -2925,8 +3215,8 @@ describe("command handler wiring", () => {
     t.mock.timers.tick(3_000);
     await flushAsyncWork();
     assert.deepStrictEqual(
-      apiCalls.filter(({ method }) => method === "sendRichMessageDraft").map(({ payload }) => payload.rich_message.markdown),
-      ["obsolete preview"],
+      apiCalls.filter(({ method }) => method === "sendRichMessageDraft").map(({ payload }) => payload.rich_message.blocks),
+      [[{ type: "paragraph", text: "obsolete preview" }]],
     );
 
     (
@@ -2939,16 +3229,16 @@ describe("command handler wiring", () => {
     t.mock.timers.tick(DRAFT_REFRESH_INTERVAL_MS * 2);
     await flushAsyncWork();
     assert.deepStrictEqual(
-      apiCalls.filter(({ method }) => method === "sendRichMessageDraft").map(({ payload }) => payload.rich_message.markdown),
-      ["obsolete preview"],
+      apiCalls.filter(({ method }) => method === "sendRichMessageDraft").map(({ payload }) => payload.rich_message.blocks),
+      [[{ type: "paragraph", text: "obsolete preview" }]],
       "echo suspension survives response reset, later deltas, and the refresh interval",
     );
 
     finish.resolve();
     await flushAsyncWork();
     assert.deepStrictEqual(
-      apiCalls.filter(({ method }) => method === "sendRichMessage").map(({ payload }) => payload.rich_message.markdown),
-      ["permanent final"],
+      apiCalls.filter(({ method }) => method === "sendRichMessage").map(({ payload }) => payload.rich_message.blocks),
+      [[{ type: "paragraph", text: "permanent final" }]],
       "the relay still emits exactly one permanent final",
     );
     messageQueue.clearAll();

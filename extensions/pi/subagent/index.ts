@@ -18,7 +18,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import { StringEnum } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, getMarkdownTheme, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -40,10 +39,11 @@ import {
 	type SubagentUsageStats,
 } from "../../../src/pi-extensions/subagent-args.js";
 import { resolvePiInvocation } from "../../../src/pi-extensions/pi-invocation.js";
+import { assemblePiSubagentFoundation } from "../../../src/pi-context-assembler.js";
+import { MINIME_BEHAVIORAL_FOUNDATION_ROOT_ENV } from "../../../src/behavioral-foundation.js";
 import {
 	buildPiSubagentChildSpawnEnv,
-	PI_SUBAGENT_CHILD_WRAPPER_RELPATHS,
-	resolvePiExtensionArgs,
+	resolvePiSubagentChildExtensionArgs,
 } from "../../../src/pi-rpc-protocol.js";
 
 const MAX_PARALLEL_TASKS = 8;
@@ -293,7 +293,10 @@ async function runSingleAgent(
 	});
 
 	try {
-		if (agent.systemPrompt.trim()) {
+		const foundationRoot = process.env[MINIME_BEHAVIORAL_FOUNDATION_ROOT_ENV];
+		const foundationContext = foundationRoot === undefined ? undefined
+			: assemblePiSubagentFoundation(foundationRoot, defaultCwd, agent.name, agent.systemPrompt);
+		if (!foundationContext && agent.systemPrompt.trim()) {
 			const tmp = await writePromptToTempFile(agent.name, agent.systemPrompt);
 			tmpPromptDir = tmp.dir;
 			tmpPromptPath = tmp.filePath;
@@ -305,17 +308,20 @@ async function runSingleAgent(
 		// allowlisted so web-capable child agents never inherit ambient secrets
 		// from the parent.
 		const args = buildSubagentSpawnArgs(agent, task, {
+			foundationContext,
 			systemPromptPath: tmpPromptPath ?? undefined,
-			extensionArgs: resolvePiExtensionArgs({ relpaths: PI_SUBAGENT_CHILD_WRAPPER_RELPATHS }),
+			extensionArgs: resolvePiSubagentChildExtensionArgs(),
 		});
 		const invocation = resolvePiInvocation(args);
+		const env = buildPiSubagentChildSpawnEnv(defaultCwd);
+		if (foundationContext?.behavioralFoundation) env[MINIME_BEHAVIORAL_FOUNDATION_ROOT_ENV] = foundationContext.behavioralFoundation.root;
 
 		const result = await runSubagentChild({
 			spawn,
 			command: invocation.command,
 			args: invocation.args,
 			cwd: defaultCwd,
-			env: buildPiSubagentChildSpawnEnv(defaultCwd),
+			env,
 			signal,
 			agentName,
 			onMessage: onUpdate
@@ -364,7 +370,7 @@ const ChainItem = Type.Object({
 	}),
 });
 
-const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
+const AgentScopeSchema = Type.Union([Type.Literal("user"), Type.Literal("project"), Type.Literal("both")], {
 	description: 'Which agent directories to use. Default: "user". Use "both" to include project-local agents.',
 	default: "user",
 });

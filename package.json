@@ -1,11 +1,20 @@
 {
   "name": "minime-bot",
-  "version": "2026.10.4",
+  "version": "2026.11.14",
   "description": "Multi-agent Telegram and Discord bot powered by Pi/Codex sessions",
   "main": "./dist/main.js",
+  "exports": {
+    ".": "./dist/main.js",
+    "./shared-behavior": {
+      "types": "./dist/shared-behavior.d.ts",
+      "default": "./dist/shared-behavior.js"
+    },
+    "./*": "./*"
+  },
   "bin": {
     "minime-bot": "./dist/cli.js",
-    "minime-codex-quota-sampler": "./dist/codex-quota-sampler.js"
+    "minime-codex-quota-sampler": "./dist/codex-quota-sampler.js",
+    "minime-agent-runtime": "./dist/agent-runtime.js"
   },
   "repository": {
     "type": "git",
@@ -43,12 +52,17 @@
     "scripts/runtime_doctor.py",
     "scripts/restart-bot.sh",
     "scripts/run-cron.sh",
+    "scripts/cron-bin/codex",
     "scripts/start-bot.sh",
     "telegram-bot.plist.example",
     "docs/launchd-operations.md",
     "docs/monitoring.md",
     "docs/collaboration.md",
-    "examples/monitoring/*"
+    "examples/monitoring/*",
+    "docs/codex-fast.md",
+    "docs/agent-runtime.md",
+    "docs/shared-behavior.md",
+    "docs/shared-behavior.schema.json"
   ],
   "keywords": [
     "telegram",
@@ -66,13 +80,14 @@
     "node": ">=22.19.0"
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "0.99.1",
-    "@earendil-works/pi-ai": "0.99.1",
-    "@earendil-works/pi-coding-agent": "0.99.1",
-    "@earendil-works/pi-tui": "0.99.1",
+    "@earendil-works/pi-agent-core": "1.5.0",
+    "@earendil-works/pi-ai": "1.5.0",
+    "@earendil-works/pi-coding-agent": "1.5.0",
+    "@earendil-works/pi-tui": "1.5.0",
     "@grammyjs/auto-retry": "^2.0.2",
     "discord.js": "^14.27.0",
     "grammy": "1.46.0",
+    "ignore": "7.0.8",
     "jiti": "2.7.0",
     "p-queue": "^9.3.3",
     "prom-client": "^15.1.3",

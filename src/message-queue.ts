@@ -1,5 +1,6 @@
 import type { PlatformContext } from "./types.js";
 import { log } from "./logger.js";
+import { AgentRuntimeError } from "./agent-runtime-protocol.js";
 import {
   recordMessageQueueRejectionNotice,
   recordMessageQueueSaturation,
@@ -11,6 +12,11 @@ export const DEFAULT_QUEUE_CAP = 20;
 export const DEFAULT_REJECTION_NOTICE_COOLDOWN_MS = 30_000;
 export const QUEUE_REJECTION_MESSAGE =
   "Message queue full: messages received while it is full are not processed. Please resend them later.";
+
+function sessionErrorMessage(error: unknown): string {
+  if (error instanceof AgentRuntimeError) return error.message;
+  return `Something went wrong: ${error instanceof Error ? error.message : String(error)}\n\nTry again or /reconnect the session.`;
+}
 
 /**
  * Callback that sends combined text to the active agent and relays the response.
@@ -343,7 +349,7 @@ export class MessageQueue {
       log.error("message-queue", `Send error for ${chatId}:`, err);
       if (this.queues.get(chatId) === state && platform) {
         await platform
-          .replyError(`Something went wrong: ${err instanceof Error ? err.message : String(err)}\n\nTry again or /reconnect the session.`)
+          .replyError(sessionErrorMessage(err))
           .catch(() => {});
       }
     } finally {
@@ -424,7 +430,7 @@ export class MessageQueue {
         log.error("message-queue", `Collect drain error for ${chatId}:`, err);
         if (this.queues.get(chatId) === state && platform) {
           await platform
-            .replyError(`Something went wrong: ${err instanceof Error ? err.message : String(err)}\n\nTry again or /reconnect the session.`)
+            .replyError(sessionErrorMessage(err))
             .catch(() => {});
         }
       } finally {
@@ -561,6 +567,13 @@ export class MessageQueue {
   /** Get mid-turn collect buffer count. */
   getCollectCount(chatId: string): number {
     return this.queues.get(chatId)?.collectEntries.length ?? 0;
+  }
+
+  hasWorkWhere(matches: (chatId: string) => boolean): boolean {
+    for (const [chatId, state] of this.queues) {
+      if ((state.busy || state.pendingTexts.length > 0 || state.collectEntries.length > 0) && matches(chatId)) return true;
+    }
+    return false;
   }
 
   /** Clear a chat's queue state (e.g., on /reconnect). */

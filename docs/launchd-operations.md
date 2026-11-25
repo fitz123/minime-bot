@@ -358,8 +358,10 @@ Proven Telegram API 4xx rejections except 429, including deleted topics and
 blocked bots, clear the pending record through the terminal/admin-notice path,
 allowing corrected cron configuration to proceed. Local destination validation
 errors are also terminal. Rate limits, 5xx, transport failures, and unknown or
-non-JSON gateway responses remain queueable. Inspect `OUTBOX` log lines for
-pickup, deferral, expiry, and terminal decisions. Delivery is not exactly-once:
+non-JSON gateway responses remain queueable. Inspect the correlated
+delivery-attempt/disposition events in `$LOG_DIR/cron-diagnostics.jsonl` and
+the existing `OUTBOX` log lines for pickup, deferral, expiry, and terminal
+decisions. Delivery is not exactly-once:
 ambiguous transport failures, partial multi-chunk delivery, or a crash before
 record removal can cause duplicates. Ordinary bot API calls retain two short
 abort-aware transport retries shared across their bounded 429/5xx retries;
@@ -475,6 +477,22 @@ python3 scripts/bot_slots.py status \
 python3 scripts/bot_slots.py rollback --slots-root /path/to/bot-slots
 python3 scripts/bot_slots.py prune --slots-root /path/to/bot-slots
 ```
+
+Private owner-only storage remains the default. To share immutable runtime
+payloads, pass `--reader-group runtime-readers` explicitly on **every** slot
+operation. The root must already be a real directory owned by the controller,
+with that group's gid and exact mode `0750`. The helper neither creates a shared
+root nor converts an existing private tree. Use a separate prepared root for
+relocation; keep the old root until its consumers have moved.
+
+Shared releases and their directories use `0750`; data files use `0640` and
+executable files `0750`. Actual gids must match the selected group, including
+new entries inherited from their parent directory. No group or world writes are
+allowed. Assembly sources remain private. Controller state and locks stay
+`0700`/`0600`, and each release's `.slot-manifest.json` stays `0600`; readers need
+payload files, including dependency package manifests, but never controller
+metadata. The schema and release identity are unchanged. Access through parent
+directories and the reader's Node executable are separate host prerequisites.
 
 The slot helper does not restart services or rewrite launchd plists. Deployment
 wrappers keep those actions separate and continue to use the validated

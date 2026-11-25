@@ -18,9 +18,15 @@ import { SESSION_EFFORT_ENV } from "../pi-extensions/session-effort.js";
 
 async function fixture(t: { after: (fn: () => unknown) => void }, thinking?: PiThinkingLevel) {
   const root = mkdtempSync(join(tmpdir(), "minime-session-effort-"));
+  const previousRoot = process.env.MINIME_CONTROL_WORKSPACE_ROOT;
+  process.env.MINIME_CONTROL_WORKSPACE_ROOT = root;
+  t.after(() => {
+    if (previousRoot === undefined) delete process.env.MINIME_CONTROL_WORKSPACE_ROOT;
+    else process.env.MINIME_CONTROL_WORKSPACE_ROOT = previousRoot;
+  });
   const config: BotConfig = {
     telegramToken: "test-token", whisperModelPath: "/tmp/test-model.bin",
-    agents: { main: { id: "main", workspaceCwd: root, model: "gpt-5.5", thinking } },
+    agents: { main: { id: "main", workspaceCwd: root, model: "effort-fixture/fixture", thinking } },
     bindings: [{ chatId: 123, agentId: "main", kind: "group" }],
     sessionDefaults: { idleTimeoutMs: 60_000, maxConcurrentSessions: 4, maxMessageAgeMs: 300_000, requireMention: false, maxMediaBytes: 1024 },
   };
@@ -47,9 +53,12 @@ async function fixture(t: { after: (fn: () => unknown) => void }, thinking?: PiT
       registerTool: (value: any) => { tool = value; },
     } as unknown as ExtensionAPI;
     const previous = process.env[SESSION_EFFORT_ENV];
+    const previousAgent = process.env.MINIME_BOT_PI_SESSION_AGENT_ID;
     process.env[SESSION_EFFORT_ENV] = JSON.stringify({ inherited: thinking });
+    process.env.MINIME_BOT_PI_SESSION_AGENT_ID = "main";
     try { extension(pi); } finally {
       if (previous === undefined) delete process.env[SESSION_EFFORT_ENV]; else process.env[SESSION_EFFORT_ENV] = previous;
+      if (previousAgent === undefined) delete process.env.MINIME_BOT_PI_SESSION_AGENT_ID; else process.env.MINIME_BOT_PI_SESSION_AGENT_ID = previousAgent;
     }
     handlers.get("session_start")?.({}, context);
     const child = new EventEmitter() as ChildProcess;
@@ -61,13 +70,16 @@ async function fixture(t: { after: (fn: () => unknown) => void }, thinking?: PiT
       if (text.startsWith("/")) {
         const [name, args] = text.slice(1).split(" ");
         void commands.get(name)?.(args, context);
-      } else emit({ type: "agent_start" });
+      } else {
+        handlers.get("message_start")?.({ message: { role: "user" } }, context);
+        emit({ type: "agent_start" });
+      }
       callback();
     } });
     Object.assign(child, { stdout, stdin, stderr: null, exitCode: null, signalCode: null, killed: false, kill() { Object.assign(child, { exitCode: 0, killed: true }); stdout.push(null); child.emit("exit", 0, "SIGTERM"); return true; } });
     const session: ActiveSession = {
       child, sessionId: key.replace(":", "-"), sessionFile: join(root, key + ".jsonl"), workspaceRealpath: root,
-      agentId: "main", provider: "pi", model: "openai-codex/gpt-5.5", thinking,
+      agentId: "main", provider: "pi", model: config.agents.main.model, thinking,
       queue: new PQueue({ concurrency: 1 }), idleTimer: null, idleTimeoutMs: 60_000, lastActivity: Date.now(),
       processingStartedAt: null, lastSuccessAt: null, restartCount: 0, outboxPath: join(root, key), pendingSteers: new Map(),
     };
@@ -90,13 +102,13 @@ it("isolates two threads, reports native capability, and restores inherited defa
   const { manager, store, lane, config, root } = await fixture(t, "medium");
   const first = lane("123:1");
   const second = lane("123:2");
-  assert.match(await manager.sessionEffort("123:1", "main", "high"), /Effort: high \(thread override: high\)/);
+  assert.match(await manager.sessionEffort("123:1", "main", "high"), /Effort is high.*conversation override/);
   assert.equal(first.effective, "high");
   assert.equal(second.effective, "medium");
   assert.equal(store.getSession("123:1")?.effortOverride, "high");
   assert.equal(store.getSession("123:2")?.effortOverride, undefined);
   assert.equal(new SessionStore(join(root, "sessions.json")).getSession("123:1")?.effortOverride, "high");
-  assert.match(await manager.sessionEffort("123:2", "main"), /inherited default/);
+  assert.match(await manager.sessionEffort("123:2", "main"), /agent configuration/);
   first.emit({ type: "extension_ui_request", id: "idle-dialog", method: "confirm", title: "Confirm" });
   await manager.sessionEffort("123:1", "main");
   assert.ok(first.writes.some(command => command.type === "extension_ui_response" && command.id === "idle-dialog" && command.cancelled === true));
@@ -104,22 +116,22 @@ it("isolates two threads, reports native capability, and restores inherited defa
   assert.equal(first.stdout.listenerCount("data"), 0, "idle reader releases stdout");
   const levels = getSupportedThinkingLevels(first.context.model!);
   assert.equal(levels.includes("max"), false);
-  await assert.rejects(manager.sessionEffort("123:1", "main", "max"), /Unsupported effort: max.*Effective effort: high/);
+  await assert.rejects(manager.sessionEffort("123:1", "main", "max"), /does not support max.*Effort is high/);
   assert.equal(first.effective, "high");
   assert.equal(store.getSession("123:1")?.effortOverride, "high");
-  await assert.rejects(manager.sessionEffort("123:1", "main", "impossible"), /Unsupported effort.*Effective effort: high/);
+  await assert.rejects(manager.sessionEffort("123:1", "main", "impossible"), /does not support impossible.*Effort is high/);
   assert.equal(store.getSession("123:1")?.effortOverride, "high");
-  assert.match(await manager.sessionEffort("123:1", "main", "default"), /Effort: medium \(inherited default\)/);
+  assert.match(await manager.sessionEffort("123:1", "main", "inherit"), /Effort is medium.*agent configuration/);
   assert.equal(store.getSession("123:1")?.effortOverride, undefined);
   config.agents.main.thinking = undefined;
-  assert.match(await manager.sessionEffort("123:1", "main", "default"), /Effort: low/);
+  assert.match(await manager.sessionEffort("123:1", "main", "inherit"), /Effort is low/);
   assert.ok(levels.includes("high"));
   first.context.model!.thinkingLevelMap = { max: "max" };
-  assert.match(await manager.sessionEffort("123:1", "main", "max"), /Effort: max \(thread override: max\).*Supported: off, minimal, low, medium, high, max, default/);
+  assert.match(await manager.sessionEffort("123:1", "main", "max"), /Effort is max.*conversation override.*Supported levels are off, minimal, low, medium, high, max/);
   assert.equal(first.effective, "max");
   assert.equal(second.effective, "medium");
   assert.equal(new SessionStore(join(root, "sessions.json")).getSession("123:1")?.effortOverride, "max");
-  assert.equal(new SessionStore(join(root, "sessions.json")).getSession("123:1")?.thinking, "max");
+  assert.equal(new SessionStore(join(root, "sessions.json")).getSession("123:1")?.thinking, "medium");
   const saved = store.getSession("123:1")!;
   assert.throws(() => store.setSession("123:1", { ...saved, effortOverride: "unknown" as PiThinkingLevel }), /unknown effort override/);
 
@@ -128,7 +140,7 @@ it("isolates two threads, reports native capability, and restores inherited defa
 it("validates the current model rather than accepting a syntactically valid level", async t => {
   const { manager, store, lane } = await fixture(t);
   lane("123:1", false);
-  await assert.rejects(manager.sessionEffort("123:1", "main", "high"), /Supported: off, default/);
+  await assert.rejects(manager.sessionEffort("123:1", "main", "high"), /Supported levels are off/);
   assert.equal(store.getSession("123:1")?.effortOverride, undefined);
 });
 
@@ -136,10 +148,10 @@ it("passes configured model syntax and explicit thinking through default reset w
   const { manager, store, lane, config } = await fixture(t);
   config.agents.main.model = "effort-fixture/fixture:high";
   const current = lane("123:1");
-  assert.match(await manager.sessionEffort("123:1", "main", "default"), /Effort: high \(inherited default\)/);
+  assert.match(await manager.sessionEffort("123:1", "main", "inherit"), /Effort is high.*agent configuration/);
   assert.equal(store.getSession("123:1")?.effortOverride, undefined);
   config.agents.main.thinking = "low";
-  assert.match(await manager.sessionEffort("123:1", "main", "default"), /Effort: low/);
+  assert.match(await manager.sessionEffort("123:1", "main", "inherit"), /Effort is low/);
   assert.equal(manager.getActive("123:1"), current.session);
   assert.equal(current.context.model?.id, "fixture");
 });
@@ -150,7 +162,7 @@ it("changes a busy turn using its reader and persists an explicit tool request b
   const turn = (async () => { for await (const _line of manager.sendSessionMessage("123:1", "main", "question")) { /* drain */ } })();
   await new Promise(resolve => setTimeout(resolve, 10));
   const readers = current.stdout.listenerCount("data");
-  assert.match(await manager.sessionEffort("123:1", "main", "high"), /Effort: high/);
+  assert.match(await manager.sessionEffort("123:1", "main", "high"), /Effort is high/);
   assert.equal(current.stdout.listenerCount("data"), readers, "no parallel turn reader");
   const result = await current.tool.execute("tool-1", { level: "medium" }, undefined, undefined, current.context);
   assert.equal(result.details.ok, true);
@@ -169,6 +181,34 @@ it("changes a busy turn using its reader and persists an explicit tool request b
   await turn;
 });
 
+it("checks default permissions and lets a private conversation change its routed agent's default by tool", async t => {
+  const { manager, store, lane, config } = await fixture(t, "low");
+  const current = lane("123:1");
+  await assert.rejects(manager.sessionEffort("123:1", "main", "default high"), /private chat with a DM binding/);
+  assert.equal(current.writes.length, 0);
+  await assert.rejects(manager.sessionEffort("123:1", "main", "default"), /\/effort inherit/);
+  const turn = (async () => { for await (const _line of manager.sendSessionMessage("123:1", "main", "question")) { /* drain */ } })();
+  await new Promise(resolve => setTimeout(resolve, 10));
+  try {
+    const denied = await current.tool.execute("denied", { scope: "default", level: "high" }, undefined, undefined, current.context);
+    assert.equal(denied.isError, true);
+    assert.match(denied.content[0].text, /private chat with a DM binding/);
+    config.bindings[0].kind = "dm";
+    const changed = await current.tool.execute("allowed", { scope: "default", level: "high" }, undefined, undefined, current.context);
+    assert.equal(changed.isError, false);
+    assert.match(changed.content[0].text, /agent's default for this model is now high/);
+    assert.equal(current.effective, "low", "the current message keeps its inherited level");
+    const status = await current.tool.execute("status", {}, undefined, undefined, current.context);
+    assert.match(status.content[0].text, /Effort is high.*agent default.*Supported levels/);
+    assert.equal(store.getSession("123:1")?.effortOverride, undefined);
+  } finally {
+    current.settle();
+    await turn;
+  }
+  await assert.rejects(manager.sessionEffort("123:1", "main", "default max"), /does not support max/);
+  assert.match(await manager.sessionEffort("123:1", "main"), /Effort is high.*agent default/);
+});
+
 it("hands a late busy-control reply to an idle owner after settlement", async t => {
   const { manager, lane } = await fixture(t);
   const current = lane("123:1");
@@ -183,11 +223,11 @@ it("hands a late busy-control reply to an idle owner after settlement", async t 
   current.settle();
   await turn;
   current.release();
-  assert.match(await change, /Effort: high/);
+  assert.match(await change, /Effort is high/);
   assert.equal(current.session.processingStartedAt, null);
   assert.equal(current.session.queue.pending, 1, "delivery still owns the prompt queue");
-  assert.match(await manager.sessionEffort("123:1", "main"), /Effort: high/, "status after reader release does not wait for delivery");
-  assert.match(await manager.sessionEffort("123:1", "main", "low"), /Effort: low/, "a later control does not wait for delivery");
+  assert.match(await manager.sessionEffort("123:1", "main"), /Effort is high/, "status after reader release does not wait for delivery");
+  assert.match(await manager.sessionEffort("123:1", "main", "low"), /Effort is low/, "a later control does not wait for delivery");
   finishOutput();
   await current.session.queue.onIdle();
 });
@@ -219,14 +259,14 @@ for (const split of [false, true]) {
     const finishReply = current.settleWithReply(split);
     await turn;
     finishReply();
-    assert.match(await change, /Effort: high/);
+    assert.match(await change, /Effort is high/);
     assert.equal(store.getSession("123:1")?.effortOverride, "high");
     assert.equal(notices, 1, "notice is decoded intact exactly once");
     assert.equal(lines.filter(type => type === "result").length, 1);
     assert.equal(current.stdout.listenerCount("data"), 0, "fallback releases stdout");
     assert.equal(current.session.queue.pending, 1, "delivery retains the prompt queue");
     current.release();
-    assert.match(await manager.sessionEffort("123:1", "main"), /Effort: high/);
+    assert.match(await manager.sessionEffort("123:1", "main"), /Effort is high/);
     finishOutput();
     await current.session.queue.onIdle();
   });
@@ -254,7 +294,7 @@ it("keeps the next prompt queued when delivery finishes before the control reply
   await new Promise(resolve => setTimeout(resolve, 10));
   assert.equal(current.writes.some(command => command.message === "next question"), false, "control reader holds the next prompt after delivery");
   current.release();
-  assert.match(await change, /Effort: high/);
+  assert.match(await change, /Effort is high/);
   await new Promise(resolve => setTimeout(resolve, 10));
   assert.equal(current.writes.some(command => command.message === "next question"), true);
   assert.equal(current.stdout.listenerCount("data"), 0, "next turn owns stdout without a duplicate control reader");

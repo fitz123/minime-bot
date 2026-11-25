@@ -9,6 +9,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  statSync,
   rmSync,
   unlinkSync,
   writeFileSync,
@@ -108,6 +109,8 @@ function runNpmPack(args: readonly string[], cwd = BOT_ROOT): PackResult {
 function createWorkspace(root: string): string {
   const workspace = join(root, "workspace");
   mkdirSync(join(workspace, "agent-workspace"), { recursive: true });
+  // Bound project-agent discovery to this fixture when TMPDIR is inside a checkout.
+  mkdirSync(join(workspace, ".pi", "agents"), { recursive: true });
   mkdirSync(join(workspace, "config"), { recursive: true });
   writeFileSync(join(workspace, "config", "secrets.sops.yaml"), "placeholder: true\n", "utf8");
   writeFileSync(
@@ -324,6 +327,10 @@ function runInstalledDeliver(
 function assertPackFiles(files: readonly string[]): void {
   for (const expected of [
     "dist/cli.js",
+    "dist/agent-runtime.js",
+    "dist/agent-runtime-worker.js",
+    "dist/agent-runtime-client.js",
+    "dist/agent-runtime-protocol.js",
     "dist/config.js",
     "dist/cron-runner.js",
     "dist/pi-rpc-protocol.js",
@@ -341,6 +348,13 @@ function assertPackFiles(files: readonly string[]): void {
     "dist/knowledge/sync.js",
     "dist/pi-extensions/codex-transport-overflow.js",
     "dist/extensions/pi/codex-usage.js",
+    "dist/extensions/pi/codex-fast.js",
+    "dist/extensions/pi/codex-fast-LICENSE.md",
+    "dist/pi-extensions/codex-fast-request.js",
+    "dist/pi-extensions/cron-fast-request.js",
+    "dist/cron-fast-env.js",
+    "dist/codex-fast.js",
+    "dist/verify-codex-fast.js",
     "dist/extensions/pi/acknowledged-steer.js",
     "dist/extensions/pi/session-effort.js",
     "dist/extensions/pi/compaction-continuation.js",
@@ -357,6 +371,7 @@ function assertPackFiles(files: readonly string[]): void {
     "scripts/runtime_doctor.py",
     "scripts/restart-bot.sh",
     "scripts/run-cron.sh",
+    "scripts/cron-bin/codex",
     "scripts/start-bot.sh",
     "telegram-bot.plist.example",
     "docs/launchd-operations.md",
@@ -466,6 +481,7 @@ describe("package artifact install", () => {
       assert.equal(install.status, 0, install.stderr || install.stdout);
 
       const installedPackage = join(projectDir, "node_modules", "minime-bot");
+      assert.ok(statSync(join(installedPackage, "scripts/cron-bin/codex")).mode & 0o111, "packed cron shim must remain executable");
       for (const packageName of [
         "@earendil-works/pi-agent-core",
         "@earendil-works/pi-ai",
@@ -475,7 +491,7 @@ describe("package artifact install", () => {
         const manifest = JSON.parse(
           readFileSync(join(projectDir, "node_modules", ...packageName.split("/"), "package.json"), "utf8"),
         ) as { version?: string };
-        assert.equal(manifest.version, "0.99.1", packageName);
+        assert.equal(manifest.version, "1.5.0", packageName);
       }
       const codingAgentRoot = join(
         projectDir,
@@ -496,13 +512,13 @@ describe("package artifact install", () => {
         const nestedManifest = JSON.parse(
           readFileSync(resolvedManifestPath, "utf8"),
         ) as { version?: string };
-        assert.equal(nestedManifest.version, "0.99.1", `Pi nested ${packageName}`);
+        assert.equal(nestedManifest.version, "1.5.0", `Pi nested ${packageName}`);
       }
       assert.equal(
         (JSON.parse(readFileSync(codingAgentRequire.resolve("brace-expansion/package.json"), "utf8")) as {
           version?: string;
         }).version,
-        "5.0.9",
+        "5.0.12",
       );
       assert.equal(
         (JSON.parse(readFileSync(codingAgentRequire.resolve("protobufjs/package.json"), "utf8")) as {
@@ -632,19 +648,21 @@ describe("package artifact install", () => {
       assert.equal(samplerHelp.status, 0, samplerHelp.stderr || samplerHelp.stdout || String(samplerHelp.error));
       assert.match(samplerHelp.stdout, /minime-codex-quota-sampler|codex-quota-sampler/);
 
+      const runtimeHelp = spawnSync(join(projectDir, "node_modules", ".bin", "minime-agent-runtime"), ["--help"], {
+        cwd: projectDir, encoding: "utf8", env: commandEnv({ MINIME_CONTROL_WORKSPACE_ROOT: workspace }), timeout: 10_000,
+      });
+      assert.equal(runtimeHelp.status, 0, runtimeHelp.stderr || runtimeHelp.stdout || String(runtimeHelp.error));
+      assert.match(runtimeHelp.stdout, /minime-agent-runtime --descriptor/);
+
       const samplerDryRun = runInstalledSamplerBin(
         projectDir,
         ["--dry-run", "--workspace", workspace, "--textfile-dir", join(temp, "quota-metrics")],
         workspace,
       );
       assert.equal(samplerDryRun.status, 0, samplerDryRun.stderr || samplerDryRun.stdout || String(samplerDryRun.error));
-      const samplerDryRunJson = JSON.parse(samplerDryRun.stdout) as { command: string; args: string[] };
-      assert.equal(samplerDryRunJson.command, process.execPath);
-      assert.match(
-        samplerDryRunJson.args[0],
-        /node_modules[\/\\]@earendil-works[\/\\]pi-coding-agent[\/\\]dist[\/\\]bundle[\/\\]cli\.js$/,
-      );
-      assert.equal(samplerDryRunJson.args[1], "--approve");
+      const samplerDryRunJson = JSON.parse(samplerDryRun.stdout) as { method: string; dryRun: boolean };
+      assert.equal(samplerDryRunJson.method, "GET");
+      assert.equal(samplerDryRunJson.dryRun, true);
 
       const configValidate = runInstalledBin(projectDir, ["config", "validate", "--workspace", workspace], workspace);
       assert.equal(configValidate.status, 0, configValidate.stderr);
@@ -1118,7 +1136,7 @@ const INSTALLED_ARTIFACT_CHECK = String.raw`
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const workspace = process.env.FIXTURE_WORKSPACE;
@@ -1129,6 +1147,10 @@ assert.ok(sourceBotRoot, "SOURCE_BOT_ROOT is required");
 const projectDir = process.cwd();
 const packageDir = join(projectDir, "node_modules", "minime-bot");
 const artifactDir = join(packageDir, "dist", "extensions", "pi");
+const fastLicense = readFileSync(join(artifactDir, "codex-fast-LICENSE.md"), "utf8");
+assert.match(fastLicense, /Copyright \(c\) 2026 narumiruna/);
+assert.match(fastLicense, /Copyright \(c\) 2026 llblab/);
+assert.match(fastLicense, /Permission is hereby granted/);
 const agentWorkspace = join(workspace, "agent-workspace");
 const controlWorkspaceEnv = "MINIME_CONTROL_WORKSPACE_ROOT";
 const agentWorkspaceEnv = "MINIME_AGENT_WORKSPACE_ROOT";
@@ -1157,7 +1179,7 @@ const { resolvePackageOwnedPiInvocation } = await importPackageFile("dist/pi-run
 const installedRpcInvocation = resolvePackageOwnedPiInvocation("rpc", ["--offline"]);
 const installedCliInvocation = resolvePackageOwnedPiInvocation("cli", ["--offline"]);
 
-assert.equal(installedPiManifest.version, "0.99.1");
+assert.equal(installedPiManifest.version, "1.5.0");
 assert.equal(installedRpcEntry, join(installedPiRoot, "dist", "bundle", "rpc-entry.js"));
 assert.deepEqual(installedRpcInvocation.args, [installedRpcEntry, "--offline"]);
 assert.deepEqual(
@@ -1269,6 +1291,7 @@ assert.deepEqual(
     "session-effort.js",
     "compaction-continuation.js",
     "codex-transport-overflow.js",
+    "codex-fast.js",
     "web-tools.js",
     "knowledge-tools.js",
     "subagent/index.js",
@@ -1279,10 +1302,7 @@ assertCanonicalWebWrapper("interactive parent", extensionPaths);
 assert.equal(extensionPaths.some((path) => path.endsWith("/recovery.js")), false);
 assertNoGuardContract("parent Pi extension args must not load the retired guard", parentExtensionArgs);
 
-const subagentChildExtensionArgs = piRpc.resolvePiExtensionArgs({
-  env: {},
-  relpaths: piRpc.PI_SUBAGENT_CHILD_WRAPPER_RELPATHS,
-});
+const subagentChildExtensionArgs = piRpc.resolvePiSubagentChildExtensionArgs({ env: {} });
 assert.deepEqual(
   extensionPathsFromArgs(subagentChildExtensionArgs).map((path) => relative(artifactDir, path)),
   ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js"],
@@ -1302,7 +1322,7 @@ const cronExtensionArgs = piRpc.resolvePiExtensionArgs({
 });
 assert.deepEqual(
   extensionPathsFromArgs(cronExtensionArgs).map((path) => relative(artifactDir, path)),
-  ["web-tools.js", "knowledge-tools.js"],
+  ["codex-fast.js", "web-tools.js", "knowledge-tools.js"],
 );
 assertCanonicalWebWrapper("cron", extensionPathsFromArgs(cronExtensionArgs));
 assert.equal(
@@ -1315,7 +1335,7 @@ assertNoGuardContract("cron Pi extension args must not load the retired guard", 
 
 for (const extensionPath of extensionPaths) {
   assert.ok(extensionPath.startsWith(artifactDir + "/"), extensionPath);
-  assert.equal(extensionPath.startsWith(sourceBotRoot), false);
+  assert.equal(extensionPath.startsWith(join(sourceBotRoot, "extensions", "pi")), false);
   const mod = await importFile(extensionPath);
   assert.equal(typeof mod.default, "function", extensionPath);
 }
@@ -1447,7 +1467,7 @@ const launchdCronResult = launchdCronPlists.generateLaunchdCronPlists({
 });
 assert.equal(launchdCronResult.context.runCronScript, join(packageDir, "scripts", "run-cron.sh"));
 assert.ok(launchdCronResult.plists[0].content.includes("<string>" + join(packageDir, "scripts", "run-cron.sh") + "</string>"));
-assert.equal(launchdCronResult.plists[0].content.includes(sourceBotRoot), false);
+assert.equal(launchdCronResult.plists[0].content.replaceAll(dirname(projectDir), "<install-fixture>").includes(sourceBotRoot), false);
 
 const registeredTools = [];
 const registeredToolDefs = [];
@@ -1554,6 +1574,11 @@ try {
 
 const askAgentArgs = await importPackageFile("dist/pi-extensions/ask-agent-args.js");
 const piInvocation = await importPackageFile("dist/pi-extensions/pi-invocation.js");
+const fastVerifier = await importPackageFile("dist/verify-codex-fast.js");
+const fastEvidence = await fastVerifier.verifyCodexFast();
+assert.equal(fastEvidence.piVersion, "1.5.0");
+assert.ok(fastEvidence.requestChecks >= 21);
+assert.ok(fastEvidence.commandsChecked >= 21);
 const installedChildInvocation = piInvocation.resolvePiInvocation(["--mode", "json"]);
 assert.equal(installedChildInvocation.command, process.execPath);
 assert.match(
@@ -1639,7 +1664,7 @@ assert.equal(askAgentSpawnCalls[0].args[askAgentSpawnCalls[0].args.indexOf("--ap
 const askAgentLoadedExtensions = extensionPathsFromSpawnArgs(askAgentSpawnCalls[0].args);
 assert.deepEqual(
   askAgentLoadedExtensions.map((path) => relative(artifactDir, path)),
-  ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js"],
+  ["codex-transport-overflow.js", "codex-fast.js", "web-tools.js", "knowledge-tools.js"],
 );
 assertCanonicalWebWrapper("ask-agent child", askAgentLoadedExtensions);
 assert.equal(
@@ -1700,6 +1725,7 @@ writeFileSync(
 const askAgentWrapperArgvPath = join(askAgentSmokeRoot, "wrapper-argv.bin");
 const askAgentWrapperCwdPath = join(askAgentSmokeRoot, "wrapper-cwd.txt");
 const askAgentWrapperCallerEnvPath = join(askAgentSmokeRoot, "wrapper-caller-env.txt");
+const cronChildEnvPath = join(askAgentSmokeRoot, "cron-child-env.json");
 const globalPiMarkerPath = join(askAgentSmokeRoot, "global-pi-ran.txt");
 const askAgentWrapperJsonl = JSON.stringify({
   type: "message_end",
@@ -1731,6 +1757,7 @@ writeFileSync(
     "writeFileSync(" + JSON.stringify(askAgentWrapperCwdPath) + ", process.cwd() + '\\n');",
     "writeFileSync(" + JSON.stringify(askAgentWrapperArgvPath) + ", process.argv.slice(2).join('\\0') + '\\0');",
     "writeFileSync(" + JSON.stringify(askAgentWrapperCallerEnvPath) + ", (process.env.MINIME_BOT_PI_SESSION_AGENT_ID ?? '__unset__') + '\\n');",
+    "writeFileSync(" + JSON.stringify(cronChildEnvPath) + ", JSON.stringify({ marker: process.env.MINIME_CRON_FAST_OFF, real: process.env.MINIME_CRON_REAL_CODEX, shimDir: process.env.MINIME_CRON_CODEX_SHIM_DIR, path: process.env.PATH, thread: process.env.MINIME_BOT_PI_SESSION_THREAD_KEY }));",
     "console.log(" + JSON.stringify(askAgentWrapperJsonl) + ");",
     "",
   ].join("\n"),
@@ -1739,7 +1766,11 @@ writeFileSync(
 
 const oldAskAgentWorkspace = process.env[controlWorkspaceEnv];
 const oldAskAgentCaller = process.env[piRpc.MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
+const askAgentCronKeys = ["MINIME_CRON_FAST_OFF", "MINIME_CRON_REAL_CODEX", "MINIME_CRON_CODEX_SHIM_DIR"];
+const oldAskAgentCronEnv = new Map(askAgentCronKeys.map(key => [key, process.env[key]]));
 try {
+  // The first wrapper call exercises a non-cron parent regardless of the launcher.
+  for (const key of askAgentCronKeys) delete process.env[key];
   process.env[controlWorkspaceEnv] = askAgentSmokeRoot;
   process.env[piRpc.MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = "agent-b";
   const askAgentTool = registeredToolDefs.find((tool) => tool.name === "ask_agent");
@@ -1762,12 +1793,12 @@ try {
   });
   assert.equal(existsSync(globalPiMarkerPath), false);
   assert.equal(readFileSync(askAgentWrapperCwdPath, "utf8").trim(), askAgentTargetWorkspace);
-  assert.equal(readFileSync(askAgentWrapperCallerEnvPath, "utf8").trim(), "__unset__");
+  assert.equal(readFileSync(askAgentWrapperCallerEnvPath, "utf8").trim(), "agent-c");
   const askAgentWrapperArgv = readFileSync(askAgentWrapperArgvPath, "utf8").split("\0").filter(Boolean);
   const askAgentWrapperExtensions = extensionPathsFromSpawnArgs(askAgentWrapperArgv);
   assert.deepEqual(
     askAgentWrapperExtensions.map((path) => relative(artifactDir, path)),
-    ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js"],
+    ["codex-transport-overflow.js", "codex-fast.js", "web-tools.js", "knowledge-tools.js"],
   );
   assertCanonicalWebWrapper("ask-agent wrapper child", askAgentWrapperExtensions);
   assert.equal(
@@ -1779,6 +1810,47 @@ try {
   assert.ok(!askAgentWrapperExtensions.some((path) => path.includes("subagent")));
   assert.ok(!askAgentWrapperExtensions.some((path) => path.includes("ask-agent")));
   assert.doesNotMatch(JSON.stringify(askAgentWrapperResult), /neutral wrapper smoke question|neutral wrapper smoke context/);
+  assert.equal(JSON.parse(readFileSync(cronChildEnvPath, "utf8")).marker, undefined);
+
+  const cronEnvMod = await importPackageFile("dist/cron-fast-env.js");
+  const fakeCodex = join(fakeBinDir, "codex");
+  writeFileSync(fakeCodex, "#!/bin/sh\nexit 0\n");
+  chmodSync(fakeCodex, 0o755);
+  const cronKeys = ["PATH", "MINIME_CRON_FAST_OFF", "MINIME_CRON_REAL_CODEX", "MINIME_CRON_CODEX_SHIM_DIR"];
+  const beforeCron = new Map(cronKeys.map(key => [key, process.env[key]]));
+  const cronEnv = cronEnvMod.buildCronFastEnv({ PATH: process.env.PATH });
+  try {
+    for (const key of cronKeys) process.env[key] = cronEnv[key];
+    const cronAsk = await askAgentTool.execute("cron-ask-wrapper-call", { agent: "agent-c", question: "cron fixture" });
+    assert.equal(cronAsk.details.ok, true, JSON.stringify(cronAsk));
+    const askCronEnv = JSON.parse(readFileSync(cronChildEnvPath, "utf8"));
+    assert.equal(askCronEnv.marker, "1");
+    assert.equal(askCronEnv.real, fakeCodex);
+    assert.equal(askCronEnv.path.split(":")[0], cronEnv.MINIME_CRON_CODEX_SHIM_DIR);
+    assert.equal(readFileSync(askAgentWrapperCallerEnvPath, "utf8").trim(), "agent-c");
+    const subagentTool = registeredToolDefs.find(tool => tool.name === "subagent");
+    assert.ok(subagentTool);
+    for (const marked of [true, false]) {
+      if (!marked) delete process.env.MINIME_CRON_FAST_OFF;
+      const subResult = await subagentTool.execute("cron-subagent-wrapper-call", {
+        agent: "worker", task: "cron fixture", agentScope: "user",
+      }, undefined, undefined, { cwd: agentWorkspace, hasUI: false });
+      assert.equal(subResult.isError, undefined, JSON.stringify(subResult));
+      const argv = readFileSync(askAgentWrapperArgvPath, "utf8").split("\0").filter(Boolean);
+      const wrappers = extensionPathsFromSpawnArgs(argv).map(path => relative(artifactDir, path));
+      assert.deepEqual(wrappers, ["codex-transport-overflow.js", "web-tools.js", "knowledge-tools.js", ...(marked ? ["codex-fast.js"] : [])]);
+      const childEnv = JSON.parse(readFileSync(cronChildEnvPath, "utf8"));
+      assert.equal(childEnv.marker, marked ? "1" : undefined);
+      assert.equal(childEnv.real, marked ? fakeCodex : undefined);
+      assert.equal(childEnv.thread, undefined);
+      assert.equal(childEnv.path.split(":").includes(cronEnv.MINIME_CRON_CODEX_SHIM_DIR), marked);
+      assert.equal(readFileSync(askAgentWrapperCallerEnvPath, "utf8").trim(), "__unset__");
+    }
+  } finally {
+    for (const [key, value] of beforeCron) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
 } finally {
   if (oldAskAgentWorkspace === undefined) {
     delete process.env[controlWorkspaceEnv];
@@ -1790,7 +1862,11 @@ try {
   } else {
     process.env[piRpc.MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = oldAskAgentCaller;
   }
+  for (const [key, value] of oldAskAgentCronEnv) {
+    if (value === undefined) delete process.env[key]; else process.env[key] = value;
+  }
 }
+assert.deepEqual(new Map(askAgentCronKeys.map(key => [key, process.env[key]])), oldAskAgentCronEnv);
 
 try {
   const searchTool = registeredToolDefs.find((tool) => tool.name === "web_search");
@@ -1949,7 +2025,7 @@ assert.deepEqual(bundledAgentNames, expectedBundledAgentFiles.map((file) => file
 const bundledWorker = discovery.agents.find((agent) => agent.name === "worker" && agent.source === "bundled");
 assert.ok(bundledWorker, "expected bundled worker agent from installed artifact");
 assert.ok(bundledWorker.filePath.startsWith(join(artifactDir, "subagent", "agents")));
-assert.equal(bundledWorker.filePath.startsWith(sourceBotRoot), false);
+assert.equal(bundledWorker.filePath.startsWith(join(sourceBotRoot, "extensions", "pi")), false);
 
 assert.equal(resourceHandlers.length, 1);
 const resources = resourceHandlers[0]();

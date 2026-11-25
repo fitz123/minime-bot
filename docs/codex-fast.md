@@ -1,0 +1,151 @@
+# Scoped Codex Fast
+
+Fast requests the Codex `priority` service tier. It does not change the model,
+thinking level, authentication, or conversation history. The package starts with
+Fast off and does not enable any agent automatically.
+
+An operator can opt one configured agent into its exact Codex model:
+
+```yaml
+agents:
+  assistant:
+    workspaceCwd: /path/to/agent-workspace
+    model: openai-codex/gpt-6-astra
+    thinking: high
+    codexFast:
+      provider: openai-codex
+      model: gpt-6-astra
+```
+
+The opt-in must match the agent's configured model exactly. Other agents,
+including those using the same model, are unchanged unless explicitly opted in.
+Changing the current model or provider makes the adapter inactive for that
+request. Generic interactive delegated subagents do not receive this adapter or
+an inherited primary-agent identity.
+
+Authenticated Telegram commands use the actual chat/topic binding:
+
+| Command | Effect |
+| --- | --- |
+| `/fast` or `/fast status` | Show compact Russian Fast state, model, thread override, and agent/model default |
+| `/fast help` | Read-only command help, scope rules, and priority/usage caveats; works without opt-in |
+| `/fast on` | Request priority for this thread |
+| `/fast off` | Stop this adapter from requesting priority in this thread |
+| `/fast inherit` | Remove the thread override and follow the agent/model default |
+| `/fast default on` | Request priority by default for this identified agent/model |
+| `/fast default off` | Stop default priority requests from this adapter |
+| `/fast default status` | Show status without changing preferences |
+
+Telegram `/fast default on` and `/fast default off` require both an actual
+private chat and a `dm` binding. Group chats and threads retain per-thread
+controls, `/fast status`, and `/fast default status`. Trusted native local
+default commands are unchanged.
+
+For example, an opted-in `main` agent using `gpt-6-astra` can show:
+
+```text
+Fast: включён
+Модель: Astra
+Этот тред: по умолчанию
+Общий режим Main/Astra: включён
+```
+
+`Этот тред` shows `включён (переопределение)` or `выключен (переопределение)`
+for an explicit override. Consumers without a thread show
+`Область: только общий режим (без треда)` instead. `Main` labels only agent
+`main`, and `Astra` labels only `gpt-6-astra` in this Fast display; other agent
+and model identities remain truthful. These labels do not change model IDs.
+
+Telegram `/status` adds Fast immediately after the existing model/thinking lines
+for the queried thread's active session: `Fast: on · inherited`,
+`Fast: off · inherited`, or `Fast: on/off · thread override`. Eligibility uses
+that session's agent and model together with the current configuration's exact
+opt-in. An unopted agent or mismatched model shows `Fast: unavailable (agent/model
+not opted in)`; config/preferences read failures show `Fast: unknown (read error)`.
+The existing session, diagnostics, and quota information stays intact. Without
+an active session, no session or Fast block is invented. Status and help do not
+write preferences or create sessions, models, or provider requests.
+
+A new thread inherits its default. Defaults also apply to identified non-chat
+consumers: native local Pi sessions and `ask_agent`
+requests targeting that agent. Those consumers never inherit the caller's
+thread override. A native Pi session with the configured wrapper and trusted
+`MINIME_BOT_PI_SESSION_AGENT_ID` supports the same `/fast` command; without an
+identified chat it can change only the default. Missing or unknown agent
+identity leaves Fast inactive. The existing extension kill switch still applies.
+
+All cron jobs always run with Fast off, regardless of chat or agent defaults.
+Pi cron requests explicitly use `service_tier: "default"` (normal processing),
+overwriting existing `priority` or `auto` values without reading preferences or
+requiring agent opt-in. Cron `/fast` commands report enforced off and never change
+chat preferences. Model, reasoning, authentication, and history are unchanged.
+
+Both Pi and script crons set `MINIME_CRON_FAST_OFF=1`. Their allowed Pi descendants,
+including `ask_agent` targets and ordinary subagents, preserve this contract;
+ordinary subagents load the Fast wrapper only under cron. Interactive launches
+clear cron state. Native monitoring HTTP event triggers are not cron and retain
+their existing behavior. Direct web-search HTTP requests already use normal
+processing by default.
+
+When Codex is available on the original PATH, cron prepends the package-owned
+`scripts/cron-bin/codex` shim. It executes the real CLI with
+`-c 'service_tier="default"'` and a process-scoped
+`shell_environment_policy.set.PATH` override containing the exact inherited PATH,
+escaped as a TOML string. Both overrides precede the original arguments; model,
+reasoning, argument order, stdin, and exit behavior are preserved.
+The PATH override restores the inherited PATH after Codex sources its shell
+snapshot ([runtime source](https://github.com/openai/codex/blob/rust-v0.167.0/codex-rs/core/src/tools/runtimes/mod.rs)).
+This covers snapshot restoration only: in Codex CLI 0.167.2, the subsequent inner
+`zsh -c` runs the user's `.zshenv`, which can reorder PATH again. Host shell startup
+that reorders PATH must restore `MINIME_CRON_CODEX_SHIM_DIR` to the front after its
+normal PATH setup when `MINIME_CRON_FAST_OFF=1`. Keep this adjustment conditional
+so normal interactive defaults remain unchanged. The package does not edit host
+shell startup files or global Codex configuration.
+`MINIME_CRON_REAL_CODEX` retains the executable's symlink path, and
+`MINIME_CRON_CODEX_SHIM_DIR` tracks the temporary PATH entry. Missing Codex leaves
+PATH unchanged for Pi-only jobs; an unavailable executable shim produces an error.
+No global CLI or model configuration is edited. This is a cooperative descendant
+contract, with no cron Fast-on option: generated direct absolute CLI calls must
+also pass `-c 'service_tier="default"'` and preserve the cron environment. Scripts
+that reset PATH or invoke an absolute CLI must follow the same rule.
+
+Pi explicitly sends `service_tier: "default"`. Codex CLI 0.167.0 instead omits
+the explicit default tier from provider request JSON; absence on the wire is
+expected and does not mean the CLI override was lost
+([request-tier source](https://github.com/openai/codex/blob/rust-v0.167.0/codex-rs/protocol/src/openai_models.rs)).
+
+Preferences are stored in control-workspace `data/codex-fast.json`, separately
+from session state, and survive `/clean` and restarts. Defaults and overrides
+are keyed by agent/provider/model, with actual chat/thread identity for overrides.
+Commands write atomically; each request reads preferences and opt-in configuration
+again, so warm sessions see changes without restarting. A concurrent writer
+causes an explicit retry message; after a crashed writer, an operator may need to
+remove the stale `data/codex-fast.json.lock` before retrying.
+
+Outside cron, independent provider `service_tier` settings are preserved. For example, an
+existing `priority` value still requests priority while this adapter's preference
+is off; an existing `auto` value prevents this adapter from adding priority even
+when its preference is on. The compact Fast state describes this adapter's
+preference; backend-granted priority cannot be inferred. `/fast help` explains
+this distinction and the independent tier behavior. Quota/usage information
+remains separate in `/status`. No `models.json` is edited.
+
+The request helper is copied from `@llblab/pi-codex-usage@0.13.2` with its MIT
+license, shipped at `dist/extensions/pi/codex-fast-LICENSE.md`. The upstream
+shared-model toggle and quota-polling composition are not loaded.
+
+For an independent installed-package check, run:
+
+```sh
+node node_modules/minime-bot/dist/verify-codex-fast.js
+```
+
+The bounded offline verifier checks the resolved Pi versions, loads the real
+packaged wrapper, exercises compact native command output, read-only help even
+without valid opt-in configuration, session Fast status formatting, and a request-hook matrix,
+and executes Pi's Codex request builder with a synthetic token, stopping before
+transport. It checks unchanged model/reasoning, preserves interactive independent
+tiers, and verifies enforced cron off without preference reads or writes.
+All fixture writes go to a disposable temporary directory; configured preferences,
+credentials, sessions, and provider endpoints are not accessed. It exits nonzero
+on failed assertions. Set `TMPDIR` to select its scratch parent.

@@ -4,7 +4,8 @@ import { appendFileSync, chmodSync, mkdirSync, realpathSync, rmSync, existsSync,
 import { EventEmitter } from "node:events";
 import { Readable, Writable } from "node:stream";
 import type { ChildProcess } from "node:child_process";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import type { AgentConfig, BotConfig, BoundSessionState, StreamLine } from "../types.js";
 import type { ActiveSession } from "../session-manager.js";
 import type { InteractiveSessionBinding } from "../interactive-session-binding.js";
@@ -19,8 +20,11 @@ import { ensureSessionMediaDir, sessionMediaDir, allocateMediaPath, releaseMedia
 import { buildPiSpawnArgs, MINIME_BOT_PI_SESSION_AGENT_ID_ENV, NewlineOnlyJsonlSplitter, handlePiExtensionUiRecord, PiStartupBlockingUiError, assertPiSessionIdentityMatchesBinding, normalizePiModel, parsePiStartupIdentityRecord, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions } from "../pi-rpc-protocol.js";
 import PQueue from "p-queue";
 import { CURRENT_SESSION_VERSION, ModelRuntime, resolveCliModel } from "@earendil-works/pi-coding-agent";
+import { collaborationTransport } from "../collaboration.js";
+import { loadConfig } from "../config.js";
+import { createTelegramBindingReload } from "../telegram-binding-reload.js";
 
-const TEST_DIR = "/tmp/minime-test-pi-spawn";
+const TEST_DIR = join(tmpdir(), "minime-test-pi-spawn");
 const TEST_STORE_PATH = `${TEST_DIR}/sessions.json`;
 const MAIN_WORKSPACE = `${TEST_DIR}/workspace-main`;
 const PI_WORKSPACE = `${TEST_DIR}/workspace-pi`;
@@ -561,6 +565,7 @@ describe("SessionManager exact Pi binding startup", () => {
       assert.ok(existsSync(reserved));
       assert.ok(!existsSync(`${path}/stale.txt`));
       assert.equal(piSpawnCaptures[0].runtimeEnvOptions?.telegramRichAnswers, true);
+      assert.equal(piSpawnCaptures[0].runtimeEnvOptions?.fastThreadKey, "218");
       await manager.closeSession("218");
       assert.ok(existsSync(reserved));
       await manager.getOrCreateSession("218", "pi");
@@ -607,7 +612,6 @@ describe("SessionManager exact Pi binding startup", () => {
       const originalArgs = captureArgs();
       assert.equal(nativeModel(originalArgs).model?.id, "custom-id");
       first.effortOverride = "low";
-      first.thinking = "low";
       await manager.closeSession("456:1");
       const resumed = await manager.getOrCreateSession("456:1", "pi");
       const resumedArgs = captureArgs();
@@ -615,7 +619,7 @@ describe("SessionManager exact Pi binding startup", () => {
       assert.equal(resumedArgs.includes("--thinking"), false);
       assert.equal(nativeModel(resumedArgs).model?.id, "custom-id");
       assert.deepEqual(piSpawnCaptures.at(-1)?.runtimeEnvOptions?.sessionEffort, { model: config.agents.pi.model, inherited: undefined, override: "low" });
-      assert.equal(resumed.thinking, "low", "runtime signature represents the effective override");
+      assert.equal(resumed.thinking, undefined, "effort is independent of the configured runtime signature");
       assert.equal(await manager.getOrCreateSession("456:1", "pi"), resumed);
     } finally { await manager.closeAll(); }
   });
@@ -626,7 +630,6 @@ describe("SessionManager exact Pi binding startup", () => {
     try {
       const session = await manager.getOrCreateSession("456:1", "pi");
       session.effortOverride = "high";
-      session.thinking = "high";
       assert.equal(await manager.getOrCreateSession("456:1", "pi"), session, "override does not trigger config respawn");
       await manager.closeSession("456:1");
       const resumed = await manager.getOrCreateSession("456:1", "pi");
@@ -649,13 +652,168 @@ describe("SessionManager exact Pi binding startup", () => {
       assert.equal(cleaned.thinking, "xhigh");
       assert.notEqual(cleaned.sessionId, session.sessionId);
       cleaned.effortOverride = "low";
-      cleaned.thinking = "low";
       await manager.closeSession("456:1");
       config.bindings[1].agentId = "main";
       const rebound = await manager.getOrCreateSession("456:1", "main");
       assert.equal(rebound.effortOverride, undefined);
       assert.equal(rebound.thinking, undefined);
     } finally { await manager.closeAll(); }
+  });
+
+  it("keeps a group spawn on the applied binding and last usable settings when disk is invalid", async t => {
+    const previousRoot = process.env.MINIME_CONTROL_WORKSPACE_ROOT;
+    process.env.MINIME_CONTROL_WORKSPACE_ROOT = TEST_DIR;
+    t.after(() => {
+      if (previousRoot === undefined) delete process.env.MINIME_CONTROL_WORKSPACE_ROOT;
+      else process.env.MINIME_CONTROL_WORKSPACE_ROOT = previousRoot;
+    });
+    const configPath = join(TEST_DIR, "config.yaml");
+    const instanceConfigPath = join(TEST_DIR, "instance.yaml");
+    writeFileSync(instanceConfigPath, "{}");
+    const initial = {
+      telegramTokenEnv: "SYNTHETIC_TELEGRAM_TOKEN",
+      agents: makeConfig().agents,
+      bindings: [{ chatId: -219, agentId: "pi", kind: "group" }, ...makeConfig().bindings],
+    };
+    writeFileSync(configPath, JSON.stringify(initial));
+    const readConfig = () => loadConfig(configPath, { instanceConfigPath, resolveSecrets: false });
+    const startup = readConfig();
+    const readCandidate = () => loadConfig(configPath, { instanceConfigPath, telegramBindingReload: true });
+    const telegramBindingReload = createTelegramBindingReload(startup, readConfig, readCandidate);
+    const manager = new SessionManager(readConfig, TEST_STORE_PATH, TEST_DIR, { initialConfig: startup, telegramBindingReload });
+
+    try {
+      writeFileSync(configPath, JSON.stringify({
+        ...initial,
+        bindings: makeConfig().bindings,
+        agents: { ...initial.agents, pi: { ...initial.agents.pi, model: "gpt-5.6-sol" } },
+      }));
+      await manager.getOrCreateSession("-219", "pi");
+      assert.equal(piSpawnCaptures.at(-1)?.agent.model, "gpt-5.6-sol");
+      assert.equal(piSpawnCaptures.at(-1)?.runtimeEnvOptions?.telegramRichAnswers, true);
+      await manager.closeSession("-219");
+
+      writeFileSync(configPath, "bindings: [");
+      assert.throws(() => telegramBindingReload.reload(() => {}), /Effective config or Telegram credential is invalid/);
+      await manager.getOrCreateSession("-219", "pi");
+      assert.equal(piSpawnCaptures.length, 2);
+      assert.equal(piSpawnCaptures.at(-1)?.agent.model, "gpt-5.6-sol");
+      assert.equal(piSpawnCaptures.at(-1)?.runtimeEnvOptions?.telegramRichAnswers, true);
+      await assert.rejects(manager.getOrCreateSession("discord:fixture", "pi"), /Flow sequence/);
+
+      const { pi, ...remainingAgents } = initial.agents;
+      const remainingBindings = makeConfig().bindings.filter(binding => binding.agentId !== "pi");
+      const workerRuntime = {
+        socketPath: "/synthetic/worker/socket",
+        workerUid: process.getuid?.() === 60001 ? 60002 : 60001,
+        controllerName: "fixture-controller",
+      };
+      writeFileSync(configPath, JSON.stringify({
+        ...initial,
+        bindings: remainingBindings,
+        agents: { ...remainingAgents, pi: { ...pi, workerRuntime } },
+      }));
+      await assert.rejects(manager.getOrCreateSession("-219", "pi"), /Worker routing changed/);
+      writeFileSync(configPath, "bindings: [");
+      await assert.rejects(manager.getOrCreateSession("-219", "pi"), /Worker routing changed/);
+
+      writeFileSync(configPath, JSON.stringify({
+        ...initial, bindings: remainingBindings, agents: remainingAgents,
+      }));
+      await assert.rejects(manager.getOrCreateSession("-219", "pi"), /Unknown agent: pi/);
+      assert.equal(piSpawnCaptures.length, 2);
+    } finally {
+      await manager.closeAll();
+    }
+  });
+
+  it("passes the private-topic flag only to eligible private Telegram topic spawns", async () => {
+    const previousRoot = process.env.MINIME_CONTROL_WORKSPACE_ROOT;
+    process.env.MINIME_CONTROL_WORKSPACE_ROOT = `${TEST_DIR}/control`;
+    const config = makeConfig({
+      collaboration: { socketPath: `${TEST_DIR}/router.sock` },
+      privateTopics: { enabled: true, maxNameGraphemes: 17 },
+      bindings: [
+        { chatId: 123, agentId: "main", kind: "dm" },
+        { chatId: 456, agentId: "pi", kind: "dm" },
+        { chatId: 789, agentId: "main", kind: "group" },
+      ],
+    });
+    const manager = new SessionManager(() => config, TEST_STORE_PATH, TEST_DIR);
+    const { PrivateTopicController } = await import("../private-topics.js");
+    const { TopicStore } = await import("../topic-store.js");
+    let botId = 900;
+    manager.setTopicController(new PrivateTopicController(config, new TopicStore(`${TEST_DIR}/topics.json`), {
+      getForumTopicIconStickers: async () => [], editForumTopic: async () => true,
+    }, () => botId));
+    const check = async (lane: string, agentId: string, enabled: boolean) => {
+      await manager.getOrCreateSession(lane, agentId);
+      assert.equal(piSpawnCaptures.at(-1)?.runtimeEnvOptions?.privateTopicPolicy, enabled ? true : undefined);
+      assert.equal(piSpawnCaptures.at(-1)?.extensionOptions?.collaboration, true);
+      await manager.closeSession(lane);
+    };
+    try {
+      await check("123:10", "main", true);
+      await check("123", "main", false);
+      await check("456:10", "pi", true);
+      await check("789:10", "main", false);
+      await check("discord:fixture", "main", false);
+      await check("collaboration:fixture:main", "main", false);
+      botId = 901;
+      await check("123:20", "main", true);
+    } finally {
+      await manager.closeAll();
+      if (previousRoot === undefined) delete process.env.MINIME_CONTROL_WORKSPACE_ROOT;
+      else process.env.MINIME_CONTROL_WORKSPACE_ROOT = previousRoot;
+    }
+  });
+
+  it("uses the instance topic-only socket/env only for private topic spawns when collaboration is disabled", async () => {
+    const previousRoot = process.env.MINIME_CONTROL_WORKSPACE_ROOT;
+    process.env.MINIME_CONTROL_WORKSPACE_ROOT = `${TEST_DIR}/control`;
+    const config = makeConfig({
+      collaboration: undefined,
+      privateTopics: { enabled: true, maxNameGraphemes: 17 },
+      bindings: [
+        { chatId: 123, agentId: "main", kind: "dm" },
+        { chatId: 456, agentId: "pi", kind: "dm" },
+        { chatId: 789, agentId: "main", kind: "group" },
+      ],
+    });
+    const manager = new SessionManager(() => config, TEST_STORE_PATH, TEST_DIR);
+    const { PrivateTopicController } = await import("../private-topics.js");
+    const { TopicStore } = await import("../topic-store.js");
+    let botId = 900;
+    manager.setTopicController(new PrivateTopicController(config, new TopicStore(`${TEST_DIR}/topics.json`), {
+      getForumTopicIconStickers: async () => [], editForumTopic: async () => true,
+    }, () => botId));
+    const check = async (lane: string, agentId: string, enabled: boolean) => {
+      await manager.getOrCreateSession(lane, agentId);
+      assert.equal(piSpawnCaptures.at(-1)?.runtimeEnvOptions?.privateTopicPolicy, enabled ? true : undefined);
+      const capture = piSpawnCaptures.at(-1)!;
+      assert.equal(capture.extensionOptions?.collaboration, enabled ? true : undefined);
+      assert.equal(capture.runtimeEnvOptions?.collaborationTopicOnly, enabled ? true : undefined);
+      assert.equal(capture.runtimeEnvOptions?.collaborationSession, enabled ? capture.sessionBinding.sessionId : undefined);
+      if (enabled) assert.equal(capture.runtimeEnvOptions?.collaborationSocket, collaborationTransport(config)!.socketPath);
+      else assert.equal(capture.runtimeEnvOptions?.collaborationSocket, undefined);
+      await manager.closeSession(lane);
+    };
+    try {
+      await check("123:10", "main", true);
+      await check("123", "main", false);
+      await check("456:10", "pi", true);
+      await check("789:10", "main", false);
+      await check("discord:fixture", "main", false);
+      await check("collaboration:fixture:main", "main", false);
+      botId = 901;
+      await check("123:20", "main", true);
+      manager.disableTopicTransport();
+      await check("123:30", "main", false);
+    } finally {
+      await manager.closeAll();
+      if (previousRoot === undefined) delete process.env.MINIME_CONTROL_WORKSPACE_ROOT;
+      else process.env.MINIME_CONTROL_WORKSPACE_ROOT = previousRoot;
+    }
   });
 
   it("pre-seeds, persists, and asserts one exact Pi binding before spawn", async () => {
@@ -673,6 +831,7 @@ describe("SessionManager exact Pi binding startup", () => {
     assert.strictEqual(session.outboxPath, outboxDir("pi-chat"));
     assert.deepStrictEqual(piSpawnCaptures[0].runtimeEnvOptions, {
       askCallerAgentId: "pi",
+      fastThreadKey: "pi-chat",
       outboxPath: session.outboxPath,
     });
     assert.ok(!session.outboxPath.startsWith("/tmp/bot-outbox"));
@@ -849,6 +1008,7 @@ describe("SessionManager exact Pi binding startup", () => {
       assert.strictEqual(piSpawnCaptures[0].agent.id, "pi");
       assert.deepStrictEqual(piSpawnCaptures[0].runtimeEnvOptions, {
         askCallerAgentId: "pi",
+        fastThreadKey: "pi-caller",
         outboxPath: outboxDir("pi-caller"),
       });
     } finally {
@@ -1359,8 +1519,8 @@ describe("SessionManager exact-path recovery", () => {
     assert.deepStrictEqual(
       piSpawnCaptures.map((capture) => capture.runtimeEnvOptions),
       [
-        { askCallerAgentId: "pi", outboxPath: outboxDir("pi-stale") },
-        { askCallerAgentId: "pi", outboxPath: outboxDir("pi-stale") },
+        { askCallerAgentId: "pi", fastThreadKey: "pi-stale", outboxPath: outboxDir("pi-stale") },
+        { askCallerAgentId: "pi", fastThreadKey: "pi-stale", outboxPath: outboxDir("pi-stale") },
       ],
       "recovery retry keeps the exact session outbox path",
     );

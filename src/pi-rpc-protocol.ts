@@ -21,7 +21,10 @@ import {
   fileDeliveryContext,
   PiContextArtifactWriteError,
   type PiContextAssemblyOptions,
+  type PiContextArtifacts,
+  piContextResourceArgs,
 } from "./pi-context-assembler.js";
+import { MINIME_BEHAVIORAL_FOUNDATION_ROOT_ENV } from "./behavioral-foundation.js";
 import {
   formatPiRuntimeDiagnostic,
   resolvePackageOwnedPiInvocation,
@@ -42,6 +45,8 @@ import {
   parsePiAcknowledgedSteerResultNotice,
 } from "./pi-extensions/acknowledged-steer.js";
 import { isReasoningOnlyLengthAgentEnd } from "./pi-extensions/compaction-continuation.js";
+import { PI_FAST_THREAD_ENV } from "./codex-fast.js";
+import { buildCronFastEnv, CRON_FAST_OFF_ENV, CRON_REAL_CODEX_ENV, CRON_CODEX_SHIM_DIR_ENV, isCronFastOff, stripCronFastEnv } from "./cron-fast-env.js";
 import { MINIME_OUTBOX_ENV } from "./pi-runtime-env.js";
 import { RUNTIME_READINESS_PATH_ENV } from "./runtime-readiness.js";
 import {
@@ -61,6 +66,7 @@ export const DEFAULT_PI_MODEL = "openai-codex/gpt-5.5";
  *   session-effort (Telegram current-session reasoning control),
  *   compaction-continuation (hidden continuation after a reasoning-only length stop),
  *   codex-transport-overflow (Codex request-byte overflow normalization),
+ *   codex-fast (opted-in agent/thread priority request intent),
  *   web-tools (subscription-backed Codex web_search),
  *   knowledge-tools (knowledge_search/knowledge_get/knowledge_update + managed wiki protection),
  *   subagent (isolated `pi -p` child spawn),
@@ -73,6 +79,7 @@ export const PI_EXTENSION_WRAPPER_RELPATHS = [
   "session-effort.ts",
   "compaction-continuation.ts",
   "codex-transport-overflow.ts",
+  "codex-fast.ts",
   "web-tools.ts",
   "knowledge-tools.ts",
   "subagent/index.ts",
@@ -84,6 +91,7 @@ export const PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS = [
   "session-effort.js",
   "compaction-continuation.js",
   "codex-transport-overflow.js",
+  "codex-fast.js",
   "web-tools.js",
   "knowledge-tools.js",
   "subagent/index.js",
@@ -95,7 +103,8 @@ export const PI_EXTENSION_ARTIFACT_WRAPPER_RELPATHS = [
  * isolated `pi -p` child to run a delegated task. Children load the transport
  * overflow normalizer, web tools, and knowledge tools/protection, but they do
  * NOT load the subagent wrapper: recursive spawning stays disabled in child
- * sessions.
+ * sessions. Marked cron children additionally load codex-fast through
+ * resolvePiSubagentChildExtensionArgs to enforce normal processing.
  */
 export const PI_SUBAGENT_CHILD_WRAPPER_RELPATHS = [
   "codex-transport-overflow.ts",
@@ -121,9 +130,9 @@ export const PI_ASK_AGENT_CHILD_WRAPPER_RELPATHS = Object.freeze(
 
 /**
  * Wrappers a Pi print-mode cron must load. Crons receive the canonical search
- * wrapper and the Knowledge wrapper, but no child-spawning tools.
+ * wrapper, Knowledge wrapper and enforced Fast-off adapter, but no child-spawning tools.
  */
-export const PI_CRON_WRAPPER_RELPATHS = ["web-tools.ts", "knowledge-tools.ts"] as const;
+export const PI_CRON_WRAPPER_RELPATHS = ["codex-fast.ts", "web-tools.ts", "knowledge-tools.ts"] as const;
 
 export const PI_SUBAGENT_CHILD_ARTIFACT_WRAPPER_RELPATHS = [
   "codex-transport-overflow.js",
@@ -177,10 +186,16 @@ export interface PiSpawnExtensionOptions extends PiExtensionResolveOptions {
 }
 
 export interface PiSpawnRuntimeEnvOptions {
+  /** Trusted adapter input captured by the same context load as the launch args. */
+  behavioralFoundationRoot?: string;
+  privateTopicPolicy?: boolean;
+  collaborationTopicOnly?: boolean;
   collaborationSession?: string;
   collaborationSocket?: string;
   /** Trusted current agent id supplied by SessionManager for first-party tools. */
   askCallerAgentId?: string;
+  /** Actual interactive chat/thread identity, never inherited by other consumers. */
+  fastThreadKey?: string;
   /** Deterministic per-chat outbox path supplied for an interactive session. */
   outboxPath?: string;
   telegramRichAnswers?: boolean;
@@ -204,6 +219,7 @@ export interface PiSessionIdentity {
 type LegacyInteractiveSessionInput = PiSpawnPathBinding | string | undefined;
 
 const PI_CHILD_ENV_KEY_ALLOWLIST = new Set([
+  MINIME_BEHAVIORAL_FOUNDATION_ROOT_ENV,
   "CI",
   "COLORTERM",
   "FORCE_COLOR",
@@ -218,6 +234,10 @@ const PI_CHILD_ENV_KEY_ALLOWLIST = new Set([
   MINIME_CRONS_PATH_ENV,
   MINIME_INSTANCE_CONFIG_PATH_ENV,
   MINIME_OUTBOX_ENV,
+  PI_FAST_THREAD_ENV,
+  CRON_FAST_OFF_ENV,
+  CRON_REAL_CODEX_ENV,
+  CRON_CODEX_SHIM_DIR_ENV,
   "NO_COLOR",
   "PATH",
   "PI_CODING_AGENT_DIR",
@@ -295,6 +315,14 @@ export function resolvePiExtensionArgs(options?: PiExtensionResolveOptions): str
   }
 
   return args;
+}
+
+/** Ordinary subagents load the Fast adapter only to enforce a marked cron parent. */
+export function resolvePiSubagentChildExtensionArgs(options?: PiExtensionResolveOptions): string[] {
+  const relpaths = isCronFastOff(options?.env ?? process.env)
+    ? [...PI_SUBAGENT_CHILD_WRAPPER_RELPATHS, "codex-fast.ts"]
+    : PI_SUBAGENT_CHILD_WRAPPER_RELPATHS;
+  return resolvePiExtensionArgs({ ...options, relpaths });
 }
 
 function resolvePiExtraExtensionArgs(options?: PiSpawnExtensionOptions): string[] {
@@ -500,6 +528,10 @@ export class NewlineOnlyJsonlSplitter {
   private readonly decoder = new StringDecoder("utf8");
   private buffer = "";
 
+  constructor(private readonly maxRecordBytes = Infinity) {
+    if (!(maxRecordBytes > 0)) throw new Error("JSONL frame bound must be positive");
+  }
+
   push(chunk: Buffer | Uint8Array | string): string[] {
     this.buffer += decodeChunk(this.decoder, chunk);
     return this.takeCompleteRecords();
@@ -516,6 +548,7 @@ export class NewlineOnlyJsonlSplitter {
     }
 
     const finalRecord = stripTrailingCarriageReturn(this.buffer);
+    this.assertBound(finalRecord);
     this.buffer = "";
     return [finalRecord];
   }
@@ -530,12 +563,20 @@ export class NewlineOnlyJsonlSplitter {
     for (;;) {
       const newlineIndex = this.buffer.indexOf("\n");
       if (newlineIndex === -1) {
+        this.assertBound(this.buffer);
         return records;
       }
 
       const record = this.buffer.slice(0, newlineIndex);
+      this.assertBound(record);
       records.push(stripTrailingCarriageReturn(record));
       this.buffer = this.buffer.slice(newlineIndex + 1);
+    }
+  }
+
+  private assertBound(record: string): void {
+    if (Buffer.byteLength(record) > this.maxRecordBytes) {
+      throw new Error("JSONL frame exceeds byte limit");
     }
   }
 }
@@ -604,6 +645,7 @@ export function buildPiSpawnArgs(
   sessionBinding?: LegacyInteractiveSessionInput,
   extensionOptions?: PiSpawnExtensionOptions,
   runtimeEnvOptions?: PiSpawnRuntimeEnvOptions,
+  prepared?: { context: PiContextArtifacts | null },
 ): string[] {
   const args = [
     "--mode", "rpc",
@@ -617,37 +659,34 @@ export function buildPiSpawnArgs(
   }
 
   // Spawn-time context assembly. The assembler (pi-context-assembler.ts) gives
-  // workspace-context parity from the agent's LIVE workspace files, delivered as three CLI
-  // layers, REPLACING the old `agent.systemPrompt → --append-system-prompt` branch:
-  //   --system-prompt <persona>   REPLACES Pi's base prompt (omitted when no persona
-  //                               resolves — the agent then rides Pi's base prompt).
-  //   --append-system-prompt <bundle>  the CLAUDE.md + @-imports + rules bundle,
-  //                                    or inline file-delivery fallback text.
+  // workspace-context parity from the agent's LIVE workspace files via CLI args:
+  //   --system-prompt <persona>   REPLACES Pi's base prompt. With no persona,
+  //                               foundation mode emits an explicit empty prompt;
+  //                               legacy mode omits the flag and keeps Pi's base prompt.
+  //   --append-system-prompt <bundle>  the pinned foundation (when configured),
+  //                                    CLAUDE.md, @-imports and local rules bundle,
+  //                                    or legacy inline file-delivery fallback text.
   //   --no-context-files          when assembled workspace/persona layers replace
   //                               native context (omitted for delivery-only bundles
   //                               so Pi can still load an AGENTS.md from cwd).
   // At most ONE --system-prompt and ONE --append-system-prompt are emitted. The
-  // assembler is fail-safe for source reads (bad source → warn+skip; empty
-  // workspace without an interactive outbox → null → bare spawn), but artifact
-  // writes can throw after source content has been classified. A throw must fail
-  // closed with --no-context-files so Pi does not flat-load context files the
-  // assembler could not safely deliver.
+  // foundation mode also emits --no-skills and explicit --skill paths; its local
+  // rules are recursive and exclude platform rules and shared source identities.
+  // Required foundation assembly errors abort launch. Legacy source reads can
+  // warn+skip (an empty workspace without an outbox yields a bare spawn). Legacy
+  // assembly errors suppress flat context loading when classified layers require
+  // it; delivery-only artifact errors preserve native context loading.
   const includeFileDelivery = Boolean(runtimeEnvOptions?.outboxPath?.trim());
   try {
-    const context = assemblePiContextForCurrentDeployment(agent, {
+    const context = prepared ? prepared.context : assemblePiContextForCurrentDeployment(agent, {
       includeFileDelivery,
       telegramRichAnswers: runtimeEnvOptions?.telegramRichAnswers,
     });
     if (context) {
-      if (context.systemPromptPath) {
-        args.push("--system-prompt", context.systemPromptPath);
-      }
-      args.push("--append-system-prompt", context.appendSystemPromptPath);
-      if (context.suppressContextFiles !== false) {
-        args.push("--no-context-files");
-      }
+      args.push(...piContextResourceArgs(context));
     }
   } catch (err) {
+    if (agent.behavioralFoundationRoot !== undefined) throw err;
     const suppressContextFiles =
       !(err instanceof PiContextArtifactWriteError) || err.suppressContextFiles;
     const contextLoadingOutcome = suppressContextFiles
@@ -723,20 +762,22 @@ export function buildPiSpawnEnv(
 }
 
 export function buildPiSubagentChildSpawnEnv(agentWorkspaceRoot?: string): Record<string, string> {
-  return buildAllowedPiChildEnv(resolveWorkspaceContract(), agentWorkspaceRoot);
+  return buildAllowedPiChildEnv(resolveWorkspaceContract(), agentWorkspaceRoot, undefined, true);
 }
 
-export function buildPiAskAgentChildSpawnEnv(agentWorkspaceRoot?: string): Record<string, string> {
-  return buildAllowedPiChildEnv(resolveWorkspaceContract(), agentWorkspaceRoot);
+export function buildPiAskAgentChildSpawnEnv(agentWorkspaceRoot?: string, targetAgentId?: string): Record<string, string> {
+  return buildAllowedPiChildEnv(resolveWorkspaceContract(), agentWorkspaceRoot, { askCallerAgentId: targetAgentId }, true);
 }
 
 function buildAllowedPiChildEnv(
   contract: ResolvedWorkspaceContract,
   agentWorkspaceRoot?: string,
   runtimeEnvOptions?: PiSpawnRuntimeEnvOptions,
+  inheritCron = false,
 ): Record<string, string> {
   const env: Record<string, string> = {};
-  for (const [key, val] of Object.entries(process.env)) {
+  const parentEnv = inheritCron && isCronFastOff(process.env) ? process.env : stripCronFastEnv(process.env);
+  for (const [key, val] of Object.entries(parentEnv)) {
     if (val !== undefined && shouldIncludePiChildEnvKey(key)) {
       env[key] = val;
     }
@@ -760,6 +801,7 @@ function buildAllowedPiChildEnv(
   delete env[MINIME_AGENT_WORKSPACE_ROOT_ENV];
   delete env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV];
   delete env[MINIME_OUTBOX_ENV];
+  delete env[PI_FAST_THREAD_ENV];
   env[MINIME_CONTROL_WORKSPACE_ROOT_ENV] = contract.paths.controlWorkspaceRoot;
   const agentRoot = agentWorkspaceRoot?.trim();
   if (agentRoot) {
@@ -769,6 +811,7 @@ function buildAllowedPiChildEnv(
   if (askCallerAgentId) {
     env[MINIME_BOT_PI_SESSION_AGENT_ID_ENV] = askCallerAgentId;
   }
+  if (askCallerAgentId && runtimeEnvOptions?.fastThreadKey) env[PI_FAST_THREAD_ENV] = runtimeEnvOptions.fastThreadKey;
   const outboxPath = runtimeEnvOptions?.outboxPath?.trim();
   if (outboxPath) {
     env[MINIME_OUTBOX_ENV] = outboxPath;
@@ -777,12 +820,19 @@ function buildAllowedPiChildEnv(
   copyExplicitControlPathEnv(env, contract, MINIME_CRONS_PATH_ENV, "cronsPath");
   env[MINIME_BOT_PI_SESSION_ENV] = "1";
   if (runtimeEnvOptions?.sessionEffort) env[SESSION_EFFORT_ENV] = JSON.stringify(runtimeEnvOptions.sessionEffort);
+  if (runtimeEnvOptions?.behavioralFoundationRoot !== undefined) {
+    env[MINIME_BEHAVIORAL_FOUNDATION_ROOT_ENV] = runtimeEnvOptions.behavioralFoundationRoot;
+  }
+  delete env.MINIME_PRIVATE_TOPIC_POLICY;
+  delete env.MINIME_COLLABORATION_TOPIC_ONLY;
+  if (runtimeEnvOptions?.privateTopicPolicy && runtimeEnvOptions.collaborationSession && runtimeEnvOptions.collaborationSocket) env.MINIME_PRIVATE_TOPIC_POLICY = "1";
   if (runtimeEnvOptions?.collaborationSession && runtimeEnvOptions.collaborationSocket) {
     env.MINIME_COLLABORATION_SOCKET = runtimeEnvOptions.collaborationSocket;
     env.MINIME_COLLABORATION_SESSION = runtimeEnvOptions.collaborationSession;
+    if (runtimeEnvOptions.collaborationTopicOnly) env.MINIME_COLLABORATION_TOPIC_ONLY = "1";
   }
 
-  return env;
+  return inheritCron && isCronFastOff(parentEnv) ? buildCronFastEnv(env) : env;
 }
 
 function copyExplicitControlPathEnv(
@@ -812,6 +862,47 @@ export interface PiStartupDiagnostics {
 /** Cap on buffered startup stderr (the classifier only needs the startup tail). */
 const PI_STARTUP_STDERR_CAP = 64 * 1024;
 
+/** Worker seam: all context, environment and resource choices are already explicit. */
+export function spawnPreparedPiRpcSession(options: {
+  binding: InteractiveSessionBinding;
+  context: PiContextArtifacts;
+  model: string;
+  thinking: string;
+  tools: readonly string[];
+  extensions: readonly string[];
+  env: NodeJS.ProcessEnv;
+  offline: boolean;
+  appendSystemPrompt?: string;
+}): ChildProcess {
+  const { binding, context } = options;
+  if (!options.model.trim() || !options.thinking) throw new Error("Explicit Pi model/thinking required");
+  const inspection = inspectInteractiveSessionBinding(binding, binding.sessionFile, binding.sessionId);
+  if (!inspection.valid) throw new Error(`Invalid prepared Pi binding: ${inspection.reason}`);
+  const args = ["--mode", "rpc", "--model", options.model, "--thinking", options.thinking,
+    "--session-dir", binding.sessionDirectory, "--session", binding.sessionFile,
+    "--no-extensions", "--no-prompt-templates",
+    ...piContextResourceArgs(context)];
+  if (!context.behavioralFoundation) args.push("--no-skills");
+  // Pi discovers SYSTEM.md independently of --no-context-files. Empty input
+  // suppresses that discovery while retaining Pi's built-in default prompt.
+  if (!context.systemPromptPath && !context.behavioralFoundation) args.push("--system-prompt", "");
+  if (options.appendSystemPrompt) args.push("--append-system-prompt", options.appendSystemPrompt);
+  if (options.tools.length) args.push("--tools", options.tools.join(","));
+  else args.push("--no-tools");
+  for (const extension of options.extensions) args.push("--extension", extension);
+  if (options.offline) args.push("--offline");
+  const invocation = resolvePackageOwnedPiInvocation("rpc", args);
+  if (invocation.diagnostic.versionMismatch) throw new Error("Worker requires the pinned Pi runtime");
+  return spawn(invocation.command, invocation.args, {
+    cwd: binding.workspaceRealpath,
+    env: {
+      ...options.env,
+      ...(context.behavioralFoundation ? { [MINIME_BEHAVIORAL_FOUNDATION_ROOT_ENV]: context.behavioralFoundation.root } : {}),
+    },
+    stdio: ["pipe", "pipe", "pipe"], detached: true,
+  });
+}
+
 export function spawnPiRpcSession(
   agent: AgentConfig,
   sessionBinding?: PiSpawnSessionBinding | string,
@@ -820,7 +911,6 @@ export function spawnPiRpcSession(
 ): ChildProcess {
   const workspaceCwd = resolveValidatedPiAgentWorkspaceCwd(agent);
   const spawnAgent = { ...agent, workspaceCwd };
-  const env = buildPiSpawnEnv(workspaceCwd, runtimeEnvOptions);
   const exactPath = assertPiSpawnSessionBinding(sessionBinding);
   if (
     !sessionBinding
@@ -844,7 +934,17 @@ export function spawnPiRpcSession(
     throw new Error(`Interactive Pi session binding is not usable: ${inspection.reason}`);
   }
   const exactBinding = inspection.binding;
-  const args = buildPiSpawnArgs(spawnAgent, exactBinding, extensionOptions, runtimeEnvOptions);
+  const prepared = agent.behavioralFoundationRoot === undefined ? undefined : {
+    context: assemblePiContextForCurrentDeployment(spawnAgent, {
+      includeFileDelivery: Boolean(runtimeEnvOptions?.outboxPath?.trim()),
+      telegramRichAnswers: runtimeEnvOptions?.telegramRichAnswers,
+    }),
+  };
+  const args = buildPiSpawnArgs(spawnAgent, exactBinding, extensionOptions, runtimeEnvOptions, prepared);
+  const env = buildPiSpawnEnv(workspaceCwd, {
+    ...runtimeEnvOptions,
+    ...(prepared?.context?.behavioralFoundation ? { behavioralFoundationRoot: prepared.context.behavioralFoundation.root } : {}),
+  });
   const invocation = resolvePackageOwnedPiInvocation("rpc", args);
   log.info("pi-rpc", `package-owned runtime ${formatPiRuntimeDiagnostic(invocation.diagnostic)}`);
   const child = spawn(invocation.command, invocation.args, {
@@ -1146,7 +1246,7 @@ const PI_RPC_SETTLED_WITHOUT_OUTCOME_MESSAGE =
 const PI_RPC_AGENT_END_WITHOUT_OUTCOME_MESSAGE =
   "Pi agent_end arrived without a usable terminal outcome";
 const PI_RPC_REASONING_ONLY_LENGTH_MESSAGE =
-  "Pi response hit the length limit before producing visible text and could not continue after compaction";
+  "Pi response hit the length limit before producing visible text";
 const PI_RPC_EXIT_BEFORE_SETTLED_MESSAGE = "Pi subprocess exited before agent_settled";
 
 /**

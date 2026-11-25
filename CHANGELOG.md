@@ -2,6 +2,75 @@
 
 ## Unreleased
 
+## 2026.11.14
+
+- Support explicit conversation adoption and rollback for worker lanes, and opt-in scheduled LLM execution with controller-owned delivery (#285).
+
+## 2026.11.13
+
+- Keep prices, emphasized labels, inline charts and genuine formulas distinct in Telegram replies (#245, #284).
+
+## 2026.11.12
+
+- Reload Telegram group binding additions and removals explicitly without restarting the running poller. Rejected changes keep the previously applied routes (#280, #282).
+
+## 2026.11.11
+
+- Support opt-in worker routing for new text conversations; local routing stays the default (#279).
+- Clarify outbox delivery for suppressed responses (#278).
+
+## 2026.11.9
+
+- Add opt-in immutable shared behavioral resources across managed Pi entrypoints, keeping private context separate (#252, #253).
+- Prepare isolated execution workers with durable session bindings, bounded lifecycle handling and explicitly selected local/Knowledge capabilities; existing routing stays unchanged by default.
+- Preserve current cron, private-topic, collaboration and quota behavior; strengthen fixture isolation (#271, #273).
+
+## 2026.11.7
+
+- Report reasoning-only length outcomes without falsely assuming compaction occurred (#197, #264).
+- Preserve existing settlement, continuation, EOF and partial-visible behavior; broader incomplete-response handling remains open.
+
+## 2026.11.6
+
+- Deliver explicitly marked detached agent results through the same native Telegram rich renderer as chat (#261, #262).
+- Preserve ordinary service messages, confirmed-result echoes, and fail-closed no-replay handling for uncertain or partial sends.
+
+## 2026.11.5
+
+- Keep scheduled LLM and script jobs in normal mode independently of interactive Fast preferences (#258, #259).
+- Preserve cron Fast-off scope through cooperative Pi and Codex descendants without changing chat settings, models or reasoning; include executable CLI enforcement and offline packaged-request verification.
+
+## 2026.11.4
+
+- Read Codex subscription quota with a bounded OAuth usage GET rather than an inference probe (#61, #256).
+- Display actual server-reported limit families, durations and resets; refresh `/status` on demand and clearly age cached data after refresh failures.
+- Export dynamic quota metrics without relabeling weekly usage as five-hour usage, preserve legacy cache readability and keep collector textfiles readable.
+
+## 2026.11.3
+
+- Allow standalone read-only Knowledge CLI get/search commands through the Knowledge integrity guard (#254).
+- Preserve managed-file mutation and output-redirection protection; compound or unsupported shell syntax retains conservative fallback.
+
+## 2026.11.2
+
+- Simplify `/fast` output and move technical priority/scope details to read-only `/fast help` (#219, #250).
+- Show Fast preference beside the actual current thread model/thinking in `/status`, distinguishing inheritance, overrides, unavailable models and read errors without changing settings or quotas.
+
+## 2026.11.1
+
+- Upgrade the coherent package-owned Pi runtime to 1.5.0, with offline RPC, session resume, extension and tool compatibility checks (#219).
+- Add explicit agent/exact-model Codex Fast opt-in, initially off, with persistent per-thread `/fast` overrides and agent defaults for identified non-chat consumers. Telegram default writes require a private DM binding. Preserve reasoning, independent provider tiers and `models.json`; ship an offline installed-package verifier and upstream MIT attribution.
+
+## 2026.11.0
+
+- Preserve explicit heading hierarchy, separated paragraphs and schedule line breaks in simple native Telegram drafts and final answers (#245, #246).
+- Keep short replies unpadded and complex Markdown on its existing paths; cover Unicode, block budgets, media custody and conservative syntax routing.
+
+## 2026.10.5
+
+- Retain bounded, redacted, run-correlated diagnostics for LLM and script crons, including logical failures, safe timeout/error metadata, delivery attempts, replay/queue dispositions and terminal outcomes (#242, #243).
+- Keep diagnostics fail-soft and owner-only, document deployment-owned rotation, and preserve existing execution, delivery, outbox, metric and exit behavior.
+
 ## 2026.10.4
 
 - Improve fresh-Markdown Knowledge retrieval with ranked partial whole-word matches and exact identity priority (#237, #238).

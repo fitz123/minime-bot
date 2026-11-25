@@ -177,6 +177,7 @@ describe("subagent: wrapper spawn environment", () => {
     const wrapper = readFileSync(resolve(BOT_DIR, "extensions", "pi", "subagent", "index.ts"), "utf8");
 
     assert.match(wrapper, /buildPiSubagentChildSpawnEnv\(defaultCwd\)/);
+    assert.match(wrapper, /extensionArgs: resolvePiSubagentChildExtensionArgs\(\)/);
     assert.match(wrapper, /resolvePiInvocation\(args\)/);
     assert.doesNotMatch(wrapper, /env:\s*\{\s*\.{3}process\.env/);
   });
@@ -708,5 +709,28 @@ describe("subagent: mergeAgentsByPrecedence", () => {
       merged.map((a) => `${a.name}:${a.source}`),
       ["scout:bundled", "worker:bundled", "custom:user"],
     );
+  });
+});
+
+describe("Pi 1.5 installed subagent schema compatibility", () => {
+  it("validates the loaded TypeBox agent scope through pi-schema", async t => {
+    const { mkdtempSync, mkdirSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { DefaultResourceLoader, SettingsManager } = await import("@earendil-works/pi-coding-agent");
+    const { validateToolArguments } = await import("@earendil-works/pi-ai");
+    const root = mkdtempSync(join(tmpdir(), "pi-subagent-schema-"));
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const agentDir = join(root, "agent");
+    mkdirSync(agentDir);
+    const loader = new DefaultResourceLoader({ cwd: root, agentDir, settingsManager: SettingsManager.inMemory({}), noExtensions: true, noContextFiles: true, noSkills: true, noPromptTemplates: true, noThemes: true, additionalExtensionPaths: [resolve(BOT_DIR, "extensions/pi/subagent/index.ts")] });
+    await loader.reload();
+    assert.deepEqual(loader.getExtensions().errors, []);
+    const tool = [...loader.getExtensions().extensions[0].tools.values()].find(tool => tool.definition.name === "subagent")!.definition;
+    for (const agentScope of ["user", "project", "both"]) {
+      const args = { agentScope, agent: "fixture", task: "offline schema check" };
+      assert.deepEqual(validateToolArguments(tool, { type: "toolCall", id: "fixture", name: tool.name, arguments: args }), args);
+    }
+    assert.throws(() => validateToolArguments(tool, { type: "toolCall", id: "fixture", name: tool.name, arguments: { agentScope: "invalid" } }), /agentScope/);
   });
 });

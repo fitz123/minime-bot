@@ -1,6 +1,6 @@
 // cron-runner.ts — CLI entry point for running scheduled cron tasks
 // Usage: npx tsx src/cron-runner.ts --task <name>
-// Loads cron definition from crons.yaml, runs a Pi print-mode one-shot, delivers output to Telegram
+// Loads cron definition from crons.yaml, runs a one-shot, delivers output to Telegram
 
 import {
   appendFileSync,
@@ -17,9 +17,11 @@ import {
 import { createHash, randomUUID } from "node:crypto";
 import {
   loadRawMergedConfig,
+  validateBehavioralFoundation,
   loadTelegramToken,
   resolveConfigWorkspaceRoot,
   validateAgent,
+  validateWorkerRuntime,
 } from "./config.js";
 import {
   execFileSync,
@@ -32,11 +34,16 @@ import {
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
+import { buildCronFastEnv } from "./cron-fast-env.js";
+import { buildCronSystemInstruction, MINIME_CRON_UNRESOLVED_MARKER } from "./cron-llm-instruction.js";
+import { AgentRuntimeClient } from "./agent-runtime-client.js";
+import { AGENT_RUNTIME_CLIENT_PROMPT_TIMEOUT_MS, AgentRuntimeError, AgentRuntimeUncertainError } from "./agent-runtime-protocol.js";
+import { isDeepStrictEqual } from "node:util";
 import { setTimeout as sleep } from "node:timers/promises";
 import { Api } from "grammy";
 import { CronResultPreparationError, deliverCronResult } from "./cron-rich-delivery.js";
 import type { TelegramAdapterApi } from "./telegram-adapter.js";
-import type { CronJob, AgentConfig } from "./types.js";
+import type { CronJob, AgentConfig, ResultMessage } from "./types.js";
 import { shouldSuppressNoReply } from "./no-reply.js";
 import {
   buildPiSpawnEnv,
@@ -45,8 +52,10 @@ import {
   resolvePiExtensionArgs,
   resolveValidatedPiAgentWorkspaceCwd,
   shouldIncludePiChildEnvKey,
+  type PiSpawnRuntimeEnvOptions,
 } from "./pi-rpc-protocol.js";
-import { assemblePiContext } from "./pi-context-assembler.js";
+import { assemblePiContext, piContextResourceArgs } from "./pi-context-assembler.js";
+import { MINIME_BEHAVIORAL_FOUNDATION_ROOT_ENV } from "./behavioral-foundation.js";
 import {
   formatPiRuntimeDiagnostic,
   resolvePackageOwnedPiInvocation,
@@ -67,7 +76,19 @@ import {
   writeCronOutboxRecord,
   type CronOutboxRecord,
 } from "./cron-outbox.js";
+import {
+  CRON_DIAGNOSTIC_OUTPUT_CHARS,
+  CRON_DIAGNOSTIC_SUMMARY_CHARS,
+  retainCronDiagnosticText,
+  writeCronDiagnosticEvent,
+  type CronDiagnosticCronType,
+  type CronDiagnosticEvent,
+  type CronDiagnosticEventPayload,
+  type CronDiagnosticFailure,
+  type CronDiagnosticFailureCategory,
+} from "./cron-diagnostics.js";
 export { loadMergedCrons, resolveCronsPath } from "./cron-loader.js";
+export { MINIME_CRON_UNRESOLVED_MARKER } from "./cron-llm-instruction.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOT_DIR = resolve(__dirname, "..");
@@ -80,12 +101,12 @@ const CRON_HEALTH_LOCK_TIMEOUT_MS = CRON_HEALTH_STALE_LOCK_MS + 5_000;
 const PI_ERROR_EXCERPT_CHARS = 1000;
 const FAILURE_FALLBACK_ERROR_CHARS = 400;
 export const CRON_DELIVERY_RETRY_DELAYS_MS = [5_000, 30_000] as const;
-export const MINIME_CRON_UNRESOLVED_MARKER = "[[MINIME_CRON_UNRESOLVED_V1]]";
 export type CronTerminalOutcome = "success" | "failure";
 type PiThinkingLevel = NonNullable<AgentConfig["thinking"]>;
 const PI_THINKING_LEVELS = new Set<PiThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh"]);
 export interface CronAgentData {
   id: string;
+  behavioralFoundationRoot?: string;
   workspaceCwd: string;
   model: string;
   systemPrompt?: string;
@@ -97,13 +118,78 @@ export type PiRunResult =
   | { status: "error"; message: string; diagnostics?: string };
 type PiErrorRunResult = Extract<PiRunResult, { status: "error" }>;
 
+interface CronDiagnosticFailureInput {
+  category: CronDiagnosticFailureCategory;
+  kind: "error" | "timeout";
+  summary: string;
+  code?: string;
+  status?: number;
+  signal?: string;
+  errorCode?: number;
+  timeoutMs?: number;
+}
+
+const SAFE_DIAGNOSTIC_CODES = new Set([
+  "EACCES",
+  "EAI_AGAIN",
+  "ECANCELED",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ENOBUFS",
+  "ENOENT",
+  "ENOMEM",
+  "ENOTFOUND",
+  "EPERM",
+  "EPIPE",
+  "ETIMEDOUT",
+]);
+const SAFE_DIAGNOSTIC_SIGNALS = new Set([
+  "SIGABRT",
+  "SIGALRM",
+  "SIGBUS",
+  "SIGCHLD",
+  "SIGCONT",
+  "SIGFPE",
+  "SIGHUP",
+  "SIGILL",
+  "SIGINT",
+  "SIGIO",
+  "SIGKILL",
+  "SIGPIPE",
+  "SIGPROF",
+  "SIGQUIT",
+  "SIGSEGV",
+  "SIGSTOP",
+  "SIGSYS",
+  "SIGTERM",
+  "SIGTRAP",
+  "SIGTSTP",
+  "SIGTTIN",
+  "SIGTTOU",
+  "SIGURG",
+  "SIGUSR1",
+  "SIGUSR2",
+  "SIGVTALRM",
+  "SIGWINCH",
+  "SIGXCPU",
+  "SIGXFSZ",
+]);
+
 class CronRunError extends Error {
   diagnostics?: string;
+  diagnosticFailure: CronDiagnosticFailureInput;
 
-  constructor(message: string, diagnostics?: string) {
+  constructor(
+    message: string,
+    diagnostics: string | undefined,
+    diagnosticFailure: CronDiagnosticFailureInput,
+  ) {
     super(message);
     this.name = "CronRunError";
     this.diagnostics = diagnostics;
+    this.diagnosticFailure = diagnosticFailure;
   }
 }
 
@@ -117,6 +203,88 @@ function cronErrorDiagnostics(err: unknown): string | undefined {
   }
   const diagnostics = (err as { diagnostics?: unknown }).diagnostics;
   return typeof diagnostics === "string" && diagnostics.trim() ? diagnostics : undefined;
+}
+
+function safeDiagnosticCode(value: unknown): string | undefined {
+  return typeof value === "string" && SAFE_DIAGNOSTIC_CODES.has(value)
+    ? value
+    : undefined;
+}
+
+function safeDiagnosticStatus(value: unknown): number | undefined {
+  return typeof value === "number"
+    && Number.isSafeInteger(value)
+    && value >= 0
+    && value <= 65_535
+    ? value
+    : undefined;
+}
+
+function safeDiagnosticSignal(value: unknown): string | undefined {
+  return typeof value === "string" && SAFE_DIAGNOSTIC_SIGNALS.has(value)
+    ? value
+    : undefined;
+}
+
+function safeDiagnosticErrorCode(value: unknown): number | undefined {
+  return typeof value === "number"
+    && Number.isInteger(value)
+    && value >= 100
+    && value <= 999
+    ? value
+    : undefined;
+}
+
+function safeDiagnosticTimeoutMs(value: unknown): number | undefined {
+  return typeof value === "number"
+    && Number.isSafeInteger(value)
+    && value > 0
+    ? value
+    : undefined;
+}
+
+function retainDiagnosticFailure(input: CronDiagnosticFailureInput): CronDiagnosticFailure {
+  return {
+    category: input.category,
+    kind: input.kind,
+    summary: retainCronDiagnosticText(input.summary, CRON_DIAGNOSTIC_SUMMARY_CHARS),
+    ...(input.code === undefined ? {} : { code: input.code }),
+    ...(input.status === undefined ? {} : { status: input.status }),
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
+    ...(input.errorCode === undefined ? {} : { errorCode: input.errorCode }),
+    ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }),
+  };
+}
+
+function genericDiagnosticFields(err: unknown): Pick<
+  CronDiagnosticFailureInput,
+  "code" | "status" | "signal"
+> {
+  const source = typeof err === "object" && err !== null
+    ? err as { code?: unknown; status?: unknown; signal?: unknown }
+    : undefined;
+  const code = safeDiagnosticCode(source?.code);
+  const status = safeDiagnosticStatus(source?.status);
+  const signal = safeDiagnosticSignal(source?.signal);
+  return {
+    ...(code === undefined ? {} : { code }),
+    ...(status === undefined ? {} : { status }),
+    ...(signal === undefined ? {} : { signal }),
+  };
+}
+
+function executionDiagnosticFailure(err: unknown): CronDiagnosticFailure {
+  if (err instanceof CronRunError) {
+    return retainDiagnosticFailure(err.diagnosticFailure);
+  }
+  const fields = genericDiagnosticFields(err);
+  const isTimeout = fields.code === "ETIMEDOUT";
+  return retainDiagnosticFailure({
+    category: isTimeout ? "execution_timeout" : "execution_error",
+    kind: isTimeout ? "timeout" : "error",
+    summary: isTimeout ? "Cron execution timed out" : "Cron execution failed",
+    ...fields,
+  });
 }
 
 export function resolveCronLogDir(): string {
@@ -579,6 +747,10 @@ export interface DeliveryDefaults {
   defaultDeliveryThreadId?: number;
 }
 
+interface CronConfigDefaults extends DeliveryDefaults {
+  workerRoutedAgents?: ReadonlyMap<string, unknown>;
+}
+
 function loadCronTask(taskName: string, cronsPath?: string, defaults?: DeliveryDefaults): CronJob {
   const crons = loadMergedCrons(cronsPath);
   const found = crons.find(
@@ -677,6 +849,7 @@ function isCronPiThinking(value: unknown): value is PiThinkingLevel {
 function resolveCronAgentData(agentId: string, configPath?: string): CronAgentData {
   const workspaceRoot = resolveConfigWorkspaceRoot(configPath);
   const raw = loadRawMergedConfig(configPath) as {
+    behavioralFoundation?: unknown;
     agents?: Record<string, unknown>;
     defaultModel?: unknown;
     defaultFallbackModel?: unknown;
@@ -702,6 +875,9 @@ function resolveCronAgentData(agentId: string, configPath?: string): CronAgentDa
   const defaultModel = typeof raw.defaultModel === "string" ? raw.defaultModel : undefined;
   const knownAgentIds = new Set(Object.keys(raw.agents));
   const agent = validateAgent(rawAgent, agentId, defaultModel, workspaceRoot, knownAgentIds);
+  if (agent.workerRuntime) {
+    throw new Error(`Cron execution is unavailable for worker-routed agent "${agentId}"`);
+  }
   if (!agent.workspaceCwd.trim()) {
     throw new Error(`Agent "${agentId}" missing workspaceCwd`);
   }
@@ -711,6 +887,8 @@ function resolveCronAgentData(agentId: string, configPath?: string): CronAgentDa
     workspaceCwd: agent.workspaceCwd,
     model: normalizePiModel(agent.model),
   };
+  const foundation = validateBehavioralFoundation(raw.behavioralFoundation);
+  if (foundation) result.behavioralFoundationRoot = foundation.root;
   if (agent.systemPrompt !== undefined) {
     result.systemPrompt = agent.systemPrompt;
   }
@@ -731,6 +909,7 @@ function buildPiCronAgentConfigFromData(agent: CronAgentData): AgentConfig {
     provider: "pi",
     model: agent.model,
   };
+  if (agent.behavioralFoundationRoot !== undefined) result.behavioralFoundationRoot = agent.behavioralFoundationRoot;
   if (agent.systemPrompt !== undefined) {
     result.systemPrompt = agent.systemPrompt;
   }
@@ -758,12 +937,20 @@ export function loadAdminChatId(configPath?: string): number | undefined {
   return undefined;
 }
 
-export function loadDefaultDelivery(configPath?: string): DeliveryDefaults {
+export function loadDefaultDelivery(configPath?: string): CronConfigDefaults {
   const raw = loadRawMergedConfig(configPath) as {
     defaultDeliveryChatId?: unknown;
     defaultDeliveryThreadId?: unknown;
+    agents?: Record<string, unknown>;
   };
-  const result: DeliveryDefaults = {};
+  const result: CronConfigDefaults = {};
+  const workerRoutedAgents = new Map<string, unknown>();
+  for (const [id, agent] of Object.entries(raw?.agents ?? {})) {
+    if (agent !== null && typeof agent === "object" && Object.hasOwn(agent, "workerRuntime")) {
+      workerRoutedAgents.set(id, (agent as Record<string, unknown>).workerRuntime);
+    }
+  }
+  if (workerRoutedAgents.size) result.workerRoutedAgents = workerRoutedAgents;
   if (raw?.defaultDeliveryChatId !== undefined) {
     if (typeof raw.defaultDeliveryChatId === "number" && Number.isInteger(raw.defaultDeliveryChatId) && raw.defaultDeliveryChatId !== 0) {
       result.defaultDeliveryChatId = raw.defaultDeliveryChatId;
@@ -853,6 +1040,49 @@ export class DeliveryError extends Error {
     this.code = details.code;
     this.stderrExcerpt = details.stderrExcerpt;
   }
+}
+
+function deliveryDiagnosticFailure(err: unknown): CronDiagnosticFailure {
+  if (err instanceof CronResultPreparationError) {
+    return retainDiagnosticFailure({
+      category: "delivery_preparation",
+      kind: "error",
+      summary: "Cron result preparation failed",
+    });
+  }
+  if (err instanceof DeliveryError) {
+    const code = safeDiagnosticCode(err.code);
+    const status = safeDiagnosticStatus(err.status);
+    const isTimeout = code === "ETIMEDOUT";
+    return retainDiagnosticFailure({
+      category: isTimeout ? "delivery_timeout" : "delivery_subprocess",
+      kind: isTimeout ? "timeout" : "error",
+      summary: isTimeout ? "Cron result delivery timed out" : "Cron result delivery failed",
+      ...(code === undefined ? {} : { code }),
+      ...(status === undefined ? {} : { status }),
+    });
+  }
+  const nativeErrorCode = safeDiagnosticErrorCode(
+    (typeof err === "object" && err !== null
+      ? err as { error_code?: unknown }
+      : undefined)?.error_code,
+  );
+  if (nativeErrorCode !== undefined) {
+    return retainDiagnosticFailure({
+      category: "delivery_api",
+      kind: "error",
+      summary: "Cron result delivery API rejected the request",
+      errorCode: nativeErrorCode,
+    });
+  }
+  const fields = genericDiagnosticFields(err);
+  const isTimeout = fields.code === "ETIMEDOUT";
+  return retainDiagnosticFailure({
+    category: isTimeout ? "delivery_timeout" : "delivery_error",
+    kind: isTimeout ? "timeout" : "error",
+    summary: isTimeout ? "Cron result delivery timed out" : "Cron result delivery failed",
+    ...fields,
+  });
 }
 
 export function isQueueableDeliveryFailure(err: unknown): boolean {
@@ -965,13 +1195,59 @@ function formatScriptFailureDiagnostics(err: ScriptExecFailure): string | undefi
   return details.length > 0 ? details.join("; ") : undefined;
 }
 
+function scriptDiagnosticFailure(
+  err: ScriptExecFailure,
+  timeoutMs: number,
+): CronDiagnosticFailureInput {
+  const code = safeDiagnosticCode(err.code);
+  const status = safeDiagnosticStatus(err.status);
+  const signal = safeDiagnosticSignal(err.signal);
+  const retainedTimeoutMs = safeDiagnosticTimeoutMs(timeoutMs);
+  if (code === "ETIMEDOUT") {
+    return {
+      category: "script_timeout",
+      kind: "timeout",
+      summary: retainedTimeoutMs === undefined
+        ? "Script cron timed out"
+        : `Script cron timed out after ${retainedTimeoutMs}ms`,
+      code,
+      ...(retainedTimeoutMs === undefined ? {} : { timeoutMs: retainedTimeoutMs }),
+      ...(signal === undefined ? {} : { signal }),
+    };
+  }
+  if (signal !== undefined) {
+    return {
+      category: "script_signal",
+      kind: "error",
+      summary: `Script cron exited with signal ${signal}`,
+      signal,
+      ...(code === undefined ? {} : { code }),
+    };
+  }
+  if (status !== undefined) {
+    return {
+      category: "script_exit",
+      kind: "error",
+      summary: `Script cron exited with code ${status}`,
+      status,
+      ...(code === undefined ? {} : { code }),
+    };
+  }
+  return {
+    category: "script_failure",
+    kind: "error",
+    summary: "Script cron failed",
+    ...(code === undefined ? {} : { code }),
+  };
+}
+
 function runScript(cron: CronJob): string {
   if (!cron.command) {
     throw new Error(`Script-mode cron "${cron.name}" has no command`);
   }
   const timeoutMs = cron.timeout ?? DEFAULT_TIMEOUT_MS;
 
-  const env = scrubLegacyRuntimeEnv(process.env);
+  const env = buildCronFastEnv(scrubLegacyRuntimeEnv(process.env));
 
   try {
     const output = execSync(cron.command, {
@@ -990,6 +1266,7 @@ function runScript(cron: CronJob): string {
       throw new CronRunError(
         formatScriptFailureSummary(error, timeoutMs),
         formatScriptFailureDiagnostics(error),
+        scriptDiagnosticFailure(error, timeoutMs),
       );
     }
     throw error;
@@ -1005,14 +1282,6 @@ function scrubLegacyRuntimeEnv(rawEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   }
   delete env.CLAUDECODE;
   return env;
-}
-
-function buildCronSystemInstruction(): string {
-  const today = new Date().toISOString().split("T")[0];
-  return [
-    `Today is ${today}. Respond concisely.`,
-    `If your final report has an unresolved finding, add ${MINIME_CRON_UNRESOLVED_MARKER} as its exact standalone final non-empty line. Do not use this marker otherwise.`,
-  ].join(" ");
 }
 
 export interface LlmCronTerminalResult {
@@ -1106,7 +1375,7 @@ type PiSpawnSync = (
 export interface PiRunDeps {
   spawnSync: PiSpawnSync;
   buildAgentConfig: (cron: CronJob, workspaceCwd: string, agentData?: CronAgentData) => AgentConfig;
-  buildEnv: (agentWorkspaceRoot?: string) => Record<string, string>;
+  buildEnv: (agentWorkspaceRoot?: string, options?: PiSpawnRuntimeEnvOptions) => Record<string, string>;
   assembleContext: typeof assemblePiContext;
   resolveExtensionArgs?: () => string[];
 }
@@ -1152,7 +1421,7 @@ function runPi(
   const validatedWorkspaceCwd = resolveValidatedPiAgentWorkspaceCwd(agent);
   const thinking = isCronPiThinking(agent.thinking) ? agent.thinking : "medium";
   const systemInstruction = buildCronSystemInstruction();
-  const env = hardenPiCronEnv(deps.buildEnv(validatedWorkspaceCwd));
+  const env = buildCronFastEnv(hardenPiCronEnv(deps.buildEnv(validatedWorkspaceCwd, { askCallerAgentId: cron.agentId })));
   env[MINIME_AGENT_WORKSPACE_ROOT_ENV] = validatedWorkspaceCwd;
   // Pi authenticates via ~/.pi/agent/auth.json, not legacy OAuth credentials.
   env.HOME ||= homedir();
@@ -1175,13 +1444,12 @@ function runPi(
       })
       : deps.assembleContext(agent);
     if (context) {
-      if (context.systemPromptPath) {
-        args.push("--system-prompt", context.systemPromptPath);
-      }
-      args.push("--append-system-prompt", context.appendSystemPromptPath);
-      args.push("--no-context-files");
+      args.push(...piContextResourceArgs(context));
+      if (!args.includes("--no-context-files")) args.push("--no-context-files");
+      if (context.behavioralFoundation) env[MINIME_BEHAVIORAL_FOUNDATION_ROOT_ENV] = context.behavioralFoundation.root;
     }
   } catch (err) {
+    if (agent.behavioralFoundationRoot !== undefined) throw err;
     log(cron.name, `Pi context assembly failed; suppressing flat context loading: ${(err as Error).message}`);
     args.push("--no-context-files");
   }
@@ -1200,12 +1468,52 @@ function runPi(
 
   if (result.error) {
     const spawnError = piErrorResult(`Pi cron spawn failed: ${result.error.message}`, result.stdout, result.stderr);
-    throw new CronRunError(spawnError.message, spawnError.diagnostics);
+    const code = safeDiagnosticCode((result.error as NodeJS.ErrnoException).code);
+    const signal = safeDiagnosticSignal(result.signal);
+    const timeoutMs = safeDiagnosticTimeoutMs(cron.timeout ?? DEFAULT_TIMEOUT_MS);
+    const isTimeout = code === "ETIMEDOUT";
+    throw new CronRunError(spawnError.message, spawnError.diagnostics, {
+      category: isTimeout ? "pi_timeout" : "pi_spawn",
+      kind: isTimeout ? "timeout" : "error",
+      summary: isTimeout
+        ? timeoutMs === undefined
+          ? "Pi cron timed out"
+          : `Pi cron timed out after ${timeoutMs}ms`
+        : "Pi cron spawn failed",
+      ...(code === undefined ? {} : { code }),
+      ...(signal === undefined ? {} : { signal }),
+      ...(!isTimeout || timeoutMs === undefined ? {} : { timeoutMs }),
+    });
   }
 
   const classified = classifyPiResult(result.status, result.signal, result.stdout, result.stderr);
   if (classified.status === "error") {
-    throw new CronRunError(classified.message, classified.diagnostics);
+    const signal = safeDiagnosticSignal(result.signal);
+    const status = safeDiagnosticStatus(result.status);
+    const diagnosticFailure: CronDiagnosticFailureInput = result.signal
+      ? {
+          category: "pi_signal",
+          kind: "error",
+          summary: signal === undefined
+            ? "Pi cron exited by signal"
+            : `Pi cron exited with signal ${signal}`,
+          ...(signal === undefined ? {} : { signal }),
+        }
+      : result.status !== 0
+        ? {
+            category: "pi_exit",
+            kind: "error",
+            summary: status === undefined
+              ? "Pi cron exited without a valid exit code"
+              : `Pi cron exited with code ${status}`,
+            ...(status === undefined ? {} : { status }),
+          }
+        : {
+            category: "pi_output_error",
+            kind: "error",
+            summary: "Pi cron produced invalid process output",
+          };
+    throw new CronRunError(classified.message, classified.diagnostics, diagnosticFailure);
   }
   return classified.output;
 }
@@ -1238,12 +1546,57 @@ function runOneShot(
   return deps.runPi(cron, workspaceCwd, agentData);
 }
 
+async function runWorkerCron(
+  cron: CronJob,
+  route: NonNullable<AgentConfig["workerRuntime"]>,
+  log: (name: string, message: string) => void,
+): Promise<string> {
+  resolveCronEngine(cron);
+  if (!cron.prompt?.trim()) throw new Error("Worker cron requires a nonempty prompt");
+  const requestId = randomUUID();
+  const laneId = `cron-${requestId}`;
+  log(cron.name, `Worker invocation lane=${laneId}`);
+
+  let client: AgentRuntimeClient;
+  try {
+    client = await AgentRuntimeClient.connect(route.socketPath, undefined, route);
+  } catch {
+    throw new AgentRuntimeError("connection_failed", "Could not connect to the scheduled worker. No prompt was submitted.");
+  }
+  try {
+    const opened = await client.open(laneId, undefined, cron.agentId);
+    const { handle } = opened;
+    if (opened.phase !== "ready" || handle.laneId !== laneId || handle.agentId !== cron.agentId || opened.request) {
+      throw new AgentRuntimeError("binding_conflict", "The worker did not open a fresh scheduled lane");
+    }
+    let result: ResultMessage | undefined;
+    const timeout = Math.min(Math.ceil(cron.timeout ?? AGENT_RUNTIME_CLIENT_PROMPT_TIMEOUT_MS), AGENT_RUNTIME_CLIENT_PROMPT_TIMEOUT_MS);
+    const finished = await client.prompt(handle, requestId, cron.prompt, event => {
+      if (event.type === "result") result = event;
+    }, timeout).completed;
+    if (!isDeepStrictEqual(finished.handle, handle) || finished.request?.requestId !== requestId
+      || finished.request.outcome !== "settled" || !result) {
+      throw new AgentRuntimeUncertainError();
+    }
+    try {
+      const closed = await client.close(handle);
+      if (closed.phase !== "closed" || !isDeepStrictEqual(closed.handle, handle)) throw new AgentRuntimeUncertainError();
+    } catch {
+      throw new AgentRuntimeError("cleanup_unconfirmed", "The scheduled worker finished, but lane cleanup could not be confirmed");
+    }
+    if (result.is_error === true) throw new AgentRuntimeError("worker_prompt_failed", "The scheduled worker reported a Pi execution failure");
+    return result.result;
+  } finally {
+    client.disconnect();
+  }
+}
+
 export interface CronRunnerMainDeps {
   argv: string[];
   consoleError: (message?: unknown, ...optionalParams: unknown[]) => void;
   exit: (code: number) => never;
   log: (taskName: string, msg: string) => void;
-  loadDefaultDelivery: (configPath?: string) => DeliveryDefaults;
+  loadDefaultDelivery: (configPath?: string) => CronConfigDefaults;
   loadCronTask: (taskName: string, cronsPath?: string, defaults?: DeliveryDefaults) => CronJob;
   loadAdminChatId: (configPath?: string) => number | undefined;
   resolveCronAgentData: (agentId: string, configPath?: string) => CronAgentData;
@@ -1268,6 +1621,8 @@ export interface CronRunnerMainDeps {
     exitCode: number,
     outcome: CronTerminalOutcome,
   ) => void;
+  writeCronDiagnosticEvent: (event: CronDiagnosticEvent) => void;
+  warnCronDiagnosticFailure: () => void;
 }
 
 const defaultMainDeps: Omit<CronRunnerMainDeps, "argv"> = {
@@ -1287,6 +1642,10 @@ const defaultMainDeps: Omit<CronRunnerMainDeps, "argv"> = {
   clearCronOutboxRecord,
   handleDeliveryFailure,
   writeCronHealthMetric,
+  writeCronDiagnosticEvent,
+  warnCronDiagnosticFailure: () => {
+    process.stderr.write("[cron-runner] WARN: cron diagnostics unavailable\n");
+  },
 };
 
 async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> {
@@ -1295,14 +1654,41 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     argv: process.argv,
     ...overrides,
   };
+  let diagnosticWarningWritten = false;
+  let diagnosticCron = "unknown";
+  let diagnosticCronType: CronDiagnosticCronType = "unknown";
+  let diagnosticRunId = `unknown@${new Date().toISOString()}#${process.pid}`;
+  const emitDiagnostic = (
+    eventOrBuild: CronDiagnosticEventPayload | (() => CronDiagnosticEventPayload),
+  ): void => {
+    try {
+      const event = typeof eventOrBuild === "function" ? eventOrBuild() : eventOrBuild;
+      deps.writeCronDiagnosticEvent({
+        ...event,
+        cron: diagnosticCron,
+        cronType: diagnosticCronType,
+        runId: diagnosticRunId,
+      } as CronDiagnosticEvent);
+    } catch {
+      if (diagnosticWarningWritten) return;
+      diagnosticWarningWritten = true;
+      try {
+        deps.warnCronDiagnosticFailure();
+      } catch {
+        // Diagnostics and their warning are observational only.
+      }
+    }
+  };
   let terminalFinalized = false;
   const finalizeInvocation = (
     cronName: string,
     outcome: CronTerminalOutcome,
+    disposition: Extract<CronDiagnosticEvent, { event: "run_terminal" }>["disposition"],
   ): void => {
     if (terminalFinalized) {
       throw new Error(`Cron invocation "${cronName}" was finalized more than once`);
     }
+    emitDiagnostic({ event: "run_terminal", outcome, disposition });
     deps.writeCronHealthMetric(cronName, outcome === "success" ? 0 : 1, outcome);
     terminalFinalized = true;
   };
@@ -1314,33 +1700,49 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     } catch {
       // Usage reporting is best-effort; the terminal failure still must publish.
     }
-    finalizeInvocation("unknown", "failure");
+    emitDiagnostic({ event: "run_started" });
+    finalizeInvocation("unknown", "failure", "usage_error");
     deps.exit(1);
   }
   const taskName = deps.argv[taskIdx + 1];
   const runId = `${taskName}@${new Date().toISOString()}#${process.pid}`;
+  diagnosticCron = taskName;
+  diagnosticRunId = runId;
 
   const deliverWithRetry = async (
     chatId: number,
     payload: string,
     threadId?: number,
   ): Promise<void> => {
-    try {
-      await deps.deliver(chatId, payload, threadId, { purpose: "result" });
-      return;
-    } catch (initialError) {
-      let lastError: unknown = initialError;
-      for (const delayMs of CRON_DELIVERY_RETRY_DELAYS_MS) {
-        await deps.sleep(delayMs);
-        try {
-          await deps.deliver(chatId, payload, threadId, { purpose: "result" });
-          return;
-        } catch (retryError) {
-          lastError = retryError;
-        }
+    let attempt = 1;
+    let lastError: unknown;
+    while (true) {
+      try {
+        await deps.deliver(chatId, payload, threadId, { purpose: "result" });
+        emitDiagnostic({
+          event: "delivery_attempt",
+          delivery: "fresh",
+          attempt,
+          outcome: "success",
+        });
+        return;
+      } catch (error) {
+        lastError = error;
+        emitDiagnostic(() => ({
+          event: "delivery_attempt",
+          delivery: "fresh",
+          attempt,
+          outcome: "failure",
+          queueable: isQueueableDeliveryFailure(error),
+          failure: deliveryDiagnosticFailure(error),
+        }));
       }
-      throw lastError;
+      const delayMs = CRON_DELIVERY_RETRY_DELAYS_MS[attempt - 1];
+      if (delayMs === undefined) break;
+      await deps.sleep(delayMs);
+      attempt += 1;
     }
+    throw lastError;
   };
 
   const queueOutputIfEmpty = (
@@ -1351,10 +1753,14 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     try {
       if (deps.readCronOutboxRecord(taskName) !== undefined) {
         deps.log(taskName, "OUTBOX QUEUE-SKIPPED pending-existing");
+        const disposition = "fresh_queue_skipped_existing";
+        emitDiagnostic({ event: "disposition", disposition });
         return;
       }
     } catch {
       deps.log(taskName, "OUTBOX QUEUE-SKIPPED pending-existing");
+      const disposition = "fresh_queue_skipped_unreadable";
+      emitDiagnostic({ event: "disposition", disposition });
       return;
     }
 
@@ -1371,14 +1777,16 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
         attempts: 0,
       });
       deps.log(taskName, `OUTBOX QUEUED runId=${runId} kind=output`);
+      emitDiagnostic({ event: "disposition", disposition: "fresh_queued" });
     } catch (err) {
       deps.log(taskName, `OUTBOX QUEUE-WRITE-FAILED: ${errorFromUnknown(err).message}`);
+      emitDiagnostic({ event: "disposition", disposition: "fresh_queue_write_failed" });
     }
   };
 
   deps.log(taskName, `Starting cron task: ${taskName}`);
 
-  let defaults: DeliveryDefaults = {};
+  let defaults: CronConfigDefaults = {};
   try {
     defaults = deps.loadDefaultDelivery();
   } catch (err) {
@@ -1386,16 +1794,27 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
   }
 
   let cron: CronJob;
+  let workerRoute: AgentConfig["workerRuntime"];
   try {
     cron = deps.loadCronTask(taskName, undefined, defaults);
+    if (defaults.workerRoutedAgents?.has(cron.agentId)) {
+      if (cron.type === "llm") {
+        workerRoute = validateWorkerRuntime(defaults.workerRoutedAgents.get(cron.agentId), cron.agentId);
+      }
+      if (!workerRoute?.scheduledLlm) {
+        throw new Error(`Cron execution is unavailable for worker-routed agent "${cron.agentId}"`);
+      }
+    }
   } catch (err) {
     try {
       deps.log(taskName, `FAIL: ${(err as Error).message}`);
     } finally {
-      finalizeInvocation(taskName, "failure");
+      finalizeInvocation(taskName, "failure", "configuration_failed");
     }
     deps.exit(1);
   }
+  diagnosticCronType = cron.type;
+  emitDiagnostic({ event: "run_started" });
 
   let adminChatId: number | undefined;
   try {
@@ -1433,6 +1852,7 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     pendingRecord = deps.readCronOutboxRecord(taskName);
   } catch (err) {
     deps.log(taskName, `OUTBOX STATE-READ-FAILED: ${errorFromUnknown(err).message}`);
+    emitDiagnostic({ event: "disposition", disposition: "replay_state_failed" });
     // No logical cron execution started, so this outbox preflight failure must
     // not increment terminal logical-run counters.
     deps.exit(1);
@@ -1450,12 +1870,22 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
         taskName,
         `OUTBOX CLEAR-FAILED legacy-failure-notice runId=${pendingRecord.runId}: ${errorFromUnknown(err).message}`,
       );
+      emitDiagnostic({
+        event: "disposition",
+        disposition: "replay_clear_failed",
+        originalRunId: pendingRecord.runId,
+      });
       deps.exit(1);
     }
     deps.log(
       taskName,
       `OUTBOX DROPPED legacy-failure-notice runId=${pendingRecord.runId}`,
     );
+    emitDiagnostic({
+      event: "disposition",
+      disposition: "replay_dropped_legacy",
+      originalRunId: pendingRecord.runId,
+    });
     pendingRecord = undefined;
   }
 
@@ -1466,9 +1896,19 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
       deps.clearCronOutboxRecord(taskName);
     } catch (err) {
       deps.log(taskName, `OUTBOX CLEAR-FAILED expired runId=${pendingRecord.runId}: ${errorFromUnknown(err).message}`);
+      emitDiagnostic({
+        event: "disposition",
+        disposition: "replay_clear_failed",
+        originalRunId: pendingRecord.runId,
+      });
       deps.exit(1);
     }
     deps.log(taskName, `OUTBOX DROPPED expired runId=${pendingRecord.runId}`);
+    emitDiagnostic({
+      event: "disposition",
+      disposition: "replay_dropped_expired",
+      originalRunId: pendingRecord.runId,
+    });
     pendingRecord = undefined;
   }
 
@@ -1476,8 +1916,10 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     try {
       deps.clearCronOutboxRecord(taskName);
       deps.log(taskName, "OUTBOX TERMINAL corrupt");
+      emitDiagnostic({ event: "disposition", disposition: "replay_dropped_corrupt" });
     } catch (err) {
       deps.log(taskName, `OUTBOX CLEAR-FAILED corrupt: ${errorFromUnknown(err).message}`);
+      emitDiagnostic({ event: "disposition", disposition: "replay_clear_failed" });
       deps.exit(1);
     }
   } else if (pendingRecord !== undefined) {
@@ -1486,8 +1928,24 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     const deliveryAttempt: { ok: true } | { ok: false; error: unknown } = await (async () => {
       try {
         await deps.deliver(pendingRecord.chatId, pendingRecord.payload, pendingRecord.threadId, { purpose: "result" });
+        emitDiagnostic({
+          event: "delivery_attempt",
+          delivery: "replay",
+          attempt: pendingRecord.attempts + 1,
+          originalRunId: pendingRecord.runId,
+          outcome: "success",
+        });
         return { ok: true };
       } catch (error) {
+        emitDiagnostic(() => ({
+          event: "delivery_attempt",
+          delivery: "replay",
+          attempt: pendingRecord.attempts + 1,
+          originalRunId: pendingRecord.runId,
+          outcome: "failure",
+          queueable: isQueueableDeliveryFailure(error),
+          failure: deliveryDiagnosticFailure(error),
+        }));
         return { ok: false, error };
       }
     })();
@@ -1506,12 +1964,22 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
             taskName,
             `OUTBOX RETRY-WRITE-FAILED runId=${pendingRecord.runId}: ${errorFromUnknown(writeError).message}`,
           );
+          emitDiagnostic({
+            event: "disposition",
+            disposition: "replay_write_failed",
+            originalRunId: pendingRecord.runId,
+          });
           deps.exit(1);
         }
         deps.log(
           taskName,
           `OUTBOX RETRY-DEFERRED runId=${pendingRecord.runId} attempts=${updatedRecord.attempts}`,
         );
+        emitDiagnostic({
+          event: "disposition",
+          disposition: "replay_deferred",
+          originalRunId: pendingRecord.runId,
+        });
         // This invocation only retried delivery owed by an earlier logical
         // run. It exits without generating or counting a new logical run.
         deps.exit(1);
@@ -1523,12 +1991,22 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
           taskName,
           `OUTBOX CLEAR-FAILED runId=${pendingRecord.runId}: ${errorFromUnknown(clearError).message}`,
         );
+        emitDiagnostic({
+          event: "disposition",
+          disposition: "replay_clear_failed",
+          originalRunId: pendingRecord.runId,
+        });
         deps.exit(1);
       }
       deps.log(
         taskName,
         `OUTBOX TERMINAL deterministic runId=${pendingRecord.runId} attempts=${pendingRecord.attempts}`,
       );
+      emitDiagnostic({
+        event: "disposition",
+        disposition: "replay_terminal",
+        originalRunId: pendingRecord.runId,
+      });
       await notifyAdminOfTerminalOutbox(pendingRecord, "deterministic");
     } else {
       try {
@@ -1538,12 +2016,22 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
           taskName,
           `OUTBOX CLEAR-FAILED runId=${pendingRecord.runId}: ${errorFromUnknown(err).message}`,
         );
+        emitDiagnostic({
+          event: "disposition",
+          disposition: "replay_clear_failed",
+          originalRunId: pendingRecord.runId,
+        });
         deps.exit(1);
       }
       deps.log(
         taskName,
         `OUTBOX REDELIVERED runId=${pendingRecord.runId} attempts=${pendingRecord.attempts}`,
       );
+      emitDiagnostic({
+        event: "disposition",
+        disposition: "replay_delivered",
+        originalRunId: pendingRecord.runId,
+      });
     }
   }
 
@@ -1554,23 +2042,32 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
       output = deps.runScript(cron);
       deps.log(taskName, `Script returned ${output.length} chars`);
     } else {
-      const cronAgentData = deps.resolveCronAgentData(cron.agentId);
-      const workspaceCwd = cronAgentData.workspaceCwd;
-      output = runOneShot(
-        cron,
-        workspaceCwd,
-        { runPi: deps.runPi },
-        cronAgentData,
-      );
+      if (workerRoute) {
+        output = await runWorkerCron(cron, workerRoute, deps.log);
+      } else {
+        const cronAgentData = deps.resolveCronAgentData(cron.agentId);
+        output = runOneShot(cron, cronAgentData.workspaceCwd, { runPi: deps.runPi }, cronAgentData);
+      }
       deps.log(taskName, `Pi returned ${output.length} chars`);
       const classified = classifyLlmCronTerminalResult(output);
       output = classified.output.trim();
       terminalOutcome = classified.outcome;
     }
+    emitDiagnostic(() => ({
+      event: "execution_result",
+      outcome: terminalOutcome,
+      detail: terminalOutcome === "failure" ? "logical_failure" : "completed",
+      output: retainCronDiagnosticText(output, CRON_DIAGNOSTIC_OUTPUT_CHARS),
+    }));
   } catch (err) {
     const error = errorFromUnknown(err);
     const errMsg = `Cron task "${taskName}" failed: ${error.message}`;
     const diagnostics = cronErrorDiagnostics(err);
+    emitDiagnostic(() => ({
+      event: "execution_failure",
+      outcome: "failure",
+      failure: executionDiagnosticFailure(err),
+    }));
     try {
       try {
         deps.log(taskName, `FAIL: ${errMsg}`);
@@ -1580,13 +2077,14 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
         }
       }
     } finally {
-      finalizeInvocation(taskName, "failure");
+      finalizeInvocation(taskName, "failure", "execution_failed");
     }
     deps.exit(1);
   }
 
   if (!output) {
-    finalizeInvocation(taskName, terminalOutcome);
+    emitDiagnostic({ event: "disposition", disposition: "empty_output" });
+    finalizeInvocation(taskName, terminalOutcome, "empty_output");
     deps.log(taskName, "WARN: empty output — skipping delivery");
     if (terminalOutcome === "failure") {
       deps.exit(1);
@@ -1595,7 +2093,8 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
     return;
   }
   if (cron.type === "llm" && shouldSuppressNoReply(output)) {
-    finalizeInvocation(taskName, terminalOutcome);
+    emitDiagnostic({ event: "disposition", disposition: "no_reply" });
+    finalizeInvocation(taskName, terminalOutcome, "no_reply");
     deps.log(taskName, "NO_REPLY — skipping delivery");
     if (terminalOutcome === "failure") {
       deps.exit(1);
@@ -1617,12 +2116,13 @@ async function main(overrides: Partial<CronRunnerMainDeps> = {}): Promise<void> 
         deps.handleDeliveryFailure(taskName, cron.deliveryChatId, (err as Error).message, adminChatId);
       }
     } finally {
-      finalizeInvocation(taskName, "failure");
+      finalizeInvocation(taskName, "failure", "delivery_failed");
     }
     deps.exit(1);
   }
 
-  finalizeInvocation(taskName, terminalOutcome);
+  emitDiagnostic({ event: "disposition", disposition: "delivered" });
+  finalizeInvocation(taskName, terminalOutcome, "delivered");
   deps.log(taskName, `Delivered to chat ${cron.deliveryChatId}${cron.deliveryThreadId ? ` thread ${cron.deliveryThreadId}` : ""}`);
   if (terminalOutcome === "failure") {
     deps.exit(1);

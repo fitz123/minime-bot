@@ -14,6 +14,8 @@ export interface AskAgentConfig {
 
 export interface AgentConfig {
   id: string;
+  /** Resolved deployment input, injected for every agent; not a per-agent setting. */
+  behavioralFoundationRoot?: string;
   /** Resolved agent workspace root used as the Pi session cwd and context source. */
   workspaceCwd: string;
   model: string;
@@ -25,6 +27,9 @@ export interface AgentConfig {
    */
   provider?: "pi";
   askAgent?: AskAgentConfig;
+  workerRuntime?: { socketPath: string; workerUid: number; controllerName: string; scheduledLlm?: boolean };
+  /** Explicit eligibility only; preferences start off and live in control data. */
+  codexFast?: { provider: "openai-codex"; model: string };
 }
 
 export interface TopicOverride {
@@ -131,6 +136,8 @@ export interface BoundSessionState extends SessionStateBase {
   sessionFile: string;
   workspaceRealpath: string;
   pendingRecoveryNotice?: PendingSessionRecoveryNotice;
+  /** This lane explicitly returned to the controller after an operator rollback. */
+  workerRollback?: true;
   failedSessionId?: never;
   legacyFailure?: never;
 }
@@ -152,7 +159,18 @@ export interface UnresolvedLegacySessionState extends SessionStateBase {
   pendingRecoveryNotice?: never;
 }
 
-export type SessionState = BoundSessionState | UnresolvedLegacySessionState;
+export interface WorkerSessionState extends SessionStateBase {
+  bindingState: "worker";
+  sessionId: string;
+  adoption?: { local: BoundSessionState; digest: string; routeDigest: string };
+  sessionFile?: never;
+  workspaceRealpath?: never;
+  pendingRecoveryNotice?: never;
+  failedSessionId?: never;
+  legacyFailure?: never;
+}
+
+export type SessionState = BoundSessionState | UnresolvedLegacySessionState | WorkerSessionState;
 
 export interface SessionDefaults {
   idleTimeoutMs: number;
@@ -164,6 +182,7 @@ export interface SessionDefaults {
 
 export interface BotConfig {
   telegramToken?: string;
+  behavioralFoundation?: { root: string };
   agents: Record<string, AgentConfig>;
   bindings: TelegramBinding[];
   sessionDefaults: SessionDefaults;
@@ -171,6 +190,8 @@ export interface BotConfig {
   piExtraExtensions?: string[];
   /** Opt-in same-host collaboration; this bot owns the socket. Restart to change. */
   collaboration?: { socketPath: string };
+  /** Opt-in cosmetic presentation for authorized private Telegram topics. Restart to change. */
+  privateTopics?: { enabled: boolean; maxNameGraphemes: number };
   logLevel?: LogLevel;
   metricsPort?: number;
   metricsHost?: string;

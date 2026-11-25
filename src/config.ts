@@ -1,6 +1,6 @@
 import { readFileSync, existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { resolve, dirname, isAbsolute } from "node:path";
+import { resolve, dirname, isAbsolute, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import type { BotConfig, AgentConfig, AskAgentConfig, TelegramBinding, TopicOverride, SessionDefaults, DiscordBinding, DiscordChannelOverride, DiscordConfig, TriggerInputConfig } from "./types.js";
@@ -19,7 +19,7 @@ const ASK_AGENT_WILDCARD = "*";
 
 export type AskAgentPolicyDecision =
   | { allowed: true }
-  | { allowed: false; code: "not_enabled" | "denied"; reason: string };
+  | { allowed: false; code: "not_enabled" | "denied" | "unsupported_runtime"; reason: string };
 
 function askAgentListMatches(list: readonly string[] | undefined, agentId: string): boolean {
   return list?.includes(ASK_AGENT_WILDCARD) === true || list?.includes(agentId) === true;
@@ -29,6 +29,9 @@ export function resolveAskAgentPolicy(
   caller: AgentConfig,
   target: AgentConfig,
 ): AskAgentPolicyDecision {
+  if (caller.workerRuntime || target.workerRuntime) {
+    return { allowed: false, code: "unsupported_runtime", reason: "Ask-agent is unavailable for worker-routed agents" };
+  }
   if (caller.askAgent?.enabled !== true) {
     return {
       allowed: false,
@@ -148,7 +151,13 @@ function validateInstanceOverlay(raw: unknown): Record<string, unknown> {
       }
       continue;
     }
-    if (key === "triggerInput" || key === "collaboration") {
+    if (key === "triggerInput" || key === "collaboration" || key === "privateTopics") {
+      continue;
+    }
+    if (key === "behavioralFoundation") {
+      if (!isConfigRecord(value) || Object.keys(value).some(k => k !== "root")) {
+        rejectInstancePath("behavioralFoundation");
+      }
       continue;
     }
     if (key === "discord") {
@@ -282,6 +291,13 @@ function mergeInstanceConfig(
   canonical: Record<string, unknown>,
   instance: Record<string, unknown>,
 ): Record<string, unknown> {
+  if (Object.hasOwn(instance, "behavioralFoundation")) {
+    const proposed = validateBehavioralFoundation(instance.behavioralFoundation);
+    const original = validateBehavioralFoundation(canonical.behavioralFoundation);
+    if (!proposed || !original || proposed.root !== original.root) {
+      throw new Error("Instance config cannot unset or replace canonical behavioralFoundation.root");
+    }
+  }
   requireAbsoluteCanonicalAgentWorkspaces(canonical);
   const withBindingIdentity = applyBindingIdentityOverrides(
     canonical,
@@ -310,13 +326,16 @@ function mergeInstanceConfig(
 export function loadRawMergedConfig(
   configPath?: string,
   instanceConfigPath?: string,
+  checkRootTypes = false,
 ): Record<string, unknown> {
   const path = resolveConfigPath(configPath);
   const base = (parseYaml(readFileSync(path, "utf8")) as Record<string, unknown>) ?? {};
+  if (checkRootTypes && !isConfigRecord(base)) throw new Error("Config must be an object");
   const localPath = deriveLocalConfigPath(path);
   let canonical = base;
   if (existsSync(localPath)) {
     const local = (parseYaml(readFileSync(localPath, "utf8")) as Record<string, unknown>) ?? {};
+    if (checkRootTypes && !isConfigRecord(local)) throw new Error("Local config must be an object");
     canonical = mergeDeep(base, local);
   }
   const resolvedInstanceConfigPath = instanceConfigPath
@@ -330,6 +349,7 @@ export function loadRawMergedConfig(
 }
 
 interface RawConfig {
+  behavioralFoundation?: unknown;
   secrets?: {
     sopsFile?: string;
   };
@@ -340,6 +360,7 @@ interface RawConfig {
   sessionDefaults?: unknown;
   piExtraExtensions?: unknown;
   collaboration?: unknown;
+  privateTopics?: unknown;
   logLevel?: string;
   metricsPort?: number;
   metricsHost?: string;
@@ -359,6 +380,8 @@ interface RawConfig {
 
 interface LoadConfigOptions {
   resolveSecrets?: boolean;
+  /** Explicit reload validates group edits and resolves the Telegram credential alone. */
+  telegramBindingReload?: boolean;
   secretExecFileSync?: ExecFileSyncLike;
   workspaceRoot?: string;
   instanceConfigPath?: string;
@@ -433,6 +456,25 @@ function validateAskAgentConfig(
   };
 }
 
+export function validateWorkerRuntime(worker: unknown, id: string): NonNullable<AgentConfig["workerRuntime"]> {
+  if (!isConfigRecord(worker)
+    || Object.keys(worker).some(key => !["socketPath", "workerUid", "controllerName", "scheduledLlm"].includes(key))
+    || typeof worker.socketPath !== "string" || !isAbsolute(worker.socketPath)
+    || normalize(worker.socketPath) !== worker.socketPath || /[\u0000-\u001f\u007f]/u.test(worker.socketPath)
+    || Buffer.byteLength(worker.socketPath) >= 104
+    || typeof worker.workerUid !== "number" || !Number.isSafeInteger(worker.workerUid)
+    || worker.workerUid <= 0 || worker.workerUid === process.getuid?.()
+    || typeof worker.controllerName !== "string" || !/^[a-zA-Z_][a-zA-Z0-9_.-]*$/.test(worker.controllerName)
+    || !/^[a-zA-Z0-9_-]{1,80}$/.test(id)) {
+    throw new Error(`Agent "${id}" workerRuntime requires a canonical socketPath, a distinct nonroot workerUid, and a controllerName`);
+  }
+  if (worker.scheduledLlm !== undefined && typeof worker.scheduledLlm !== "boolean") {
+    throw new Error(`Agent "${id}" workerRuntime.scheduledLlm must be a boolean`);
+  }
+  return { socketPath: worker.socketPath, workerUid: worker.workerUid, controllerName: worker.controllerName,
+    ...(worker.scheduledLlm === undefined ? {} : { scheduledLlm: worker.scheduledLlm }) };
+}
+
 export function validateAgent(
   raw: unknown,
   id: string,
@@ -445,6 +487,10 @@ export function validateAgent(
   }
   const obj = raw as Record<string, unknown>;
   const askAgent = validateAskAgentConfig(obj.askAgent, id, knownAgentIds);
+  const workerRuntime = obj.workerRuntime === undefined ? undefined : validateWorkerRuntime(obj.workerRuntime, id);
+  if (Object.hasOwn(obj, "behavioralFoundation") || Object.hasOwn(obj, "behavioralFoundationRoot")) {
+    throw new Error(`Agent "${id}": behavioralFoundation.root is deployment-global, not a per-agent setting`);
+  }
   if (typeof obj.workspaceCwd !== "string") {
     throw new Error(`Agent "${id}" missing workspaceCwd`);
   }
@@ -469,6 +515,18 @@ export function validateAgent(
     throw new Error(`Agent "${id}" missing model (Pi agents must set an explicit model${defaultHint})`);
   }
   const model = obj.model;
+  let codexFast: AgentConfig["codexFast"];
+  if (obj.codexFast !== undefined) {
+    const fast = obj.codexFast;
+    if (!isConfigRecord(fast) || Object.keys(fast).some(key => !["provider", "model"].includes(key)) ||
+        fast.provider !== "openai-codex" || typeof fast.model !== "string" ||
+        !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(fast.model) ||
+        (model.includes("/") ? model : `openai-codex/${model}`) !== `openai-codex/${fast.model}`) {
+      throw new Error(`Agent "${id}" codexFast must pin its exact openai-codex provider/model`);
+    }
+    codexFast = { provider: "openai-codex", model: fast.model };
+  }
+
   if (obj.fallbackModel !== undefined) {
     throw new Error(
       `Agent "${id}" uses fallbackModel, but fallback models were removed with the Claude runtime; remove fallbackModel`,
@@ -507,10 +565,12 @@ export function validateAgent(
     thinking: obj.thinking as AgentConfig["thinking"] | undefined,
     provider: "pi",
     askAgent,
+    codexFast,
+    ...(workerRuntime ? { workerRuntime } : {}),
   };
 }
 
-function validateBinding(raw: unknown, index: number): TelegramBinding {
+function validateBinding(raw: unknown, index: number, telegramBindingReload = false): TelegramBinding {
   if (typeof raw !== "object" || raw === null) {
     throw new Error(`Binding[${index}] must be an object`);
   }
@@ -531,6 +591,18 @@ function validateBinding(raw: unknown, index: number): TelegramBinding {
   if (obj.topicId !== undefined && obj.topics !== undefined) {
     throw new Error(`Binding[${index}] cannot have both topicId and topics`);
   }
+  const strictGroup = telegramBindingReload && kind === "group";
+  if (strictGroup) {
+    if (!Number.isSafeInteger(obj.chatId) || obj.chatId >= 0) {
+      throw new Error(`Binding[${index}].chatId must be a negative safe integer for a Telegram group`);
+    }
+    if (obj.topicId !== undefined && (!Number.isSafeInteger(obj.topicId) || (obj.topicId as number) < 0)) {
+      throw new Error(`Binding[${index}].topicId must be a non-negative safe integer`);
+    }
+    if (obj.requireMention !== undefined && typeof obj.requireMention !== "boolean") {
+      throw new Error(`Binding[${index}].requireMention must be a boolean`);
+    }
+  }
   return {
     chatId: obj.chatId,
     agentId: obj.agentId,
@@ -538,13 +610,13 @@ function validateBinding(raw: unknown, index: number): TelegramBinding {
     topicId: typeof obj.topicId === "number" ? obj.topicId : undefined,
     label: typeof obj.label === "string" ? obj.label : undefined,
     requireMention: typeof obj.requireMention === "boolean" ? obj.requireMention : undefined,
-    topics: validateTopics(obj.topics, index),
+    topics: validateTopics(obj.topics, index, strictGroup),
     voiceTranscriptEcho: typeof obj.voiceTranscriptEcho === "boolean" ? obj.voiceTranscriptEcho : undefined,
     typingIndicator: typeof obj.typingIndicator === "boolean" ? obj.typingIndicator : undefined,
   };
 }
 
-function validateTopics(raw: unknown, bindingIndex: number): TopicOverride[] | undefined {
+function validateTopics(raw: unknown, bindingIndex: number, strictGroup: boolean): TopicOverride[] | undefined {
   if (raw === undefined || raw === null) return undefined;
   if (!Array.isArray(raw)) {
     throw new Error(`Binding[${bindingIndex}].topics must be an array`);
@@ -554,8 +626,20 @@ function validateTopics(raw: unknown, bindingIndex: number): TopicOverride[] | u
       throw new Error(`Binding[${bindingIndex}].topics[${i}] must be an object`);
     }
     const obj = t as Record<string, unknown>;
+    const path = `Binding[${bindingIndex}].topics[${i}]`;
     if (typeof obj.topicId !== "number") {
-      throw new Error(`Binding[${bindingIndex}].topics[${i}] missing topicId (number)`);
+      throw new Error(`${path} missing topicId (number)`);
+    }
+    if (strictGroup) {
+      if (!Number.isSafeInteger(obj.topicId) || obj.topicId < 0) {
+        throw new Error(`${path}.topicId must be a non-negative safe integer`);
+      }
+      if (obj.agentId !== undefined && (typeof obj.agentId !== "string" || !obj.agentId)) {
+        throw new Error(`${path}.agentId must be a non-empty string`);
+      }
+      if (obj.requireMention !== undefined && typeof obj.requireMention !== "boolean") {
+        throw new Error(`${path}.requireMention must be a boolean`);
+      }
     }
     return {
       topicId: obj.topicId,
@@ -811,6 +895,7 @@ const TRIGGER_INPUT_KEYS = new Set([
 function validateTriggerInput(
   raw: unknown,
   bindings: TelegramBinding[],
+  agents: BotConfig["agents"],
   telegramToken: string | undefined,
   sopsFile: string | undefined,
   options: LoadConfigOptions,
@@ -871,9 +956,11 @@ function validateTriggerInput(
   if (!telegramToken) {
     throw new Error("triggerInput requires a resolved Telegram token");
   }
-  if (!resolveBinding(chatId, bindings, threadId)) {
+  const binding = resolveBinding(chatId, bindings, threadId);
+  if (!binding) {
     throw new Error("triggerInput chatId/threadId does not match a configured Telegram binding");
   }
+  if (agents[binding.agentId]?.workerRuntime) throw new Error("Trigger input cannot target a worker-routed agent");
 
   const bearer = options.resolveSecrets === false
     ? CONFIGURED_SECRET_PLACEHOLDER
@@ -939,9 +1026,29 @@ export function validateCollaboration(raw: unknown): BotConfig["collaboration"] 
   return { socketPath: raw.socketPath };
 }
 
+/** Config schema: one optional deployment-global absolute publication root. */
+export function validateBehavioralFoundation(raw: unknown): BotConfig["behavioralFoundation"] {
+  if (raw === undefined) return undefined;
+  if (!isConfigRecord(raw) || Object.keys(raw).some(k => k !== "root") ||
+      typeof raw.root !== "string" || !isAbsolute(raw.root) || /[\0\r\n]/.test(raw.root)) {
+    throw new Error("behavioralFoundation must be { root: an absolute publication directory path }");
+  }
+  return { root: raw.root };
+}
+
+export function validatePrivateTopics(raw: unknown): BotConfig["privateTopics"] {
+  if (raw === undefined || raw === false) return undefined;
+  if (!isConfigRecord(raw) || Object.keys(raw).some(key => !["enabled", "maxNameGraphemes"].includes(key)) ||
+      typeof raw.enabled !== "boolean" ||
+      (raw.maxNameGraphemes !== undefined && (!Number.isSafeInteger(raw.maxNameGraphemes) || (raw.maxNameGraphemes as number) < 1 || (raw.maxNameGraphemes as number) > 128))) {
+    throw new Error("privateTopics must be false or { enabled: boolean, maxNameGraphemes?: 1..128 }");
+  }
+  return raw.enabled ? { enabled: true, maxNameGraphemes: raw.maxNameGraphemes as number ?? 17 } : undefined;
+}
+
 export function loadConfig(configPath?: string, options: LoadConfigOptions = {}): BotConfig {
-  const raw: RawConfig = loadRawMergedConfig(configPath, options.instanceConfigPath) as RawConfig;
-  const resolveSecrets = options.resolveSecrets !== false;
+  const raw: RawConfig = loadRawMergedConfig(configPath, options.instanceConfigPath, options.telegramBindingReload) as RawConfig;
+  const resolveTelegramToken = options.telegramBindingReload || options.resolveSecrets !== false;
   const workspaceRoot = resolveConfigWorkspaceRoot(configPath, options.workspaceRoot);
 
   if (!raw || typeof raw !== "object") {
@@ -960,6 +1067,8 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
   const defaultModel = typeof raw.defaultModel === "string" ? raw.defaultModel : undefined;
   const piExtraExtensions = validatePiExtraExtensions(raw.piExtraExtensions);
   const collaboration = validateCollaboration(raw.collaboration);
+  const behavioralFoundation = validateBehavioralFoundation(raw.behavioralFoundation);
+  const privateTopics = validatePrivateTopics(raw.privateTopics);
   const whisperModelPath = resolveWhisperModelPath(raw.whisperModel);
 
   // Validate agents (needed before validating bindings)
@@ -970,9 +1079,10 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
   const knownAgentIds = new Set(Object.keys(raw.agents));
   for (const [id, agentRaw] of Object.entries(raw.agents)) {
     agents[id] = { ...validateAgent(agentRaw, id, defaultModel, workspaceRoot, knownAgentIds), id };
+    if (behavioralFoundation) agents[id].behavioralFoundationRoot = behavioralFoundation.root;
   }
 
-  // Resolve Telegram transport only when this process owns Telegram bindings.
+  // Reload also verifies the credential when the candidate removes every Telegram binding.
   const legacyTelegramKey = findLegacyConfigKey(raw, LEGACY_TELEGRAM_SERVICE_KEY_RE);
   if (legacyTelegramKey) {
     throw new Error(
@@ -982,11 +1092,14 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
   const telegramTokenSopsKey = optionalConfigString(raw.telegramTokenSopsKey, "telegramTokenSopsKey");
   const telegramTokenEnv = optionalConfigString(raw.telegramTokenEnv, "telegramTokenEnv");
   validateConfiguredSopsSource(sopsFile, telegramTokenSopsKey, "telegramTokenSopsKey");
+  if (options.telegramBindingReload && raw.bindings !== undefined && !Array.isArray(raw.bindings)) {
+    throw new Error("bindings must be an array");
+  }
   const rawTelegramBindings = Array.isArray(raw.bindings) ? raw.bindings : [];
   const hasTelegramBindings = rawTelegramBindings.length > 0;
   let telegramToken: string | undefined;
-  if (hasTelegramBindings && (telegramTokenSopsKey || telegramTokenEnv)) {
-    telegramToken = resolveSecrets
+  if ((hasTelegramBindings || options.telegramBindingReload) && (telegramTokenSopsKey || telegramTokenEnv)) {
+    telegramToken = resolveTelegramToken
       ? resolveSecret({
         sopsFile,
         sopsKey: telegramTokenSopsKey,
@@ -1004,7 +1117,7 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
       throw new Error("Telegram bindings require a token source (telegramTokenSopsKey with secrets.sopsFile, or telegramTokenEnv)");
     }
     bindings = rawTelegramBindings.map((b, i) => {
-      const binding = validateBinding(b, i);
+      const binding = validateBinding(b, i, options.telegramBindingReload);
       if (!agents[binding.agentId]) {
         throw new Error(`Binding[${i}] references unknown agent "${binding.agentId}"`);
       }
@@ -1020,14 +1133,16 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
   }
 
   // Validate Discord config (optional)
-  const discord = validateDiscordConfig(raw.discord, agents, sopsFile, options);
+  const otherSecretOptions = options.telegramBindingReload ? { ...options, resolveSecrets: false } : options;
+  const discord = validateDiscordConfig(raw.discord, agents, sopsFile, otherSecretOptions);
 
   const triggerInput = validateTriggerInput(
     raw.triggerInput,
     bindings,
+    agents,
     telegramToken,
     sopsFile,
-    options,
+    otherSecretOptions,
   );
 
   // At least one platform must be configured
@@ -1089,7 +1204,7 @@ export function loadConfig(configPath?: string, options: LoadConfigOptions = {})
     defaultDeliveryThreadId = raw.defaultDeliveryThreadId;
   }
 
-  return { telegramToken, agents, bindings, sessionDefaults, whisperModelPath, piExtraExtensions, collaboration, logLevel, metricsPort, metricsHost, discord, adminChatId, defaultDeliveryChatId, defaultDeliveryThreadId, triggerInput };
+  return { telegramToken, agents, behavioralFoundation, bindings, sessionDefaults, whisperModelPath, piExtraExtensions, collaboration, privateTopics, logLevel, metricsPort, metricsHost, discord, adminChatId, defaultDeliveryChatId, defaultDeliveryThreadId, triggerInput };
 }
 
 function realpathOrResolve(path: string): string {
