@@ -27,7 +27,7 @@ Authenticated Telegram commands use the actual chat/topic binding:
 
 | Command | Effect |
 | --- | --- |
-| `/fast` or `/fast status` | Show compact Russian Fast state, model, thread override, and agent/model default |
+| `/fast` or `/fast status` | Show the Fast setting, model, thread override, and default for the agent and model |
 | `/fast help` | Read-only command help, scope rules, and priority/usage caveats; works without opt-in |
 | `/fast on` | Request priority for this thread |
 | `/fast off` | Stop this adapter from requesting priority in this thread |
@@ -44,15 +44,14 @@ default commands are unchanged.
 For example, an opted-in `main` agent using `gpt-6-astra` can show:
 
 ```text
-Fast: включён
-Модель: Astra
-Этот тред: по умолчанию
-Общий режим Main/Astra: включён
+Fast: on
+Model: Astra
+This thread: follows the default
+Default for Main/Astra: on
 ```
 
-`Этот тред` shows `включён (переопределение)` or `выключен (переопределение)`
-for an explicit override. Consumers without a thread show
-`Область: только общий режим (без треда)` instead. `Main` labels only agent
+`This thread` shows `on (override)` or `off (override)` for an explicit override.
+Sessions without a thread show `This session has no thread.` `Main` labels only agent
 `main`, and `Astra` labels only `gpt-6-astra` in this Fast display; other agent
 and model identities remain truthful. These labels do not change model IDs.
 

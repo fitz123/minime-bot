@@ -49,20 +49,20 @@ test("Fast presentation distinguishes inherited, overridden and default-only sco
   const path = join(fixture(t), "codex-fast.json");
   const scope = { agent: { ...agent, id: "main" }, threadKey: "fixture-topic" };
   assert.equal(handleFastCommand("", scope, path), [
-    "Fast: выключен", "Модель: Astra", "Этот тред: по умолчанию", "Общий режим Main/Astra: выключен",
+    "Fast: off", "Model: Astra", "This thread: follows the default", "Default for Main/Astra: off",
   ].join("\n"));
   assert.equal(existsSync(path), false);
   handleFastCommand("default on", scope, path);
-  assert.match(handleFastCommand("off", scope, path), /Fast: выключен\nМодель: Astra\nЭтот тред: выключен \(переопределение\)\nОбщий режим Main\/Astra: включён/);
-  assert.match(handleFastCommand("on", scope, path), /Этот тред: включён \(переопределение\)/);
-  assert.match(handleFastCommand("inherit", scope, path), /Fast: включён[\s\S]*Этот тред: по умолчанию/);
+  assert.match(handleFastCommand("off", scope, path), /Fast: off\nModel: Astra\nThis thread: off \(override\)\nDefault for Main\/Astra: on/);
+  assert.match(handleFastCommand("on", scope, path), /This thread: on \(override\)/);
+  assert.match(handleFastCommand("inherit", scope, path), /Fast: on[\s\S]*This thread: follows the default/);
   const bytes = readFileSync(path, "utf8");
-  assert.match(handleFastCommand("status", { agent: scope.agent }, path), /Область: только общий режим \(без треда\)/);
+  assert.match(handleFastCommand("status", { agent: scope.agent }, path), /This session has no thread\./);
   assert.equal(readFileSync(path, "utf8"), bytes);
   const other = { ...agent, id: "helper", model: "openai-codex/gpt-6-sol", codexFast: { provider: "openai-codex" as const, model: "gpt-6-sol" } };
   const text = handleFastCommand("", { agent: other }, path);
-  assert.match(text, /Модель: openai-codex\/gpt-6-sol/);
-  assert.match(text, /Общий режим helper\/openai-codex\/gpt-6-sol: выключен/);
+  assert.match(text, /Model: openai-codex\/gpt-6-sol/);
+  assert.match(text, /Default for helper\/openai-codex\/gpt-6-sol: off/);
   assert.doesNotMatch(text, /Astra|Main|priority|service_tier|Backend/);
 });
 
@@ -72,7 +72,7 @@ test("Fast help is read-only and useful without identity, opt-in or valid prefer
   assert.match(help, /\/fast default on\|off\|status/);
   assert.match(help, /service_tier/);
   assert.match(help, /priority/);
-  assert.match(help, /Квоты и расход — отдельно: в Telegram \/status показывает доступные данные квот\./);
+  assert.match(help, /Use \/status in Telegram to see available quota information\./);
   assert.equal(existsSync(path), false);
   writeFileSync(path, "invalid fixture preferences");
   assert.equal(handleFastCommand("help", { agent: { ...agent, codexFast: undefined } }, path), help);
@@ -146,16 +146,16 @@ test("strict store and commands reject malformed input without silently activati
     assert.match(handleFastCommand(args, scope, path), /Usage:/);
     assert.equal(existsSync(path), false);
   }
-  assert.match(handleFastCommand("on", { agent }, path), /No identified chat/);
+  assert.match(handleFastCommand("on", { agent }, path), /This session has no thread\./);
   assert.match(handleFastCommand("on", undefined, path), /unavailable/);
   assert.match(handleFastCommand("on", { agent: { ...agent, codexFast: undefined } }, path), /unavailable/);
   for (const raw of ["{", "null", '{"version":2,"defaults":[],"threads":[]}', '{"version":1,"defaults":[],"threads":[{"agentId":"fixture-primary","provider":"openai-codex","model":"gpt-6-astra","enabled":true}]}']) {
     writeFileSync(path, raw);
-    assert.throws(() => readFastStatus(scope, path), /Invalid Codex Fast preferences/);
+    assert.throws(() => readFastStatus(scope, path), /The Codex Fast preferences file is invalid\./);
   }
   writeFileSync(path, JSON.stringify({ version: 1, defaults: [], threads: [] }));
   writeFileSync(`${path}.lock`, "");
-  assert.throws(() => handleFastCommand("default on", scope, path), /busy; retry/);
+  assert.throws(() => handleFastCommand("default on", scope, path), /Codex Fast preferences are busy\. Try again\./);
   assert.equal(readFastStatus(scope, path).enabled, false);
 });
 
@@ -193,5 +193,5 @@ test("offline verifier CLI executes through a current directory symlink", { time
   });
   assert.equal(result.error, undefined);
   assert.equal(result.status, 0, result.stderr || result.stdout);
-  assert.deepEqual(JSON.parse(result.stdout), { piVersion: "1.5.0", requestChecks: 53, commandsChecked: 93 });
+  assert.deepEqual(JSON.parse(result.stdout), { piVersion: "1.5.0", requestChecks: 53, commandsChecked: 95 });
 });

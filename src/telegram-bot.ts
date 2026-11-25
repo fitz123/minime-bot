@@ -73,7 +73,7 @@ export const BOT_COMMANDS = [
   { command: "reconnect", description: "Reconnect session (keeps context)" },
   { command: "clean", description: "Clean session (fresh start)" },
   { command: "status", description: "Show bot status" },
-  { command: "fast", description: "Show/set scoped Codex Fast" },
+  { command: "fast", description: "Check or change Codex Fast settings" },
 ] as const;
 
 export const TELEGRAM_ALLOWED_UPDATES = ["message", "message_reaction"] as const;
@@ -923,7 +923,7 @@ export function createTelegramBot(
     if (!binding) return;
     if (ctx.message) setThread(ctx.chat.id, ctx.message.message_id, topicId);
     if (sessionManager.isWorkerLane(sessionKey(ctx.chat.id, topicId), binding.agentId)) {
-      await ctx.reply("Fast controls are unavailable for worker-routed sessions.");
+      await ctx.reply("This session is routed to a worker, so Fast controls are unavailable here.");
       return;
     }
     try {
@@ -932,7 +932,7 @@ export function createTelegramBot(
         return;
       }
       if (/^default\s+(?:on|off)$/.test(ctx.match.trim()) && (ctx.chat.type !== "private" || binding.kind !== "dm")) {
-        await ctx.reply("Use a private chat with a DM binding to change Fast defaults.");
+        await ctx.reply("To change the Fast default, use a private Telegram chat with a DM binding.");
         return;
       }
       const currentConfig = loadControlConfig(binding);

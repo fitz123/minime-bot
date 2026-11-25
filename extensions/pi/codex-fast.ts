@@ -26,10 +26,10 @@ export default function codexFast(pi: ExtensionAPI): void {
     return applyFastToRequest(event.payload, ctx.model.id, readFastStatus(scope).enabled);
   });
   pi.registerCommand("fast", {
-    description: "Show/set scoped Fast; /fast help for scopes and priority details",
+    description: "Check or change Codex Fast settings. See /fast help for details.",
     handler: async (args, ctx) => {
       if (isCronFastOff(process.env)) {
-        ctx.ui.notify("Fast: off (enforced for cron jobs). Chat preferences are unchanged.", "info");
+        ctx.ui.notify("Fast is always off for cron jobs.", "info");
         return;
       }
       try { ctx.ui.notify(handleFastCommand(args, args.trim() === "help" ? undefined : currentScope(ctx.model)), "info"); }

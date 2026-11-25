@@ -259,6 +259,7 @@ describe("BOT_COMMANDS", () => {
   it("contains start, reconnect, clean, status, and fast commands", () => {
     const names = BOT_COMMANDS.map((c) => c.command);
     assert.deepStrictEqual(names, ["start", "reconnect", "clean", "status", "fast"]);
+    assert.equal(BOT_COMMANDS.find(command => command.command === "fast")?.description, "Check or change Codex Fast settings");
   });
 
   it("each command has a non-empty description", () => {
@@ -1579,12 +1580,12 @@ describe("command handler wiring", () => {
       await bot.handleUpdate(update);
     };
     await send("on");
-    assert.match(apiCalls.at(-1)!.payload.text, /Этот тред: включён \(переопределение\)/);
+    assert.match(apiCalls.at(-1)!.payload.text, /This thread: on \(override\)/);
     assert.equal(readFastStatus({ agent: primary, threadKey: `${testChatId}:11` }).enabled, true);
     await send("", 12);
-    assert.match(apiCalls.at(-1)!.payload.text, /Этот тред: по умолчанию/);
+    assert.match(apiCalls.at(-1)!.payload.text, /This thread: follows the default/);
     await send("on", 22);
-    assert.match(apiCalls.at(-1)!.payload.text, /unavailable/);
+    assert.match(apiCalls.at(-1)!.payload.text, /Codex Fast is unavailable\. The agent must opt in to Fast/);
     await send("on extra");
     assert.match(apiCalls.at(-1)!.payload.text, /Usage:/);
     const beforeUnauthorized = apiCalls.length;
@@ -1596,13 +1597,17 @@ describe("command handler wiring", () => {
     await bot.handleUpdate(clean);
     assert.deepEqual(manager.calls, ["destroySession"]);
     await send("");
-    assert.match(apiCalls.at(-1)!.payload.text, /Этот тред: включён \(переопределение\)/);
+    assert.match(apiCalls.at(-1)!.payload.text, /This thread: on \(override\)/);
     await send("default on");
-    assert.match(apiCalls.at(-1)!.payload.text, /private chat.*DM binding/);
+    assert.match(apiCalls.at(-1)!.payload.text, /To change the Fast default, use a private Telegram chat with a DM binding\./);
     await send("", 12);
-    assert.match(apiCalls.at(-1)!.payload.text, /Fast: выключен/);
+    assert.match(apiCalls.at(-1)!.payload.text, /Fast: off/);
     await send("inherit");
-    assert.match(apiCalls.at(-1)!.payload.text, /Этот тред: по умолчанию/);
+    assert.match(apiCalls.at(-1)!.payload.text, /This thread: follows the default/);
+    manager.isWorkerLane = () => true;
+    await send("on");
+    assert.equal(apiCalls.at(-1)!.payload.text, "This session is routed to a worker, so Fast controls are unavailable here.");
+    assert.equal(readFastStatus({ agent: primary, threadKey: `${testChatId}:11` }).override, "inherit");
   });
 
   it("allows Telegram Fast default mutations only for private chats with DM bindings", async t => {
@@ -1639,32 +1644,32 @@ describe("command handler wiring", () => {
         assert.match(await send("default on extra"), /Usage:/);
         assert.equal(existsSync(path), false);
         if (chatType !== "private" || kind !== "dm") {
-          assert.match(await send("default on"), /private chat.*DM binding/);
+          assert.match(await send("default on"), /To change the Fast default, use a private Telegram chat with a DM binding\./);
           assert.equal(existsSync(path), false);
         }
-        assert.match(await send("on"), /Этот тред: включён \(переопределение\)/);
+        assert.match(await send("on"), /This thread: on \(override\)/);
         const beforeDefault = readFileSync(path, "utf8");
         if (chatType === "private" && kind === "dm") {
-          assert.match(await send("default on"), /Общий режим .*: включён/);
+          assert.match(await send("default on"), /Default for .*: on/);
           assert.equal(readFastStatus({ agent: primary }).enabled, true);
           assert.equal(readFastStatus({ agent: primary, threadKey: "new-thread" }).enabled, true);
-          assert.match(await send("default off"), /Общий режим .*: выключен/);
+          assert.match(await send("default off"), /Default for .*: off/);
           assert.equal(readFastStatus({ agent: primary }).enabled, false);
         } else {
           for (const args of ["default on", "default off"]) {
-            assert.match(await send(args), /private chat.*DM binding/);
+            assert.match(await send(args), /To change the Fast default, use a private Telegram chat with a DM binding\./);
             assert.equal(readFileSync(path, "utf8"), beforeDefault);
           }
         }
         const beforeReadOnly = readFileSync(path, "utf8");
-        assert.match(await send("default status"), /Общий режим .*: выключен/);
-        assert.match(await send("status"), /Этот тред: включён \(переопределение\)/);
+        assert.match(await send("default status"), /Default for .*: off/);
+        assert.match(await send("status"), /This thread: on \(override\)/);
         for (const args of ["default", "default on extra", "default off extra", "default inherit", "default ON"]) {
           assert.match(await send(args), /Usage:/);
           assert.equal(readFileSync(path, "utf8"), beforeReadOnly);
         }
-        assert.match(await send("off"), /Этот тред: выключен \(переопределение\)/);
-        assert.match(await send("inherit"), /Этот тред: по умолчанию/);
+        assert.match(await send("off"), /This thread: off \(override\)/);
+        assert.match(await send("inherit"), /This thread: follows the default/);
         assert.equal(readFastStatus({ agent: primary, threadKey: `${testChatId}:11` }).enabled, false);
         assert.deepEqual(manager.calls, [], "Fast commands must not invoke model sessions");
       });
@@ -1702,13 +1707,13 @@ describe("command handler wiring", () => {
     };
     assert.match(await send("status"), /unavailable/);
     updateAgent({ codexFast: pin("gpt-6-astra") });
-    assert.match(await send("on"), /Модель: Astra/);
+    assert.match(await send("on"), /Model: Astra/);
     assert.equal(readFastStatus({ agent: { ...primary, codexFast: pin("gpt-6-astra") }, threadKey: `${testChatId}:11` }).enabled, true);
     updateAgent({ model: "openai-codex/gpt-6-sol", codexFast: pin("gpt-6-sol") });
     const changed = await send("status");
-    assert.match(changed, /Модель: openai-codex\/gpt-6-sol/);
-    assert.match(changed, /Fast: выключен/);
-    assert.match(await send("default on"), /Общий режим .*: включён/);
+    assert.match(changed, /Model: openai-codex\/gpt-6-sol/);
+    assert.match(changed, /Fast: off/);
+    assert.match(await send("default on"), /Default for .*: on/);
     const sol = { ...primary, model: "openai-codex/gpt-6-sol", codexFast: { provider: "openai-codex" as const, model: "gpt-6-sol" } };
     assert.equal(readFastStatus({ agent: sol }).enabled, true);
     // The base config has no opt-in; removing the overlay removes eligibility.
@@ -1718,7 +1723,7 @@ describe("command handler wiring", () => {
     assert.match(await send("default off"), /unavailable/);
     assert.equal(readFileSync(join(root, "data/codex-fast.json"), "utf8"), before);
     updateAgent({ model: sol.model, codexFast: sol.codexFast });
-    assert.match(await send("status"), /Общий режим .*: включён/);
+    assert.match(await send("status"), /Default for .*: on/);
     assert.deepEqual(manager.calls, [], "Local commands must not invoke or create model sessions");
   });
 
