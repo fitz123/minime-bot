@@ -478,6 +478,12 @@ python3 scripts/bot_slots.py rollback --slots-root /path/to/bot-slots
 python3 scripts/bot_slots.py prune --slots-root /path/to/bot-slots
 ```
 
+Before starting v2026.11.14 or another release whose session reader rejects
+`effortOverride`, stop all writers to the control workspace session store.
+Make a private backup of `data/sessions.json` with mode `0600`. In the
+original JSON, remove only the `effortOverride` property from every entry in
+`sessions`, keeping the file owner and mode `0600`. Then start the older slot.
+
 Private owner-only storage remains the default. To share immutable runtime
 payloads, pass `--reader-group runtime-readers` explicitly on **every** slot
 operation. The root must already be a real directory owned by the controller,

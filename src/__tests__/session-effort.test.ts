@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { Readable, Writable } from "node:stream";
 import type { ChildProcess } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -14,7 +14,7 @@ const { default: extension } = await import(pathToFileURL(resolve("extensions/pi
 import { SessionManager, type ActiveSession } from "../session-manager.js";
 import { SessionStore } from "../session-store.js";
 import type { BotConfig, NativeEffortLevel, PiThinkingLevel } from "../types.js";
-import { formatEffortError, SESSION_EFFORT_ENV } from "../pi-extensions/session-effort.js";
+import { formatEffortError, SESSION_EFFORT_ENV } from "../session-effort-wire.js";
 import { createTelegramBindingReload } from "../telegram-binding-reload.js";
 
 async function fixture(t: TestContext, thinking?: PiThinkingLevel) {
@@ -50,9 +50,10 @@ async function fixture(t: TestContext, thinking?: PiThinkingLevel) {
     let suppressed = false;
     let suppressNext = false;
     let held: string | undefined;
+    let idle = true;
     const stdout = new Readable({ read() {} });
     const emit = (event: unknown) => stdout.push(JSON.stringify(event) + "\n");
-    const context = { model, modelRegistry: { getAll: () => [model], hasConfiguredAuth: () => true }, ui: { notify(message: string) {
+    const context = { model, isIdle: () => idle, modelRegistry: { getAll: () => [model], hasConfiguredAuth: () => true }, ui: { notify(message: string) {
       if (suppressed || suppressNext) {
         held = message;
         suppressNext = false;
@@ -81,12 +82,17 @@ async function fixture(t: TestContext, thinking?: PiThinkingLevel) {
       const command = JSON.parse(chunk.toString());
       writes.push(command);
       const text = String(command.message);
-      if (text.startsWith("/")) {
+      if (command.type === "get_state") {
+        emit({ type: "response", id: command.id, command: "get_state", success: true, data: { sessionId: session.sessionId, sessionFile: session.sessionFile } });
+      } else if (text.startsWith("/")) {
         const [name, args] = text.slice(1).split(" ");
         void commands.get(name)?.(args, context);
       } else {
-        handlers.get("message_start")?.({ message: { role: "user" } }, context);
+        idle = false;
+        const message = { role: "user", content: text };
+        handlers.get("message_start")?.({ message }, context);
         emit({ type: "agent_start" });
+        emit({ type: "message_start", message });
       }
       callback();
     } });
@@ -99,7 +105,7 @@ async function fixture(t: TestContext, thinking?: PiThinkingLevel) {
     };
     (manager as unknown as { active: Map<string, ActiveSession> }).active.set(key, session);
     store.setSession(key, { bindingState: "bound", sessionId: session.sessionId, sessionFile: session.sessionFile!, workspaceRealpath: root, chatId: key, agentId: "main", lastActivity: Date.now(), thinking, effortOverride: override });
-    return { session, stdout, writes, emit, tool, context, get effective() { return effective; }, suppress() { suppressed = true; }, suppressNext() { suppressNext = true; }, release() { suppressed = false; if (held) context.ui.notify(held, "info"); }, settle() { emit({ type: "agent_end", messages: [] }); emit({ type: "agent_settled" }); },
+    return { session, stdout, writes, emit, tool, context, get effective() { return effective; }, suppress() { suppressed = true; }, suppressNext() { suppressNext = true; }, release() { suppressed = false; if (held) context.ui.notify(held, "info"); }, settle() { idle = true; emit({ type: "agent_end", messages: [] }); emit({ type: "agent_settled" }); },
       settleWithReply(split: boolean) {
         assert.ok(held, "effort result is ready before settlement");
         const reply = Buffer.from(JSON.stringify({ type: "extension_ui_request", id: "notice-🧠", method: "notify", notifyType: "info", message: held }) + "\n");
@@ -225,10 +231,11 @@ it("uses applied permissions for commands and tools and reads DM settings once p
       } else {
         assert.equal(changed.isError, false);
         assert.match(changed.content[0].text, /agent's default for this model is now high/);
+        assert.match(changed.content[0].text, /The current answer uses low\. The next message will use high\./);
         assert.equal(loadControlConfig.mock.callCount(), 1);
         assert.equal(dm.effective, "low", "the current message keeps its inherited level");
         const status = await manager.sessionEffort(key, "main");
-        assert.match(status, /Effort is high.*agent default.*Supported levels/);
+        assert.match(status, /The current answer uses low\. The next message will use high\..*agent default.*Supported levels/);
         assert.equal(loadControlConfig.mock.callCount(), 2);
         assert.equal(store.getSession(key)?.effortOverride, undefined);
       }
@@ -262,6 +269,42 @@ it("rejects and acknowledges an internal tool request while a human control wait
   }
   assert.match(await change, /Effort is medium/);
   assert.equal(store.getSession("123:1")?.effortOverride, "medium");
+});
+
+it("applies a slash control queued during consultation before a human turn can call the effort tool", { timeout: 2_000 }, async t => {
+  const { manager, store, lane } = await fixture(t, "low");
+  const key = "123:1";
+  const current = lane(key);
+  mkdirSync(current.session.outboxPath, { mode: 0o700 });
+  async function run(text: string, options?: Parameters<SessionManager["sendSessionMessage"]>[3]) {
+    for await (const _line of manager.sendSessionMessage(key, "main", text, options)) { /* drain */ }
+  }
+  let consumed!: () => void;
+  const running = new Promise<void>(resolve => { consumed = resolve; });
+  const consultation = run("Consultation", { internal: true, expectedSession: current.session, consumed });
+  await running;
+  const human = run("Human request");
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(current.session.queue.size, 1);
+  const change = manager.sessionEffort(key, "main", "medium");
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(current.session.queue.size, 2);
+
+  try {
+    current.settle();
+    await consultation;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(current.writes.slice(-2).map(command => command.message.split(" ")[0]), [
+      "/minime-session-effort", "Human",
+    ]);
+    assert.match(await change, /Effort is medium/);
+    const result = await current.tool.execute("human", { level: "high" }, undefined, undefined, current.context);
+    assert.equal(result.isError, false);
+    assert.equal(store.getSession(key)?.effortOverride, "high");
+  } finally {
+    current.settle();
+    await Promise.all([human, change]);
+  }
 });
 
 it("hands a late busy-control reply to an idle owner after settlement", async t => {

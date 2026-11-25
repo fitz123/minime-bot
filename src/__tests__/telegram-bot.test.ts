@@ -18,6 +18,7 @@ import {
 import { ActiveDraftCoordinator } from "../active-draft-coordinator.js";
 import { buildCollectPrompt } from "../message-queue.js";
 import { DRAFT_REFRESH_INTERVAL_MS } from "../stream-relay.js";
+import { createTelegramBindingReload } from "../telegram-binding-reload.js";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -1981,6 +1982,47 @@ describe("command handler wiring", () => {
       assert.equal(replies.length, 1);
       assert.equal(replies[0].payload.message_thread_id, 9);
     } finally { pending.resolve("Effort: high"); await handling; }
+  });
+
+  it("blocks group removal until every detached effort reply has finished delivery", async () => {
+    const chatId = -456;
+    const group: TelegramBinding = { chatId, agentId: "main", kind: "group" };
+    const startup = { ...handlerConfig, bindings: [...handlerConfig.bindings, group] };
+    const candidate = { ...startup, bindings: handlerConfig.bindings };
+    const bindingReload = createTelegramBindingReload(startup, () => candidate, () => candidate);
+    const manager = createMockSessionManager();
+    const effort = [deferred<string>(), deferred<string>()];
+    const delivery = [deferred<boolean>(), deferred<boolean>()];
+    let controls = 0;
+    let replies = 0;
+    manager.sessionEffort = () => effort[controls++].promise;
+    const { bot, reloadGroupBindings } = initBot(manager, [], { bindingReload },
+      method => method === "sendMessage" ? delivery[replies++].promise : undefined,
+      (_base, sm, options) => createTelegramBot(startup, sm, options));
+    for (const id of [76, 77]) {
+      const update = makeCommandUpdate("effort", id);
+      Object.assign(update.message, { message_thread_id: 9 });
+      Object.assign(update.message.chat, { id: chatId, type: "supergroup" });
+      await bot.handleUpdate(update);
+    }
+    try {
+      assert.equal(controls, 2);
+      assert.throws(reloadGroupBindings!, /removed Telegram lane still has accepted work/);
+      effort[0].resolve("Effort: high");
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(replies, 1);
+      delivery[0].resolve(true);
+      effort[1].reject(new Error("synthetic effort failure"));
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(replies, 2);
+      assert.throws(reloadGroupBindings!, /removed Telegram lane still has accepted work/);
+    } finally {
+      effort[0].resolve("Effort: high");
+      effort[1].resolve("Effort: high");
+      for (const pending of delivery) pending.resolve(true);
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    assert.equal(reloadGroupBindings!(), 0);
   });
 
   for (const fails of [false, true]) {

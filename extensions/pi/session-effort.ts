@@ -1,13 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { Type } from "typebox";
-import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { PI_ACKNOWLEDGED_STEER_CUSTOM_TYPE } from "../../src/pi-extensions/acknowledged-steer.js";
+import { applySessionEffort, getSessionEffort } from "../../src/pi-extensions/session-effort.js";
 import {
   SESSION_EFFORT_ENV, SESSION_EFFORT_COMMAND, SESSION_EFFORT_ACK_COMMAND,
-  effortDefaultPath, effortNotice, formatEffortStatus, resolveSessionEffort, writeEffortDefault,
-  type EffortConfiguration, type EffortRequestAction, type EffortSource, type SessionEffortStartup,
-} from "../../src/pi-extensions/session-effort.js";
+  effortNotice, type EffortCommandRequest, type SessionEffortStartup,
+} from "../../src/session-effort-wire.js";
 
 export default function sessionEffort(pi: ExtensionAPI): void {
   const initial = process.env[SESSION_EFFORT_ENV];
@@ -15,24 +14,11 @@ export default function sessionEffort(pi: ExtensionAPI): void {
   if (!initial || !routedAgent) return;
   const agentId = routedAgent;
   const startup = JSON.parse(initial) as SessionEffortStartup;
-  let configured: EffortConfiguration = startup;
-  let override = startup.override;
+  const state = { configured: startup, override: startup.override };
   const pending = new Map<string, (result: { text: string; ok: boolean }) => void>();
 
-  function effective(ctx: ExtensionContext) {
-    const model = ctx.model;
-    if (!model) return { effective: pi.getThinkingLevel(), source: "Pi default" as const };
-    return resolveSessionEffort({
-      agentId, model, override, configured, getSettings: () => pi.getSettings(),
-      modelRuntime: {
-        getModels: () => ctx.modelRegistry.getAll(),
-        hasConfiguredAuth: provider => ctx.modelRegistry.getAll().some(candidate => candidate.provider === provider && ctx.modelRegistry.hasConfiguredAuth(candidate)),
-      },
-    });
-  }
-
   const sync = (ctx: ExtensionContext) => {
-    const level = effective(ctx).effective;
+    const level = getSessionEffort(pi, ctx, agentId, state).effective;
     if (level !== pi.getThinkingLevel()) pi.setThinkingLevel(level);
   };
   pi.on("session_start", (_event, ctx) => sync(ctx));
@@ -47,45 +33,9 @@ export default function sessionEffort(pi: ExtensionAPI): void {
   pi.registerCommand(SESSION_EFFORT_COMMAND, {
     description: "Control reasoning effort for this Telegram conversation",
     handler: async (args, ctx) => {
-      const request = JSON.parse(Buffer.from(args, "base64url").toString()) as EffortConfiguration & { id: string; action: EffortRequestAction };
+      const request = JSON.parse(Buffer.from(args, "base64url").toString()) as EffortCommandRequest;
       if (!request.id) return;
-      const { action } = request;
-      const model = ctx.model;
-      const levels = model ? getSupportedThinkingLevels(model) : [];
-      const previousOverride = override;
-      const previousLevel = pi.getThinkingLevel();
-      let result = { effective: previousLevel, source: "Pi default" as EffortSource };
-      let error: string | undefined;
-      try {
-        if (action.kind === "default" || action.kind === "override") {
-          const level = levels.find(candidate => candidate === action.level);
-          if (!model || level === undefined) {
-            error = model ? "This model does not support that effort level." : "No current model is available.";
-          } else if (action.kind === "default") {
-            writeEffortDefault(effortDefaultPath(agentId, model), level);
-          } else {
-            override = level;
-          }
-        } else if (action.kind !== "status") {
-          override = action.kind === "restore" ? action.level : undefined;
-        }
-        if (request.model !== undefined) configured = { model: request.model, inherited: request.inherited };
-        result = effective(ctx);
-        if (error) error += ` ${formatEffortStatus({ ...result, levels })}`;
-        if (!error && action.kind !== "status" && action.kind !== "default") {
-          pi.setThinkingLevel(result.effective);
-        }
-      } catch {
-        override = previousOverride;
-        // Pi assigns the native level before writing its transcript entry.
-        if (pi.getThinkingLevel() !== previousLevel) {
-          try { pi.setThinkingLevel(previousLevel); } catch { /* Verify the native level below. */ }
-        }
-        result.effective = pi.getThinkingLevel();
-        error = "Could not apply effort. Check the control workspace permissions and retry.";
-        if (result.effective !== previousLevel) error += ` The previous level could not be restored. Effective effort is ${result.effective}.`;
-      }
-      ctx.ui.notify(effortNotice({ kind: "result", id: request.id, ...result, levels, ...(error ? { error } : {}) }), "info");
+      ctx.ui.notify(effortNotice(applySessionEffort(pi, ctx, agentId, state, request)), "info");
     },
   });
   pi.registerCommand(SESSION_EFFORT_ACK_COMMAND, {

@@ -1,4 +1,4 @@
-import { SESSION_EFFORT_ENV, type SessionEffortStartup } from "./pi-extensions/session-effort.js";
+import { SESSION_EFFORT_ENV, type SessionEffortStartup } from "./session-effort-wire.js";
 import { readVisionImages } from "./vision-input.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { spawn, type ChildProcess } from "node:child_process";

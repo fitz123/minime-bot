@@ -2,7 +2,7 @@ import {
   EFFORT_CURRENT_CONVERSATION, EFFORT_DEFAULT_PERMISSION, EFFORT_USAGE, EffortConfirmationTimeout, EffortControlError,
   effortInvocation, formatEffortError, formatEffortStatus, parseEffortAction, parseEffortNotice,
   SESSION_EFFORT_COMMAND, SESSION_EFFORT_ACK_COMMAND, type EffortRequestAction, type EffortResult,
-} from "./pi-extensions/session-effort.js";
+} from "./session-effort-wire.js";
 import { RICH_RESERVED_DIR } from "./telegram-rich.js";
 import { type ChildProcess } from "node:child_process";
 import { chmodSync, createWriteStream, existsSync, lstatSync, mkdirSync, readdirSync, renameSync, rmSync, type Stats, unlinkSync } from "node:fs";
@@ -18,7 +18,7 @@ import type { Address } from "./collaboration.js";
 import { topicScopeEnabled, type PrivateTopicController, type TopicApply } from "./private-topics.js";
 import type { TopicRecord, TopicTarget } from "./topic-store.js";
 import type { BoundSessionState, PendingSessionRecoveryNotice, PlatformContext, SessionRecoveryReason, SessionState, StreamLine, BotConfig, AgentConfig, NativeEffortLevel, TelegramBinding } from "./types.js";
-import { spawnPiRpcSession, sendPiPrompt, sendPiSteer, sendPiAcknowledgedSteer, sendPiGetState, readPiStream, parsePiStartupIdentityRecord, assertPiSessionIdentityMatchesBinding, PiStartupBlockingUiError, NewlineOnlyJsonlSplitter, handlePiExtensionUiRecord, normalizePiModel, PI_EXTENSIONS_DISABLED_ENV, type PiAcknowledgedSteerResult, type PiRpcEvent, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions, type PiStartupDiagnostics } from "./pi-rpc-protocol.js";
+import { spawnPiRpcSession, sendPiPrompt, sendPiSteer, sendPiAcknowledgedSteer, sendPiGetState, readPiStream, parsePiStartupIdentityRecord, assertPiSessionIdentityMatchesBinding, PiStartupBlockingUiError, NewlineOnlyJsonlSplitter, handlePiExtensionUiRecord, normalizePiModel, PI_EXTENSIONS_DISABLED_ENV, PI_PROVIDER, type PiAcknowledgedSteerResult, type PiRpcEvent, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions, type PiStartupDiagnostics } from "./pi-rpc-protocol.js";
 import { SessionStore } from "./session-store.js";
 import { AgentRuntimeClient } from "./agent-runtime-client.js";
 import { AgentRuntimeError, AgentRuntimeUncertainError, workerChatLaneId, workerRouteDigest, type AgentLaneState } from "./agent-runtime-protocol.js";
@@ -178,6 +178,8 @@ export interface ActiveSession {
   /** Spawn-time thinking configuration used by the runtime signature. */
   thinking?: AgentConfig["thinking"];
   effortOverride?: NativeEffortLevel;
+  /** Set when this child started with effort inheritance only. */
+  effortReadOnly?: boolean;
   queue: PQueue;
   idleTimer: ReturnType<typeof setTimeout> | null;
   /** Idle timeout baked at spawn time from config. */
@@ -857,8 +859,9 @@ export class SessionManager {
       }
       : undefined;
     const state = this.boundState(chatId, agentId, agent, binding, notice);
-    if (expected?.bindingState === "bound" && expected.agentId === agentId && expected.workerRollback) {
-      state.workerRollback = true;
+    if (expected?.bindingState === "bound" && expected.agentId === agentId) {
+      if (expected.workerRollback) state.workerRollback = true;
+      if (expected.effortOverride !== undefined) state.effortOverride = expected.effortOverride;
     }
     if (!this.store.compareAndSetSession(chatId, expected, state)) {
       throw new Error(`Session binding changed concurrently for chat ${chatId}`);
@@ -991,6 +994,12 @@ export class SessionManager {
     return this.admitSession(chatId, agentId, expectedId, internal);
   }
 
+  private effortBinding(chatId: string): TelegramBinding | undefined {
+    const lane = /^(-?\d+)(?::(\d+))?$/.exec(chatId);
+    if (!lane) return;
+    return resolveBinding(Number(lane[1]), this.getTelegramBindings(), lane[2] === undefined ? undefined : Number(lane[2]));
+  }
+
   private async admitSession(chatId: string, agentId: string, expectedId: string | undefined, internal: boolean, config?: BotConfig): Promise<ActiveSession> {
     this.assertLocalLane(chatId, agentId);
     if (expectedId) {
@@ -1004,12 +1013,15 @@ export class SessionManager {
     const inFlight = this.sessionStartups.get(chatId);
     if (inFlight?.generation === generation) {
       if (inFlight.agentId === agentId) {
-        return inFlight.promise;
-      }
-      try {
-        await inFlight.promise;
-      } catch {
-        // A differently bound caller still gets its own serialized decision.
+        const session = await inFlight.promise;
+        if (expectedId || !session.effortReadOnly || this.effortBinding(chatId)?.agentId !== agentId) return session;
+        // The binding can be re-added while an exact, read-only reopen is starting.
+      } else {
+        try {
+          await inFlight.promise;
+        } catch {
+          // A differently bound caller still gets its own serialized decision.
+        }
       }
       if ((this.sessionGenerations.get(chatId) ?? 0) !== generation) {
         throw new SessionStartupSupersededError();
@@ -1067,15 +1079,20 @@ export class SessionManager {
         const activeConfig = tryGetFreshConfigForActiveSession();
         const activeAgent = activeConfig?.agents[agentId];
         if (activeConfig) this.assertUnchangedWorkerRoute(chatId, agentId, activeConfig);
-        if (!activeConfig || (activeAgent && !runtimeSignatureChanged(existing, activeAgent))) {
+        const needsEffortControls = existing.effortReadOnly && this.effortBinding(chatId)?.agentId === agentId;
+        if (!activeConfig || (activeAgent && !runtimeSignatureChanged(existing, activeAgent) && !needsEffortControls)) {
           existing.lastActivity = Date.now();
           this.resetIdleTimer(chatId);
           return existing;
         }
         const currentSignature = activeAgent ? sessionRuntimeSignature(activeAgent) : undefined;
-        const reason = activeAgent
+        const reason = needsEffortControls ? "Telegram effort controls are now available" : activeAgent
           ? `runtime config changed from ${formatRuntimeSignature(existing)} to ${formatRuntimeSignature(currentSignature!)}`
           : `agent "${agentId}" no longer exists in config`;
+        if (needsEffortControls && existing.queue.pending) {
+          await existing.queue.onIdle();
+          if (isStartupSuperseded()) await abortSupersededStartup();
+        }
         log.warn("session-manager", `Closing active session for chat ${chatId}: ${reason}`);
         await this.closeSession(chatId, { mediaCleanup: "stale" });
         if (isStartupSuperseded()) {
@@ -1159,9 +1176,6 @@ export class SessionManager {
     const telegramLane = /^(-?\d+)(?::(\d+))?$/.exec(chatId);
     const telegramBinding = telegramLane && resolveBinding(Number(telegramLane[1]), freshConfig.bindings,
       telegramLane[2] === undefined ? undefined : Number(telegramLane[2]));
-    const effortBinding = telegramLane && resolveBinding(Number(telegramLane[1]), this.getTelegramBindings(),
-      telegramLane[2] === undefined ? undefined : Number(telegramLane[2]));
-    const discordEffort = chatId.startsWith("discord:");
     const telegramRichAnswers = !!telegramBinding;
     const topicBotId = this.topicController?.currentBotId();
     const privateTopicPolicy = !!this.transport && process.env.PI_EXTENSIONS_DISABLED !== "1" && topicBotId !== undefined && !!telegramLane?.[2] &&
@@ -1180,12 +1194,10 @@ export class SessionManager {
     let child: ChildProcess | undefined;
     for (;;) {
       try {
-        if (discordEffort || effortBinding?.agentId === agentId) {
-          runtimeEnvOptions.sessionEffort = {
-            model: normalizedSessionModel(agent), inherited: agent.thinking,
-            ...(discordEffort ? { readOnly: true } : { override: prepared.state.effortOverride }),
-          };
-        }
+        runtimeEnvOptions.sessionEffort = {
+          provider: PI_PROVIDER, model: normalizedSessionModel(agent), inherited: agent.thinking,
+          ...(this.effortBinding(chatId)?.agentId === agentId ? { override: prepared.state.effortOverride } : { readOnly: true }),
+        };
         child = spawnPiRpcSession(agent, prepared.binding, extensionOptions, transportEnabled
           ? { ...runtimeEnvOptions, collaborationSession: prepared.binding.sessionId, collaborationSocket: this.transport!.socketPath, ...(this.transport!.topicOnly ? { collaborationTopicOnly: true } : {}) }
           : runtimeEnvOptions);
@@ -1300,6 +1312,7 @@ export class SessionManager {
       model: normalizedSessionModel(agent),
       thinking: agent.thinking,
       effortOverride: prepared.state.effortOverride,
+      effortReadOnly: runtimeEnvOptions.sessionEffort.readOnly,
       queue: new PQueue({ concurrency: 1 }),
       idleTimer: null,
       idleTimeoutMs: freshConfig.sessionDefaults.idleTimeoutMs,
@@ -1857,9 +1870,8 @@ export class SessionManager {
       const lane = /^(-?\d+)(?::(\d+))?$/.exec(chatId);
       if (!lane) throw new EffortControlError("Effort controls require a Telegram conversation.");
       const telegramChatId = Number(lane[1]);
-      const topicId = lane[2] === undefined ? undefined : Number(lane[2]);
       const assertControlBinding = () => {
-        const binding = resolveBinding(telegramChatId, this.getTelegramBindings(), topicId);
+        const binding = this.effortBinding(chatId);
         if (binding?.agentId !== agentId) throw new EffortControlError("Telegram thread binding changed.");
         if (action.kind === "default" && (binding.kind !== "dm" || telegramChatId <= 0)) throw new EffortControlError(EFFORT_DEFAULT_PERMISSION);
         if (this.isWorkerLane(chatId, agentId)) throw new EffortControlError("Effort controls are unavailable for worker-routed sessions.");
@@ -1875,15 +1887,17 @@ export class SessionManager {
         const current = this.active.get(chatId);
         if (expected && (current !== expected || expected.internalTurn)) throw new EffortControlError(EFFORT_CURRENT_CONVERSATION);
         const live = current && !hasExited(current.child) && !current.child.killed && !current.child.stdout?.destroyed ? current : undefined;
-        const reuse = live?.agentId === agentId && live.model === configuredModel;
-        if (live && !reuse && (live.processingStartedAt !== null || live.queue.pending || live.queue.size)) {
-          const change = live.agentId === agentId ? "Configured model" : "Thread binding";
+        const sameModel = live?.agentId === agentId && live.model === configuredModel;
+        if (live && !sameModel && (live.processingStartedAt !== null || live.queue.pending || live.queue.size)) {
+          const change = live.agentId === agentId && live.model !== configuredModel ? "Configured model" : "Thread binding";
           throw new EffortControlError(`${change} changed; wait for the current answer before retrying /effort.`);
         }
+        const reuse = sameModel && !live.effortReadOnly;
         if (expected && !reuse) throw new EffortControlError(EFFORT_CURRENT_CONVERSATION);
         const session = reuse ? live : await this.admitSession(chatId, agentId, undefined, true, config);
         if (!generationMatches()) throw new EffortControlError("Session changed; retry /effort.");
         if (session.model !== configuredModel) throw new EffortControlError("Configured model changed; retry /effort.");
+        if (session.effortReadOnly) throw new EffortControlError("Telegram thread binding changed; retry /effort.");
         const apply = async (ownsReader: boolean): Promise<string> => {
           const readerReleased = ownsReader ? Promise.resolve() : session.turnReaderDone;
           const saveOverride = action.kind === "override" || action.kind === "inherit";
@@ -1925,7 +1939,9 @@ export class SessionManager {
         // A turn holds the queue through delivery, but releases stdout earlier.
         // Controls can use that boundary without waiting for final delivery.
         if (!session.internalTurn && (session.processingStartedAt !== null || session.turnReaderDone)) return await apply(false);
-        return await session.queue.add(() => apply(true)) as string;
+        // Run a waiting control before queued human prompts. A tool in the
+        // next prompt can itself be waiting on this lane's control operation.
+        return await session.queue.add(() => apply(true), { priority: 1 }) as string;
       } finally { release(); }
     });
     this.effortOperations.set(chatId, operation);

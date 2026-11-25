@@ -12,6 +12,7 @@ import {
   PiStartupBlockingUiError,
   assertPiSessionIdentityMatchesBinding,
   normalizePiModel,
+  PI_PROVIDER,
   parsePiStartupIdentityRecord,
   parsePiStartupRecord,
 } from "../pi-rpc-protocol.js";
@@ -105,6 +106,7 @@ mock.module("../pi-rpc-protocol.js", {
     PI_EXTENSIONS_DISABLED_ENV: "PI_EXTENSIONS_DISABLED",
     async *readPiStream() {},
     normalizePiModel,
+    PI_PROVIDER,
     NewlineOnlyJsonlSplitter,
     PiStartupBlockingUiError,
     assertPiSessionIdentityMatchesBinding,

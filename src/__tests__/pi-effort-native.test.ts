@@ -5,9 +5,10 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createAgentSession, ModelRuntime, resolveCliModel, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
-import { SESSION_EFFORT_ENV, SESSION_EFFORT_COMMAND, SESSION_EFFORT_ACK_COMMAND, parseEffortNotice, effortInvocation, parseEffortAction } from "../pi-extensions/session-effort.js";
+import { SESSION_EFFORT_ENV, SESSION_EFFORT_COMMAND, SESSION_EFFORT_ACK_COMMAND, parseEffortNotice, effortInvocation, parseEffortAction } from "../session-effort-wire.js";
 import { buildPiAcknowledgedSteerInvocation, parsePiAcknowledgedSteerResultNotice } from "../pi-extensions/acknowledged-steer.js";
-import type { NativeEffortLevel } from "../types.js";
+import { buildPiSpawnArgs, PI_PROVIDER } from "../pi-rpc-protocol.js";
+import type { NativeEffortLevel, PiThinkingLevel } from "../types.js";
 
 function effortEnvironment(t: { after: (fn: () => void) => void }, cwd: string, initial: object): void {
   for (const [key, value] of Object.entries({
@@ -156,21 +157,37 @@ for (const scenario of [
   { name: "global default", id: "reasoner", pattern: "reasoner", expected: "minimal" },
   { name: "literal colon model ID", id: "reasoner:high", pattern: "reasoner:high", expected: "medium", perModel: "medium" },
   { name: "literal non-effort colon model ID", id: "reasoner:extended", pattern: "reasoner:extended", expected: "minimal" },
+  { name: "spawn provider for a cross-provider literal ID", id: "openai/gpt-6-sol", pattern: "openai/gpt-6-sol", provider: PI_PROVIDER, thinking: "high", expected: "high", perModel: "medium" },
 ] as const) {
   it(`inherits ${scenario.name} at startup, reset and resume without changing models`, { timeout: 20_000 }, async t => {
     const cwd = await mkdtemp(join(tmpdir(), "minime-effort-inheritance-"));
     t.after(() => rm(cwd, { recursive: true, force: true }));
     const runtime = await ModelRuntime.create({ modelsPath: null, authPath: join(cwd, "auth.json") });
-    const faux = fauxProvider({ provider: "effort-inheritance-test", models: [{ id: scenario.id, reasoning: true }] });
+    const provider = "provider" in scenario ? scenario.provider : "effort-inheritance-test";
+    const faux = fauxProvider({ provider, models: [{ id: scenario.id, reasoning: true }] });
     runtime.registerNativeProvider(faux.provider);
-    const configured = { model: `effort-inheritance-test/${scenario.pattern}`, inherited: "thinking" in scenario ? scenario.thinking : undefined };
-    const resolved = resolveCliModel({ cliModel: configured.model, cliThinking: configured.inherited, modelRuntime: runtime });
+    let configured: { model: string; inherited?: PiThinkingLevel; provider?: string } = {
+      model: `${provider}/${scenario.pattern}`, inherited: "thinking" in scenario ? scenario.thinking : undefined,
+    };
+    if ("provider" in scenario) {
+      runtime.registerNativeProvider(fauxProvider({ provider: "openai", models: [{ id: "gpt-6-sol", reasoning: true }] }).provider);
+      await runtime.refresh({ allowNetwork: false });
+      const args = buildPiSpawnArgs({ id: "fixture", workspaceCwd: cwd, model: scenario.pattern, thinking: scenario.thinking });
+      configured = {
+        provider: args[args.indexOf("--provider") + 1],
+        model: args[args.indexOf("--model") + 1],
+        inherited: args[args.indexOf("--thinking") + 1] as PiThinkingLevel,
+      };
+      assert.equal(resolveCliModel({ cliModel: configured.model, modelRuntime: runtime }).model?.provider, "openai");
+    }
+    const resolved = resolveCliModel({ cliProvider: configured.provider, cliModel: configured.model, cliThinking: configured.inherited, modelRuntime: runtime });
     assert.equal(resolved.error, undefined);
     assert.equal(resolved.model?.id, scenario.id, "native CLI resolution keeps the intended model");
+    assert.equal(resolved.model?.provider, provider);
     const perModel = "perModel" in scenario ? scenario.perModel : undefined;
     const settings = SettingsManager.inMemory({
       extensions: [resolve("extensions/pi/session-effort.ts")], defaultThinkingLevel: "minimal",
-      modelThinkingLevels: perModel ? { [`effort-inheritance-test/${scenario.id}`]: perModel } : {},
+      modelThinkingLevels: perModel ? { [`${provider}/${scenario.id}`]: perModel } : {},
       compaction: { enabled: false }, retry: { enabled: false },
     });
     effortEnvironment(t, cwd, configured);
@@ -188,7 +205,7 @@ for (const scenario of [
         await active!.prompt(effortInvocation(SESSION_EFFORT_COMMAND, { id: "reset", action: { kind: "inherit" }, ...configured }));
         assert.equal(active!.thinkingLevel, scenario.expected);
         assert.equal(active!.model?.id, scenario.id);
-        assert.equal(active!.model?.provider, "effort-inheritance-test");
+        assert.equal(active!.model?.provider, provider);
         assert.equal(settings.getDefaultThinkingLevel(), "minimal");
       };
       await reset();
@@ -300,6 +317,11 @@ it("native Pi refreshes agent/model defaults for acknowledged Telegram steers an
       levels: ["off", "minimal", "low", "medium", "high"],
     });
     assert.equal(first.session.thinkingLevel, "low");
+    await first.session.prompt(effortInvocation(SESSION_EFFORT_COMMAND, { id: "status", action: { kind: "status" } }));
+    assert.deepEqual(parseEffortNotice(first.notices.at(-1)), {
+      kind: "result", id: "status", effective: "high", source: "agent default", running: "low",
+      levels: ["off", "minimal", "low", "medium", "high"],
+    });
     await first.session.prompt(buildPiAcknowledgedSteerInvocation("telegram-steer", "Steered Telegram message"));
   } finally { release(); }
   await run;
