@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 2026.11.15
+
+- Add per-topic reasoning effort and personal-agent model defaults (#240, #241).
+
 ## 2026.11.14
 
 - Support explicit conversation adoption and rollback for worker lanes, and opt-in scheduled LLM execution with controller-owned delivery (#285).
