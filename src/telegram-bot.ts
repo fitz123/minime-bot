@@ -1,6 +1,6 @@
 import { loadConfig } from "./config.js";
 import { formatFastCommandError, formatFastStatusLine, handleFastCommand } from "./codex-fast.js";
-import { EFFORT_DEFAULT_PERMISSION, parseEffortAction } from "./pi-extensions/session-effort.js";
+import { EFFORT_DEFAULT_PERMISSION, formatEffortError, parseEffortAction } from "./pi-extensions/session-effort.js";
 import { statSync } from "node:fs";
 import type { RichMessage } from "grammy/types";
 import { validateRichPhoto } from "./telegram-rich.js";
@@ -1022,7 +1022,7 @@ export function createTelegramBot(
       try {
         response = await sessionManager.sessionEffort(key, binding.agentId, value);
       } catch (error) {
-        response = `Effort change not confirmed: ${(error as Error).message}`;
+        response = formatEffortError(error);
       }
       await ctx.reply(response, topicId === undefined ? {} : { message_thread_id: topicId });
     })().catch(error => log.warn("telegram-bot", `Effort reply failed: ${(error as Error).message}`));
@@ -1055,6 +1055,7 @@ export function createTelegramBot(
       maxSessions: config.sessionDefaults.maxConcurrentSessions,
       uptimeSeconds: Math.floor(process.uptime()),
       sessionHealth,
+      effortHint: process.env.PI_EXTENSIONS_DISABLED !== "1",
       fastStatusLine,
       quotaStatus,
     }));

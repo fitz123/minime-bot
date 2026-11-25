@@ -18,6 +18,7 @@ import { ensureSessionMediaDir, sessionMediaDir, allocateMediaPath, releaseMedia
 // Resolved here BEFORE mock.module installs the stub, so these are the genuine
 // implementations; the stub below re-exports them so capture parses correctly.
 import { buildPiSpawnArgs, MINIME_BOT_PI_SESSION_AGENT_ID_ENV, NewlineOnlyJsonlSplitter, handlePiExtensionUiRecord, PiStartupBlockingUiError, assertPiSessionIdentityMatchesBinding, normalizePiModel, parsePiStartupIdentityRecord, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions } from "../pi-rpc-protocol.js";
+import type { EffortRequestAction, EffortResult } from "../pi-extensions/session-effort.js";
 import PQueue from "p-queue";
 import { CURRENT_SESSION_VERSION, ModelRuntime, resolveCliModel } from "@earendil-works/pi-coding-agent";
 import { collaborationTransport } from "../collaboration.js";
@@ -589,6 +590,59 @@ describe("SessionManager exact Pi binding startup", () => {
         assert.equal(capture.agent.thinking, undefined);
         assert.deepEqual(capture.runtimeEnvOptions?.sessionEffort, { model: "openai-codex/gpt-5.5:high", inherited: undefined, override: undefined });
       }
+    } finally { await manager.closeAll(); }
+  });
+
+  it("admits the newly configured model before controlling idle effort and honors a new worker route", async t => {
+    const startup = makeConfig();
+    const disk = structuredClone(startup);
+    const loadFullConfig = t.mock.fn(() => disk);
+    const loadControlConfig = t.mock.fn(() => disk);
+    const telegramBindingReload = createTelegramBindingReload(startup, loadControlConfig, loadFullConfig);
+    const manager = new SessionManager(loadFullConfig, TEST_STORE_PATH, TEST_DIR, { initialConfig: startup, loadControlConfig, telegramBindingReload });
+    const key = "456:1";
+    try {
+      const previous = await manager.getOrCreateSession(key, "pi");
+      loadFullConfig.mock.resetCalls();
+      disk.agents.pi.model = "openai-codex/another-model";
+      disk.bindings[1].kind = "group";
+      const request = t.mock.method(manager as unknown as {
+        requestEffort: (lane: string, session: typeof previous, action: EffortRequestAction) => Promise<EffortResult>;
+      }, "requestEffort", async (_lane: string, session: typeof previous, action: EffortRequestAction): Promise<EffortResult> => {
+        assert.notEqual(session, previous);
+        assert.equal(session.model, "openai-codex/another-model");
+        assert.deepEqual(action, { kind: "default", level: "high" });
+        return { kind: "result", id: "new-model", effective: "high", source: "agent default", levels: ["off", "high"] };
+      });
+
+      assert.match(await manager.sessionEffort(key, "pi", "default high"), /default for this model is now high/);
+      const replacement = manager.getActive(key)!;
+      assert.equal(replacement.sessionId, previous.sessionId);
+      assert.equal(previous.child.killed, true);
+      assert.equal(piSpawnCaptures.length, 2);
+      assert.equal(piSpawnCaptures.at(-1)?.runtimeEnvOptions?.sessionEffort?.model, disk.agents.pi.model);
+      assert.equal(loadFullConfig.mock.callCount(), 0);
+      assert.equal(loadControlConfig.mock.callCount(), 1);
+
+      disk.agents.pi.workerRuntime = { socketPath: "/tmp/synthetic-worker.sock", workerUid: 1234, controllerName: "fixture" };
+      await assert.rejects(manager.sessionEffort(key, "pi", "high"), /Worker routing changed.*Restart the controller/);
+      assert.equal(manager.getActive(key), replacement);
+      assert.equal(piSpawnCaptures.length, 2);
+      assert.equal(request.mock.callCount(), 1);
+    } finally { await manager.closeAll(); }
+  });
+
+  it("enables read-only effort inheritance on local Discord lanes", async () => {
+    const config = makeConfig();
+    const manager = new SessionManager(() => config, TEST_STORE_PATH, TEST_DIR);
+    try {
+      await manager.getOrCreateSession("discord:789", "pi");
+      assert.deepEqual(piSpawnCaptures.at(-1)?.runtimeEnvOptions?.sessionEffort, {
+        model: "openai-codex/gpt-5.5", inherited: "xhigh", readOnly: true,
+      });
+      await assert.rejects(manager.sessionEffort("discord:789", "pi"), /require a Telegram conversation/);
+      await manager.getOrCreateSession("789", "pi");
+      assert.equal(piSpawnCaptures.at(-1)?.runtimeEnvOptions?.sessionEffort, undefined);
     } finally { await manager.closeAll(); }
   });
 

@@ -1,4 +1,8 @@
-import { EFFORT_DEFAULT_PERMISSION, EFFORT_USAGE, effortInvocation, parseEffortAction, parseEffortNotice, SESSION_EFFORT_COMMAND, SESSION_EFFORT_ACK_COMMAND, type EffortRequestAction, type EffortResult } from "./pi-extensions/session-effort.js";
+import {
+  EFFORT_CURRENT_CONVERSATION, EFFORT_DEFAULT_PERMISSION, EFFORT_USAGE, EffortConfirmationTimeout, EffortControlError,
+  effortInvocation, formatEffortError, formatEffortStatus, parseEffortAction, parseEffortNotice,
+  SESSION_EFFORT_COMMAND, SESSION_EFFORT_ACK_COMMAND, type EffortRequestAction, type EffortResult,
+} from "./pi-extensions/session-effort.js";
 import { RICH_RESERVED_DIR } from "./telegram-rich.js";
 import { type ChildProcess } from "node:child_process";
 import { chmodSync, createWriteStream, existsSync, lstatSync, mkdirSync, readdirSync, renameSync, rmSync, type Stats, unlinkSync } from "node:fs";
@@ -13,7 +17,7 @@ import { CollaborationDeliveryError, collaborationPrompt, collaborationTransport
 import type { Address } from "./collaboration.js";
 import { topicScopeEnabled, type PrivateTopicController, type TopicApply } from "./private-topics.js";
 import type { TopicRecord, TopicTarget } from "./topic-store.js";
-import type { BoundSessionState, PendingSessionRecoveryNotice, PlatformContext, SessionRecoveryReason, SessionState, StreamLine, BotConfig, AgentConfig } from "./types.js";
+import type { BoundSessionState, PendingSessionRecoveryNotice, PlatformContext, SessionRecoveryReason, SessionState, StreamLine, BotConfig, AgentConfig, NativeEffortLevel, TelegramBinding } from "./types.js";
 import { spawnPiRpcSession, sendPiPrompt, sendPiSteer, sendPiAcknowledgedSteer, sendPiGetState, readPiStream, parsePiStartupIdentityRecord, assertPiSessionIdentityMatchesBinding, PiStartupBlockingUiError, NewlineOnlyJsonlSplitter, handlePiExtensionUiRecord, normalizePiModel, PI_EXTENSIONS_DISABLED_ENV, type PiAcknowledgedSteerResult, type PiRpcEvent, type PiSpawnExtensionOptions, type PiSpawnRuntimeEnvOptions, type PiStartupDiagnostics } from "./pi-rpc-protocol.js";
 import { SessionStore } from "./session-store.js";
 import { AgentRuntimeClient } from "./agent-runtime-client.js";
@@ -36,6 +40,8 @@ import {
 const LOG_DIR = process.env.LOG_DIR ?? join(homedir(), ".minime", "logs");
 const OUTBOX_DIR_NAME = "bot-outbox";
 const STARTUP_TIMEOUT_MS = 10_000;
+const WORKER_ROUTE_CHANGED = "Worker routing changed. Restart the controller before sending more messages to this lane.";
+const SESSION_SLOTS_BUSY = "all bot session slots are busy";
 const PI_EXACT_OPEN_REJECTION_SETTLE_MS = 300;
 const RESPONSE_ACTIVITY_TIMEOUT_MS = 1_800_000; // 30 minutes with no events = hung
 const RESPONSE_LIVENESS_PROBE_TIMEOUT_MS = 10_000;
@@ -171,7 +177,7 @@ export interface ActiveSession {
   model: string;
   /** Spawn-time thinking configuration used by the runtime signature. */
   thinking?: AgentConfig["thinking"];
-  effortOverride?: AgentConfig["thinking"];
+  effortOverride?: NativeEffortLevel;
   queue: PQueue;
   idleTimer: ReturnType<typeof setTimeout> | null;
   /** Idle timeout baked at spawn time from config. */
@@ -327,6 +333,8 @@ export class SessionManager {
   private effortWaiters = new Map<string, { session: ActiveSession; resolve: (result: EffortResult) => void }>();
   private store: SessionStore;
   private loadConfig: () => BotConfig;
+  private loadControlConfig: () => BotConfig;
+  private getTelegramBindings: () => TelegramBinding[];
   private telegramBindingReload?: TelegramBindingReload;
   private logDir: string;
   private startupTimeoutMs: number;
@@ -339,12 +347,15 @@ export class SessionManager {
     loadConfig: () => BotConfig,
     storePath?: string,
     logDir?: string,
-    options?: { startupTimeoutMs?: number; initialConfig?: BotConfig; telegramBindingReload?: TelegramBindingReload },
+    options?: { startupTimeoutMs?: number; initialConfig?: BotConfig; telegramBindingReload?: TelegramBindingReload; loadControlConfig?: () => BotConfig },
   ) {
     this.loadConfig = loadConfig;
+    this.loadControlConfig = options?.loadControlConfig ?? loadConfig;
     this.telegramBindingReload = options?.telegramBindingReload;
     // Validate config at boot — fail fast if config is broken
     const startupConfig = options?.initialConfig ?? loadConfig();
+    const startupBindings = startupConfig.bindings;
+    this.getTelegramBindings = this.telegramBindingReload?.getBindings ?? (() => startupBindings);
     this.transport = collaborationTransport(startupConfig);
     for (const [agentId, agent] of Object.entries(startupConfig.agents)) {
       if (agent.workerRuntime) this.workerRoutes.set(agentId, { ...agent.workerRuntime });
@@ -376,6 +387,14 @@ export class SessionManager {
   private assertLocalLane(chatId: string, agentId?: string): void {
     if (this.isWorkerLane(chatId, agentId)) {
       throw new AgentRuntimeError("unsupported_route", "This operation is unavailable for worker-routed sessions. The existing binding was retained.");
+    }
+  }
+
+  private assertUnchangedWorkerRoute(chatId: string, agentId: string, config: BotConfig): void {
+    const stored = this.store.getSession(chatId);
+    if (stored?.bindingState === "bound" && stored.workerRollback && stored.agentId === agentId) return;
+    if (config.agents[agentId]?.workerRuntime || (stored && config.agents[stored.agentId]?.workerRuntime)) {
+      throw new AgentRuntimeError("route_changed", WORKER_ROUTE_CHANGED);
     }
   }
 
@@ -969,6 +988,10 @@ export class SessionManager {
    * Enforces maxConcurrentSessions via LRU eviction.
    */
   async getOrCreateSession(chatId: string, agentId: string, expectedId?: string, internal = false): Promise<ActiveSession> {
+    return this.admitSession(chatId, agentId, expectedId, internal);
+  }
+
+  private async admitSession(chatId: string, agentId: string, expectedId: string | undefined, internal: boolean, config?: BotConfig): Promise<ActiveSession> {
     this.assertLocalLane(chatId, agentId);
     if (expectedId) {
       const state = this.store.getSession(chatId);
@@ -991,10 +1014,10 @@ export class SessionManager {
       if ((this.sessionGenerations.get(chatId) ?? 0) !== generation) {
         throw new SessionStartupSupersededError();
       }
-      return this.getOrCreateSession(chatId, agentId, expectedId, internal);
+      return this.admitSession(chatId, agentId, expectedId, internal, config);
     }
 
-    const promise = this.startSession(chatId, agentId, expectedId, internal);
+    const promise = this.startSession(chatId, agentId, expectedId, internal, config);
     const startup: SessionStartup = { generation, agentId, promise };
     this.sessionStartups.set(chatId, startup);
     try {
@@ -1006,7 +1029,7 @@ export class SessionManager {
     }
   }
 
-  private async startSession(chatId: string, agentId: string, expectedId?: string, internal = false): Promise<ActiveSession> {
+  private async startSession(chatId: string, agentId: string, expectedId?: string, internal = false, freshConfig?: BotConfig): Promise<ActiveSession> {
     const generation = this.sessionGenerations.get(chatId) ?? 0;
     const isStartupSuperseded = () => (this.sessionGenerations.get(chatId) ?? 0) !== generation;
     const abortSupersededStartup = async (childToTerminate?: ChildProcess): Promise<never> => {
@@ -1022,17 +1045,9 @@ export class SessionManager {
       await abortSupersededStartup();
     }
 
-    let freshConfig: BotConfig | undefined;
     const getFreshConfig = (): BotConfig => {
       freshConfig ??= this.getFreshConfig(chatId);
       return freshConfig;
-    };
-    const assertUnchangedRoute = (config: BotConfig): void => {
-      const stored = this.store.getSession(chatId);
-      if (stored?.bindingState === "bound" && stored.workerRollback && stored.agentId === agentId) return;
-      if (config.agents[agentId]?.workerRuntime || (stored && config.agents[stored.agentId]?.workerRuntime)) {
-        throw new AgentRuntimeError("route_changed", "Worker routing changed. Restart the controller before sending more messages to this lane.");
-      }
     };
     const tryGetFreshConfigForActiveSession = (): BotConfig | undefined => {
       try {
@@ -1051,7 +1066,7 @@ export class SessionManager {
         if (expectedId && existing.sessionId === expectedId) return existing;
         const activeConfig = tryGetFreshConfigForActiveSession();
         const activeAgent = activeConfig?.agents[agentId];
-        if (activeConfig) assertUnchangedRoute(activeConfig);
+        if (activeConfig) this.assertUnchangedWorkerRoute(chatId, agentId, activeConfig);
         if (!activeConfig || (activeAgent && !runtimeSignatureChanged(existing, activeAgent))) {
           existing.lastActivity = Date.now();
           this.resetIdleTimer(chatId);
@@ -1069,7 +1084,7 @@ export class SessionManager {
         existing = undefined;
       } else {
         const activeConfig = tryGetFreshConfigForActiveSession();
-        if (activeConfig) assertUnchangedRoute(activeConfig);
+        if (activeConfig) this.assertUnchangedWorkerRoute(chatId, agentId, activeConfig);
         log.warn(
           "session-manager",
           `Closing active session for chat ${chatId}: agentId changed from "${existing.agentId}" to "${agentId}"`,
@@ -1105,7 +1120,7 @@ export class SessionManager {
 
     // Reload config fresh — pick up any changes to agents/sessionDefaults
     freshConfig = getFreshConfig();
-    assertUnchangedRoute(freshConfig);
+    this.assertUnchangedWorkerRoute(chatId, agentId, freshConfig);
     const agent = freshConfig.agents[agentId];
     if (!agent) {
       throw new Error(`Unknown agent: ${agentId}`);
@@ -1144,6 +1159,9 @@ export class SessionManager {
     const telegramLane = /^(-?\d+)(?::(\d+))?$/.exec(chatId);
     const telegramBinding = telegramLane && resolveBinding(Number(telegramLane[1]), freshConfig.bindings,
       telegramLane[2] === undefined ? undefined : Number(telegramLane[2]));
+    const effortBinding = telegramLane && resolveBinding(Number(telegramLane[1]), this.getTelegramBindings(),
+      telegramLane[2] === undefined ? undefined : Number(telegramLane[2]));
+    const discordEffort = chatId.startsWith("discord:");
     const telegramRichAnswers = !!telegramBinding;
     const topicBotId = this.topicController?.currentBotId();
     const privateTopicPolicy = !!this.transport && process.env.PI_EXTENSIONS_DISABLED !== "1" && topicBotId !== undefined && !!telegramLane?.[2] &&
@@ -1162,8 +1180,11 @@ export class SessionManager {
     let child: ChildProcess | undefined;
     for (;;) {
       try {
-        if (telegramBinding?.agentId === agentId) {
-          runtimeEnvOptions.sessionEffort = { model: normalizedSessionModel(agent), inherited: agent.thinking, override: prepared.state.effortOverride };
+        if (discordEffort || effortBinding?.agentId === agentId) {
+          runtimeEnvOptions.sessionEffort = {
+            model: normalizedSessionModel(agent), inherited: agent.thinking,
+            ...(discordEffort ? { readOnly: true } : { override: prepared.state.effortOverride }),
+          };
         }
         child = spawnPiRpcSession(agent, prepared.binding, extensionOptions, transportEnabled
           ? { ...runtimeEnvOptions, collaborationSession: prepared.binding.sessionId, collaborationSocket: this.transport!.socketPath, ...(this.transport!.topicOnly ? { collaborationTopicOnly: true } : {}) }
@@ -1826,70 +1847,79 @@ export class SessionManager {
   /** Plain-text, current-lane control. Native Pi remains the capability authority. */
   async sessionEffort(chatId: string, agentId: string, value?: string, expected?: ActiveSession): Promise<string> {
     const action = parseEffortAction(value);
-    if (!action) throw new Error(EFFORT_USAGE);
-    this.assertLocalLane(chatId, agentId);
+    if (!action) throw new EffortControlError(EFFORT_USAGE);
     const generation = this.sessionGenerations.get(chatId) ?? 0;
+    const generationMatches = () => (this.sessionGenerations.get(chatId) ?? 0) === generation;
     const previous = this.effortOperations.get(chatId) ?? Promise.resolve();
     const operation = previous.catch(() => {}).then(async () => {
-      if (!this.acceptingSessionWork || (this.sessionGenerations.get(chatId) ?? 0) !== generation) throw new Error("Session changed; retry /effort.");
-      if (process.env[PI_EXTENSIONS_DISABLED_ENV] === "1") throw new Error("Session effort extension is disabled.");
+      if (!this.acceptingSessionWork || !generationMatches()) throw new EffortControlError("Session changed; retry /effort.");
+      if (process.env[PI_EXTENSIONS_DISABLED_ENV] === "1") throw new EffortControlError("Session effort extension is disabled.");
       const lane = /^(-?\d+)(?::(\d+))?$/.exec(chatId);
-      if (!lane) throw new Error("Effort controls require a Telegram conversation.");
+      if (!lane) throw new EffortControlError("Effort controls require a Telegram conversation.");
       const telegramChatId = Number(lane[1]);
       const topicId = lane[2] === undefined ? undefined : Number(lane[2]);
-      const configuredAgent = (): AgentConfig => {
-        const config = this.getFreshConfig(chatId);
-        const binding = resolveBinding(telegramChatId, config.bindings, topicId);
-        if (!binding || binding.agentId !== agentId) throw new Error("Telegram thread binding changed.");
-        if (action.kind === "default" && (binding.kind !== "dm" || telegramChatId <= 0)) throw new Error(EFFORT_DEFAULT_PERMISSION);
-        const agent = config.agents[agentId];
-        if (!agent) throw new Error("Current agent is unavailable.");
-        return agent;
+      const assertControlBinding = () => {
+        const binding = resolveBinding(telegramChatId, this.getTelegramBindings(), topicId);
+        if (binding?.agentId !== agentId) throw new EffortControlError("Telegram thread binding changed.");
+        if (action.kind === "default" && (binding.kind !== "dm" || telegramChatId <= 0)) throw new EffortControlError(EFFORT_DEFAULT_PERMISSION);
+        if (this.isWorkerLane(chatId, agentId)) throw new EffortControlError("Effort controls are unavailable for worker-routed sessions.");
       };
-      configuredAgent();
+      assertControlBinding();
+      const config = (telegramChatId < 0 ? this.telegramBindingReload?.loadGroupConfig() : undefined) ?? this.loadControlConfig();
+      const agent = config.agents[agentId];
+      if (!agent) throw new EffortControlError("Current agent is unavailable.");
+      const configuredModel = normalizedSessionModel(agent);
+      this.assertUnchangedWorkerRoute(chatId, agentId, config);
       const release = this.holdHumanInput(chatId);
       try {
         const current = this.active.get(chatId);
-        if (current && current.agentId !== agentId && (current.processingStartedAt !== null || current.queue.pending > 0)) throw new Error("Thread binding changed; wait for the current answer before retrying /effort.");
-        if (expected && (current !== expected || expected.internalTurn)) throw new Error("Effort controls are available only in the current Telegram conversation.");
-        const session = current && current.agentId === agentId && !hasExited(current.child) && !current.child.killed
-          ? current : await this.getOrCreateSession(chatId, agentId, undefined, true);
-        if ((this.sessionGenerations.get(chatId) ?? 0) !== generation) throw new Error("Session changed; retry /effort.");
+        if (expected && (current !== expected || expected.internalTurn)) throw new EffortControlError(EFFORT_CURRENT_CONVERSATION);
+        const live = current && !hasExited(current.child) && !current.child.killed && !current.child.stdout?.destroyed ? current : undefined;
+        const reuse = live?.agentId === agentId && live.model === configuredModel;
+        if (live && !reuse && (live.processingStartedAt !== null || live.queue.pending || live.queue.size)) {
+          const change = live.agentId === agentId ? "Configured model" : "Thread binding";
+          throw new EffortControlError(`${change} changed; wait for the current answer before retrying /effort.`);
+        }
+        if (expected && !reuse) throw new EffortControlError(EFFORT_CURRENT_CONVERSATION);
+        const session = reuse ? live : await this.admitSession(chatId, agentId, undefined, true, config);
+        if (!generationMatches()) throw new EffortControlError("Session changed; retry /effort.");
+        if (session.model !== configuredModel) throw new EffortControlError("Configured model changed; retry /effort.");
         const apply = async (ownsReader: boolean): Promise<string> => {
           const readerReleased = ownsReader ? Promise.resolve() : session.turnReaderDone;
+          const saveOverride = action.kind === "override" || action.kind === "inherit";
+          let applied = false;
           let releaseControl!: () => void;
           session.effortControlDone = new Promise(resolve => { releaseControl = resolve; });
           try {
-            if (this.active.get(chatId) !== session) throw new Error("Current session closed.");
-            const agent = configuredAgent();
+            if (this.active.get(chatId) !== session || !generationMatches()) throw new EffortControlError("Current session changed.");
+            assertControlBinding();
             const result = await this.requestEffort(chatId, session, action, agent, readerReleased);
-            if (this.active.get(chatId) !== session || (this.sessionGenerations.get(chatId) ?? 0) !== generation) throw new Error("Current session changed.");
-            const supported = result.levels.length ? `Supported levels are ${result.levels.join(", ")}.` : "No supported levels are available.";
-            const status = `Effort is ${result.effective}. Source is the ${result.source}. ${supported}`;
-            if (result.error) throw new Error(`${result.error} ${status}`);
-            if (action.kind === "override" || action.kind === "inherit") {
+            if (result.error) throw new EffortControlError(result.error);
+            applied = true;
+            if (this.active.get(chatId) !== session || !generationMatches()) throw new EffortControlError("Current session changed.");
+            const status = formatEffortStatus(result);
+            if (saveOverride) {
               const stored = this.store.getSession(chatId);
-              if (stored?.bindingState !== "bound" || stored.sessionId !== session.sessionId || stored.sessionFile !== session.sessionFile) throw new Error("Session binding changed; effort was not saved.");
-              const previousOverride = session.effortOverride;
+              if (stored?.bindingState !== "bound" || stored.sessionId !== session.sessionId || stored.sessionFile !== session.sessionFile) throw new EffortControlError("Session binding changed; effort was not saved.");
               const override = action.kind === "inherit" ? undefined : result.effective;
               const { effortOverride: _previous, ...snapshot } = this.toSessionState(chatId, session);
               const replacement = { ...snapshot, ...(override === undefined ? {} : { effortOverride: override }) };
-              try {
-                if (!this.store.compareAndSetSession(chatId, stored, replacement)) throw new Error("Session binding changed; effort was not saved.");
-              } catch (error) {
-                // A failed durable write must not leave an untracked live override.
-                if (this.active.get(chatId) === session) {
-                  const restored = await this.requestEffort(chatId, session, { kind: "restore", level: previousOverride }, agent, readerReleased);
-                  if (restored.error) throw new Error(`Effort was not saved and restoring the previous value failed. Effective effort: ${restored.effective}.`);
-                }
-                throw error;
-              }
+              if (!this.store.compareAndSetSession(chatId, stored, replacement)) throw new EffortControlError("Session binding changed; effort was not saved.");
               session.effortOverride = override;
+              applied = false;
             }
             this.touchActivity(chatId);
             if (action.kind === "default") return `The agent's default for this model is now ${action.level}. Conversations that inherit it will use it from their next message. ${status}`;
             if (action.kind === "status") return status;
             return `${status} This applies from the next model request.`;
+          } catch (error) {
+            // Pi may have applied the change before a save fails or its reply times out.
+            if (saveOverride && (applied || error instanceof EffortConfirmationTimeout)
+              && this.active.get(chatId) === session && generationMatches() && !hasExited(session.child)) {
+              const restored = await this.requestEffort(chatId, session, { kind: "restore", level: session.effortOverride }, agent, readerReleased);
+              if (restored.error) throw new EffortControlError(`Effort was not saved and restoring the previous value failed. Effective effort is ${restored.effective}.`);
+            }
+            throw error;
           } finally { releaseControl(); }
         };
         // A turn holds the queue through delivery, but releases stdout earlier.
@@ -1900,6 +1930,13 @@ export class SessionManager {
     });
     this.effortOperations.set(chatId, operation);
     try { return await operation; }
+    catch (error) {
+      if ((error instanceof AgentRuntimeError && error.code === "route_changed")
+        || (error instanceof CollaborationDeliveryError && error.message === SESSION_SLOTS_BUSY)) {
+        throw new EffortControlError(error.message);
+      }
+      throw error;
+    }
     finally { if (this.effortOperations.get(chatId) === operation) this.effortOperations.delete(chatId); }
   }
 
@@ -1913,10 +1950,13 @@ export class SessionManager {
     } else if (this.active.get(chatId) === session) {
       // The tool has no target parameter. Its owning reader supplies the lane;
       // return success only after the exact binding has durably accepted it.
-      void this.sessionEffort(chatId, session.agentId, notice.value, session).then(
-        text => ({ text, ok: true }),
-        error => ({ text: `Effort change not confirmed: ${(error as Error).message}`, ok: false }),
-      ).then(result => {
+      const response = session.internalTurn
+        ? Promise.resolve({ text: formatEffortError(new EffortControlError(EFFORT_CURRENT_CONVERSATION)), ok: false })
+        : this.sessionEffort(chatId, session.agentId, notice.value, session).then(
+          text => ({ text, ok: true }),
+          error => ({ text: formatEffortError(error), ok: false }),
+        );
+      void response.then(result => {
         if (this.active.get(chatId) === session && !hasExited(session.child)) {
           sendPiPrompt(session.child, effortInvocation(SESSION_EFFORT_ACK_COMMAND, { id: notice.id, ...result }), "followUp");
         }
@@ -1945,8 +1985,8 @@ export class SessionManager {
     try {
       const response = new Promise<EffortResult>((resolve, reject) => {
         this.effortWaiters.set(id, { session, resolve });
-        timer = setTimeout(() => reject(new Error("Pi did not confirm effort; check /effort before retrying.")), this.startupTimeoutMs);
-        onExit = () => reject(new Error("Pi exited before confirming effort."));
+        timer = setTimeout(() => reject(new EffortConfirmationTimeout("Pi did not confirm effort; check /effort before retrying.")), this.startupTimeoutMs);
+        onExit = () => reject(new EffortControlError("Pi exited before confirming effort."));
         session.child.once("exit", onExit);
         try { sendPiPrompt(session.child, effortInvocation(SESSION_EFFORT_COMMAND, { id, action, inherited: agent.thinking, model: normalizedSessionModel(agent) }), "followUp"); }
         catch (error) { reject(error); }
@@ -2284,7 +2324,7 @@ export class SessionManager {
     if (oldest) {
       await this.closeSession(oldest.chatId);
     } else if (internal) {
-      throw new CollaborationDeliveryError("rejected", "all bot session slots are busy");
+      throw new CollaborationDeliveryError("rejected", SESSION_SLOTS_BUSY);
     }
   }
 

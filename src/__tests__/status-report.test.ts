@@ -70,7 +70,7 @@ describe("buildStatusReport", () => {
   it("places Fast beside model/thinking while preserving session and quota lines", () => {
     const baseline = baseReport();
     const text = baseReport({ fastStatusLine: "Fast: on · inherited" });
-    assert.match(text, /Model: openai-codex\/gpt-5\.5\nThinking: xhigh\nFast: on · inherited\nState: idle/);
+    assert.match(text, /Model: openai-codex\/gpt-5\.5\nConfigured thinking: xhigh\nFast: on · inherited\nState: idle/);
     assert.equal(text.replace("Fast: on · inherited\n", ""), baseline);
   });
 
@@ -86,7 +86,7 @@ describe("buildStatusReport", () => {
     assert.match(text, /Uptime: 2h 5m/);
     assert.match(text, /Agent: main \(pi\)/);
     assert.match(text, /Model: openai-codex\/gpt-5\.5/);
-    assert.match(text, /Thinking: xhigh/);
+    assert.match(text, /Configured thinking: xhigh/);
     assert.match(text, /State: idle \(2m\)/);
     assert.match(text, /Session ID: session-123/);
     assert.match(text, /Codex quota: unavailable \(no cached state\)/);
@@ -114,7 +114,7 @@ describe("buildStatusReport", () => {
 
     assert.match(text, /Agent: main \(pi\)/);
     assert.match(text, /Model: openai-codex\/gpt-5\.5/);
-    assert.match(text, /Thinking: high/);
+    assert.match(text, /Configured thinking: high/);
     assert.match(text, /State: processing \(42s\)/);
     assert.match(text, /Codex quota: unavailable \(state file missing\)/);
   });

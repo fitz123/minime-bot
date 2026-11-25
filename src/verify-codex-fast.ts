@@ -115,7 +115,7 @@ export async function verifyCodexFast(extensionPath?: string): Promise<{ piVersi
       activeCount: 1, maxSessions: 2, uptimeSeconds: 60, fastStatusLine,
       sessionHealth: { agentId: "fixture-primary", model: agent.model, thinking: "high", provider: "pi", sessionId: "fixture-session", pid: null, alive: true, idleMs: 0, processingMs: null, lastSuccessAt: Date.now(), restartCount: 0 },
     });
-    assert.match(report, /Model: openai-codex\/gpt-6-astra\nThinking: high\nFast: on · inherited\nState:/);
+    assert.match(report, /Model: openai-codex\/gpt-6-astra\nConfigured thinking: high\nFast: on · inherited\nState:/);
     assert.match(report, /Session ID: fixture-session/);
     assert.match(report, /Codex quota:/);
     assert.equal(readFileSync(preferencesPath, "utf8"), beforeStatus);

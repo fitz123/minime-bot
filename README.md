@@ -660,7 +660,8 @@ from, and the levels the current model supports. Send `/effort high` to pin the
 current conversation or `/effort inherit` to remove its pin. To change the
 routed agent's default for its current provider and model, send
 `/effort default high` in a private chat with a DM binding, as with `/fast`.
-Conversations that inherit pick up the new default on their next message.
+Conversations that inherit, including local Discord lanes, pick up the new
+default on their next message.
 Until the agent has a saved default for that model, it uses the configured
 thinking level or Pi's settings.
 

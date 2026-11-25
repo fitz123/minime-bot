@@ -1,4 +1,4 @@
-import { SESSION_EFFORT_ENV } from "./pi-extensions/session-effort.js";
+import { SESSION_EFFORT_ENV, type SessionEffortStartup } from "./pi-extensions/session-effort.js";
 import { readVisionImages } from "./vision-input.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -199,8 +199,8 @@ export interface PiSpawnRuntimeEnvOptions {
   /** Deterministic per-chat outbox path supplied for an interactive session. */
   outboxPath?: string;
   telegramRichAnswers?: boolean;
-  /** Enables current-session effort tools only for Telegram-owned lanes. */
-  sessionEffort?: { model?: string; inherited?: AgentConfig["thinking"]; override?: AgentConfig["thinking"] };
+  /** Enables Telegram effort controls or read-only Discord inheritance. */
+  sessionEffort?: SessionEffortStartup;
   /** Create a process group rooted at the Pi child so fence loss can kill its tool descendants. */
   startNewProcessGroup?: boolean;
 }
@@ -2012,73 +2012,76 @@ export async function* readPiStream(
   // Keep unread bytes intact so the next stdout owner can decode even a UTF-8
   // character split across the terminal handoff.
   let pending: Buffer = Buffer.alloc(0);
+  const returnUnreadBytes = () => {
+    if (pending.length === 0 || stdout.readableEnded || stdout.destroyed) return;
+    stdout.unshift(pending);
+    pending = Buffer.alloc(0);
+  };
   const parseState: PiRpcParseState = { expectedPromptId };
 
-  for (;;) {
-    let chunk: Buffer | string | null;
-    while ((chunk = stdout.read()) !== null) {
-      pending = Buffer.concat([pending, typeof chunk === "string" ? Buffer.from(chunk) : chunk]);
-      let newline: number;
-      while ((newline = pending.indexOf(10)) !== -1) {
-        const record = stripTrailingCarriageReturn(pending.subarray(0, newline).toString("utf8"));
-        pending = pending.subarray(newline + 1);
-        const line = handlePiStreamRecord(
-          child,
-          record,
-          parseState,
-          onActivity,
-          onAcknowledgedSteerResult,
-        );
-        if (line) {
-          // Return unread bytes before yielding: consumers may stop here, and
-          // keeping them in stdout also prevents EOF during a paused yield.
-          if (pending.length > 0) {
-            stdout.unshift(pending);
-            pending = Buffer.alloc(0);
-          }
-          yield line;
-          if (line.type === "result") {
+  try {
+    for (;;) {
+      if (stdout.readableLength === 0) stdout.read(0);
+      while (stdout.readableLength > 0) {
+        // Read only the available bytes so a finite stream stays open until
+        // we consume or hand back the records from this batch.
+        const chunk: Buffer | string | null = stdout.read(stdout.readableLength);
+        if (chunk === null) break;
+        const incoming = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+        pending = pending.length === 0 ? incoming : Buffer.concat([pending, incoming]);
+        let newline: number;
+        while ((newline = pending.indexOf(10)) !== -1) {
+          const record = stripTrailingCarriageReturn(pending.subarray(0, newline).toString("utf8"));
+          pending = pending.subarray(newline + 1);
+          const line = handlePiStreamRecord(
+            child,
+            record,
+            parseState,
+            onActivity,
+            onAcknowledgedSteerResult,
+          );
+          if (line?.type === "result") {
+            returnUnreadBytes();
+            yield line;
             return;
           }
+          if (line) yield line;
         }
       }
-    }
 
-    const handledResult = pending.length > 0
-      ? null
-      : consumeHandledPromptOutcome(parseState);
-    if (handledResult) {
-      yield handledResult;
-      return;
-    }
-
-    const waitResult = await waitForPiStdout(stdout);
-    if (waitResult === "end" || waitResult === "close") {
-      break;
-    }
-  }
-
-  if (pending.length > 0) {
-    const record = stripTrailingCarriageReturn(pending.toString("utf8"));
-    pending = Buffer.alloc(0);
-    const line = handlePiStreamRecord(
-      child,
-      record,
-      parseState,
-      onActivity,
-      onAcknowledgedSteerResult,
-    );
-    if (line) {
-      yield line;
-      if (line.type === "result") {
+      stdout.read(0);
+      if (stdout.readableLength > 0) continue;
+      const handledResult = pending.length > 0 ? null : consumeHandledPromptOutcome(parseState);
+      if (handledResult) {
+        yield handledResult;
         return;
       }
-    }
-  }
 
-  const eofResult = consumeHandledPromptOutcome(parseState) ?? consumeEofOutcome(parseState);
-  if (eofResult) {
-    yield eofResult;
+      const waitResult = await waitForPiStdout(stdout);
+      if (waitResult === "end" || waitResult === "close") break;
+    }
+
+    if (pending.length > 0) {
+      const record = stripTrailingCarriageReturn(pending.toString("utf8"));
+      pending = Buffer.alloc(0);
+      const line = handlePiStreamRecord(
+        child,
+        record,
+        parseState,
+        onActivity,
+        onAcknowledgedSteerResult,
+      );
+      if (line) {
+        yield line;
+        if (line.type === "result") return;
+      }
+    }
+
+    const eofResult = consumeHandledPromptOutcome(parseState) ?? consumeEofOutcome(parseState);
+    if (eofResult) yield eofResult;
+  } finally {
+    // An early consumer return must also release any bytes already buffered.
+    returnUnreadBytes();
   }
 }
 

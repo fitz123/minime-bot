@@ -1,4 +1,4 @@
-import { it } from "node:test";
+import { it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { Readable, Writable } from "node:stream";
@@ -13,10 +13,11 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 const { default: extension } = await import(pathToFileURL(resolve("extensions/pi/session-effort.ts")).href);
 import { SessionManager, type ActiveSession } from "../session-manager.js";
 import { SessionStore } from "../session-store.js";
-import type { BotConfig, PiThinkingLevel } from "../types.js";
-import { SESSION_EFFORT_ENV } from "../pi-extensions/session-effort.js";
+import type { BotConfig, NativeEffortLevel, PiThinkingLevel } from "../types.js";
+import { formatEffortError, SESSION_EFFORT_ENV } from "../pi-extensions/session-effort.js";
+import { createTelegramBindingReload } from "../telegram-binding-reload.js";
 
-async function fixture(t: { after: (fn: () => unknown) => void }, thinking?: PiThinkingLevel) {
+async function fixture(t: TestContext, thinking?: PiThinkingLevel) {
   const root = mkdtempSync(join(tmpdir(), "minime-session-effort-"));
   const previousRoot = process.env.MINIME_CONTROL_WORKSPACE_ROOT;
   process.env.MINIME_CONTROL_WORKSPACE_ROOT = root;
@@ -27,10 +28,16 @@ async function fixture(t: { after: (fn: () => unknown) => void }, thinking?: PiT
   const config: BotConfig = {
     telegramToken: "test-token", whisperModelPath: "/tmp/test-model.bin",
     agents: { main: { id: "main", workspaceCwd: root, model: "effort-fixture/fixture", thinking } },
-    bindings: [{ chatId: 123, agentId: "main", kind: "group" }],
+    bindings: [{ chatId: 123, agentId: "main", kind: "group" }, { chatId: 124, agentId: "main", kind: "dm" }],
     sessionDefaults: { idleTimeoutMs: 60_000, maxConcurrentSessions: 4, maxMessageAgeMs: 300_000, requireMention: false, maxMediaBytes: 1024 },
   };
-  const manager = new SessionManager(() => config, join(root, "sessions.json"), root, { startupTimeoutMs: 300 });
+  const initialConfig = { ...config, bindings: structuredClone(config.bindings) };
+  const loadControlConfig = t.mock.fn(() => config);
+  const loadFullConfig = t.mock.fn(() => config);
+  const telegramBindingReload = createTelegramBindingReload(initialConfig, loadControlConfig, loadFullConfig);
+  const manager = new SessionManager(loadFullConfig, join(root, "sessions.json"), root, {
+    startupTimeoutMs: 300, initialConfig, loadControlConfig, telegramBindingReload,
+  });
   const store = (manager as unknown as { store: SessionStore }).store;
   t.after(async () => { await manager.closeAll(); rmSync(root, { recursive: true, force: true }); });
   function lane(key: string, reasoning = true) {
@@ -38,23 +45,30 @@ async function fixture(t: { after: (fn: () => unknown) => void }, thinking?: PiT
     const commands = new Map<string, (args: string, ctx: ExtensionContext) => Promise<void>>();
     const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => void>();
     let tool: any;
-    let effective: PiThinkingLevel = "medium";
+    const override = store.getSession(key)?.effortOverride;
+    let effective: NativeEffortLevel = "medium";
     let suppressed = false;
+    let suppressNext = false;
     let held: string | undefined;
     const stdout = new Readable({ read() {} });
     const emit = (event: unknown) => stdout.push(JSON.stringify(event) + "\n");
-    const context = { model, modelRegistry: { getAll: () => [model], hasConfiguredAuth: () => true }, ui: { notify(message: string) { if (!suppressed) emit({ type: "extension_ui_request", id: "fixture-notice", method: "notify", notifyType: "info", message }); else held = message; } } } as unknown as ExtensionContext;
+    const context = { model, modelRegistry: { getAll: () => [model], hasConfiguredAuth: () => true }, ui: { notify(message: string) {
+      if (suppressed || suppressNext) {
+        held = message;
+        suppressNext = false;
+      } else emit({ type: "extension_ui_request", id: "fixture-notice", method: "notify", notifyType: "info", message });
+    } } } as unknown as ExtensionContext;
     const pi = {
       getSettings: () => ({ defaultThinkingLevel: "low" }),
       getThinkingLevel: () => effective,
-      setThinkingLevel: (level: PiThinkingLevel) => { effective = clampThinkingLevel(model, level); },
+      setThinkingLevel: (level: NativeEffortLevel) => { effective = clampThinkingLevel(model, level); },
       on: (name: string, handler: any) => handlers.set(name, handler),
       registerCommand: (name: string, options: any) => commands.set(name, options.handler),
       registerTool: (value: any) => { tool = value; },
     } as unknown as ExtensionAPI;
     const previous = process.env[SESSION_EFFORT_ENV];
     const previousAgent = process.env.MINIME_BOT_PI_SESSION_AGENT_ID;
-    process.env[SESSION_EFFORT_ENV] = JSON.stringify({ inherited: thinking });
+    process.env[SESSION_EFFORT_ENV] = JSON.stringify({ inherited: thinking, override });
     process.env.MINIME_BOT_PI_SESSION_AGENT_ID = "main";
     try { extension(pi); } finally {
       if (previous === undefined) delete process.env[SESSION_EFFORT_ENV]; else process.env[SESSION_EFFORT_ENV] = previous;
@@ -79,13 +93,13 @@ async function fixture(t: { after: (fn: () => unknown) => void }, thinking?: PiT
     Object.assign(child, { stdout, stdin, stderr: null, exitCode: null, signalCode: null, killed: false, kill() { Object.assign(child, { exitCode: 0, killed: true }); stdout.push(null); child.emit("exit", 0, "SIGTERM"); return true; } });
     const session: ActiveSession = {
       child, sessionId: key.replace(":", "-"), sessionFile: join(root, key + ".jsonl"), workspaceRealpath: root,
-      agentId: "main", provider: "pi", model: config.agents.main.model, thinking,
+      agentId: "main", provider: "pi", model: config.agents.main.model, thinking, effortOverride: override,
       queue: new PQueue({ concurrency: 1 }), idleTimer: null, idleTimeoutMs: 60_000, lastActivity: Date.now(),
       processingStartedAt: null, lastSuccessAt: null, restartCount: 0, outboxPath: join(root, key), pendingSteers: new Map(),
     };
     (manager as unknown as { active: Map<string, ActiveSession> }).active.set(key, session);
-    store.setSession(key, { bindingState: "bound", sessionId: session.sessionId, sessionFile: session.sessionFile!, workspaceRealpath: root, chatId: key, agentId: "main", lastActivity: Date.now(), thinking });
-    return { session, stdout, writes, emit, tool, context, get effective() { return effective; }, suppress() { suppressed = true; }, release() { suppressed = false; if (held) context.ui.notify(held, "info"); }, settle() { emit({ type: "agent_end", messages: [] }); emit({ type: "agent_settled" }); },
+    store.setSession(key, { bindingState: "bound", sessionId: session.sessionId, sessionFile: session.sessionFile!, workspaceRealpath: root, chatId: key, agentId: "main", lastActivity: Date.now(), thinking, effortOverride: override });
+    return { session, stdout, writes, emit, tool, context, get effective() { return effective; }, suppress() { suppressed = true; }, suppressNext() { suppressNext = true; }, release() { suppressed = false; if (held) context.ui.notify(held, "info"); }, settle() { emit({ type: "agent_end", messages: [] }); emit({ type: "agent_settled" }); },
       settleWithReply(split: boolean) {
         assert.ok(held, "effort result is ready before settlement");
         const reply = Buffer.from(JSON.stringify({ type: "extension_ui_request", id: "notice-🧠", method: "notify", notifyType: "info", message: held }) + "\n");
@@ -95,7 +109,7 @@ async function fixture(t: { after: (fn: () => unknown) => void }, thinking?: PiT
       },
     };
   }
-  return { manager, store, root, config, lane };
+  return { manager, store, root, config, lane, loadControlConfig, loadFullConfig, telegramBindingReload };
 }
 
 it("isolates two threads, reports native capability, and restores inherited defaults", async t => {
@@ -116,10 +130,16 @@ it("isolates two threads, reports native capability, and restores inherited defa
   assert.equal(first.stdout.listenerCount("data"), 0, "idle reader releases stdout");
   const levels = getSupportedThinkingLevels(first.context.model!);
   assert.equal(levels.includes("max"), false);
-  await assert.rejects(manager.sessionEffort("123:1", "main", "max"), /does not support max.*Effort is high/);
+  await assert.rejects(manager.sessionEffort("123:1", "main", "max"), /does not support that effort level.*Effort is high/);
   assert.equal(first.effective, "high");
   assert.equal(store.getSession("123:1")?.effortOverride, "high");
-  await assert.rejects(manager.sessionEffort("123:1", "main", "impossible"), /does not support impossible.*Effort is high/);
+  const invalid = "x".repeat(4096 - "/effort ".length);
+  await assert.rejects(manager.sessionEffort("123:1", "main", invalid), error => {
+    const reply = formatEffortError(error);
+    assert.match(reply, /does not support that effort level.*Effort is high.*Supported levels/);
+    assert.ok(reply.length <= 4096);
+    return true;
+  });
   assert.equal(store.getSession("123:1")?.effortOverride, "high");
   assert.match(await manager.sessionEffort("123:1", "main", "inherit"), /Effort is medium.*agent configuration/);
   assert.equal(store.getSession("123:1")?.effortOverride, undefined);
@@ -133,8 +153,7 @@ it("isolates two threads, reports native capability, and restores inherited defa
   assert.equal(new SessionStore(join(root, "sessions.json")).getSession("123:1")?.effortOverride, "max");
   assert.equal(new SessionStore(join(root, "sessions.json")).getSession("123:1")?.thinking, "medium");
   const saved = store.getSession("123:1")!;
-  assert.throws(() => store.setSession("123:1", { ...saved, effortOverride: "unknown" as PiThinkingLevel }), /unknown effort override/);
-
+  assert.throws(() => store.setSession("123:1", { ...saved, effortOverride: "unknown" as NativeEffortLevel }), /unknown effort override/);
 });
 
 it("validates the current model rather than accepting a syntactically valid level", async t => {
@@ -169,11 +188,13 @@ it("changes a busy turn using its reader and persists an explicit tool request b
   assert.equal(store.getSession("123:1")?.effortOverride, "medium");
   assert.match(result.content[0].text, /next model request/);
   const save = store.compareAndSetSession.bind(store);
-  store.compareAndSetSession = () => { throw new Error("simulated persistence failure"); };
+  store.compareAndSetSession = () => { throw new Error("simulated persistence failure at /tmp/synthetic-private-store.json"); };
   const failed = await current.tool.execute("tool-2", { level: "high" }, undefined, undefined, current.context);
   store.compareAndSetSession = save;
   assert.equal(failed.details.ok, false);
   assert.equal(failed.isError, true);
+  assert.match(failed.content[0].text, /control data is unavailable/);
+  assert.doesNotMatch(failed.content[0].text, /synthetic-private-store/);
   assert.equal(current.effective, "medium");
   assert.equal(store.getSession("123:1")?.effortOverride, "medium");
   assert.equal(current.session.child.killed, false);
@@ -181,32 +202,66 @@ it("changes a busy turn using its reader and persists an explicit tool request b
   await turn;
 });
 
-it("checks default permissions and lets a private conversation change its routed agent's default by tool", async t => {
-  const { manager, store, lane, config } = await fixture(t, "low");
+it("uses applied permissions for commands and tools and reads DM settings once per control", async t => {
+  const { manager, store, lane, config, loadFullConfig, loadControlConfig } = await fixture(t, "low");
   const current = lane("123:1");
+  config.bindings[0].kind = "dm";
+  config.bindings[1].kind = "group";
   await assert.rejects(manager.sessionEffort("123:1", "main", "default high"), /private chat with a DM binding/);
   assert.equal(current.writes.length, 0);
   await assert.rejects(manager.sessionEffort("123:1", "main", "default"), /\/effort inherit/);
+  const dm = lane("124:1");
+  for (const [key, session] of [["123:1", current], ["124:1", dm]] as const) {
+    const turn = (async () => { for await (const _line of manager.sendSessionMessage(key, "main", "question")) { /* drain */ } })();
+    await new Promise(resolve => setImmediate(resolve));
+    loadFullConfig.mock.resetCalls();
+    loadControlConfig.mock.resetCalls();
+    try {
+      const changed = await session.tool.execute("change", { scope: "default", level: "high" }, undefined, undefined, session.context);
+      if (session === current) {
+        assert.equal(changed.isError, true);
+        assert.match(changed.content[0].text, /private chat with a DM binding/);
+        assert.equal(loadControlConfig.mock.callCount(), 0);
+      } else {
+        assert.equal(changed.isError, false);
+        assert.match(changed.content[0].text, /agent's default for this model is now high/);
+        assert.equal(loadControlConfig.mock.callCount(), 1);
+        assert.equal(dm.effective, "low", "the current message keeps its inherited level");
+        const status = await manager.sessionEffort(key, "main");
+        assert.match(status, /Effort is high.*agent default.*Supported levels/);
+        assert.equal(loadControlConfig.mock.callCount(), 2);
+        assert.equal(store.getSession(key)?.effortOverride, undefined);
+      }
+      assert.equal(loadFullConfig.mock.callCount(), 0);
+    } finally {
+      session.settle();
+      await turn;
+    }
+  }
+  await assert.rejects(manager.sessionEffort("124:1", "main", "default max"), /does not support that effort level/);
+  assert.match(await manager.sessionEffort("123:1", "main"), /Effort is high.*agent default/);
+});
+
+it("rejects and acknowledges an internal tool request while a human control waits for settlement", { timeout: 2_000 }, async t => {
+  const { manager, store, lane } = await fixture(t);
+  const current = lane("123:1");
   const turn = (async () => { for await (const _line of manager.sendSessionMessage("123:1", "main", "question")) { /* drain */ } })();
-  await new Promise(resolve => setTimeout(resolve, 10));
+  await new Promise(resolve => setImmediate(resolve));
+  current.session.internalTurn = true;
+  const change = manager.sessionEffort("123:1", "main", "medium");
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(current.session.queue.size, 1);
   try {
-    const denied = await current.tool.execute("denied", { scope: "default", level: "high" }, undefined, undefined, current.context);
-    assert.equal(denied.isError, true);
-    assert.match(denied.content[0].text, /private chat with a DM binding/);
-    config.bindings[0].kind = "dm";
-    const changed = await current.tool.execute("allowed", { scope: "default", level: "high" }, undefined, undefined, current.context);
-    assert.equal(changed.isError, false);
-    assert.match(changed.content[0].text, /agent's default for this model is now high/);
-    assert.equal(current.effective, "low", "the current message keeps its inherited level");
-    const status = await current.tool.execute("status", {}, undefined, undefined, current.context);
-    assert.match(status.content[0].text, /Effort is high.*agent default.*Supported levels/);
-    assert.equal(store.getSession("123:1")?.effortOverride, undefined);
+    const result = await current.tool.execute("internal", { level: "high" }, undefined, undefined, current.context);
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /current human Telegram conversation/);
   } finally {
+    current.session.internalTurn = false;
     current.settle();
     await turn;
   }
-  await assert.rejects(manager.sessionEffort("123:1", "main", "default max"), /does not support max/);
-  assert.match(await manager.sessionEffort("123:1", "main"), /Effort is high.*agent default/);
+  assert.match(await change, /Effort is medium/);
+  assert.equal(store.getSession("123:1")?.effortOverride, "medium");
 });
 
 it("hands a late busy-control reply to an idle owner after settlement", async t => {
@@ -333,7 +388,7 @@ it("retains control ownership through restoration when delivery finishes during 
   await next;
 });
 
-it("does not confirm a clean race, missing acknowledgement, or failed durable write", async t => {
+it("restores durable effort after a late reply and does not persist across clean", async t => {
   const { manager, store, lane } = await fixture(t);
   const current = lane("123:1");
   const original = store.compareAndSetSession.bind(store);
@@ -342,9 +397,18 @@ it("does not confirm a clean race, missing acknowledgement, or failed durable wr
   assert.equal(current.session.effortOverride, undefined);
   assert.equal(current.effective, "low", "failed persistence restores native effort");
   store.compareAndSetSession = original;
-  current.suppress();
+  assert.match(await manager.sessionEffort("123:1", "main", "medium"), /Effort is medium/);
+  current.suppressNext();
   await assert.rejects(manager.sessionEffort("123:1", "main", "high"), /did not confirm effort/);
-  assert.equal(store.getSession("123:1")?.effortOverride, undefined);
+  current.release();
+  assert.equal(current.effective, "medium");
+  assert.equal(store.getSession("123:1")?.effortOverride, "medium");
+  assert.match(await manager.sessionEffort("123:1", "main"), /Effort is medium.*conversation override/);
+  await manager.closeSession("123:1");
+  const reopened = lane("123:1");
+  assert.equal(reopened.effective, "medium");
+  assert.match(await manager.sessionEffort("123:1", "main"), /Effort is medium.*conversation override/);
+  reopened.suppress();
   const changing = manager.sessionEffort("123:1", "main", "high");
   await new Promise(resolve => setTimeout(resolve, 10));
   const rejected = assert.rejects(changing, /exited|changed|closed/);
@@ -354,11 +418,40 @@ it("does not confirm a clean race, missing acknowledgement, or failed durable wr
 });
 
 it("rejects a changed binding without touching the busy answer", async t => {
-  const { manager, lane, config } = await fixture(t);
+  const { manager, lane, telegramBindingReload } = await fixture(t);
   const current = lane("123:1");
   current.session.processingStartedAt = Date.now();
-  config.bindings[0].agentId = "another";
+  telegramBindingReload.getBindings()[0].agentId = "another";
   await assert.rejects(manager.sessionEffort("123:1", "main", "high"), /binding changed/);
+  assert.equal(current.session.child.killed, false);
+  assert.equal(current.writes.length, 0);
+});
+
+it("rechecks the applied binding before dispatching a queued control", async t => {
+  const { manager, lane, config, telegramBindingReload } = await fixture(t);
+  const current = lane("123:1");
+  let release!: () => void;
+  const held = current.session.queue.add(() => new Promise<void>(resolve => { release = resolve; }));
+  t.after(() => release());
+  const change = manager.sessionEffort("123:1", "main", "high");
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(current.session.queue.size, 1);
+  config.bindings = config.bindings.filter(binding => binding.kind === "dm");
+  telegramBindingReload.reload(() => {});
+  release();
+  await held;
+  await assert.rejects(change, /binding changed/);
+  assert.equal(current.writes.length, 0);
+});
+
+it("preserves a busy answer when its configured model or worker route changes", async t => {
+  const { manager, lane, config } = await fixture(t);
+  const current = lane("124:1");
+  current.session.processingStartedAt = Date.now();
+  config.agents.main.model = "effort-fixture/another-model";
+  await assert.rejects(manager.sessionEffort("124:1", "main", "default high"), /Configured model changed.*wait for the current answer/);
+  config.agents.main.workerRuntime = { socketPath: "/tmp/synthetic-worker.sock", workerUid: 1234, controllerName: "fixture" };
+  await assert.rejects(manager.sessionEffort("124:1", "main"), /Worker routing changed.*Restart the controller/);
   assert.equal(current.session.child.killed, false);
   assert.equal(current.writes.length, 0);
 });

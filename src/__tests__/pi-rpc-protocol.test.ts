@@ -4636,18 +4636,21 @@ describe("readPiStream", () => {
     assert.strictEqual((lines[1] as { is_error?: boolean }).is_error, true);
   });
 
-  it("preserves coalesced records exactly once across terminal handoff on a finite stream", async () => {
+  it("preserves coalesced records exactly once across terminal handoff on a finite stream", async t => {
     const child = childWithStdout([
       JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "first" } }),
       JSON.stringify({ type: "agent_end", messages: [] }),
       JSON.stringify({ type: "agent_settled" }),
       JSON.stringify({ type: "response", command: "get_state", success: true, data: { sessionId: "next-owner" } }),
     ]);
+    const unshift = t.mock.method(child.stdout!, "unshift");
     const observed: string[] = [];
     const first = readPiStream(child, event => observed.push(event.type!));
     assert.equal((await first.next()).value?.type, "stream_event");
+    assert.equal(unshift.mock.callCount(), 0, "the active reader keeps the remainder of the batch");
     await new Promise(resolve => setImmediate(resolve));
     assert.equal((await first.next()).value?.type, "result");
+    assert.equal(unshift.mock.callCount(), 1, "only the terminal handoff returns unread bytes");
     await first.return(undefined);
     const second = readPiStream(child, event => observed.push(event.type!));
     const next = await second.next();

@@ -1995,12 +1995,13 @@ describe("command handler wiring", () => {
       const update = makeCommandUpdate("effort", 75);
       Object.assign(update.message, { message_thread_id: 9 });
       await bot.handleUpdate(update);
-      if (fails) pending.reject(new Error("simulated startup failure")); else pending.resolve("Effort: high");
+      if (fails) pending.reject(new Error("simulated startup failure at /tmp/synthetic-private-config.yaml")); else pending.resolve("Effort: high");
       await new Promise(resolve => setImmediate(resolve));
       const replies = apiCalls.filter(call => call.method === "sendMessage");
       assert.equal(replies.length, 1, "failed delivery does not trigger a second send");
       assert.equal(replies[0].payload.message_thread_id, 9);
-      assert.match(replies[0].payload.text, fails ? /Effort change not confirmed: simulated startup failure/ : /Effort: high/);
+      assert.match(replies[0].payload.text, fails ? /Effort change not confirmed: Effort control data is unavailable/ : /Effort: high/);
+      assert.doesNotMatch(replies[0].payload.text, /synthetic-private-config/);
     });
   }
 
@@ -2064,7 +2065,7 @@ describe("command handler wiring", () => {
       await bot.handleUpdate(update);
       return String(apiCalls.at(-1)!.payload.text);
     };
-    assert.match(await send(11), /Thinking: high\nFast: off · inherited\nState:/);
+    assert.match(await send(11), /Configured thinking: high \(see \/effort for the effective level\)\nFast: off · inherited\nState:/);
     assert.equal(existsSync(path), false);
     handleFastCommand("default on", { agent: primary }, path);
     handleFastCommand("off", { agent: primary, threadKey: `${testChatId}:11` }, path);
@@ -2083,7 +2084,7 @@ describe("command handler wiring", () => {
       ...primary, model: "openai-codex/gpt-6-sol", codexFast: { provider: "openai-codex", model: "gpt-6-sol" },
     } } };
     const mismatch = await send(12);
-    assert.match(mismatch, /Model: openai-codex\/gpt-6-astra\nThinking: high\nFast: unavailable/);
+    assert.match(mismatch, /Model: openai-codex\/gpt-6-astra\nConfigured thinking: high[^\n]*\nFast: unavailable/);
     assert.doesNotMatch(mismatch, /Model: .*gpt-6-sol/);
     currentConfig = { ...currentConfig, agents: { ...currentConfig.agents, main: primary } };
     configError = true;
@@ -2100,7 +2101,7 @@ describe("command handler wiring", () => {
     health = undefined;
     const noSession = await send(12);
     assert.match(noSession, /Sessions: 1\/2/);
-    assert.doesNotMatch(noSession, /Agent:|Model:|Thinking:|Fast:|Session ID:/);
+    assert.doesNotMatch(noSession, /Agent:|Model:|Configured thinking:|Fast:|Session ID:/);
     assert.equal(configReads, readsBeforeHelp, "No-session status must not read Fast config");
     assert.equal(readFileSync(path, "utf8"), "invalid fixture preferences");
     assert.ok(manager.calls.every(call => call.startsWith("getSessionHealth:")), "Status/help must never create or prompt a session");

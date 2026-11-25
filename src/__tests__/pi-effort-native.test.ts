@@ -6,7 +6,8 @@ import { join, resolve } from "node:path";
 import { createAgentSession, ModelRuntime, resolveCliModel, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
 import { SESSION_EFFORT_ENV, SESSION_EFFORT_COMMAND, SESSION_EFFORT_ACK_COMMAND, parseEffortNotice, effortInvocation, parseEffortAction } from "../pi-extensions/session-effort.js";
-import type { PiThinkingLevel } from "../types.js";
+import { buildPiAcknowledgedSteerInvocation, parsePiAcknowledgedSteerResultNotice } from "../pi-extensions/acknowledged-steer.js";
+import type { NativeEffortLevel } from "../types.js";
 
 function effortEnvironment(t: { after: (fn: () => void) => void }, cwd: string, initial: object): void {
   for (const [key, value] of Object.entries({
@@ -97,13 +98,16 @@ it("installed Pi extension changes effort through its tool and waits for durable
   const faux = fauxProvider({ provider: "effort-extension-test", models: [{ id: "reasoner", reasoning: true }] });
   runtime.registerNativeProvider(faux.provider);
   const levels: unknown[] = [];
-  faux.setResponses([
+  const responses: Parameters<typeof faux.setResponses>[0] = [
     (_context, options) => { levels.push(options?.reasoning); return fauxAssistantMessage(fauxToolCall("set_session_effort", { level: "high" }), { stopReason: "toolUse" }); },
     (_context, options) => { levels.push(options?.reasoning); return fauxAssistantMessage("effort changed"); },
-  ]);
+  ];
+  faux.setResponses(responses);
   const settings = SettingsManager.inMemory({ extensions: [resolve("extensions/pi/session-effort.ts")], defaultThinkingLevel: "minimal", modelThinkingLevels: { "effort-extension-test/reasoner": "medium" }, compaction: { enabled: false }, retry: { enabled: false } });
-  const { session, extensionsResult } = await createAgentSession({ cwd, agentDir: join(cwd, "agent"), modelRuntime: runtime, model: faux.getModel(), settingsManager: settings, sessionManager: SessionManager.inMemory(cwd), tools: ["set_session_effort"] });
+  const nativeStore = SessionManager.inMemory(cwd);
+  const { session, extensionsResult } = await createAgentSession({ cwd, agentDir: join(cwd, "agent"), modelRuntime: runtime, model: faux.getModel(), settingsManager: settings, sessionManager: nativeStore, tools: ["set_session_effort"] });
   let saved = false;
+  let rejectTranscript = false;
   let requestId: string | undefined;
   try {
     assert.deepEqual(extensionsResult.errors, []);
@@ -115,10 +119,12 @@ it("installed Pi extension changes effort through its tool and waits for durable
           requestId = notice.id;
           void session.prompt(effortInvocation(SESSION_EFFORT_COMMAND, { id: notice.id, action: parseEffortAction(notice.value) }));
         } else if (notice?.kind === "result" && notice.id === requestId) {
-          assert.equal(notice.effective, "high");
+          assert.equal(notice.effective, rejectTranscript ? "low" : "high");
           assert.ok(notice.levels.includes("high"));
-          saved = true;
-          void session.prompt(effortInvocation(SESSION_EFFORT_ACK_COMMAND, { id: requestId, text: "Saved thread effort: high", ok: true }));
+          assert.equal(Boolean(notice.error), rejectTranscript);
+          assert.doesNotMatch(notice.error ?? "", /could not be restored/i);
+          saved = !notice.error;
+          void session.prompt(effortInvocation(SESSION_EFFORT_ACK_COMMAND, { id: requestId, text: notice.error ?? "Saved thread effort: high", ok: saved }));
         }
       },
     } });
@@ -130,6 +136,14 @@ it("installed Pi extension changes effort through its tool and waits for durable
     assert.equal(settings.getDefaultThinkingLevel(), "minimal");
     await session.prompt(effortInvocation(SESSION_EFFORT_COMMAND, { id: "reset", action: { kind: "inherit" } }));
     assert.equal(session.thinkingLevel, "low");
+    rejectTranscript = true;
+    const append = t.mock.method(nativeStore, "appendThinkingLevelChange", () => { throw new Error("simulated transcript write failure"); });
+    faux.setResponses(responses);
+    await session.prompt("Ask the tool to change effort again");
+    assert.equal(append.mock.callCount(), 2, "Pi attempts to persist both the rejected level and the native restoration");
+    assert.equal(saved, false);
+    assert.equal(session.thinkingLevel, "low");
+    assert.deepEqual(levels.slice(2), ["low", "low"], "the next provider request keeps the previous effort");
   } finally {
     session.dispose();
   }
@@ -178,20 +192,28 @@ for (const scenario of [
         assert.equal(settings.getDefaultThinkingLevel(), "minimal");
       };
       await reset();
-      active.setThinkingLevel("low");
+      faux.setResponses([fauxAssistantMessage("Persisted reply")]);
+      await active.prompt("Keep this exchange in the transcript");
+      const stale = scenario.expected === "low" ? "medium" : "low";
+      active.setThinkingLevel(stale);
       const file = nativeStore.getSessionFile()!;
+      const sessionId = nativeStore.getSessionId();
       active.dispose();
       active = undefined;
       // Resume native saved effort without an override: configured inheritance
       // still wins over the last native thinking entry.
-      const resumed = await createAgentSession({ ...options, sessionManager: SessionManager.open(file) });
+      const reopened = SessionManager.open(file);
+      assert.equal(reopened.getSessionId(), sessionId);
+      const resumed = await createAgentSession({ ...options, sessionManager: reopened });
       active = resumed.session;
+      assert.match(JSON.stringify(active.messages), /Keep this exchange in the transcript/);
+      assert.equal(active.thinkingLevel, stale);
       await active.bindExtensions({});
       assert.equal(active.thinkingLevel, scenario.expected);
       await reset();
       active.dispose();
       active = undefined;
-      process.env[SESSION_EFFORT_ENV] = JSON.stringify({ ...configured, override: "high" satisfies PiThinkingLevel });
+      process.env[SESSION_EFFORT_ENV] = JSON.stringify({ ...configured, override: "high" satisfies NativeEffortLevel });
       const overridden = await createAgentSession({ ...options, sessionManager: SessionManager.open(file) });
       active = overridden.session;
       await active.bindExtensions({});
@@ -203,7 +225,7 @@ for (const scenario of [
   });
 }
 
-it("native Pi refreshes an agent/model default on the next user message across live and resumed conversations", { timeout: 20_000 }, async t => {
+it("native Pi refreshes agent/model defaults for acknowledged Telegram steers and read-only Discord conversations", { timeout: 20_000 }, async t => {
   const cwd = await mkdtemp(join(tmpdir(), "minime-effort-default-"));
   t.after(() => rm(cwd, { recursive: true, force: true }));
   effortEnvironment(t, cwd, {});
@@ -216,15 +238,15 @@ it("native Pi refreshes an agent/model default on the next user message across l
   runtime.registerNativeProvider(faux.provider);
   runtime.registerNativeProvider(otherProvider.provider);
   const settings = SettingsManager.inMemory({
-    extensions: [resolve("extensions/pi/session-effort.ts")], defaultThinkingLevel: "low",
+    extensions: [resolve("extensions/pi/acknowledged-steer.ts"), resolve("extensions/pi/session-effort.ts")], defaultThinkingLevel: "low",
     compaction: { enabled: false }, retry: { enabled: false },
   });
-  async function open(agent: string, model = faux.getModel("reasoner"), override?: PiThinkingLevel, nativeStore = SessionManager.create(cwd, join(cwd, "sessions"))) {
+  async function open(agent: string, model = faux.getModel("reasoner"), override?: NativeEffortLevel, nativeStore = SessionManager.create(cwd, join(cwd, "sessions")), readOnly = false) {
     process.env.MINIME_BOT_PI_SESSION_AGENT_ID = agent;
-    process.env[SESSION_EFFORT_ENV] = JSON.stringify({ override });
+    process.env[SESSION_EFFORT_ENV] = JSON.stringify({ override, readOnly });
     const { session, extensionsResult } = await createAgentSession({
       cwd, agentDir: join(cwd, "agent"), modelRuntime: runtime, model,
-      settingsManager: settings, sessionManager: nativeStore, noTools: "all",
+      settingsManager: settings, sessionManager: nativeStore, tools: [],
     });
     assert.deepEqual(extensionsResult.errors, []);
     const notices: string[] = [];
@@ -234,7 +256,10 @@ it("native Pi refreshes an agent/model default on the next user message across l
   }
 
   const first = await open("personal");
-  const second = await open("personal");
+  const second = await open("personal", undefined, undefined, undefined, true);
+  assert.equal(second.session.extensionRunner.getCommand(SESSION_EFFORT_COMMAND), undefined);
+  assert.equal(second.session.extensionRunner.getCommand(SESSION_EFFORT_ACK_COMMAND), undefined);
+  assert.ok(!second.session.getAllTools().some(tool => tool.name === "set_session_effort"));
   const pinned = await open("personal", undefined, "minimal");
   const otherAgent = await open("another");
   const otherModel = await open("personal", faux.getModel("other-model"));
@@ -248,7 +273,7 @@ it("native Pi refreshes an agent/model default on the next user message across l
   await second.session.prompt("Keep this message in history");
 
   // The native provider has already captured the current request by the time
-  // the default is changed. A follow-up queued in that run must use the new default.
+  // the default is changed. The acknowledged steer must use the new default.
   let started!: () => void;
   const startedRequest = new Promise<void>(resolve => { started = resolve; });
   let release!: () => void;
@@ -260,7 +285,11 @@ it("native Pi refreshes an agent/model default on the next user message across l
       await gate;
       return fauxAssistantMessage("first answer");
     },
-    respond,
+    (...args) => {
+      const [context] = args;
+      assert.match(JSON.stringify(context.messages), /Steered Telegram message/);
+      return respond(...args);
+    },
   ]);
   const run = first.session.prompt("Start a request");
   try {
@@ -271,10 +300,13 @@ it("native Pi refreshes an agent/model default on the next user message across l
       levels: ["off", "minimal", "low", "medium", "high"],
     });
     assert.equal(first.session.thinkingLevel, "low");
-    await first.session.prompt("Queued follow-up", { streamingBehavior: "followUp" });
+    await first.session.prompt(buildPiAcknowledgedSteerInvocation("telegram-steer", "Steered Telegram message"));
   } finally { release(); }
   await run;
   assert.deepEqual(seen, ["low", "low", "high"]);
+  assert.deepEqual(first.notices.map(parsePiAcknowledgedSteerResultNotice).filter(Boolean), [
+    { id: "telegram-steer", status: "enqueued" }, { id: "telegram-steer", status: "consumed" },
+  ]);
 
   faux.setResponses([respond, respond, respond, respond]);
   otherProvider.setResponses([respond]);
@@ -287,8 +319,8 @@ it("native Pi refreshes an agent/model default on the next user message across l
 
   const file = second.nativeStore.getSessionFile()!;
   second.session.dispose();
-  const resumed = await open("personal", undefined, undefined, SessionManager.open(file));
-  const fresh = await open("personal");
+  const resumed = await open("personal", undefined, undefined, SessionManager.open(file), true);
+  const fresh = await open("personal", undefined, undefined, undefined, true);
   assert.equal(resumed.session.thinkingLevel, "high");
   assert.match(JSON.stringify(resumed.session.messages), /Keep this message in history/);
   assert.equal(fresh.session.thinkingLevel, "high");
