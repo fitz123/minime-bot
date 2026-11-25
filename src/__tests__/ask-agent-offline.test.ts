@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -15,6 +15,10 @@ import {
   resolveValidatedPiAgentWorkspaceCwd,
 } from "../pi-rpc-protocol.js";
 import type { AgentConfig } from "../types.js";
+import { AgentRuntimeWorker } from "../agent-runtime-worker.js";
+import {
+  alive, assertConsultationClean, consultationFixture, consultationPromptCount, consultationProvider, consultationStarted,
+} from "./fixtures/consultation-worker.js";
 
 const scratch = fileURLToPath(new URL("../../.tmp/", import.meta.url));
 const provider = fileURLToPath(new URL("./fixtures/collaboration-provider.ts", import.meta.url));
@@ -100,7 +104,7 @@ test("one-shot Ask Agent returns one target-context answer without a durable tra
   });
 
   assert.deepEqual(
-    readdirSync(root, { recursive: true }).filter(path => path.endsWith(".jsonl") || path.endsWith("sessions.json")),
+    readdirSync(root, { recursive: true, encoding: "utf8" }).filter(path => path.endsWith(".jsonl") || path.endsWith("sessions.json")),
     [],
     "Consultation must leave no session transcript or session store",
   );
@@ -146,4 +150,42 @@ test("Ask Agent rejects a worker target before local workspace access or spawn",
   assert.equal(runTarget.mock.callCount(), 0);
   assert.equal(result.ok, false);
   assert.equal(result.error.code, "unsupported_runtime");
+});
+
+test("protected TEST Unix socket returns one isolated target-context answer using package Pi", { timeout: 25_000 }, async t => {
+  const descriptor = consultationFixture(t);
+  const oldHome = process.env.HOME;
+  process.env.HOME = descriptor.home;
+  const worker = new AgentRuntimeWorker(descriptor, { trustedTestExtensions: [consultationProvider] });
+  try {
+    await worker.listen();
+    assert.equal(lstatSync(descriptor.socketDirectory).mode & 0o777, 0o700);
+    assert.equal(lstatSync(descriptor.socketPath).mode & 0o777, 0o600);
+    const agents = consultationAgents(join(scratch, "unused-worker-route"));
+    agents[targetId].workerRuntime = {
+      socketPath: descriptor.socketPath, workerUid: descriptor.workerUid, controllerName: descriptor.controllerName,
+      inboundConsultation: true,
+    };
+    const validateTargetWorkspace = t.mock.fn(() => assert.fail("Unexpected local workspace validation"));
+    const assembleContext = t.mock.fn(() => assert.fail("Unexpected local context assembly"));
+    const runTarget = t.mock.fn(async () => assert.fail("Unexpected local child dispatch"));
+    const result = await executeAskAgent({ agent: targetId, question }, {
+      config: { agents }, env: { [MINIME_BOT_PI_SESSION_AGENT_ID_ENV]: callerId },
+      validateTargetWorkspace, assembleContext, runTarget, signal: t.signal,
+    });
+    assert.deepEqual(result, { ok: true, callerAgentId: callerId, targetAgentId: targetId,
+      result: { answer: "ISOLATED_TARGET_ANSWER", truncated: false, needsClarification: false } });
+    for (const hook of [validateTargetWorkspace, assembleContext, runTarget]) assert.equal(hook.mock.callCount(), 0);
+    assert.equal(consultationPromptCount(descriptor), 1);
+    const started = consultationStarted(descriptor);
+    assert.equal(started.noSession, true);
+    assert.equal(started.noCentralEnv, true);
+    assert.deepEqual(started.tools, ["ls", "read"]);
+    assert.equal(alive(started.pid), false);
+    assertConsultationClean(descriptor);
+  } finally {
+    await worker.shutdown();
+    if (oldHome === undefined) delete process.env.HOME;
+    else process.env.HOME = oldHome;
+  }
 });

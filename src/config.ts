@@ -29,7 +29,7 @@ export function resolveAskAgentPolicy(
   caller: AgentConfig,
   target: AgentConfig,
 ): AskAgentPolicyDecision {
-  if (caller.workerRuntime || target.workerRuntime) {
+  if (caller.workerRuntime || (target.workerRuntime && target.workerRuntime.inboundConsultation !== true)) {
     return { allowed: false, code: "unsupported_runtime", reason: "Ask-agent is unavailable for worker-routed agents" };
   }
   if (caller.askAgent?.enabled !== true) {
@@ -458,7 +458,7 @@ function validateAskAgentConfig(
 
 export function validateWorkerRuntime(worker: unknown, id: string): NonNullable<AgentConfig["workerRuntime"]> {
   if (!isConfigRecord(worker)
-    || Object.keys(worker).some(key => !["socketPath", "workerUid", "controllerName", "scheduledLlm"].includes(key))
+    || Object.keys(worker).some(key => !["socketPath", "workerUid", "controllerName", "scheduledLlm", "inboundConsultation"].includes(key))
     || typeof worker.socketPath !== "string" || !isAbsolute(worker.socketPath)
     || normalize(worker.socketPath) !== worker.socketPath || /[\u0000-\u001f\u007f]/u.test(worker.socketPath)
     || Buffer.byteLength(worker.socketPath) >= 104
@@ -471,8 +471,12 @@ export function validateWorkerRuntime(worker: unknown, id: string): NonNullable<
   if (worker.scheduledLlm !== undefined && typeof worker.scheduledLlm !== "boolean") {
     throw new Error(`Agent "${id}" workerRuntime.scheduledLlm must be a boolean`);
   }
+  if (worker.inboundConsultation !== undefined && typeof worker.inboundConsultation !== "boolean") {
+    throw new Error(`Agent "${id}" workerRuntime.inboundConsultation must be a boolean`);
+  }
   return { socketPath: worker.socketPath, workerUid: worker.workerUid, controllerName: worker.controllerName,
-    ...(worker.scheduledLlm === undefined ? {} : { scheduledLlm: worker.scheduledLlm }) };
+    ...(worker.scheduledLlm === undefined ? {} : { scheduledLlm: worker.scheduledLlm }),
+    ...(worker.inboundConsultation === undefined ? {} : { inboundConsultation: worker.inboundConsultation }) };
 }
 
 export function validateAgent(

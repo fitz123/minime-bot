@@ -53,8 +53,9 @@ clearing that worker state.
 This route handles text. Attachments and voice are rejected before download or
 transcription. Outbox delivery, live steering, passive echo steering, private
 topic tools, Fast controls, and session cleanup/reconnect commands are
-unavailable on worker lanes. Collaboration and ask-agent reject worker agents,
-and trigger input cannot target one. Transport bindings and reply delivery
+unavailable on worker lanes. Collaboration and trigger input cannot target a
+worker agent. Worker agents can receive opt-in one-shot Ask Agent questions
+through the separate operation below. Transport bindings and reply delivery
 remain controller responsibilities.
 
 ## Adopt or roll back one existing text lane
@@ -123,6 +124,82 @@ and outbox logic. A worker failure or uncertain completion ends the invocation
 without replaying its prompt or starting local Pi. Worker-created files and
 the local cron Web wrapper are outside this delivery path.
 
+## Inbound Ask Agent
+
+Set `workerRuntime.inboundConsultation: true` on the target agent's controller
+route and add `"inbound-consultation"` to the worker descriptor's
+`capabilities`. Both opt-ins default to off. The controller also requires
+`askAgent.enabled: true` for both agents and applies the caller's `canAsk` and
+`deny` lists. Worker-routed callers are refused.
+
+For each call, the controller verifies the existing protected endpoint and
+checks the expected agent ID and inbound capability on a fresh connection.
+Only after confirmation does it send the question. Questions are capped at
+64 KiB in UTF-8. The worker route rejects the optional `context` field,
+including an explicit empty value. The protocol has no fields for paths,
+tools, model selection, environment, or a session handle.
+
+The worker accepts at most one active consultation at a time. It assembles
+the target's private context, starts pinned Pi RPC with the SDK's in-memory
+session, checks its model, thinking level, and empty history, and submits one
+prompt. The consultation has a 120-second worker deadline including startup,
+with a 10-second startup bound. The controller allows 15 seconds for preflight
+and 130 seconds after sending the question. Worker shutdown, socket loss,
+and deadlines stop the owned process. The worker returns its answer only
+after reap, then closes the connection. There is no durable lane, transcript,
+resume, automatic retry, or local fallback. A hard worker crash during
+startup can leave a private context artifact containing only the target's
+assembled context. The worker removes its reserved scratch directory on
+startup and before prompting Pi.
+
+The descriptor selects the workspace, model, context, and read-only tool
+allowlist. From `local-tools`, only `read`, `grep`, `find`, and `ls` are
+available. The `knowledge-tools` capability adds `knowledge_search` and
+`knowledge_get`. Bash, edit/write, Knowledge updates, Web, MCP, Code Mode,
+skills, extra extensions, Fast, Ask Agent, subagents, collaboration, and
+delivery tools are unavailable. Filesystem access follows the worker's OS
+permissions.
+
+Pi uses the worker's existing subscription login under `stateRoot/pi` for
+chat, cron, and consultations. The descriptor must select a bundled model
+for the provider the worker signed in to. Pi owns credential access and
+refresh in that profile. Each consultation supplies in-memory settings with
+agent and provider retries, automatic compaction, and cache warming disabled.
+It uses SSE to avoid Codex WebSocket resubmissions and disables Anthropic's
+strict-tool resubmissions and model fallbacks for the consultation.
+
+The pinned Pi 1.5.0 implementation uses the following paths under
+`node_modules/@earendil-works/`.
+
+- `pi-coding-agent/dist/config.js:510` resolves the worker's
+  `PI_CODING_AGENT_DIR`. `dist/core/model-runtime.js:79` uses the default
+  credential store and selects an in-memory model catalog with
+  `modelsPath: null`. `dist/core/auth-storage.js:289` opens `auth.json` in
+  the agent directory.
+- `pi-coding-agent/dist/core/settings-manager.js:251` and
+  `dist/core/session-manager.js:1376` provide in-memory settings and session
+  storage. The CLI RPC setters at `dist/modes/rpc/rpc-mode.js:421` call
+  settings setters that save to storage at
+  `dist/core/settings-manager.js:646` and `:697`.
+- `pi-coding-agent/dist/core/sdk.js:193` passes the provider retry budget
+  into requests, and `:285` selects the transport. Codex WebSocket and SSE
+  retry paths are in `pi-ai/dist/api/openai-codex-responses.js:193` and
+  `:261`. Anthropic's strict-tool resubmission and fallback selection are in
+  `pi-ai/dist/api/anthropic-messages.js:453` and `:1011`.
+
+The result contains one answer, capped at 32,768 UTF-16 code units and 128 KiB,
+with the usual truncation and clarification flags. Errors contain no question,
+answer, or provider diagnostics. A missing controller opt-in yields
+`unsupported_runtime`, and submitting `context` yields `invalid_request`.
+Worker preflight can return `agent_mismatch`,
+`consultation_disabled`, or `consultation_unavailable` for a bad endpoint or
+legacy protocol. Other codes include `consultation_busy`,
+`consultation_timeout`, `consultation_failed`, and
+`consultation_cleanup_failed`. A cancelled call before send returns
+`cancelled`. Cancellation, connection loss, or a missing or invalid result
+after send yields `uncertain_outcome`. A missing answer does not show whether
+the provider received the question.
+
 ## Descriptor and capability slice
 
 The version 1 descriptor has no defaults for identity or roots. It requires:
@@ -152,11 +229,12 @@ selects no local tools. The optional `knowledge-tools` capability requires
 It can be used independently of `local-tools`. The worker resolves only the
 Knowledge wrapper bundled with its executing source/distribution; a missing or
 unloadable required wrapper fails before prompt execution. Ambient extension
-settings cannot disable a requested capability. All other capabilities fail with
-`unsupported_capability`. Ask-agent, cross-UID collaboration, interactive Fast,
+settings cannot disable a requested capability. The `inbound-consultation`
+capability applies to the separate Ask Agent operation above. Other capabilities fail with
+`unsupported_capability`. Cross-UID collaboration, interactive Fast,
 subagents, Web/provider wrappers, media, and worker-side outbox delivery remain
 outside the worker capability slice. Knowledge v2 **context** can be required independently
-of Knowledge **tools**. Without either capability the worker passes `--no-tools`.
+of Knowledge **tools**. Workers with neither tool capability pass `--no-tools`.
 Knowledge calls use only the worker-local `MINIME_AGENT_WORKSPACE_ROOT`; no
 controller configuration or auth is passed over IPC.
 
@@ -302,7 +380,18 @@ provider. Its in-memory wire replaces socket I/O and endpoint checks. Cron
 delivery is a controller-side test double. Cross-UID endpoints and authentic
 provider requests require separate evidence.
 
+`src/__tests__/ask-agent-offline.test.ts` includes the protected same-UID Unix
+socket consultation test with actual pinned Pi and a deterministic provider.
+`src/__tests__/worker-consultation.test.ts` uses an in-memory wire to exercise
+the consultation protocol and Pi lifecycle, including hard worker loss. Its
+synthetic subscription exists only in the primary worker profile. The test
+runs consultations, chat, and cron through pinned Pi and checks the profile's
+settings, the consultation's retry controls, and the absence of a consultation
+transcript or second credential store.
+Those fixtures establish neither cross-UID filesystem denial nor live
+provider or tool parity.
+
 Remaining migration work includes other first-party wrappers and transport
-capabilities, collaboration and consultation, worker-side file delivery,
+capabilities, collaboration, worker-side file delivery,
 per-user auth provisioning, additional isolated agents, and representative
 production canaries with history preservation.

@@ -1,13 +1,89 @@
 import { createConnection, type Socket } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { NewlineOnlyJsonlSplitter } from './pi-rpc-protocol.js';
-import type { StreamLine } from './types.js';
+import type { AgentConfig, StreamLine } from './types.js';
+import {
+  MAX_ASK_AGENT_ANSWER_BYTES, MAX_ASK_AGENT_ANSWER_CHARS, normalizeAskAgentQuestion, type AskAgentStructuredResult,
+} from './pi-extensions/ask-agent-result.js';
 import { verifyAgentRuntimeEndpoint, type AgentRuntimeEndpointIdentity } from './agent-runtime-descriptor.js';
 import {
   AGENT_RUNTIME_MAX_FRAME_BYTES, AGENT_RUNTIME_RPC_TIMEOUT_MS, AGENT_RUNTIME_CLIENT_PROMPT_TIMEOUT_MS,
-  AgentRuntimeError, AgentRuntimeUncertainError,
+  AgentRuntimeError, AgentRuntimeUncertainError, AgentRuntimeConsultationError, type ConsultationErrorCode,
   type AgentLaneHandle, type AgentLaneState, type AgentRuntimeMessage, type AgentRuntimeOperation,
 } from './agent-runtime-protocol.js';
+
+/** A fresh connection with a content-free preflight followed by at most one question. */
+export async function consultAgentRuntime(
+  route: NonNullable<AgentConfig['workerRuntime']>, agentId: string, question: string, signal?: AbortSignal,
+): Promise<AskAgentStructuredResult> {
+  const unavailable = () => new AgentRuntimeConsultationError('consultation_unavailable');
+  if (route.inboundConsultation !== true || !/^[a-zA-Z0-9_-]{1,80}$/.test(agentId) || !normalizeAskAgentQuestion(question)) {
+    throw unavailable();
+  }
+  if (signal?.aborted) throw new AgentRuntimeConsultationError('cancelled');
+  try { verifyAgentRuntimeEndpoint(route.socketPath, route); }
+  catch { throw unavailable(); }
+
+  const socket = createConnection(route.socketPath);
+  const id = randomUUID();
+  const splitter = new NewlineOnlyJsonlSplitter(AGENT_RUNTIME_MAX_FRAME_BYTES);
+  let sent = false;
+  try {
+    return await new Promise<AskAgentStructuredResult>((resolve, reject) => {
+      const lost = () => reject(sent ? new AgentRuntimeConsultationError('uncertain_outcome') : unavailable());
+      const cancel = () => sent ? lost() : reject(new AgentRuntimeConsultationError('cancelled'));
+      let deadline = setTimeout(lost, AGENT_RUNTIME_RPC_TIMEOUT_MS);
+      const write = (request: AgentRuntimeOperation) => socket.write(JSON.stringify({ version: 1, id, ...request }) + '\n');
+      const cleanup = () => {
+        clearTimeout(deadline);
+        signal?.removeEventListener('abort', cancel);
+      };
+      socket.once('close', () => { cleanup(); lost(); });
+      socket.once('end', lost);
+      socket.on('error', lost);
+      socket.once('connect', () => {
+        if (!signal?.aborted) write({ op: 'consult_check', expectedAgentId: agentId });
+      });
+      signal?.addEventListener('abort', cancel, { once: true });
+      if (signal?.aborted) cancel();
+      socket.on('data', (chunk: Buffer) => {
+        try {
+          const records = splitter.push(chunk);
+          if (!records.length) return;
+          if (records.length !== 1 || splitter.hasPendingRecord()) return lost();
+          const reply = JSON.parse(records[0]) as AgentRuntimeMessage;
+          if (reply.version !== 1 || reply.id !== id) return lost();
+          if (reply.type === 'error') {
+            const codes: readonly ConsultationErrorCode[] = sent
+              ? ['agent_mismatch', 'consultation_disabled', 'consultation_busy', 'consultation_timeout',
+                'consultation_failed', 'consultation_cleanup_failed']
+              : ['agent_mismatch', 'consultation_disabled'];
+            const code = codes.find(code => code === reply.code);
+            return code ? reject(new AgentRuntimeConsultationError(code)) : lost();
+          }
+          if (!sent && reply.type === 'consult_ready') {
+            if (reply.agentId !== agentId) return reject(new AgentRuntimeConsultationError('agent_mismatch'));
+            if (reply.inboundConsultation !== true || signal?.aborted) return lost();
+            clearTimeout(deadline);
+            deadline = setTimeout(lost, AGENT_RUNTIME_CLIENT_PROMPT_TIMEOUT_MS);
+            sent = true;
+            write({ op: 'consult', question });
+            return;
+          }
+          if (sent && reply.type === 'consult_result') {
+            const result = reply.result;
+            if (typeof result?.answer === 'string' && result.answer.trim()
+              && result.answer.length <= MAX_ASK_AGENT_ANSWER_CHARS && Buffer.byteLength(result.answer) <= MAX_ASK_AGENT_ANSWER_BYTES
+              && typeof result.truncated === 'boolean' && typeof result.needsClarification === 'boolean') {
+              return resolve({ answer: result.answer, truncated: result.truncated, needsClarification: result.needsClarification });
+            }
+          }
+          lost();
+        } catch { lost(); }
+      });
+    });
+  } finally { socket.destroy(); }
+}
 
 interface Pending {
   prompt: boolean;

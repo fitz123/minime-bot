@@ -6,7 +6,7 @@ import {
 } from './pi-rpc-protocol.js';
 import type { InteractiveSessionBinding } from './interactive-session-binding.js';
 import type { StreamLine } from './types.js';
-import { AgentRuntimeError } from './agent-runtime-protocol.js';
+import { AGENT_RUNTIME_MAX_FRAME_BYTES, AgentRuntimeError } from './agent-runtime-protocol.js';
 
 /** One stdout owner for the whole child lifetime, including startup and side replies. */
 export class AgentRuntimePi {
@@ -17,10 +17,10 @@ export class AgentRuntimePi {
   private failure?: Error;
   private readonly exited: Promise<void>;
 
-  constructor(readonly child: ChildProcess, binding: InteractiveSessionBinding, startupTimeoutMs: number,
+  constructor(readonly child: ChildProcess, binding: InteractiveSessionBinding | null, startupTimeoutMs: number,
     expected: { model: string; thinking: string }) {
-    const splitter = new NewlineOnlyJsonlSplitter();
-    this.exited = new Promise(resolve => child.once('close', resolve));
+    const splitter = new NewlineOnlyJsonlSplitter(binding === null ? AGENT_RUNTIME_MAX_FRAME_BYTES : undefined);
+    this.exited = new Promise(resolve => child.once('close', () => resolve()));
     this.ready = new Promise((resolve, reject) => { this.startup = { id: randomUUID(), resolve, reject }; });
     const timer = setTimeout(() => this.fail(new AgentRuntimeError('startup_timeout', 'Pi startup identity deadline exceeded')), startupTimeoutMs);
     // Attach both branches so a fast spawn failure cannot become an unhandled rejection.
@@ -33,16 +33,27 @@ export class AgentRuntimePi {
       try {
         for (const record of splitter.push(chunk)) {
           if (this.startup) {
-            const identity = parsePiStartupIdentityRecord(child, record, this.startup.id);
-            if (identity) {
+            if (binding) {
+              const identity = parsePiStartupIdentityRecord(child, record, this.startup.id);
+              if (!identity) continue;
               assertPiSessionIdentityMatchesBinding(binding, identity);
-              const data = JSON.parse(record).data;
-              if (`${data?.model?.provider}/${data?.model?.id}` !== expected.model || data?.thinkingLevel !== expected.thinking) {
-                throw new AgentRuntimeError('model_mismatch', 'Pi did not open the explicit model/thinking selection');
+            } else {
+              if (handlePiExtensionUiRecord(child, record) === 'blocking') {
+                throw new AgentRuntimeError('unsupported_ui', 'Blocking Pi UI is unsupported');
               }
-              this.startup.resolve();
-              this.startup = undefined;
+              const reply = JSON.parse(record);
+              if (reply?.type !== 'response' || reply.id !== this.startup.id) continue;
+              if (reply.command !== 'get_state' || reply.success !== true || typeof reply.data?.sessionId !== 'string'
+                || !reply.data.sessionId || reply.data.sessionFile != null || reply.data.messageCount !== 0) {
+                throw new AgentRuntimeError('pi_protocol', 'Pi consultation requires a fresh in-memory session');
+              }
             }
+            const data = JSON.parse(record).data;
+            if (`${data?.model?.provider}/${data?.model?.id}` !== expected.model || data?.thinkingLevel !== expected.thinking) {
+              throw new AgentRuntimeError('model_mismatch', 'Pi did not open the explicit model/thinking selection');
+            }
+            this.startup.resolve();
+            this.startup = undefined;
             continue;
           }
           if (handlePiExtensionUiRecord(child, record) === 'blocking') throw new AgentRuntimeError('unsupported_ui', 'Blocking Pi UI is unsupported');
