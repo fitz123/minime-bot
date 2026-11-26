@@ -1,10 +1,12 @@
 import { SESSION_EFFORT_ENV, type SessionEffortStartup } from "./session-effort-wire.js";
 import { readVisionImages } from "./vision-input.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
+import type { ConsultationPiResources } from "./agent-runtime-consultation-pi.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, normalize, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Readable } from "node:stream";
 import type {
   AgentConfig,
@@ -900,6 +902,41 @@ export function spawnPreparedPiRpcSession(options: {
       ...(context.behavioralFoundation ? { [MINIME_BEHAVIORAL_FOUNDATION_ROOT_ENV]: context.behavioralFoundation.root } : {}),
     },
     stdio: ["pipe", "pipe", "pipe"], detached: true,
+  });
+}
+
+/** Use a separate RPC process with an in-memory Pi session and an owner-liveness pipe. */
+export function spawnPreparedPiConsultation(options: Omit<ConsultationPiResources, "systemPrompt" | "appendSystemPrompt"> & {
+  workspace: string;
+  context: PiContextArtifacts;
+  env: NodeJS.ProcessEnv;
+}): ChildProcess {
+  const invocation = resolvePackageOwnedPiInvocation("rpc", []);
+  if (invocation.diagnostic.versionMismatch) throw new Error("Worker requires the pinned Pi runtime");
+  const { context, model, thinking, tools, extensions } = options;
+  const resources: ConsultationPiResources = {
+    model, thinking, tools, extensions,
+    systemPrompt: context.systemPromptPath ?? "",
+    appendSystemPrompt: context.appendSystemPromptPath,
+  };
+  // fd 3 is dedicated to ownership. EOF on it exits even during Pi startup or a
+  // stuck provider call, including subprocesses in the owned process group.
+  const ownerWatch = `import { Socket } from 'node:net';
+    const owner = new Socket({fd: 3, readable: true, writable: false});
+    const stop = () => process.kill(-process.pid, 'SIGKILL');
+    owner.once('end', stop);
+    owner.once('error', stop);
+    owner.resume();`;
+  const entrypoint = new URL(import.meta.url.endsWith(".ts")
+    ? "./agent-runtime-consultation-pi.ts" : "./agent-runtime-consultation-pi.js", import.meta.url);
+  return spawn(invocation.command, ["--import", `data:text/javascript,${encodeURIComponent(ownerWatch)}`,
+    fileURLToPath(entrypoint), JSON.stringify(resources)], {
+    cwd: options.workspace,
+    env: {
+      ...options.env,
+      ...(context.behavioralFoundation ? { [MINIME_BEHAVIORAL_FOUNDATION_ROOT_ENV]: context.behavioralFoundation.root } : {}),
+    },
+    stdio: ["pipe", "pipe", "pipe", "pipe"], detached: true,
   });
 }
 

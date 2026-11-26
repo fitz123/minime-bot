@@ -454,14 +454,23 @@ assembled context. Ask-agent children do not load recursive `subagent` or
 `ask_agent` tools in the MVP.
 
 The Pi tool is named `ask_agent` and accepts `agent`, `question`, and optional
-`context`. Questions and caller-provided context are capped at 64 KiB. Target
-children have a bounded 120s run window, and returned answers are capped at
-32 KiB / 128 KiB with a `…[truncated]` marker. Successful tool content is JSON
+`context`. Questions and caller-provided context are capped at 64 KiB. Returned
+answers are capped at 32,768 UTF-16 code units and 128 KiB with a
+`…[truncated]` marker. Successful tool content is JSON
 with `answer`, `truncated`, and `needsClarification`; tool details also include
 the caller and target ids.
 Structured errors use stable codes such as `caller_unknown`, `target_unknown`,
 `context_failed`, `not_enabled`, `denied`, `invalid_request`, `config_unavailable`,
 and `spawn_unavailable`.
+
+A local caller can ask an isolated target when its controller route sets
+`workerRuntime.inboundConsultation: true` and the worker descriptor enables
+`inbound-consultation`. The existing `askAgent` rules still apply. Omit the
+optional `context` field for these calls. Worker agents cannot initiate Ask
+Agent calls. The worker runs a fresh, in-memory Pi invocation with a 120-second
+deadline and uses the same Pi subscription login as the worker's chat and
+scheduled jobs. See [isolated Ask Agent](docs/agent-runtime.md#inbound-ask-agent)
+for the worker tool allowlist and error codes.
 
 ## Knowledge v2 Layout
 

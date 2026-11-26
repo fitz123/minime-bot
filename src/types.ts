@@ -28,7 +28,7 @@ export interface AgentConfig {
    */
   provider?: "pi";
   askAgent?: AskAgentConfig;
-  workerRuntime?: { socketPath: string; workerUid: number; controllerName: string; scheduledLlm?: boolean };
+  workerRuntime?: { socketPath: string; workerUid: number; controllerName: string; scheduledLlm?: boolean; inboundConsultation?: boolean };
   /** Explicit eligibility only; preferences start off and live in control data. */
   codexFast?: { provider: "openai-codex"; model: string };
 }
