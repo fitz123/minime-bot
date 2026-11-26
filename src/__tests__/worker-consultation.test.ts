@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { EventEmitter, once } from 'node:events';
-import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { createServer, type Socket } from 'node:net';
 import { dirname, join } from 'node:path';
 import { mock, test, type TestContext } from 'node:test';
@@ -50,8 +50,13 @@ const { executeAskAgent } = await import('../pi-extensions/ask-agent-args.js');
 const { MINIME_BOT_PI_SESSION_AGENT_ID_ENV } = await import('../pi-rpc-protocol.js');
 const { validateWorkerRuntime } = await import('../config.js');
 
-function setup(t: TestContext, options: { enabled?: boolean; timeout?: number; knowledge?: boolean } = {}) {
+function setup(t: TestContext, options: {
+  enabled?: boolean; timeout?: number; knowledge?: boolean;
+  model?: string; thinking?: descriptorModule.AgentRuntimeDescriptor['thinking'];
+} = {}) {
   const d = consultationFixture(t);
+  if (options.model) d.model = options.model;
+  if (options.thinking) d.thinking = options.thinking;
   if (options.enabled === false) d.capabilities = ['local-tools'];
   if (options.knowledge) {
     d.capabilities = [...d.capabilities, 'knowledge-tools'];
@@ -142,17 +147,47 @@ test('actual Pi consultation, chat and cron use one worker subscription with sep
   assert.equal(consultationPromptCount(f.d), 3);
 });
 
-test('consultation requires a subscription even when the primary profile contains an API key', { timeout: 15_000 }, async t => {
-  const f = setup(t);
-  writeFileSync(join(f.d.stateRoot, 'pi', 'auth.json'), JSON.stringify({
-    'consultation-fixture': { type: 'api_key', key: 'offline-authorization-marker' },
-  }));
-  const result = await f.ask();
-  assert.equal(result.ok, false);
-  assert.equal(result.error.code, 'consultation_failed');
-  assert.equal(consultationPromptCount(f.d), 0);
+const unlistedModelId = 'consultation-fixture/unlisted-preview:low';
+
+test('consultation sends the unlisted literal model ID and configured thinking to its subscription provider', { timeout: 15_000 }, async t => {
+  const f = setup(t, { model: `consultation-fixture/${unlistedModelId}`, thinking: 'high' });
+  const result = await f.ask('CONSULT_ONE CONSULT_LITERAL');
+  assert.equal(result.ok, true);
+  assert.deepEqual(JSON.parse(result.result.answer), {
+    provider: 'consultation-fixture', id: unlistedModelId, reasoning: 'high',
+  });
+  assert.equal(consultationPromptCount(f.d), 1);
+  const started = consultationStarted(f.d);
+  assert.equal(started.noSession, true);
+  assert.equal(alive(started.pid), false);
   assertConsultationClean(f.d);
 });
+
+for (const changedId of ['offlin', 'Offline', 'offline:low']) {
+  test(`consultation rejects model substitution for ${changedId} before session start`, { timeout: 15_000 }, async t => {
+    const f = setup(t, { model: `consultation-fixture/${changedId}` });
+    const result = await f.ask();
+    assert.equal(result.ok, false);
+    assert.equal(result.error.code, 'consultation_failed');
+    assert.equal(existsSync(join(f.d.workspace, 'consultation-started.json')), false);
+    assert.equal(consultationPromptCount(f.d), 0);
+    assertConsultationClean(f.d);
+  });
+}
+
+for (const id of ['offline', unlistedModelId]) {
+  test(`consultation requires a subscription for ${id} even when the primary profile contains an API key`, { timeout: 15_000 }, async t => {
+    const f = setup(t, { model: `consultation-fixture/${id}` });
+    writeFileSync(join(f.d.stateRoot, 'pi', 'auth.json'), JSON.stringify({
+      'consultation-fixture': { type: 'api_key', key: 'offline-authorization-marker' },
+    }));
+    const result = await f.ask();
+    assert.equal(result.ok, false);
+    assert.equal(result.error.code, 'consultation_failed');
+    assert.equal(consultationPromptCount(f.d), 0);
+    assertConsultationClean(f.d);
+  });
+}
 
 test('controller rules deny worker callers, disabled participants, unallowed targets and explicit caller context before contact', async t => {
   const f = setup(t);

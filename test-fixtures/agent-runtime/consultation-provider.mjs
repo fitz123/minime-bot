@@ -33,8 +33,11 @@ export default function (pi) {
         || (!normal && !prompt.includes('CONSULT_ONE'))
         || !instructions.includes('ISOLATED_TARGET_CONTEXT')
         || instructions.includes('SYNTHETIC_AMBIENT_SYSTEM');
-      const answer = normal ? 'PRIMARY_PROFILE_ANSWER'
+      let answer = normal ? 'PRIMARY_PROFILE_ANSWER'
         : prompt.includes('CONSULT_LONG') ? 'a'.repeat(40_000) + '?' : 'ISOLATED_TARGET_ANSWER';
+      if (prompt.includes('CONSULT_LITERAL')) {
+        answer = JSON.stringify({ provider: model.provider, id: model.id, reasoning: options.reasoning });
+      }
       const message = { role: 'assistant', content: failed ? [] : [{ type: 'text', text: answer }],
         api: model.api, provider: model.provider, model: model.id, timestamp: Date.now(),
         usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
