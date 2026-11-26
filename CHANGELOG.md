@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 2026.11.16
+
+- Support opt-in, one-shot Ask Agent consultations on isolated workers (#289).
+
 ## 2026.11.15
 
 - Add per-topic reasoning effort and personal-agent model defaults (#240, #241).
