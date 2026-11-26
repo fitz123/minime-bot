@@ -1,7 +1,7 @@
 import type { ThinkingLevel } from '@earendil-works/pi-agent-core';
 import {
   createAgentSessionFromServices, createAgentSessionRuntime, createAgentSessionServices,
-  ModelRuntime, runRpcMode, SessionManager, SettingsManager,
+  ModelRuntime, resolveCliModel, runRpcMode, SessionManager, SettingsManager,
 } from '@earendil-works/pi-coding-agent';
 
 export interface ConsultationPiResources {
@@ -21,7 +21,7 @@ if (!agentDir) throw new Error('Pi consultation requires the worker agent direct
 const runtime = await createAgentSessionRuntime(async ({ sessionManager }) => {
   // Pi's default credential store uses PI_CODING_AGENT_DIR. Use its
   // in-memory model catalog to keep model configuration scoped to this call.
-  const modelRuntime = await ModelRuntime.create({ modelsPath: null });
+  const modelRuntime = await ModelRuntime.create({ modelsPath: null, allowModelNetwork: false });
   const services = await createAgentSessionServices({
     cwd, agentDir, modelRuntime,
     settingsManager: SettingsManager.inMemory({
@@ -40,8 +40,14 @@ const runtime = await createAgentSessionRuntime(async ({ sessionManager }) => {
   });
   const slash = resources.model.indexOf('/');
   const provider = resources.model.slice(0, slash);
-  const model = modelRuntime.getModel(provider, resources.model.slice(slash + 1));
-  if (!model || !modelRuntime.isUsingSubscription(provider)) {
+  const modelId = resources.model.slice(slash + 1);
+  // Pi can construct an unlisted model from local provider metadata. Its CLI
+  // resolver also accepts fuzzy matches and thinking suffixes.
+  const model = modelRuntime.getModel(provider, modelId) ?? resolveCliModel({
+    cliProvider: provider, cliModel: resources.model, cliThinking: resources.thinking, modelRuntime,
+  }).model;
+  if (model?.provider !== provider || model.id !== modelId || model.api === 'pi-virtual'
+    || !modelRuntime.isUsingSubscription(provider)) {
     throw new Error('Pi consultation requires the explicit model and its worker subscription');
   }
   // Anthropic can resubmit a strict-tool rejection or request model fallbacks

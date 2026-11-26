@@ -161,10 +161,15 @@ delivery tools are unavailable. Filesystem access follows the worker's OS
 permissions.
 
 Pi uses the worker's existing subscription login under `stateRoot/pi` for
-chat, cron, and consultations. The descriptor must select a bundled model
-for the provider the worker signed in to. Pi owns credential access and
-refresh in that profile. Each consultation supplies in-memory settings with
-agent and provider retries, automatic compaction, and cache warming disabled.
+chat, cron, and consultations. For a consultation, the descriptor must give
+the exact `provider/model-id` for that subscription. Pi uses a matching
+catalog entry when available. It can also use an unlisted literal ID when
+it can construct the same provider and ID from local metadata. Consultations
+disable network catalog discovery and reject model substitutions and virtual
+models. Pi owns credential access and refresh in that profile.
+
+Each consultation supplies in-memory settings with agent and provider
+retries, automatic compaction, and cache warming disabled.
 It uses SSE to avoid Codex WebSocket resubmissions and disables Anthropic's
 strict-tool resubmissions and model fallbacks for the consultation.
 
