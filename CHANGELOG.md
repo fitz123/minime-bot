@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 2026.11.17
+
+- Preserve exact subscription model IDs in worker consultations without accepting fuzzy matches (#293).
+
 ## 2026.11.16
 
 - Support opt-in, one-shot Ask Agent consultations on isolated workers (#289).
